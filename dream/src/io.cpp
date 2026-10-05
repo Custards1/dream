@@ -409,7 +409,7 @@ public:
             auto [it, fresh] = waiters_.try_emplace(fd);
             added = fresh;
             std::vector<Waiter>& side = writable ? it->second.writers : it->second.readers;
-            side.push_back(Waiter{pid, sched});
+            side.push_back(Waiter{pid, sched->serial()});
             events = interest(it->second);
             // Made under the lock, so that two processes arming one descriptor
             // in opposite directions cannot leave it registered for only one.
@@ -433,7 +433,7 @@ public:
         std::lock_guard<std::mutex> g(mutex_);
         if (!running_) return false;
         sched->note_io_wait(true);
-        (writable ? waiters_[fd].writers : waiters_[fd].readers).push_back(Waiter{pid, sched});
+        (writable ? waiters_[fd].writers : waiters_[fd].readers).push_back(Waiter{pid, sched->serial()});
         changed_.notify_all();
         return true;
 #endif
@@ -474,7 +474,7 @@ public:
     /// else waiting on it.
     void cancel(int fd, uint64_t pid) {
         size_t dropped = 0;
-        Scheduler* sched = nullptr;
+        uint64_t sched = 0;
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto it = waiters_.find(fd);
@@ -505,13 +505,15 @@ public:
             if (it->second.readers.empty() && it->second.writers.empty()) waiters_.erase(it);
 #endif
         }
-        for (size_t i = 0; i < dropped; ++i) sched->note_io_wait(false);
+        Scheduler::release_io_waits(sched, dropped);
     }
 
 private:
+    /// The scheduler is named by its serial, not held: this thread outlives
+    /// it. See `Scheduler::serial`.
     struct Waiter {
         uint64_t pid = 0;
-        Scheduler* sched = nullptr;
+        uint64_t sched = 0;
     };
     /// Who is parked on one descriptor, in each direction.
     struct Waiters {
@@ -523,10 +525,7 @@ private:
     /// IO-waiter count; see `run_child` in os.cpp for why the other order
     /// invents a deadlock.
     static void release(const std::vector<Waiter>& ws) {
-        for (const Waiter& w : ws) {
-            w.sched->wake(w.pid);
-            w.sched->note_io_wait(false);
-        }
+        for (const Waiter& w : ws) Scheduler::wake_external(w.sched, w.pid);
     }
 
 #if DREAM_HAVE_EPOLL
@@ -1212,6 +1211,109 @@ NativeResult io_chmod(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(UNIT);
 }
 
+Value stamp_list(Process& p, int64_t size, int64_t modified, const char* kind) {
+    Value list = p.heap().make_cons(make_atom(p.runtime().intern_atom(kind)), NIL);
+    list = p.heap().make_cons(make_integer(p, modified), list);
+    return p.heap().make_cons(make_integer(p, size), list);
+}
+
+/// `lstat! path` -- `stat!` of the name itself rather than what it leads to:
+/// a symbolic link answers `:link`, its size being the length of the target
+/// it holds and its time when the link was made, and a dangling one is still
+/// there. Anything that is not a link answers exactly what `stat!` does.
+///
+/// A separate call rather than a fourth kind from `stat!`, because a stamp
+/// wants the file a build will actually read, and that is the one a link
+/// leads to.
+NativeResult io_lstat(Process& p, Value self, Value* args, uint32_t argc) {
+    if (!is_string(args[0])) return fail(p, "type_error", "lstat! needs a path");
+    std::string path = string_arg(args[0]);
+#if defined(_WIN32)
+    // `_wstat64` follows a reparse point and there is no `_wlstat64`; the
+    // attributes call does not follow, which is the half wanted here.
+    std::error_code ec;
+    auto st = std::filesystem::symlink_status(fs_path(path), ec);
+    if (ec || st.type() == std::filesystem::file_type::not_found) return NativeResult::ok(UNIT);
+    if (st.type() != std::filesystem::file_type::symlink) return io_stat(p, self, args, argc);
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(windows::wide(path.c_str()).c_str(), GetFileExInfoStandard, &data)) {
+        return fail(p, "io_error", "lstat " + path);
+    }
+    // FILETIME counts 100ns ticks from 1601; the epoch is 11644473600s later.
+    int64_t ticks = (int64_t(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
+    auto target = std::filesystem::read_symlink(fs_path(path), ec);
+    return NativeResult::ok(stamp_list(p, ec ? 0 : int64_t(fs_text(target).size()),
+                                       (ticks - 116444736000000000) * 100, "link"));
+#else
+    (void)self; (void)argc;
+    sys::FileStat st{};
+    if (::lstat(path.c_str(), &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return NativeResult::ok(UNIT);
+        return fail_errno(p, "lstat " + path, errno);
+    }
+    const char* kind = S_ISLNK(st.st_mode) ? "link" : S_ISDIR(st.st_mode) ? "dir" : S_ISREG(st.st_mode) ? "file" : "other";
+    return NativeResult::ok(stamp_list(p, int64_t(st.st_size), modified_ns(st), kind));
+#endif
+}
+
+/// `mode! path` -- the permission bits `chmod!` sets, `0o755` being `493`, of
+/// what the path leads to; `()` when nothing is there, as `stat!` answers.
+/// Windows has only the read-only attribute to report, which its C library
+/// spreads across the owner, group and other bits: `0o666` or `0o444`, with
+/// the execute bits for a directory or a name it runs.
+NativeResult io_mode(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "mode! needs a path");
+    std::string path = string_arg(args[0]);
+    sys::FileStat st{};
+    if (sys::stat(path.c_str(), &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return NativeResult::ok(UNIT);
+        return fail_errno(p, "mode " + path, errno);
+    }
+    return NativeResult::ok(make_fixnum(int64_t(st.st_mode) & 07777));
+}
+
+/// `is_link! path` -- whether the name itself is a symbolic link, dangling or
+/// not; `is_dir!`'s question of the name rather than of where it leads.
+NativeResult io_is_link(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "is_link! needs a path");
+    std::error_code ec;
+    return NativeResult::ok(make_bool(std::filesystem::is_symlink(fs_path(string_arg(args[0])), ec)));
+}
+
+/// `symlink! target to` -- `to` becomes a symbolic link holding `target`, in
+/// the order `ln -s` and `link!` take them. The target is stored as written:
+/// a relative one is read from the link's directory, not from where the
+/// program is running, and it need not exist yet. `to` must not.
+///
+/// Windows makes a link to a directory differently from one to a file, so
+/// the target is looked at, from the link's directory, to choose; on POSIX
+/// the two calls are the same one. Windows also refuses either without
+/// developer mode or the privilege, which surfaces as `:permission_denied`.
+NativeResult io_symlink(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0]) || !is_string(args[1])) return fail(p, "type_error", "symlink! needs two paths");
+    auto target = fs_path(string_arg(args[0]));
+    auto to = fs_path(string_arg(args[1]));
+    std::error_code ec;
+    auto seen = target.is_absolute() ? target : to.parent_path() / target;
+    if (std::filesystem::is_directory(seen, ec)) std::filesystem::create_directory_symlink(target, to, ec);
+    else std::filesystem::create_symlink(target, to, ec);
+    if (ec) return fail_fs(p, "symlink " + fs_text(to) + " to " + fs_text(target), ec);
+    return NativeResult::ok(UNIT);
+}
+
+/// `read_link! path` -- the target a symbolic link holds, as it was written
+/// rather than resolved. Not a link is `:wrong_kind`.
+NativeResult io_read_link(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "read_link! needs a path");
+    auto path = fs_path(string_arg(args[0]));
+    std::error_code ec;
+    auto target = std::filesystem::read_symlink(path, ec);
+    if (ec == std::errc::invalid_argument) return fail(p, "wrong_kind", "read_link " + fs_text(path) + ": not a symbolic link");
+    if (ec) return fail_fs(p, "read_link " + fs_text(path), ec);
+    std::string text = fs_text(target);
+    return NativeResult::ok(p.heap().make_string(text.data(), uint32_t(text.size())));
+}
+
 /// `walk! dir` -- every file under `dir`, as paths relative to it with `/`
 /// between the parts, sorted. Directories are walked and not listed, and a
 /// link to a directory is not followed, so a tree that links back into itself
@@ -1737,6 +1839,11 @@ ModuleDef make_io_module() {
                          {"link!", 2, 0b11, io_link},
                          {"copy!", 2, 0b11, io_copy},
                          {"chmod!", 2, 0b11, io_chmod},
+                         {"mode!", 1, 0b1, io_mode},
+                         {"lstat!", 1, 0b1, io_lstat},
+                         {"is_link!", 1, 0b1, io_is_link},
+                         {"symlink!", 2, 0b11, io_symlink},
+                         {"read_link!", 1, 0b1, io_read_link},
                          {"walk!", 1, 0b1, io_walk},
                          {"async", 1, 0b1, io_async},
                      }};

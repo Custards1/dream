@@ -1,0 +1,356 @@
+// ship -- a program made into what each platform installs.
+//
+//   ship init        add a [ship] section to mind.toml, to fill in
+//   ship check       read the manifest and every file it names, and say what is wrong
+//   ship files       what every package will install, and from where
+//   ship deb         a Debian package (.deb), for apt and dpkg
+//   ship rpm         an RPM (.rpm), for dnf, yum, zypper and rpm
+//   ship arch        an Arch Linux package (.pkg.tar.zst), for pacman
+//   ship tarball     a release tarball (.tar.gz), laid out from the prefix
+//   ship brew        a Homebrew formula, from the tarballs already made
+//   ship pkgbuild    a PKGBUILD for the AUR, from the tarballs already made
+//   ship installer   install.sh: `curl ... | sh`, from the tarballs already made
+//   ship sums        SHA256SUMS for everything in the output directory
+//   ship all         every package this machine can make, then the rest
+//
+// Every package is written by `ship` itself -- the tar, ar and cpio inside
+// them, RPM's binary headers, Debian's control files -- so making a .deb
+// needs no dpkg and making an RPM no rpmbuild, and every one of them can be
+// made on any machine with a VM. What it does run is a compressor (gzip, xz
+// or zstd), which every machine has. README.md is the manifest's reference.
+
+import std.cli;
+import std.console;
+import std.file;
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+import std.toml;
+
+import arch;
+import aur;
+import brew;
+import bytes;
+import compress;
+import deb;
+import installer;
+import layout;
+import layout.Layout;
+import release;
+import rpm;
+import scratch;
+import spec;
+import spec.Spec;
+import sums;
+import tarball;
+
+let version : :string = "0.1.0";
+
+let opts = [
+    cli.section "what to package",
+    cli.value "m" "manifest" "PATH" "the manifest to read" |> cli.default_to "mind.toml",
+    cli.value "" "package-version" "V" "package this version, whatever the manifest says",
+    cli.value "" "release" "N" "the package's own revision (default: [ship] release, or 1)",
+    cli.value "" "arch" "ARCH" "the machine it is for: x86_64, aarch64, all, or native",
+    cli.value "" "os" "OS" "the system a tarball is for: linux, macos, or native",
+
+    cli.section "what to write",
+    cli.value "o" "out" "DIR" "where packages go" |> cli.default_to "dist",
+    cli.value "" "compress" "HOW" "how to compress what each format compresses"
+        |> cli.choices ["auto", "none", "gzip", "xz", "zstd"] |> cli.default_to "auto",
+    cli.flag "q" "quiet" "print only what was made, and what went wrong",
+    cli.flag "h" "help" "this message",
+    cli.flag "" "version" "print ship's version",
+];
+
+let command_spec = [
+    cli.command "init" "add a [ship] section to the manifest, to fill in" [],
+    cli.command "check" "read the manifest and every file it names, and say what is wrong" [],
+    cli.command "files" "list what every package will install, and from where" [],
+    cli.command "deb" "a Debian package, for apt and dpkg" [],
+    cli.command "rpm" "an RPM, for dnf, yum, zypper and rpm" [],
+    cli.command "arch" "an Arch Linux package, for pacman" [],
+    cli.command "tarball" "a release tarball, laid out from the prefix" [],
+    cli.command "brew" "a Homebrew formula, from the tarballs in the output directory" [],
+    cli.command "pkgbuild" "a PKGBUILD and .SRCINFO for the AUR, from the tarballs there" [],
+    cli.command "installer" "install.sh, for `curl ... | sh`, from the tarballs there" [],
+    cli.command "sums" "SHA256SUMS for everything in the output directory" [],
+    cli.command "all" "every package, then what is made from them, then the sums" [],
+    cli.command "help" "this message" [],
+];
+
+let usage = "ship -- a program made into what each platform installs
+
+usage: ship <command> [options]
+
+commands:
+" + cli.commands_help command_spec + "\n\n" + cli.options_help opts + "\n";
+
+let fail! : :string -> :never;
+let fail! message = {
+    console.error! ("ship: " + message)
+    os.exit! 1
+};
+
+/// The spec, checked, or the reasons it is not one.
+let spec! : :any -> Spec;
+let spec! c = {
+    let overrides = %{
+        "version" => cli.get "" c "package-version",
+        "release" => cli.get "" c "release",
+        "arch" => cli.get "" c "arch",
+        "os" => cli.get "" c "os",
+    };
+    match spec.load! (cli.get "mind.toml" c "manifest") overrides {
+        [:error, why] => fail! why,
+        [:ok, sp] => match spec.problems sp {
+            [] => {
+                if not (cli.flag_set c "quiet") {
+                    each! (fn w -> console.error! ("ship: warning: " + w)) (spec.warnings sp)
+                }
+                sp
+            },
+            ps => fail! ("the manifest is not ready:\n  " + str.join_str "\n  " ps),
+        },
+    }
+};
+
+let layout! : Spec -> Layout;
+let layout! sp = match layout.collect! sp {
+    [:ok, lay] => lay,
+    [:error, why] => fail! why,
+};
+
+/// `f!` on each of `xs`, in order. A fold would be a pure expression, which
+/// nothing evaluates when its value is not used.
+let each! : (:any -> :any) -> [:any] -> :unit;
+let rec each! f! xs = match xs {
+    [] => (),
+    [x, ..rest] => {
+        f! x
+        each! f! rest
+    },
+};
+
+let say! : :any -> :string -> :unit;
+let say! c line = if not (cli.flag_set c "quiet") { console.print! line };
+
+let out! : :any -> :string;
+let out! c = {
+    let dir = cli.get "dist" c "out";
+    file.mkdir_all! dir
+    dir
+};
+
+let compression : :any -> :any;
+let compression c = match compress.parse (cli.get "auto" c "compress") { [:ok, w] => w, _ => :auto };
+
+/// Report one package made, or stop.
+let made! : [:ok, :string] | [:error, :string] -> :string;
+let made! r = match r {
+    [:ok, path] => {
+        console.print! ("made " + path)
+        path
+    },
+    [:error, why] => fail! why,
+};
+
+let counted : :integer -> :string -> :string;
+let counted n noun = to_string n + " " + noun + (if n == 1 { "" } else { "s" });
+
+/// What each format would refuse, found without making anything: Debian's
+/// maintainer, and every format's dependencies read as that format reads them.
+let format_problems : Spec -> Layout -> [:string];
+let format_problems sp lay = {
+    let deb_ok = match deb.problems sp { [:ok, _] => deb.control sp lay, other => other };
+    let outcomes = [["deb", deb_ok], ["rpm", rpm.relations sp :xz], ["arch", arch.pkginfo sp lay]];
+    list.flat_map (fn [format, r] -> match r {
+        [:error, why] => [if str.starts_with (format + ":") why { why } else { format + ": " + why }],
+        _ => [],
+    }) outcomes
+};
+
+let cmd_check! c = {
+    let sp = spec! c;
+    let lay = layout! sp;
+    match format_problems sp lay {
+        [] => (),
+        ps => fail! ("the manifest is not ready:\n  " + str.join_str "\n  " ps),
+    }
+    let items = Layout.items lay;
+    let files = list.count (fn i -> list.head i == :file) items;
+    let links = list.length items - files;
+    say! c (Spec.name sp + " " + spec.full_version sp + ": " + counted files "file" + ", " + counted links "link" + ", "
+            + to_string (layout.installed_size items) + " bytes, ready to package")
+};
+
+let cmd_files! c = {
+    let sp = spec! c;
+    let lay = layout! sp;
+    each! (fn i -> console.print! (match i {
+        [:file, path, mode, source, size] => bytes.octal 4 mode + " " + bytes.pad_left 10 " " (to_string size) + "  /" + path + "  <- " + source,
+        [:link, path, target] => "link " + bytes.pad_left 10 " " "" + "  /" + path + "  -> " + target,
+        _ => "",
+    })) (Layout.items lay)
+};
+
+let cmd_deb! c = {
+    let sp = spec! c;
+    made! (deb.make! sp (layout! sp) (out! c) (compression c))
+};
+
+let cmd_rpm! c = {
+    let sp = spec! c;
+    made! (rpm.make! sp (layout! sp) (out! c) (compression c))
+};
+
+let cmd_arch! c = {
+    let sp = spec! c;
+    made! (arch.make! sp (layout! sp) (out! c) (compression c))
+};
+
+let cmd_tarball! c = {
+    let sp = spec! c;
+    made! (tarball.make! sp (layout! sp) (out! c) (compression c))
+};
+
+let cmd_brew! c = {
+    let sp = spec! c;
+    made! (brew.make! sp (layout! sp) (out! c))
+};
+
+let cmd_pkgbuild! c = {
+    let sp = spec! c;
+    made! (aur.make! sp (layout! sp) (out! c))
+};
+
+let cmd_installer! c = {
+    let sp = spec! c;
+    made! (installer.make! sp (out! c))
+};
+
+let cmd_sums! c = made! (sums.make! (out! c));
+
+/// Say what was made, or why not, and answer whether it was.
+let report! : [:ok, :string] | [:error, :string] -> :bool;
+let report! r = match r {
+    [:ok, path] => {
+        console.print! ("made " + path)
+        true
+    },
+    [:error, why] => {
+        console.error! ("ship: " + why)
+        false
+    },
+};
+
+/// Everything, each format going on when another fails, and failing at the
+/// end if any did. The tarball is gzip whatever `--compress` says, since it
+/// is what the formula, the PKGBUILD and the install script read.
+let cmd_all! c = {
+    let sp = spec! c;
+    let lay = layout! sp;
+    let dest = out! c;
+    let w = compression c;
+    let packages = [report! (deb.make! sp lay dest w), report! (rpm.make! sp lay dest w),
+                    report! (arch.make! sp lay dest w), report! (tarball.make! sp lay dest :auto)];
+    strict! packages
+    let derived = if str.is_empty (release.url_template sp "brew") && str.is_empty (release.url_template sp "aur")
+                     && str.is_empty (release.url_template sp "installer") {
+        say! c "no url in [ship]: not making a formula, a PKGBUILD or install.sh, which say where to download from"
+        []
+    } else {
+        let made = [report! (brew.make! sp lay dest), report! (aur.make! sp lay dest), report! (installer.make! sp dest)];
+        strict! made
+        made
+    };
+    let summed = report! (sums.make! dest);
+    if not (list.all (fn ok -> ok) (summed :: packages + derived)) { os.exit! 1 }
+};
+
+/// What git says the user is called, for the maintainer line; `""` without
+/// git or without the setting.
+let git_config! : :string -> :string;
+let git_config! key = try! {
+    let r = os.exec! "git" ["config", key];
+    if r.[:code] == 0 { str.trim r.[:out] } else { "" }
+} catch e { "" };
+
+/// The `[ship]` a project starts from: what `[package]` already says, and the
+/// rest left to fill in, each key with the line that says what it is for.
+let skeleton : :string -> :string -> :string -> :string;
+let skeleton name summary maintainer =
+    "\n# What `ship` makes packages from: `ship check`, then `ship all`. Each key is\n"
+    + "# described in ship's README.\n[ship]\n"
+    + "summary = " + toml.quote summary + "\n"
+    + "maintainer = " + toml.quote maintainer + "\n"
+    + "license = \"\"\nhomepage = \"\"\n"
+    + "# Where release tarballs will be published, which the Homebrew formula, the\n"
+    + "# PKGBUILD and install.sh download from; {file} is each tarball's name.\n"
+    + "# url = \"https://github.com/OWNER/REPO/releases/download/v{version}/{file}\"\n"
+    + "# A Dream image runs wherever the VM does. Say \"native\" for native code.\n"
+    + "arch = \"all\"\n\n"
+    + "[ship.files]\n"
+    + "# Where it is installed = what it is made from. Build the image with\n"
+    + "#   mind build --release -f --shebang\n"
+    + "# so that it runs as a command.\n"
+    + toml.quote ("bin/" + name) + " = " + toml.quote ("target/release/" + name + ".dream") + "\n\n"
+    + "# What each format calls what it needs: the VM, here.\n"
+    + "[ship.deb]\ndepends = [\"dream\"]\n\n[ship.rpm]\ndepends = [\"dream\"]\n\n"
+    + "[ship.arch]\ndepends = [\"dream\"]\n\n[ship.brew]\ndepends = [\"dream\"]\n";
+
+let cmd_init! c = {
+    let path = cli.get "mind.toml" c "manifest";
+    let text = match file.read! path { () => "", t => t };
+    let doc = match toml.parse text { [:ok, d] => d, [:error, why] => fail! (path + ": " + why) };
+    if not (list.is_empty (toml.entries doc "ship")) || str.contains_str "\n[ship]" ("\n" + text) {
+        fail! (path + " already has a [ship] section")
+    }
+    let name = match toml.get "" doc "package" "name" {
+        "" => fail! (path + " has no [package] name; write [ship] by hand, with a name"),
+        n => n,
+    };
+    let summary = match toml.get "" doc "package" "description" { "" => "what " + name + " is, in one line", d => d };
+    let maintainer = match [git_config! "user.name", git_config! "user.email"] {
+        ["", _] => "Your Name <you@example.org>",
+        [who, ""] => who,
+        [who, email] => who + " <" + email + ">",
+    };
+    file.write! path (text + skeleton name summary maintainer)
+    console.print! ("added [ship] to " + path + ": fill it in, then run `ship check`")
+};
+
+let main! = {
+    match cli.commands opts command_spec (os.args! ()) {
+        [:error, why] => fail! (why + "\n\n" + usage),
+        [:ok, c] => {
+            if cli.flag_set c "help" {
+                console.print! usage
+                os.exit! 0
+            }
+            if cli.flag_set c "version" {
+                console.print! ("ship " + version)
+                os.exit! 0
+            }
+            match cli.chosen c {
+                () => console.print! usage,
+                cm => match cli.command_name cm {
+                    "init" => cmd_init! c,
+                    "check" => cmd_check! c,
+                    "files" => cmd_files! c,
+                    "deb" => cmd_deb! c,
+                    "rpm" => cmd_rpm! c,
+                    "arch" => cmd_arch! c,
+                    "tarball" => cmd_tarball! c,
+                    "brew" => cmd_brew! c,
+                    "pkgbuild" => cmd_pkgbuild! c,
+                    "installer" => cmd_installer! c,
+                    "sums" => cmd_sums! c,
+                    "all" => cmd_all! c,
+                    _ => console.print! usage,
+                },
+            }
+        },
+    }
+};

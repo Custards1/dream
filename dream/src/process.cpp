@@ -144,6 +144,10 @@ Process::Process(Runtime& rt, uint64_t id) : rt_(rt), id_(id), heap_(64 * 1024) 
 Process::~Process() { release_foreign(*this); }
 
 void Process::maybe_collect() {
+    if (jit_stack_hi) {
+        collect_under_compiled();
+        return;
+    }
     // A mark the helpers are still on is not a state to launch anything from:
     // starting a second collection while the first's helpers were walking old
     // space would be two collectors on one heap. The one legal move is to
@@ -160,6 +164,43 @@ void Process::maybe_collect() {
     } else {
         heap_.minor_collect(*this);
     }
+}
+
+namespace {
+
+/// The collection itself, one frame below the one that pushed the registers:
+/// its own frame address is then below every word that matters, the saved
+/// registers included. Never inlined, or that would stop being true.
+__attribute__((noinline)) void collect_from_here(Process& p, Heap& heap) {
+    heap.set_conservative_roots(__builtin_frame_address(0), p.jit_stack_hi);
+    // A concurrent mark is not *started* from here. Its snapshot would be
+    // read while compiled frames hold values it cannot see, and nothing
+    // would pin those at the finalize but a second scan of a stack that has
+    // moved on. A whole-world major costs this one collection its overlap.
+    if (heap.marking()) {
+        heap.finalize_concurrent_mark(p);
+    } else if (heap.major_due()) {
+        heap.major_collect(p);
+    } else {
+        heap.minor_collect(p);
+    }
+    heap.clear_conservative_roots();
+}
+
+}  // namespace
+
+__attribute__((noinline)) void Process::collect_under_compiled() {
+    // Every callee-saved register onto this frame, where the scan will read
+    // it: a compiled caller may be keeping a value in one. (A caller-saved
+    // register holding a value across the call that led here was spilled to
+    // the caller's frame by the calling convention.) `setjmp` would do it
+    // too, but glibc mangles the frame pointer it saves, and a compiled body
+    // with no frame pointer uses that register like any other.
+    __builtin_unwind_init();
+    collect_from_here(*this, heap_);
+    // Keeps the call above from becoming a tail call, which would pop this
+    // frame -- and the registers with it -- before the scan.
+    asm volatile("" ::: "memory");
 }
 
 void Process::visit_roots(Heap& heap) {

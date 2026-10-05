@@ -11,7 +11,9 @@ and are the first thing to read before working on what they describe.
 | [language-spec.md](language-spec.md) | **The language**, start to finish: syntax, values, laziness, purity, patterns, errors, types, records and unions, modules, behaviours, processes, compile-time evaluation, C libraries, tests, and writing code that runs fast. Start at "A first program". |
 | [builtins.md](builtins.md) | Every builtin and every native module's members, with their types. |
 | [console.md](console.md) | `std.console`: output, prompts, formatting, colour and logging. |
+| [binary.md](binary.md) | `std.binary`: custom binary layouts, integers, floats, bit fields, bounds, and IO. |
 | [ffi.md](ffi.md) | Calling C: `std.ffi`, `std.foreign`, and `foreign` declarations. |
+| [images.md](images.md) | Calling another Dream image: `std.image`, and `image` declarations. |
 | [build.md](build.md) | Build scripts and `std.build`: plans, steps, caching, goals, checks, and C/C++ with any compiler. |
 | [platforms.md](platforms.md) | What an image may assume about where it runs, and what stays platform-specific. |
 

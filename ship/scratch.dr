@@ -1,0 +1,35 @@
+// A directory to build one package in, gone afterwards however it went.
+//
+// Each format writes its pieces -- a data tar, a control tar, a payload --
+// before putting them together, and those pieces are as large as the package.
+// They go in a directory of their own beside the output (not in `/tmp`, which
+// is often a small RAM disk, and so that the final rename never crosses a
+// file system), named for this process so that two runs never share one, and
+// removed whether the build answered, failed or raised.
+
+import std.error;
+import std.file;
+import std.io;
+
+/// What went wrong, as a line a person can read.
+let describe : :any -> :string;
+let describe e = match error.payload e {
+    s if type_of s == :string => s,
+    _ => to_string e,
+};
+
+/// Run `build!` with a fresh directory under `out`, answering what it answers.
+/// Anything it raises becomes `[:error, why]`.
+let within! : :string -> :string -> (:string -> [:ok, :any] | [:error, :string]) -> [:ok, :any] | [:error, :string];
+let within! out label build! = {
+    let dir = out + "/.ship-" + label + "-" + file.scratch_suffix! ();
+    file.remove_all! dir
+    file.mkdir_all! dir
+    let answer = try! { build! dir } catch e { [:error, describe e] };
+    file.remove_all! dir
+    answer
+};
+
+/// Move a finished package into place, replacing one of the same name.
+let place! : :string -> :string -> :unit;
+let place! from to = io.rename! from to;

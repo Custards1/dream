@@ -1,0 +1,345 @@
+// URLs: taking them apart, putting them together, and the encodings in them.
+//
+//     import std.http.url;
+//
+//     let u = url.parse_or_raise "https://ada:pw@example.com:8443/a/b?x=1&y=two#top";
+//     url.Url.host u                                   // "example.com"
+//     url.port_of u                                    // 8443
+//     url.query_pairs u                                // [["x", "1"], ["y", "two"]]
+//     url.resolve u "../c?z=3" |> url.to_text          // "https://ada:pw@example.com:8443/c?z=3"
+//     url.encode_query [["q", "dream lang"], ["page", "2"]]  // "q=dream+lang&page=2"
+//
+// RFC 3986's grammar, read with the string primitives: a URL is split at the
+// first `:` (scheme), `//` (authority), and the first of `/`, `?` and `#`
+// after it, which is all the structure a URL has. Each part is kept as it
+// was written -- still percent-encoded -- because decoding a path and
+// encoding it again does not always give back the same path (`%2F` is not
+// `/`), and a client must send what it was given. `decode` is for when a
+// part's *meaning* is wanted.
+//
+// `resolve` is RFC 3986 section 5: how a browser turns `href="../x"` into a
+// URL, and how a client follows a `Location` header that is relative.
+
+import std.char;
+import std.list;
+import std.map;
+import std.num;
+import std.result;
+import std.str;
+
+/// A URL in parts, each as written. `port` is `()` when none is given; the
+/// scheme and host are lower-cased, being case-insensitive.
+mapping Url {
+    scheme : :string = ""
+    user : :string = ""
+    password : :string = ""
+    host : :string = ""
+    port : :any = ()
+    path : :string = ""
+    query : :string = ""
+    fragment : :string = ""
+    has_authority : :bool = false
+    has_query : :bool = false
+}
+
+/// The parts of a URL, or `[:error, why]`.
+let parse : :string -> result.Of Url :string;
+let parse text = {
+    let t = str.trim text;
+    let colon = str.upto ":/?#" 0 t;
+    let has_scheme = colon < len t && str.byte colon t == 58 && colon > 0 && is_scheme (str.slice 0 colon t);
+    let scheme = if has_scheme { str.lower (str.slice 0 colon t) } else { "" };
+    let rest_at = if has_scheme { colon + 1 } else { 0 };
+    let after_hash = str.upto "#" rest_at t;
+    let fragment = if after_hash < len t { str.slice (after_hash + 1) (len t - after_hash - 1) t } else { "" };
+    let before_frag = str.slice rest_at (after_hash - rest_at) t;
+    let q = str.upto "?" 0 before_frag;
+    let has_query = q < len before_frag;
+    let query = if has_query { str.slice (q + 1) (len before_frag - q - 1) before_frag } else { "" };
+    let hier = str.slice 0 q before_frag;
+    if str.starts_with "//" hier {
+        let auth_end = str.upto "/" 2 hier;
+        let authority = str.slice 2 (auth_end - 2) hier;
+        let path = str.slice auth_end (len hier - auth_end) hier;
+        match parse_authority authority {
+            [:error, why] => result.error why,
+            [:ok, [user, password, host, port]] =>
+                result.ok (Url.make scheme user password host port path query fragment true has_query),
+        }
+    } else {
+        result.ok (Url.make scheme "" "" "" () hier query fragment false has_query)
+    }
+};
+
+/// `parse`, for a URL written into the program: one that does not parse is a
+/// bug, and raises.
+let parse_or_raise : :string -> Url;
+let parse_or_raise text = match parse text {
+    [:ok, u] => u,
+    [:error, why] => type_assert false ("not a URL: " + why) (Url.new ()),
+};
+
+priv let is_scheme : :string -> :bool;
+priv let is_scheme s = {
+    let c = str.byte 0 s;
+    ((c >= 65 && c <= 90) || (c >= 97 && c <= 122))
+        && str.span "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-" 0 s == len s
+};
+
+/// `user:password@host:port`, with `[..]` around an IPv6 host.
+priv let parse_authority : :string -> result.Of [:any] :string;
+priv let parse_authority a = {
+    let at = last_index "@" a;
+    let userinfo = if at >= 0 { str.slice 0 at a } else { "" };
+    let hostport = if at >= 0 { str.slice (at + 1) (len a - at - 1) a } else { a };
+    let ucolon = str.find ":" userinfo;
+    let user = if ucolon >= 0 { str.slice 0 ucolon userinfo } else { userinfo };
+    let password = if ucolon >= 0 { str.slice (ucolon + 1) (len userinfo - ucolon - 1) userinfo } else { "" };
+    let [host, port_text] = if str.starts_with "[" hostport {
+        let close = str.find "]" hostport;
+        if close < 0 { ["", ()] }
+        else { [str.slice 0 (close + 1) hostport, if str.byte (close + 1) hostport == 58 { str.slice (close + 2) (len hostport) hostport } else { "" }] }
+    } else {
+        let c = str.find ":" hostport;
+        if c >= 0 { [str.slice 0 c hostport, str.slice (c + 1) (len hostport) hostport] } else { [hostport, ""] }
+    };
+    if port_text == () { result.error ("an unclosed [ in " + a) }
+    else if port_text == "" { result.ok [user, password, str.lower host, ()] }
+    else {
+        match num.parse_int port_text {
+            n if n != () && n >= 0 && n <= 65535 && str.span "0123456789" 0 port_text == len port_text =>
+                result.ok [user, password, str.lower host, n],
+            _ => result.error ("not a port: " + port_text),
+        }
+    }
+};
+
+priv let last_index : :string -> :string -> :integer;
+priv let last_index needle s = {
+    let rec go from best = { let at = str.find_from from needle s; if at < 0 { best } else { go (at + 1) at } };
+    go 0 (0 - 1)
+};
+
+/// The URL written out again.
+let to_text : Url -> :string;
+let to_text u = str.concat_all [
+    (if Url.scheme u == "" { "" } else { Url.scheme u + ":" }),
+    (if Url.has_authority u { "//" + authority u } else { "" }),
+    Url.path u,
+    (if Url.has_query u { "?" + Url.query u } else { "" }),
+    (if Url.fragment u == "" { "" } else { "#" + Url.fragment u }),
+];
+
+/// `user:password@host:port`, as much of it as there is.
+let authority : Url -> :string;
+let authority u = str.concat_all [
+    (if Url.user u == "" { "" } else { Url.user u + (if Url.password u == "" { "" } else { ":" + Url.password u }) + "@" }),
+    Url.host u,
+    (match Url.port u { () => "", p => ":" + to_string p }),
+];
+
+/// The port, or the scheme's default: 80 for http and ws, 443 for https and
+/// wss, 21 for ftp.
+let port_of : Url -> :integer;
+let port_of u = match Url.port u {
+    () => match Url.scheme u { "https" => 443, "wss" => 443, "ftp" => 21, _ => 80 },
+    p => p,
+};
+
+/// What follows the host on a request line: the path (`/` when empty) and
+/// the query.
+let target : Url -> :string;
+let target u = (if Url.path u == "" { "/" } else { Url.path u }) + (if Url.has_query u { "?" + Url.query u } else { "" });
+
+/// The host as a `Host` header names it: with its port when that is not the
+/// scheme's default.
+let host_header : Url -> :string;
+let host_header u = match Url.port u {
+    () => Url.host u,
+    p => if p == port_of (Url.set_port () u) { Url.host u } else { Url.host u + ":" + to_string p },
+};
+
+/// The host with IPv6 brackets taken off, as a socket wants it.
+let bare_host : Url -> :string;
+let bare_host u = { let h = Url.host u; if str.starts_with "[" h { str.slice 1 (len h - 2) h } else { h } };
+
+// --- resolving a reference ---------------------------------------------------------
+
+/// `reference` read relative to `base`, as RFC 3986 section 5.2 says: what a
+/// `Location: ../x` or an `href` means.
+let resolve : Url -> :string -> Url;
+let resolve base reference = match parse reference {
+    [:error, _] => base,
+    [:ok, r] => {
+        if Url.scheme r != "" { Url.set_path (remove_dots (Url.path r)) r }
+        else if Url.has_authority r { r |> Url.set_scheme (Url.scheme base) |> Url.set_path (remove_dots (Url.path r)) }
+        else if Url.path r == "" {
+            base |> Url.set_fragment (Url.fragment r)
+                 |> (fn u -> if Url.has_query r { u |> Url.set_query (Url.query r) |> Url.set_has_query true } else { u })
+        } else {
+            let path = if str.starts_with "/" (Url.path r) { Url.path r } else { merge_paths base (Url.path r) };
+            base |> Url.set_path (remove_dots path) |> Url.set_query (Url.query r) |> Url.set_has_query (Url.has_query r)
+                 |> Url.set_fragment (Url.fragment r)
+        }
+    },
+};
+
+priv let merge_paths : Url -> :string -> :string;
+priv let merge_paths base path =
+    if Url.has_authority base && Url.path base == "" { "/" + path }
+    else { str.slice 0 (last_index "/" (Url.path base) + 1) (Url.path base) + path };
+
+/// A path with its `.` and `..` segments taken out.
+let remove_dots : :string -> :string;
+let remove_dots path = {
+    let absolute = str.starts_with "/" path;
+    let segments = str.split "/" (if absolute { str.slice 1 (len path) path } else { path });
+    let rec walk segs out = match segs {
+        [] => list.reverse out,
+        [".."] => list.reverse ("" :: (match out { [] => [], [_, ..rest] => rest })),
+        [".."  , ..rest] => walk rest (match out { [] => [], [_, ..r] => r }),
+        ["."] => list.reverse ("" :: out),
+        [".", ..rest] => walk rest out,
+        [s, ..rest] => walk rest (s :: out),
+    };
+    (if absolute { "/" } else { "" }) + str.join_str "/" (walk segments [])
+};
+
+// --- percent-encoding ----------------------------------------------------------------
+
+/// Every byte outside RFC 3986's unreserved set (`A-Z a-z 0-9 - . _ ~`) as
+/// `%XX`: for a path segment or a query value.
+let encode : :string -> :string;
+let encode s = encode_except "" s;
+
+/// The same, leaving `/` alone: for a whole path.
+let encode_path : :string -> :string;
+let encode_path s = encode_except "/" s;
+
+/// HTML forms' encoding (`application/x-www-form-urlencoded`): a space is `+`.
+let encode_form : :string -> :string;
+let encode_form s = str.join_str "+" (list.map encode (str.split " " s));
+
+priv let unreserved : :string;
+priv let unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+
+priv let encode_except : :string -> :string -> :string;
+priv let encode_except keep s = {
+    let allowed = unreserved + keep;
+    let rec pieces i acc =
+        if i >= len s { str.concat_all (list.reverse acc) }
+        else {
+            let run = str.span allowed i s;
+            if run > i { pieces run (str.slice i (run - i) s :: acc) }
+            else { pieces (i + 1) (percent (str.byte i s) :: acc) }
+        };
+    pieces 0 []
+};
+
+priv let percent : :integer -> :string;
+priv let percent b = "%" + str.slice (b / 16) 1 "0123456789ABCDEF" + str.slice (b % 16) 1 "0123456789ABCDEF";
+
+/// `%XX` decoded. A `%` not followed by two hex digits is left as it is.
+let decode : :string -> :string;
+let decode s = decode_with false s;
+
+/// Form decoding: `+` is a space too.
+let decode_form : :string -> :string;
+let decode_form s = decode_with true s;
+
+priv let decode_with : :bool -> :string -> :string;
+priv let decode_with plus s = {
+    let stops = if plus { "%+" } else { "%" };
+    let rec pieces i acc =
+        if i >= len s { str.concat_all (list.reverse acc) }
+        else {
+            let at = str.upto stops i s;
+            let literal = str.slice i (at - i) s;
+            if at >= len s { pieces at (literal :: acc) }
+            else if str.byte at s == 43 { pieces (at + 1) (" " :: literal :: acc) }
+            else {
+                let h = hex2 (str.slice (at + 1) 2 s);
+                if h < 0 { pieces (at + 1) ("%" :: literal :: acc) }
+                else { pieces (at + 3) (str.of_bytes [h] :: literal :: acc) }
+            }
+        };
+    pieces 0 []
+};
+
+priv let hex2 : :string -> :integer;
+priv let hex2 h = if len h == 2 && str.span "0123456789abcdefABCDEF" 0 h == 2 { hexd (str.byte 0 h) * 16 + hexd (str.byte 1 h) } else { 0 - 1 };
+
+priv let hexd : :integer -> :integer;
+priv let hexd b = if b <= 57 { b - 48 } else if b <= 70 { b - 55 } else { b - 87 };
+
+// --- query strings --------------------------------------------------------------------
+
+/// `a=1&b=x+y` as `[["a", "1"], ["b", "x y"]]`, decoded, in order, keeping
+/// repeated names. A name with no `=` has the value `""`.
+let decode_query : :string -> [[:string]];
+let decode_query q = list.map (fn part -> {
+    let eq = str.find "=" part;
+    if eq < 0 { [decode_form part, ""] }
+    else { [decode_form (str.slice 0 eq part), decode_form (str.slice (eq + 1) (len part - eq - 1) part)] }
+}) (list.filter (fn p -> p != "") (str.split "&" q));
+
+/// The pairs written as a query string, form-encoded. Takes a list of pairs
+/// or a map; a value that is not a string is written as it prints.
+let encode_query : :any -> :string;
+let encode_query pairs = {
+    let ps = if type_of pairs == :map { list.map (fn k -> [k, pairs.[k]]) (map.sorted_keys pairs) } else { pairs };
+    str.join_str "&" (list.map (fn [k, v] -> encode_form (text_of k) + "=" + encode_form (text_of v)) ps)
+};
+
+priv let text_of : :any -> :string;
+priv let text_of v = match type_of v { :string => v, :atom => str.slice 1 (len (to_string v)) (to_string v), _ => to_string v };
+
+/// A URL's query as pairs.
+let query_pairs : Url -> [[:string]];
+let query_pairs u = decode_query (Url.query u);
+
+/// A URL's query as a map; the first value wins for a repeated name.
+let query_map : Url -> :map;
+let query_map u = list.fold (fn m [k, v] -> if map.has k m { m } else { m.[k => v] }) %{} (query_pairs u);
+
+/// The URL with these pairs added to its query.
+let add_query : :any -> Url -> Url;
+let add_query pairs u = {
+    let more = encode_query pairs;
+    if more == "" { u }
+    else { u |> Url.set_query (if Url.query u == "" { more } else { Url.query u + "&" + more }) |> Url.set_has_query true }
+};
+
+when test {
+    import std.test;
+
+    let full = parse_or_raise "HTTPS://ada:pw@Example.COM:8443/a/b/c?x=1&y=two%20words#frag";
+    let base = parse_or_raise "http://a/b/c/d;p?q";
+    let r ref = to_text (resolve base ref);
+
+    let tests = [
+        test.case "the parts" $( test.eq! ["https", "ada", "pw", "example.com", 8443, "/a/b/c", "x=1&y=two%20words", "frag"]
+            [Url.scheme full, Url.user full, Url.password full, Url.host full, Url.port full, Url.path full, Url.query full, Url.fragment full] ),
+        test.case "written out again" $( test.eq! "https://ada:pw@example.com:8443/a/b/c?x=1&y=two%20words#frag" (to_text full) ),
+        test.case "default ports" $( test.eq! [80, 443, 8443] [port_of (parse_or_raise "http://x"), port_of (parse_or_raise "https://x/"), port_of full] ),
+        test.case "the request target" $( test.eq! ["/", "/a?b"] [target (parse_or_raise "http://x"), target (parse_or_raise "http://x/a?b")] ),
+        test.case "the Host header" $( test.eq! ["x", "x:81", "x"] [host_header (parse_or_raise "http://x:80/"),
+                                                                   host_header (parse_or_raise "http://x:81/"), host_header (parse_or_raise "https://x:443")] ),
+        test.case "IPv6" $( test.eq! ["[::1]", 8080, "::1"] { let u = parse_or_raise "http://[::1]:8080/"; [Url.host u, Url.port u, bare_host u] } ),
+        test.case "a bad port" $( test.true! (result.is_error (parse "http://x:99999/")) ),
+        test.case "a mailto" $( test.eq! ["mailto", "ada@example.com", false] { let u = parse_or_raise "mailto:ada@example.com"; [Url.scheme u, Url.path u, Url.has_authority u] } ),
+        test.case "query pairs" $( test.eq! [["x", "1"], ["y", "two words"]] (query_pairs full) ),
+        test.case "query map" $( test.eq! %{ "a" => "1", "b" => "" } (query_map (parse_or_raise "/?a=1&b&a=2")) ),
+        test.case "encode a query" $( test.eq! "q=dream+lang&n=2&k=%26%3D" (encode_query [["q", "dream lang"], ["n", 2], ["k", "&="]]) ),
+        test.case "a query round-trips" $( test.eq! [["k", "a b&c=d/é"]] (decode_query (encode_query [["k", "a b&c=d/é"]])) ),
+        test.case "add to a query" $( test.eq! "http://x/p?a=1&b=2" (to_text (add_query [["b", "2"]] (parse_or_raise "http://x/p?a=1"))) ),
+        test.case "percent-encoding" $( test.eq! ["a%20b%2Fc", "a%20b/c", "caf%C3%A9", "a+b"] [encode "a b/c", encode_path "a b/c", encode "café", encode_form "a b"] ),
+        test.case "decoding" $( test.eq! ["a b/c", "café", "a b", "100%", "a+b"] [decode "a%20b%2Fc", decode "caf%C3%A9", decode_form "a+b", decode "100%", decode "a+b"] ),
+        // RFC 3986 section 5.4.1's normal examples.
+        test.case "resolving, as the RFC's examples do" $( test.eq!
+            ["g:h", "http://a/b/c/g", "http://a/b/c/g", "http://a/b/c/g/", "http://a/g", "http://g", "http://a/b/c/d;p?y",
+             "http://a/b/c/g?y", "http://a/b/c/d;p?q#s", "http://a/b/c/g#s", "http://a/b/c/", "http://a/b/", "http://a/b/g", "http://a/", "http://a/g"]
+            [r "g:h", r "g", r "./g", r "g/", r "/g", r "//g", r "?y", r "g?y", r "#s", r "g#s", r ".", r "..", r "../g", r "../..", r "../../g"] ),
+        test.case "dots past the root" $( test.eq! ["http://a/g", "http://a/g"] [r "../../../g", r "/./g"] ),
+    ];
+}

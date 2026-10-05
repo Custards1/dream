@@ -1,0 +1,55 @@
+// Streams: a body made, or arriving, in pieces -- a lazy list of strings, a
+// function of unit answering the next piece or `()`, or `#[:mapped, f, s]`,
+// the pieces of another stream passed through a pure `f` as they are pulled.
+// `std.http` describes them; this module is where they are taken apart, so
+// that `std.http.h2`, which `std.http` uses, can take them apart too.
+
+import std.list;
+import std.str;
+import std.streams;
+
+/// The next piece of a stream and the rest of it: `[piece, rest]`, the piece
+/// `()` at the end.
+let pull! : :any -> [:any, :any];
+let pull! s = match type_of s {
+    :list => match s { [] => [(), []], [piece, ..rest] => [piece, rest] },
+    :unit => [(), ()],
+    :array => match s {
+        #[:mapped, f, inner] => match pull! inner { [(), _] => [(), ()], [piece, rest] => [f piece, #[:mapped, f, rest]] },
+        _ => [(), ()],
+    },
+    _ => { let piece = s (); strict! piece; [piece, s] },
+};
+
+/// Every piece of a stream, concatenated: for a handler that wants a
+/// streamed request body whole after all.
+let stream_text! : :any -> :string;
+let stream_text! s = {
+    let rec go! rest acc = match pull! rest {
+        [(), _] => str.concat_all (list.reverse acc),
+        [piece, more] => go! more (piece :: acc),
+    };
+    go! s []
+};
+
+/// Write a stream to a socket, chunked (`chunked` true) or as it is, calling
+/// `progress!` after each piece. Empty pieces are skipped, since an empty
+/// chunk is how a chunked body ends.
+let write_stream! : :any -> :any -> :bool -> (:unit -> :any) -> :unit;
+let rec write_stream! sock s chunked progress! = match pull! s {
+    [(), _] => { if chunked { streams.write_all! sock "0\r\n\r\n" }; () },
+    [piece, rest] => {
+        if len piece > 0 {
+            streams.write_all! sock (if chunked { hex_of (len piece) + "\r\n" + piece + "\r\n" } else { piece })
+            progress! ()
+        }
+        write_stream! sock rest chunked progress!
+    },
+};
+
+priv let hex_of : :integer -> :string;
+priv let rec hex_of n = if n < 16 { str.slice n 1 "0123456789abcdef" } else { hex_of (n / 16) + str.slice (n % 16) 1 "0123456789abcdef" };
+
+/// A stream whose pieces are `f` of another's, as they are pulled.
+let map_stream : (:any -> :string) -> :any -> :any;
+let map_stream f s = if type_of s == :list { list.map f s } else { #[:mapped, f, s] };

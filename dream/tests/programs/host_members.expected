@@ -5,4 +5,4 @@ true
 true
 true
 true
-["sqrt", "abs", "floor"]
+["sqrt", "abs", "floor", "exp", "log", "sin", "cos", "tan", "tanh", "atan", "pow"]

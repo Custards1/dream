@@ -287,6 +287,25 @@ public:
     bool force_vouched = false;
     uint32_t force_pins = 0;
 
+    /// Where the machine stack a collection under compiled code must scan
+    /// ends, or null when no compiled frame is running.
+    ///
+    /// Compiled code is the one place the rule above cannot be kept: its
+    /// values are in registers and stack slots, where nothing can re-read
+    /// them. So instead of vouching it is *scanned*. `loop_stack_hi` is the
+    /// frame of the innermost machine loop -- `run_process`, or the nested one
+    /// behind `force_whnf` -- which keeps nothing in C++ locals at a
+    /// safepoint. `enter_function` copies it to `jit_stack_hi` when it enters
+    /// the outermost compiled frame, and a collection while that is set pins
+    /// every object a word between the collector and there points into
+    /// (`Heap::set_conservative_roots`). The frames in between -- compiled
+    /// bodies, the `dream_rt_*` helpers they call, and the interpreter's own
+    /// frames that entered them -- are covered without any of them having to
+    /// say what they hold. A native among them that holds a value anywhere
+    /// but the machine stack still pins the heap as it always has.
+    void* loop_stack_hi = nullptr;
+    void* jit_stack_hi = nullptr;
+
     /// Nested `force_whnf` loops currently on the process's machine stack.
     ///
 
@@ -322,6 +341,12 @@ public:
     /// already claimed, and this is the running tally they claim into. Only
     /// touched while profiling.
     uint64_t alloc_attributed = 0;
+    /// The heap's collection count when the heap limit was last raised in
+    /// this process. The limit is judged by the live bytes the last
+    /// collection measured, so until another collection has measured them
+    /// again every step would raise it afresh -- including the steps of the
+    /// `catch` that caught it, which is what made it uncatchable.
+    uint64_t heap_limit_raised_at = UINT64_MAX;
 
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }
@@ -473,6 +498,9 @@ public:
     /// Collect if the heap has grown past its threshold. Only legal at a
     /// safepoint, where every live value is reachable from the stacks.
     void maybe_collect();
+    /// `maybe_collect` underneath compiled code, with the machine stack as
+    /// roots. See `jit_stack_hi`.
+    void collect_under_compiled();
 
     void visit_roots(Heap& heap) override;
 

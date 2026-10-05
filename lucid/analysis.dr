@@ -18,6 +18,7 @@
 // a cursor sitting on empty space needs answered.
 
 import std.list;
+import std.map;
 import std.str;
 
 import dreams.ast;
@@ -752,9 +753,9 @@ let foreign_of a mi = {
             if own == full { [:library, f] }
             else {
                 match list.filter (fn e -> match e {
-                          [:c_struct, s, _, _] => own + "." + s == full,
-                          _ => false,
-                      }) (foreign_entries f) {
+                    [:c_struct, s, _, _] => own + "." + s == full,
+                    _ => false,
+                }) (foreign_entries f) {
                     [e, .._] => [:struct, f, e],
                     [] => (),
                 }
@@ -1229,6 +1230,335 @@ let hover_at a line character =
             },
     };
 
+// --- inlay hints -------------------------------------------------------------------
+//
+// The type the checker gave each `let` nobody wrote a signature for, shown
+// after its name -- or after its parameters, where a function's answer goes
+// in the inline form `let f x : t = ..` -- so a hint reads as the signature
+// the author could have written. Every type comes from `typecheck.hints`,
+// which is the checker's own walk, so a hint and a diagnostic cannot
+// disagree; see "what each binding is" there.
+
+/// LSP's kind for a hint that is a type.
+let hint_kind_type = 1;
+
+/// Where a hint goes, as a byte offset into `src`: after the last parameter,
+/// or after the name for a binding that has none. The name is found as a
+/// token, the first identifier spelled that way from where the `let` starts --
+/// a search of the text would find `le` inside `let`.
+let hint_offset src span name params = match list.reverse params {
+    [p, .._] => ast.span_end (list.nth 1 p),
+    [] => match list.filter (fn t -> lexer.kind t == :ident && lexer.value t == name
+                                     && lexer.span_start t >= ast.span_start span)
+                            (lexer.tokens src) {
+        [] => (),
+        [t, .._] => lexer.span_end t,
+    },
+};
+
+/// The hints for this file between two lines, inclusive, as LSP `InlayHint`s.
+let inlay_hints a first last = match module_of a {
+    () => [],
+    mi => {
+        let l = loader a;
+        let si = modules.module_source (modules.module_at l mi);
+        let f = modules.file_at l si;
+        let src = diag.source_text f;
+        let placed = list.concat (list.map (fn hint -> {
+            let [_, _, span, name, params, shown] = hint;
+            // A span past 2^31 is generated code, which is in no file.
+            if ast.span_start span >= 2147483648 { [] }
+            else {
+                match hint_offset src (diag.origin_span f span) name params {
+                    () => [],
+                    at => [[at, shown]],
+                }
+            }
+        }) (typecheck.hints l (resolved a) si));
+        let once = list.unique placed;
+        let starts = diag.line_starts src;
+        list.concat (list.map (fn one -> {
+            let [at, shown] = one;
+            let [line, character] = pos.position_in starts src at;
+            if line < first || line > last { [] }
+            else { [%{ "position" => %{ "line" => line, "character" => character },
+                       "label" => ": " + shown, "kind" => hint_kind_type }] }
+        }) (list.sort_on (fn one -> list.head one) once))
+    },
+};
+
+// --- rename ------------------------------------------------------------------------
+//
+// Renaming is go-to-definition run backwards over the whole program: find what
+// the name under the cursor *is*, then every place that names the same thing.
+// What a thing is comes in two kinds, and they are found differently.
+//
+// A **global** is a module and a name. Every use of one is in the resolver's
+// table (`scope.refs`), keyed by where it was written, so the uses are a scan
+// of that table for entries that resolve to it. What the table does not hold
+// is what is not a use: the declaration, its signature, and an import that
+// selects it by name (`import m.{f}`), which are read off the declarations.
+//
+// A **local** is a binder. The resolver records a use of one with the slot it
+// lives in -- or, from inside a lambda, the capture that reaches it, which
+// says nothing about which binder -- so a local is identified the way the
+// cursor's scope already is: the innermost binder of that name in scope where
+// it is used (`locals_at`). A binder is the `let`, parameter or pattern that
+// introduced the name, and its own name is found by `binders_in`.
+//
+// The program is the one rooted at the file being edited, as every question
+// here is: a module used by some other program is renamed in this one only.
+
+/// The ident token spelled `name` at or after `from`, or `()`.
+let token_at_or_after toks name from =
+    match list.filter (fn t -> lexer.kind t == :ident && lexer.value t == name
+                               && lexer.span_start t >= from) toks {
+        [] => (),
+        [t, .._] => lexer.span_start t,
+    };
+
+/// Every local binder in a module's declarations, by where its name is
+/// written: `name offset => binder offset`, the binder offset being the start
+/// of the span `locals_at` reports for it. A top-level `let` binds a global,
+/// so only its parameters and what is inside it are here.
+let binders_in toks items = {
+    let note acc n span = match token_at_or_after toks n (ast.span_start span) {
+        () => acc,
+        at => acc.[at => ast.span_start span],
+    };
+    let params acc ps = list.fold (fn m b -> note m (binder_name b) (binder_span b)) acc (param_binders ps);
+    let patterned acc pattern = list.fold (fn m b -> note m (binder_name b) (binder_span b)) acc (pattern_binders pattern);
+    let rec walk acc e = match e {
+        [:let, n, ps, body, _, span] => walk (params (note acc n span) ps) body,
+        [:let_p, pattern, body, _] => walk (patterned acc pattern) body,
+        [:lambda, ps, body, _] => walk (params acc ps) body,
+        [:match, subject, arms, _] => list.fold (fn m arm ->
+            walk (walk (patterned m (ast.arm_pattern arm)) (ast.arm_guard arm)) (ast.arm_body arm))
+            (walk acc subject) arms,
+        xs if type_of xs == :list => list.fold (fn m x -> walk m x) acc xs,
+        _ => acc,
+    };
+    let rec items_walk acc its = list.fold (fn m it -> match it {
+        [:let, _, ps, body, _, _] => walk (params m ps) body,
+        [:macro, _, ps, body, _] => walk (params m ps) body,
+        [:virtual, _, ps, body, _, _] => if body == () { m } else { walk (params m ps) body },
+        [:mod, _, inner, _] => items_walk m inner,
+        [:when, _, inner, _] => items_walk m inner,
+        _ => walk m it,
+    }) acc its;
+    items_walk %{} items
+};
+
+/// What the name at `offset` in this file is: `[:local, binder offset]`,
+/// `[:global, module, name]`, or `()` for something that cannot be renamed --
+/// a builtin, a host module's member, a keyword, nothing at all.
+let identity a mi toks binders offset name =
+    match binders.[offset else ()] {
+        b if b != () => [:local, b],
+        _ => {
+            let src = module_text a mi;
+            let source = modules.module_source (modules.module_at (loader a) mi);
+            let ctx = navigation_context a offset;
+            let found = match scope.at (resolved a) ctx source offset {
+                () => match chain_start src offset {
+                    head => if head == offset { () } else { scope.at (resolved a) ctx source head },
+                },
+                f => f,
+            };
+            match found {
+                // Nothing recorded, where a binder of the name is in scope: a
+                // local the resolver *staged* -- a pipeline stage read once is
+                // written where it is read, and the use is not a use any more
+                // (`scope.staging`) -- which is still the binder's to rename.
+                () => match local_identity a offset name {
+                    () => declared_identity a source toks offset name,
+                    id => id,
+                },
+                [:local, _, _] => local_identity a offset name,
+                [:capture, _, _] => local_identity a offset name,
+                [:global, m, n, _] if n == name => [:global, m, n],
+                [:member, [:dream, t], f, _] if f == name => [:global, t, f],
+                _ => declared_identity a source toks offset name,
+            }
+        },
+    };
+
+/// The global whose declaration names it at `offset`, or `()`.
+let declared_identity a source toks offset name =
+    match list.filter (fn d -> list.nth 1 d == source && list.nth 2 d == name
+                               && token_at_or_after toks name (ast.span_start (list.nth 3 d)) == offset)
+                      (scope.defs (resolved a)) {
+        [d, .._] => [:global, list.head d, name],
+        [] => (),
+    };
+
+let local_identity a offset name =
+    match list.filter (fn b -> binder_name b == name) (locals_at a offset) {
+        [] => (),
+        [b, .._] => [:local, ast.span_start (binder_span b)],
+    };
+
+/// A new name is a name: a letter or `_`, then letters, digits and `_`, and a
+/// `!` at the end exactly when the old name has one -- renaming cannot make
+/// an impure function pure, since purity is spelling.
+let valid_rename old new = {
+    let n = str.byte_length new;
+    let bang = n > 0 && str.byte (n - 1) new == 33;
+    let body = if bang { str.slice 0 (n - 1) new } else { new };
+    let m = str.byte_length body;
+    let first = if m == 0 { 0 } else { str.byte 0 body };
+    if m == 0 || not ((first >= 97 && first <= 122) || (first >= 65 && first <= 90) || first == 95) {
+        [:error, "`" + new + "` is not a name"]
+    }
+    else if not (list.all (fn i -> { let b = str.byte i body; is_name_byte b && b != 33 }) (list.range 0 m)) {
+        [:error, "`" + new + "` is not a name"]
+    }
+    else if bang != str.ends_with "!" old {
+        [:error, if bang { "only an impure name ends with `!`" } else { "an impure name must keep its `!`" }]
+    }
+    else { [:ok, new] }
+};
+
+/// What the cursor is on, for a rename: `[:ok, identity, start, end, name]`
+/// or `[:error, why]`.
+let rename_target a line character = match module_of a {
+    () => [:error, "this file is not part of the program"],
+    mi => {
+        let src = module_text a mi;
+        let here = name_start src (pos.offset_of src line character);
+        let name = name_at src here;
+        let toks = lexer.tokens src;
+        if name == "" { [:error, "there is no name here"] }
+        else {
+            match identity a mi toks (binders_in toks (source_items a mi)) here name {
+                () => [:error, "`" + name + "` cannot be renamed here"],
+                id => [:ok, id, here, here + str.byte_length name, name],
+            }
+        }
+    },
+};
+
+/// LSP's `prepareRename`: the range of the name, or an error saying why not.
+let prepare_rename_at a line character = match rename_target a line character {
+    [:ok, _, start, end, name] => {
+        let src = module_text a (module_of a);
+        [:ok, %{ "range" => pos.range src start end, "placeholder" => name }]
+    },
+    failed => failed,
+};
+
+/// Every occurrence of a global in the program, as `[source, offset]`.
+let global_sites a target name = {
+    let l = loader a;
+    let r = resolved a;
+    let text_of si = diag.source_text (modules.file_at l si);
+    // Uses: the resolver's table, decoded. A key is `(ctx * 65536 + source)
+    // * 2^32 + start` (`scope.ref_key`), and a member is recorded at the head
+    // of its chain, so the member's own segment is found in the text.
+    let uses = list.concat (list.map (fn kv -> {
+        let [key, what] = kv;
+        let start = key % 4294967296;
+        let si = (key / 4294967296) % 65536;
+        let hit = match what {
+            [:global, m, n, _] => m == target && n == name,
+            [:member, [:dream, t], f, _] => t == target && f == name,
+            _ => false,
+        };
+        if not hit || start >= 2147483648 { [] }
+        else {
+            match last_segment (text_of si) start name {
+                () => [],
+                at => [[si, at]],
+            }
+        }
+    }) (map.pairs (scope.refs r)));
+    let toks_of si = lexer.tokens (text_of si);
+    let defined = match scope.definition r target name {
+        () => [],
+        [_, si, span] => match token_at_or_after (toks_of si) name (ast.span_start span) {
+            () => [],
+            at => [[si, at]],
+        },
+    };
+    // Signatures and selective imports are declarations, read off the
+    // program as written.
+    let declared = list.concat (list.map (fn mi -> {
+        let si = modules.module_source (modules.module_at l mi);
+        let items = modules.module_items (modules.module_at (source a) mi);
+        let toks = toks_of si;
+        list.concat (list.map (fn it -> match it {
+            [:sig, n, _, sp] if n == name && mi == target => match token_at_or_after toks name (ast.span_start sp) {
+                () => [],
+                at => [[si, at]],
+            },
+            [:import, segs, _, names, sp] if names != () && selects names name
+                && modules.find l (scope.relative_path l mi (str.join_str "." segs)) == target =>
+                match token_at_or_after toks name (ast.span_start sp) {
+                    () => [],
+                    at => [[si, at]],
+                },
+            _ => [],
+        }) items)
+    }) (list.range 0 (modules.module_count l)));
+    list.unique (list.concat [defined, declared, uses])
+};
+
+let selects names name = list.any (fn sel -> list.head sel == name) names;
+
+/// Where `name` is written in the dotted chain starting at `start`: the
+/// chain's last segment, which is the member a chain is recorded for, when it
+/// is spelled `name`.
+let last_segment src start name = {
+    let rec segs at acc = {
+        let end = name_end src at;
+        let seg = [at, end];
+        if end < str.byte_length src && str.byte end src == 46 { segs (end + 1) (list.cons seg acc) }
+        else { list.cons seg acc }
+    };
+    match segs start [] {
+        [[s0, e0], .._] => if str.slice s0 (e0 - s0) src == name { s0 } else { () },
+        _ => (),
+    }
+};
+
+/// Every occurrence of a local, in this file: each token spelled the same
+/// whose identity is the same binder.
+let local_sites a mi toks binders name id =
+    list.concat (list.map (fn t ->
+        if lexer.kind t != :ident || lexer.value t != name { [] }
+        else if identity a mi toks binders (lexer.span_start t) name == id { [lexer.span_start t] }
+        else { [] }) toks);
+
+/// LSP's `rename`: a `WorkspaceEdit` replacing every occurrence, or an error.
+let rename_at a line character new = match rename_target a line character {
+    [:ok, id, _, _, name] => match valid_rename name new {
+        [:error, why] => [:error, why],
+        _ => {
+            let l = loader a;
+            let mi = module_of a;
+            let si = modules.module_source (modules.module_at l mi);
+            let sites = match id {
+                [:local, _] => {
+                    let src = module_text a mi;
+                    let toks = lexer.tokens src;
+                    list.map (fn at -> [si, at]) (local_sites a mi toks (binders_in toks (source_items a mi)) name id)
+                },
+                [:global, target, _] => global_sites a target name,
+            };
+            let files = list.unique (list.map (fn s -> list.head s) sites);
+            [:ok, %{ "changes" => list.fold (fn m f -> {
+                let file = modules.file_at l f;
+                let text = diag.source_text file;
+                m.[path_to_uri (diag.source_path file) =>
+                    list.map (fn s -> %{ "range" => pos.range text (list.nth 1 s) (list.nth 1 s + str.byte_length name),
+                                         "newText" => new })
+                             (list.sort_on (fn s -> list.nth 1 s) (list.filter (fn s -> list.head s == f) sites))]
+            }) %{} files }]
+        },
+    },
+    failed => failed,
+};
+
 // --- the outline -------------------------------------------------------------------
 
 /// LSP `SymbolKind`. A Dream global is a function or a value and the resolver
@@ -1436,6 +1766,18 @@ when test {
         match of! text { a => match module_of a { () => "", mi => shown_signature a mi name } };
 
     let tests = [
+        test.case "a rename keeps a name a name"
+            $( test.eq! [[:ok, "b"], [:error, "`1b` is not a name"], [:error, "`a-b` is not a name"]]
+                        [valid_rename "a" "b", valid_rename "a" "1b", valid_rename "a" "a-b"] ),
+        test.case "a rename keeps purity"
+            $( test.eq! [[:ok, "go!"], [:error, "only an impure name ends with `!`"],
+                         [:error, "an impure name must keep its `!`"]]
+                        [valid_rename "run!" "go!", valid_rename "run" "go!", valid_rename "run!" "go"] ),
+        test.case "a member is the last segment of its chain"
+            $( test.eq! [11, (), 0]
+                        [last_segment "x = helper.double 1" 4 "double",
+                         last_segment "x = helper.double 1" 4 "helper",
+                         last_segment "double 1" 0 "double"] ),
         test.case "a module prefix leads to its declaration, not its member"
             $( test.eq! [0, 0] (definition_start!
                 "mod Helper { let value = 1; }\nlet x = Helper.value;" 1 10) ),

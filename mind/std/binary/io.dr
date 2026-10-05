@@ -1,0 +1,47 @@
+// Transport adapters for a binary layout. Framing policy remains with the
+// protocol (std.codec already supplies framing for std.wire and std.json).
+// Callbacks allow files, sockets, TLS or test readers without a new IO type.
+import std.binary as binary;
+import std.io;
+import std.result;
+import std.str;
+import std.list;
+import std.streams;
+
+priv let failure kind offset message = result.error (binary.problem kind (offset * 8) message);
+
+/// Read exactly count bytes. The callback accepts a maximum count and returns
+/// up to that many bytes; empty means EOF. Chunks are joined once. Exceptions
+/// become :io_error results. A partial EOF is :truncated, with bytes read.
+let read_exact_with! count source! =
+    if type_of count != :integer || count < 0 { failure :invalid_argument 0 "read size must be non-negative" }
+    else {
+        let rec go! !at parts = if at == count { result.ok (str.concat_all (list.reverse parts)) }
+            else { match try! { let chunk = source! (count - at); strict! chunk; [:ok, chunk] } catch e { [:error, e] } {
+                [:error, e] => failure :io_error at (to_string e),
+                [:ok, chunk] => if type_of chunk != :string { failure :io_error at "reader returned a non-string" }
+                    else if len chunk == 0 { failure :truncated at "stream ended inside the field" }
+                    else if len chunk > count - at { failure :io_error at "reader exceeded the requested count" }
+                    else { go! (at + len chunk) (chunk :: parts) },
+            } };
+        go! 0 []
+    };
+
+let read_with! codec count source! = match read_exact_with! count source! {
+    [:error, e] => result.error e,
+    [:ok, data] => binary.decode codec data,
+};
+
+/// Encode completely before doing IO; an invalid value writes no bytes.
+/// Short writes are handled by std.streams. IO failure may have written a
+/// prefix: the caller owns recovery and must not blindly retry the message.
+let write_with! codec value sink! = match binary.encode codec value {
+    [:error, e] => result.error e,
+    [:ok, data] => try! {
+        streams.write_all_with! sink! data
+        result.ok ()
+    } catch e { failure :io_error 0 (to_string e) },
+};
+
+let read! codec count handle = read_with! codec count (io.read! handle);
+let write! codec value handle = write_with! codec value (io.write! handle);

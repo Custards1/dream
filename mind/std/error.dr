@@ -91,10 +91,50 @@ let raise_as! k p = raise! (_error_new k p);
 let rethrow! : :any -> :never;
 let rethrow! e = raise! e;
 
+// --- where it was raised ----------------------------------------------------
+//
+// An error remembers where it was first raised: the functions that were
+// running, innermost first, and -- because a lazy program fails where a value
+// is *needed*, which is seldom where it was written -- the functions that made
+// each value being forced at the time. The machine fills that in as it starts
+// to unwind (`locate_error` in dream/src/interp.cpp), from the place each
+// function was written, which the image keeps. It is what an uncaught error is
+// reported with, and these are the same answer for a program that catches one.
+//
+// The places are functions', not lines within them: the optimizer shares
+// identical nodes across the whole program, so a node has no one place.
+
+/// Where `e` was raised, innermost first: `[:in, name, path, line, col]` for
+/// a function that was running, and `[:made, name, path, line, col]` for one
+/// that made a value being forced. `[]` for an error never raised, and for one
+/// raised by another image. Impure because raising is what fills it in, so
+/// the same value answers differently before and after.
+let trace! : :any -> [[:any]];
+let trace! e = _error_trace! e;
+
+/// One place of a trace, as a line reads: ``in `f` (path:3:1)``.
+let place_line : [:any] -> :string;
+let place_line at = {
+    let [how, name, path, line, col] = at;
+    let lead = if how == :made { "forcing a value made in `" } else { "in `" };
+    let where = if line == 0 { "" }
+                else { " (" + path + ":" + to_string line + ":" + to_string col + ")" };
+    lead + name + "`" + where
+};
+
+/// The trace as lines, the way the VM reports an uncaught error.
+let trace_lines! : :any -> [:string];
+let trace_lines! e = {
+    let rec lines places = if _list_is_empty places { [] }
+                           else { _list_cons (place_line (places.[0])) (lines (_list_tail places)) };
+    lines (trace! e)
+};
+
 // --- tests -------------------------------------------------------------------
 
 when test {
     import std.test;
+    import std.list;
 
     /// Run a thunk in its own process and answer whatever it raised. In a
     /// process, because a case that raises should not take the runner with it,
@@ -140,7 +180,23 @@ when test {
         test.case "describe"     $( test.eq! ":not_found: /tmp/x" (describe (new :not_found "/tmp/x")) ),
         test.case "describe of an empty payload is just the kind"
             $( test.eq! ":stopped" (describe (new :stopped "")) ),
+
+        test.case "an error never raised has no trace"
+            $( test.eq! [] (trace! (new :x 1)) ),
+        test.case "a raised one names the function it was raised in"
+            $( test.true! (list.any (fn at -> at.[1] == "divide" && str.ends_with "error.dr" (at.[2]))
+                                    (trace! (caught! $( divide 1 0 )))) ),
+        test.case "and the one that made the value being forced"
+            $( test.true! (list.any (fn at -> at.[0] == :made)
+                                    (trace! (caught! $( divide 1 0 )))) ),
+        test.case "a place reads as a line"
+            $( test.eq! "in `f` (a.dr:3:1)" (place_line [:in, "f", "a.dr", 3, 1]) ),
+        test.case "a place the image does not know reads without one"
+            $( test.eq! "forcing a value made in `<thunk>`" (place_line [:made, "<thunk>", "", 0, 0]) ),
     ];
+    // Not a wrapper, which a call would be replaced by (see "wrappers" in
+    // dreams/scope.dr), so that it has a frame of its own to be named by.
+    let divide a b = { let q = a / b; q + 1 };
 }
 
 // --- optional types ---------------------------------------------------------

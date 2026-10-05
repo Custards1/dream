@@ -19,13 +19,39 @@ using namespace dream;
 
 extern "C" {
 
-// A compiled frame holds its slots in registers the collector cannot see, so
-// nothing reached from one may collect -- see `PinsTheHeap` in interp.hpp. Each
-// helper below that can run the machine says so. `force_whnf` would pin anyway
-// for want of a vouch, but saying it here is what keeps the guarantee if
-// someone later vouches for something `arith` or `compare` reaches.
+// A compiled frame holds its slots in registers the collector cannot find
+// precisely. Underneath a force or a call, which is where a compiled loop can
+// spend unbounded time, that no longer stops a collection: the machine stack
+// is scanned instead, and whatever it points at stays where it is
+// (`Process::jit_stack_hi`, `Heap::set_conservative_roots`). So those two
+// vouch, through `ScannedForGc`. Every other helper below that can run the
+// machine still pins the heap and says so, because what it reaches holds
+// values somewhere a scan of the stack would not see: `arith` on two lists is
+// `concat_lists`, and a native is whatever it is.
+namespace {
+
+/// Vouch for a nested force under compiled code, when the stack will be
+/// scanned -- which it is whenever compiled code is running from a machine
+/// loop. Outside one there is nothing to scan up to, and it pins instead.
+struct ScannedForGc {
+    Process& p;
+    const bool scanned;
+    const bool saved;
+    explicit ScannedForGc(Process& proc)
+        : p(proc), scanned(proc.jit_stack_hi != nullptr), saved(proc.force_vouched) {
+        if (scanned) p.force_vouched = true; else ++p.force_pins;
+    }
+    ~ScannedForGc() {
+        if (scanned) p.force_vouched = saved; else --p.force_pins;
+    }
+    ScannedForGc(const ScannedForGc&) = delete;
+    ScannedForGc& operator=(const ScannedForGc&) = delete;
+};
+
+}  // namespace
+
 int dream_rt_force(Process* p, Value v, Value* out) {
-    PinsTheHeap pinned(*p);
+    ScannedForGc scanned(*p);
     Value result;
     if (!force_whnf(*p, v, &result)) {
         *out = p->result;
@@ -185,13 +211,12 @@ Value* dream_rt_frame_slots(Value frame) {
 // underneath itself is pure too. `Block` is answered all the same, in the one
 // way that is honest about not having handled it.
 //
-// The heap is pinned for the duration, for the reason every helper in this file
-// that can run Dream code pins it: the compiled frame above holds its values in
-// machine registers, and a collection would move what they name. That is the
-// same bargain `dream_rt_force` makes, and it has the same cost -- a native that
-// walks a long lazy structure allocates for the length of the walk with nothing
-// able to collect any of it. See `PinsTheHeap`, and "A JIT that can allocate" in
-// docs/notes/vm-performance.md, whose de-pinning stage is what would remove it.
+// The heap is pinned for the duration. Not for the compiled frame above --
+// a scan of the machine stack covers that now, see `ScannedForGc` -- but for
+// the native below, which may hold a value where no scan of the stack looks.
+// A native that vouches for itself still collects underneath, as it would
+// interpreted; one that does not walks a long lazy structure with nothing able
+// to collect any of it. See `PinsTheHeap`.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -303,8 +328,10 @@ int dream_rt_builtin(Process* p, uint32_t builtin_id, uint32_t argc, Value a0, V
 // the interpreter's, word for word, because the e2e harness compares the two
 // tiers' output and an error is output.
 //
-// Every one pins the heap, for the reason the helpers above do: the compiled
-// frame that called it holds its values in registers.
+// Every one pins the heap: what each runs -- a map's lookup, a list's walk --
+// holds values in C++ locals across a force, and has not been audited for a
+// collection underneath it. `dream_rt_force` and `dream_rt_apply` are the two
+// that may collect; see `ScannedForGc`.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -601,7 +628,7 @@ bool callee_is_impure(Process& p, Value v) {
 
 }  // namespace
 
-int dream_rt_apply(Process* p, Value callee, uint32_t argc, const Value* args, Value* out) {
+int dream_rt_apply(Process* p, Value callee, uint32_t argc, Value* args, Value* out) {
     // Compiled code orders no effects, and a call it makes is retried from the
     // top if something under it parks -- so an impure function must never run
     // from here. A pure caller is handed one only through a parameter, which
@@ -610,7 +637,7 @@ int dream_rt_apply(Process* p, Value callee, uint32_t argc, const Value* args, V
     // compiled body has performed no effect, since this is the only way it
     // could have, and the interpreter runs it from its frame.
     if (callee_is_impure(*p, callee)) return 2;
-    PinsTheHeap pinned(*p);
+    ScannedForGc scanned(*p);
     // A nested loop that runs the slice out re-arms it rather than stopping
     // (`Process::slice_spent`), which is right for a native and wrong for a
     // compiled loop around this call: it would see a full budget at its next
@@ -621,7 +648,7 @@ int dream_rt_apply(Process* p, Value callee, uint32_t argc, const Value* args, V
     // iteration yield.
     const bool spent_before = p->slice_spent;
     Value r;
-    const bool ok = apply_whnf(*p, callee, args, argc, &r);
+    const bool ok = apply_whnf_taking(*p, callee, args, argc, &r);
     if (!spent_before && p->slice_spent && p->reductions > 0) p->reductions = 0;
     if (!ok) {
         *out = p->result;

@@ -602,3 +602,33 @@ byte-identical. This is the fifth time the lesson at the top of CLAUDE.md
 has been found by measuring rather than reading: the fold was in plain
 sight, under a comment about ordering, and a repository whose largest module
 has a few hundred items cannot feel it.
+
+## Where the wall is now (2026-10-04)
+
+The case for compiling a package at a time was always this file's wall:
+"12,800 declarations still do not fit" under the default 1 GB
+`DREAM_MAX_HEAP`. Measured again with `scale.py`'s generator, before any work
+was started on it, it is not true any more:
+
+| declarations | modules | result | live at the heaps' peaks (summed) |
+|---|---|---|---|
+| 12,800 | 1 | compiles | 1.68 GB |
+| 19,200 | 1 | compiles | 2.54 GB |
+| 25,600 | 1 | compiles | 3.42 GB |
+| 51,200 | 64 | compiles, 16 s | 5.58 GB |
+| 51,200 | 1 | `:out_of_memory` after 6 s, in the parse (`modules.dr`, `parse_elsewhere!`) | |
+
+Read the last column with care, because it is what made the old wall look
+lower than it was and would make this one look higher: `--stats` *sums* every
+process's peak, and the cap is per process. A parallel build resolves and
+lowers each module in a process of its own, so the sum outgrows 1 GB long
+before any one heap does. The 1 GB is a fact about the largest single part.
+
+So the wall is between 25,600 and 51,200 declarations *in one module*, and it
+is that module's parse. More modules move it out of the way entirely, and so
+compiling a package at a time -- which divides by package, and a package is
+bigger than a module -- is no longer the answer to any wall this generator can
+find. `.libdream` stays a plan for the other reason it was ever wanted, that a
+dependency should be linked rather than recompiled, and stops being the next
+thing to build. The item-list fold above and the parallel parts are what moved
+the wall; nothing was built for it.

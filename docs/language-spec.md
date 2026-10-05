@@ -29,7 +29,7 @@ the machine works, see the [VM's README](../dream/README.md).
 12. [Behaviours: `virtual` and `derive`](#12-behaviours-virtual-and-derive)
 13. [Processes](#13-processes)
 14. [Compile time: `comp`, `when` and macros](#14-compile-time-comp-when-and-macros)
-15. [C libraries: `foreign`](#15-c-libraries-foreign)
+15. [Libraries: `foreign` and `image`](#15-libraries-foreign-and-image)
 16. [Tests](#16-tests)
 17. [Running a program](#17-running-a-program)
 18. [Writing code that runs fast](#18-writing-code-that-runs-fast)
@@ -133,13 +133,14 @@ or form can begin, and are ordinary names elsewhere.
 | Word | Special where |
 |---|---|
 | `group`, `struct`, `mapping` | at the start of an item: a record ([§10](#10-records-and-unions)) |
-| `foreign` | at the start of an item: a C library ([§15](#15-c-libraries-foreign)) |
+| `foreign` | at the start of an item: a C library ([§15](#15-libraries-foreign-and-image)) |
+| `image` | at the start of an item: another Dream image ([§15](#another-image-image)) |
 | `dyn` | after `virtual` or a record's `derive` ([§12](#dispatch-virtual-dyn-and-derive-dyn)) |
 | `where` | inside a type ([§9](#the-type-grammar)) |
 | `strict` | in `(strict name)`, a strict parameter |
 
 So `let group = 1` in a block, and `import std.foreign;` followed by
-`foreign.call!`, both work.
+`foreign.call!`, both work, as does `image.installed` after `import std.image;`.
 
 ### Literals
 
@@ -373,9 +374,13 @@ From loosest to tightest:
 | `&&` | left |
 | `==` `!=` `<` `<=` `>` `>=` | left |
 | `::` | **right** |
+| `\|` | left |
+| `^` | left |
+| `&` | left |
+| `<<` `>>` | left |
 | `+` `-` | left |
 | `*` `/` `%` `@` | left |
-| prefix `-`, `not`, and `comp`, `comp!`, `expand` | prefix |
+| prefix `-`, `~`, `not`, and `comp`, `comp!`, `expand` | prefix |
 | application `f a b` | left |
 | `.name`, `.[ ]` | postfix |
 
@@ -410,6 +415,17 @@ A parameter written `()` takes a slot but binds no name: `let now! () = ..`
 is called as `now! ()`.
 
 ### Operators
+
+The integer operators `&`, `|`, `^` and `~` use infinite two's complement:
+`~x == -x - 1` and `-1 & x == x`. They accept integers only, including
+arbitrarily large integers. `x << n` multiplies by `2^n`; `x >> n` divides
+by `2^n` rounded toward negative infinity, so `-3 >> 1 == -2`. A negative
+count raises `:out_of_bounds`; a nonzero left shift by more than `2^32` bits
+raises `:out_of_memory` before allocation. Ordinary process heap limits
+also apply. Huge right shifts yield `0` or `-1` according to the sign.
+
+`x & 1 == 0` means `(x & 1) == 0`; `1 << n - 1` means `1 << (n - 1)`.
+
 
 | | |
 |---|---|
@@ -549,7 +565,9 @@ something already forced costs nothing. It takes a block too:
 
 **`strict!` inside a value is itself suspended.** `[:ok, strict! x]` builds
 a list whose second element is a thunk of the force. To force `x` first, make
-it a statement: `strict! x` on its own line, then `[:ok, x]`.
+it a statement: `strict! x` on its own line, then `[:ok, x]`. The compiler
+warns about a `strict!` written as an element of a list, array or map
+literal (`dreams/lint.dr`).
 
 ### Strict parameters
 
@@ -1028,6 +1046,12 @@ and writes the defaults in.
 - **A field annotation** (`x : :integer`) contributes to `Point.type`, a
   description of the record, and gives the generated functions signatures
   that the checker uses.
+- **A strict field** (`!x`, or `(strict x)`) is forced before it is stored:
+  it is a [strict parameter](#strict-parameters) of `make`, `new` and
+  `set_x`. A suspended field holds whatever its frame reached, and a record
+  kept in a table then keeps the table it was computed from; `!` is the fix.
+  A default is not forced, since it names nothing and so holds nothing.
+  Only a field can be strict: `!` before a member is an error.
 
 A record adds no tag or runtime type. Its values are the list, array or map,
 and indexing, equality, patterns and `type_of` see exactly that. A record
@@ -1432,7 +1456,7 @@ uses ordinary functions, imports and `match` to read and build it.
 
 ---
 
-## 15. C libraries: `foreign`
+## 15. Libraries: `foreign` and `image`
 
 ```dream
 foreign libc from "libc.so.6" {
@@ -1466,8 +1490,38 @@ the Dream side, so passing a `Stmt` where a `Db` is wanted is a compile error.
 
 A pointer C hands back is **owned** by the process that made the call, and is
 freed when it is released or the process ends. The library is
-`from "path"`, `from embedded "name"` (a payload carried in the image), or
-`from (expression)`. [ffi.md](ffi.md) is the guide.
+`from "path"`, `from system "name"` (one installed on the system, searched
+for; `from system "name" "0"` holds it to one ABI version), `from embedded
+"name"` (a payload carried in the image), or `from (expression)`.
+[ffi.md](ffi.md) is the guide.
+
+### Another image: `image`
+
+```dream
+image fmt from installed "formatter" {
+    pretty : :string -> :string
+    check! : :string -> [:ok, :string] | [:error, :string] = formatter.lint.check!
+}
+
+fmt.pretty source
+```
+
+`image` declares another compiled Dream program and the functions this one
+calls in it. Each line is a name and its Dream type, with `= module.member`
+when the function is not the image's top-level `name`. The block is a
+module: each name is bound, as an effect if it has a `!` and as a pure
+function if not, and signed with the type written, so the checker holds
+callers to it. A line with no arrow is a value of the image, computed there
+once.
+
+The image runs in a runtime of its own, and only **data** crosses: numbers,
+strings, atoms, lists, arrays, maps and errors. A parameter that is a
+function is a compile error, and an error the image raises is raised in the
+caller. The image is `from "path"`, `from installed "name"` (found as
+`dream NAME` finds one), `from embedded "name"` (carried in this image's
+payload), or `from (expression)` -- `std.image`'s `any_of`, for one. It is
+opened, and each function found in it, the first time it is used.
+[images.md](images.md) is the guide.
 
 ---
 
@@ -1583,6 +1637,7 @@ item        ::= 'import' path ( 'as' name | '.{' member (',' member)* '}' )?
               | ('group' | 'struct' | 'mapping') name ('derive' 'dyn'? path)? '{' entry* '}'
               | 'union' name param* '{' (variant | member)* '}'
               | 'foreign' name ('from' library)? '{' foreign_entry* '}'
+              | 'image' name 'from' image '{' (name ':' type ('=' path)?)* '}'
 binding     ::= 'rec'? name param* ( ':' type )? '=' expr
               | name ':' type
               | pattern '=' expr

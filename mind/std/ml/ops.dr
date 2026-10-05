@@ -1,0 +1,157 @@
+// The compositions of `std.tensor` that machine learning keeps writing:
+// softmax and its logarithm, a mean or a variance along the last axis, a
+// mask applied as a choice, and tensors made where another one already is.
+//
+//     ops.softmax logits                 // each row sums to 1
+//     ops.log_softmax logits             // without the overflow
+//     ops.like x (tensor.one_hot 10 labels)   // on x's device, in x's type
+//
+// Everything here is `std.tensor` and nothing else, so everything here runs
+// where its operands are and fuses the way they do. The one shape this file
+// adds is **along the last axis**: a value per row computed with a fold
+// (`tensor.max_axis`), stretched back across the row with `tensor.repeat`,
+// which a chain reads in place. `softmax` of a matrix is therefore two folds
+// and one fused pass on the host, and three kernels on the GPU, with nothing
+// the size of the input stored but the answer.
+//
+// A vector is one row: its fold is a number, which meets a tensor without
+// being stretched at all.
+
+import std.list;
+import std.math;
+import std.tensor;
+
+/// The last axis's index and length.
+priv let last_axis : :tensor -> [:integer, :integer];
+priv let last_axis x = {
+    let shape = tensor.shape x;
+    let r = len shape;
+    [r - 1, shape.[r - 1]]
+};
+
+/// A fold along the last axis by `fold` (`tensor.sum_axis`, `tensor.max_axis`,
+/// ..), stretched back to `x`'s shape: one value per row, repeated across it.
+/// For a vector the fold is a number, which needs no stretching.
+let per_row : (:integer -> :tensor -> :any) -> :tensor -> :any;
+let per_row fold x = {
+    let [axis, n] = last_axis x;
+    let r = fold axis x;
+    if type_of r == :tensor { tensor.repeat n r } else { r }
+};
+
+/// The sum of each row, stretched across it.
+let row_sum : :tensor -> :any;
+let row_sum x = stretch x (tensor.sum_axis (tensor.rank x - 1) x);
+
+/// The largest number of each row, stretched across it.
+let row_max : :tensor -> :any;
+let row_max x = stretch x (tensor.max_axis (tensor.rank x - 1) x);
+
+/// The mean of each row, along the last axis; a number for a vector.
+let mean_last : :tensor -> :any;
+let mean_last x = { let [axis, n] = last_axis x; tensor.sum_axis axis x / n };
+
+/// The mean along `axis`, which drops out.
+let mean_axis : :integer -> :tensor -> :any;
+let mean_axis axis x = tensor.sum_axis axis x / (tensor.shape x).[axis];
+
+/// The variance along `axis` (dividing by the count, as a batch statistic
+/// does), which drops out.
+let var_axis : :integer -> :tensor -> :any;
+let var_axis axis x = {
+    let m = mean_axis axis x;
+    mean_axis axis (x * x) - m * m
+};
+
+/// Each row's values as probabilities: `exp x / sum (exp x)`, with each
+/// row's largest value taken off first so that nothing overflows.
+let softmax : :tensor -> :tensor;
+let softmax x = {
+    let e = tensor.exp (x - row_max x);
+    e / row_sum e
+};
+
+/// `log (softmax x)`, computed as `x - logsumexp x` so that a row whose
+/// probabilities underflow still has finite logarithms.
+let log_softmax : :tensor -> :tensor;
+let log_softmax x = x - stretch x (logsumexp x);
+
+/// `log (sum (exp x))` of each row -- a vector of them for a matrix, one
+/// number for a vector -- with the row's largest value taken out first.
+let logsumexp : :tensor -> :any;
+let logsumexp x = {
+    let [axis, _] = last_axis x;
+    let m = tensor.max_axis axis x;
+    let shifted = x - stretch x m;
+    let s = tensor.sum_axis axis (tensor.exp shifted);
+    log_of s + m
+};
+
+/// A value per row (`r`, as a fold along the last axis answers it) stretched
+/// to `x`'s shape.
+let stretch : :tensor -> :any -> :any;
+let stretch x r = if type_of r == :tensor { tensor.repeat (last_axis x).[1] r } else { r };
+
+priv let log_of : :any -> :any;
+priv let log_of v = if type_of v == :tensor { tensor.log v } else { math.log v };
+
+/// `a` where `mask` is 1 and `b` where it is 0, for a mask of ones and zeros
+/// as the comparisons (`tensor.gt` and the rest) answer.
+let where : :tensor -> :any -> :any -> :any;
+let where mask a b = mask * a + (1.0 - mask) * b;
+
+/// `x` held to `[lo, hi]`.
+let clip : :float -> :float -> :any -> :any;
+let clip lo hi x = tensor.min (tensor.max x lo) hi;
+
+/// `t` moved to wherever `ref` is, in the type `ref` holds there: what a
+/// tensor made on the host (labels, a mask, a table) needs before it can meet
+/// one on the GPU.
+let like : :tensor -> :tensor -> :tensor;
+let like ref t = if tensor.device ref == :host { tensor.host t } else { on_gpu_as (tensor.dtype ref) t };
+
+priv let on_gpu_as : :atom -> :tensor -> :tensor;
+priv let on_gpu_as dtype t = match dtype { :f32 => tensor.gpu t, _ => tensor.gpu64 t };
+
+/// The positions `0 .. n - 1` in an order fixed by `seed`: a permutation, for
+/// shuffling the rows of a dataset with `tensor.take`. Sorting random keys
+/// is simple and n log n; a dataset is shuffled once an epoch.
+let permutation : :integer -> :integer -> [:integer];
+let permutation seed n = {
+    let keys = tensor.to_list (tensor.random seed [n]);
+    list.map (fn [_, i] -> i) (list.sort_on (fn [k, _] -> k) (list.zip keys (list.range 0 n)))
+};
+
+/// The number of rows of `t`, the length of its first axis.
+let rows : :tensor -> :integer;
+let rows t = (tensor.shape t).[0];
+
+/// `t` as a matrix: its first axis kept, everything after it flattened.
+let flatten : :tensor -> :tensor;
+let flatten t = { let n = rows t; tensor.reshape [n, tensor.size t / n] t };
+
+when test {
+    import std.test;
+
+    let m = tensor.of_list [[1, 2, 3], [1000, 1000, 1000]];
+    let close a b = tensor.maximum (tensor.abs (a - b)) < 1.0e-9;
+
+    let tests = [
+        test.case "softmax rows sum to one"
+            $( test.true! (close (tensor.sum_axis 1 (softmax m)) (tensor.of_list [1, 1])) ),
+        test.case "softmax does not overflow"
+            $( test.true! (close (softmax m).[1] (tensor.of_list [1, 1, 1] / 3.0)) ),
+        test.case "softmax of a vector" $( test.near! 1.0e-12 1.0 (tensor.sum (softmax (tensor.of_list [1, 2]))) ),
+        test.case "log_softmax is the log of softmax"
+            $( test.true! (close (log_softmax m) (tensor.log (softmax m))) ),
+        test.case "logsumexp of a large row"
+            $( test.near! 1.0e-9 (1000.0 + math.log 3.0) ((logsumexp m).[1]) ),
+        test.case "mean and variance along an axis"
+            $( test.true! (close (var_axis 1 m) (tensor.of_list [2.0 / 3.0, 0])) ),
+        test.case "where chooses" $( test.eq! (tensor.of_list [1, 20]) (where (tensor.of_list [1, 0]) (tensor.of_list [1, 2]) (tensor.of_list [10, 20])) ),
+        test.case "clip" $( test.eq! (tensor.of_list [0, 0.5, 1]) (clip 0.0 1.0 (tensor.of_list [-3, 0.5, 9])) ),
+        test.case "a permutation has every position once"
+            $( test.eq! (list.range 0 50) (list.sort (permutation 3 50)) ),
+        test.case "flatten" $( test.eq! [2, 12] (tensor.shape (flatten (tensor.zeros [2, 3, 4]))) ),
+    ];
+}

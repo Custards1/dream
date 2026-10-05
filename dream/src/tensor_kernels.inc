@@ -32,62 +32,87 @@ namespace {
 
 using Z = size_t;
 
-inline double apply_binary(int op, double a, double b) {
-    switch (op) {
-        case KOP_ADD: return a + b;
-        case KOP_SUB: return a - b;
-        case KOP_MUL: return a * b;
-        case KOP_DIV: return a / b;
-        default: return std::fmod(a, b);
-    }
+// Each operation is its own loop, with the switch outside it, so that every
+// loop is a plain `out[i] = x[i] op y[i]` the vectorizer can take: `each`
+// is instantiated once per lambda, and each lambda is its own type.
+template <class F>
+inline void each(const double* __restrict x, const double* __restrict y, double* __restrict out,
+                 Z n, F f) {
+    for (Z i = 0; i < n; ++i) out[i] = f(x[i], y[i]);
+}
+template <class F>
+inline void each_scalar(const double* __restrict x, double s, double* __restrict out, Z n, F f) {
+    for (Z i = 0; i < n; ++i) out[i] = f(x[i], s);
+}
+template <class F>
+inline void each_unary(const double* __restrict x, double* __restrict out, Z n, F f) {
+    for (Z i = 0; i < n; ++i) out[i] = f(x[i]);
 }
 
-// Each operation is its own loop, with the switch outside it, so that every
-// loop is a plain `out[i] = x[i] op y[i]` the vectorizer can take.
+// One case per `KernelOp`, written once and expanded into each of the three
+// shapes of loop below. A comparison answers 1 or 0, so a mask multiplies.
+#define DREAM_KERNEL_BINARY_CASES(LOOP)                                         \
+    case KOP_ADD: LOOP([](double a, double b) { return a + b; }); break;        \
+    case KOP_SUB: LOOP([](double a, double b) { return a - b; }); break;        \
+    case KOP_MUL: LOOP([](double a, double b) { return a * b; }); break;        \
+    case KOP_DIV: LOOP([](double a, double b) { return a / b; }); break;        \
+    case KOP_MOD: LOOP([](double a, double b) { return std::fmod(a, b); }); break; \
+    case KOP_MAX: LOOP([](double a, double b) { return std::fmax(a, b); }); break; \
+    case KOP_MIN: LOOP([](double a, double b) { return std::fmin(a, b); }); break; \
+    case KOP_POW: LOOP([](double a, double b) { return std::pow(a, b); }); break;  \
+    case KOP_LT: LOOP([](double a, double b) { return a < b ? 1.0 : 0.0; }); break; \
+    case KOP_LE: LOOP([](double a, double b) { return a <= b ? 1.0 : 0.0; }); break; \
+    case KOP_GT: LOOP([](double a, double b) { return a > b ? 1.0 : 0.0; }); break; \
+    case KOP_GE: LOOP([](double a, double b) { return a >= b ? 1.0 : 0.0; }); break; \
+    case KOP_EQ: LOOP([](double a, double b) { return a == b ? 1.0 : 0.0; }); break; \
+    default: LOOP([](double a, double b) { return a != b ? 1.0 : 0.0; }); break;
+
 void binary(int op, const double* __restrict x, const double* __restrict y,
             double* __restrict out, Z n) {
-    switch (op) {
-        case KOP_ADD: for (Z i = 0; i < n; ++i) out[i] = x[i] + y[i]; break;
-        case KOP_SUB: for (Z i = 0; i < n; ++i) out[i] = x[i] - y[i]; break;
-        case KOP_MUL: for (Z i = 0; i < n; ++i) out[i] = x[i] * y[i]; break;
-        case KOP_DIV: for (Z i = 0; i < n; ++i) out[i] = x[i] / y[i]; break;
-        default: for (Z i = 0; i < n; ++i) out[i] = std::fmod(x[i], y[i]); break;
-    }
+#define DREAM_LOOP(f) each(x, y, out, n, f)
+    switch (op) { DREAM_KERNEL_BINARY_CASES(DREAM_LOOP) }
+#undef DREAM_LOOP
 }
 
 void scalar(int op, const double* __restrict x, double s, bool scalar_left,
             double* __restrict out, Z n) {
     if (scalar_left) {
-        switch (op) {
-            case KOP_ADD: for (Z i = 0; i < n; ++i) out[i] = s + x[i]; break;
-            case KOP_SUB: for (Z i = 0; i < n; ++i) out[i] = s - x[i]; break;
-            case KOP_MUL: for (Z i = 0; i < n; ++i) out[i] = s * x[i]; break;
-            case KOP_DIV: for (Z i = 0; i < n; ++i) out[i] = s / x[i]; break;
-            default: for (Z i = 0; i < n; ++i) out[i] = std::fmod(s, x[i]); break;
-        }
+        // `s op x[i]`: the same cases with the operands swapped.
+#define DREAM_LOOP(f) each_scalar(x, s, out, n, [](double a, double b) { return f(b, a); })
+        switch (op) { DREAM_KERNEL_BINARY_CASES(DREAM_LOOP) }
+#undef DREAM_LOOP
         return;
     }
-    switch (op) {
-        case KOP_ADD: for (Z i = 0; i < n; ++i) out[i] = x[i] + s; break;
-        case KOP_SUB: for (Z i = 0; i < n; ++i) out[i] = x[i] - s; break;
-        case KOP_MUL: for (Z i = 0; i < n; ++i) out[i] = x[i] * s; break;
-        case KOP_DIV: for (Z i = 0; i < n; ++i) out[i] = x[i] / s; break;
-        default: for (Z i = 0; i < n; ++i) out[i] = std::fmod(x[i], s); break;
-    }
+#define DREAM_LOOP(f) each_scalar(x, s, out, n, f)
+    switch (op) { DREAM_KERNEL_BINARY_CASES(DREAM_LOOP) }
+#undef DREAM_LOOP
 }
+
+#undef DREAM_KERNEL_BINARY_CASES
 
 void unary(int fn, const double* __restrict x, double* __restrict out, Z n) {
     switch (fn) {
-        case KFN_NEG: for (Z i = 0; i < n; ++i) out[i] = -x[i]; break;
-        case KFN_SQRT: for (Z i = 0; i < n; ++i) out[i] = std::sqrt(x[i]); break;
-        case KFN_EXP: for (Z i = 0; i < n; ++i) out[i] = std::exp(x[i]); break;
-        case KFN_LOG: for (Z i = 0; i < n; ++i) out[i] = std::log(x[i]); break;
-        case KFN_ABS: for (Z i = 0; i < n; ++i) out[i] = std::fabs(x[i]); break;
-        case KFN_TANH: for (Z i = 0; i < n; ++i) out[i] = std::tanh(x[i]); break;
-        case KFN_SIN: for (Z i = 0; i < n; ++i) out[i] = std::sin(x[i]); break;
-        case KFN_COS: for (Z i = 0; i < n; ++i) out[i] = std::cos(x[i]); break;
-        case KFN_RELU: for (Z i = 0; i < n; ++i) out[i] = x[i] > 0.0 ? x[i] : 0.0; break;
-        default: for (Z i = 0; i < n; ++i) out[i] = 1.0 / (1.0 + std::exp(-x[i])); break;
+        case KFN_NEG: each_unary(x, out, n, [](double a) { return -a; }); break;
+        case KFN_SQRT: each_unary(x, out, n, [](double a) { return std::sqrt(a); }); break;
+        case KFN_EXP: each_unary(x, out, n, [](double a) { return std::exp(a); }); break;
+        case KFN_LOG: each_unary(x, out, n, [](double a) { return std::log(a); }); break;
+        case KFN_ABS: each_unary(x, out, n, [](double a) { return std::fabs(a); }); break;
+        case KFN_TANH: each_unary(x, out, n, [](double a) { return std::tanh(a); }); break;
+        case KFN_SIN: each_unary(x, out, n, [](double a) { return std::sin(a); }); break;
+        case KFN_COS: each_unary(x, out, n, [](double a) { return std::cos(a); }); break;
+        case KFN_RELU: each_unary(x, out, n, [](double a) { return a > 0.0 ? a : 0.0; }); break;
+        case KFN_SIGMOID:
+            each_unary(x, out, n, [](double a) { return 1.0 / (1.0 + std::exp(-a)); });
+            break;
+        case KFN_FLOOR: each_unary(x, out, n, [](double a) { return std::floor(a); }); break;
+        case KFN_CEIL: each_unary(x, out, n, [](double a) { return std::ceil(a); }); break;
+        // Half away from zero, which is C's `round` and OpenCL's: the two
+        // devices agree.
+        case KFN_ROUND: each_unary(x, out, n, [](double a) { return std::round(a); }); break;
+        case KFN_SIGN:
+            each_unary(x, out, n, [](double a) { return a > 0.0 ? 1.0 : (a < 0.0 ? -1.0 : 0.0); });
+            break;
+        default: each_unary(x, out, n, [](double a) { return std::erf(a); }); break;
     }
 }
 

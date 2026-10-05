@@ -1,0 +1,57 @@
+// Writing an archive to disk without holding it.
+//
+// Every writer here goes through a handle, never through a string of the
+// whole archive: a member's bytes are copied from its source file a megabyte
+// at a time, so the largest package costs the heap one chunk, not its size.
+// The reads are `std.io`'s; what is here is the loop around them, and the
+// check that what was copied is what was promised -- a file that grew or
+// shrank after its size went into a header would leave an archive whose every
+// later member is read from the wrong offset.
+
+import std.io;
+import std.str;
+import std.streams;
+
+let chunk : :integer = 1048576;
+
+/// Copy the file at `source` onto `h`, answering how many bytes went.
+let copy_into! : :any -> :string -> :integer;
+let copy_into! h source = {
+    let src = io.open! source :read;
+    let rec pump! !total = {
+        let piece = io.read! src chunk;
+        if str.byte_length piece == 0 { total }
+        else {
+            streams.write_all! h piece
+            pump! (total + str.byte_length piece)
+        }
+    };
+    let copied = pump! 0;
+    io.close! src
+    copied
+};
+
+/// Copy exactly `expected` bytes of `source` onto `h`, or raise saying the
+/// file changed while it was being packaged.
+let copy_exactly! : :any -> :string -> :integer -> :unit;
+let copy_exactly! h source expected = {
+    let copied = copy_into! h source;
+    if copied != expected {
+        raise! (source + " changed while it was being packaged: expected " + to_string expected
+                + " bytes, read " + to_string copied)
+    }
+    ()
+};
+
+let write! : :any -> :string -> :unit;
+let write! h text = {
+    streams.write_all! h text
+    ()
+};
+
+/// The size of the file at `path`, which must be there.
+let size_of! : :string -> :integer;
+let size_of! path = match io.stat! path {
+    [n, _, _] => n,
+    _ => raise! (path + " is not there"),
+};

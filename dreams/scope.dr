@@ -1214,9 +1214,13 @@ let complain_note_at span message note source r =
 
 /// A function record: everything the VM needs about one function except its
 /// body, which lowering supplies.
-let func_rec name arity impure is_rec thunk span =
+///
+/// `source` is the file the span is in, which is what lets the image say
+/// where the function was written (`lower.link_funcs`), and so where an error
+/// raised in it came from.
+let func_rec name arity impure is_rec thunk span source =
     %{ :name => name, :arity => arity, :impure => impure, :rec => is_rec,
-       :thunk => thunk, :span => span, :slots => 0, :captures => [] };
+       :thunk => thunk, :span => span, :source => source, :slots => 0, :captures => [] };
 
 let func_name f  = f.[:name else ""];
 let func_arity f = f.[:arity else 0];
@@ -1235,10 +1239,10 @@ let func_impure f = f.[:impure else false];
 /// effects may happen while its body is walked. A lambda written inside an
 /// impure function may perform effects but is not itself impure; a thunk may
 /// always perform them, because suspending an effect is not performing one.
-let begin_func name arity impure allow is_rec thunk span r = {
+let begin_func name arity impure allow is_rec thunk span source r = {
     let fi = func_count r;
     let with_func =
-        ((r.[:funcs => (((func_map r)).[fi => (func_rec name arity impure is_rec thunk span)])])).[:func_count => (fi + 1)];
+        ((r.[:funcs => (((func_map r)).[fi => (func_rec name arity impure is_rec thunk span source)])])).[:func_count => (fi + 1)];
     [set_frames (list.cons (frame fi allow name) (frames with_func)) with_func, fi]
 };
 
@@ -1535,6 +1539,16 @@ let lazy_accumulators_warned c n ps body r =
         }) r (lint.lazy_accumulators n ps body)
     };
 
+/// A warning for each `strict!` written as an element of a list, array or map
+/// literal, where it is suspended with the element and forces nothing early.
+/// dreams/lint.dr says why only a literal's element is read.
+let suspended_forces_warned c body r =
+    list.fold (fn acc span ->
+        warn_note c span
+            "this `strict!` is an element, and an element is suspended: it forces nothing until the element is read"
+            "force it as a statement first -- `strict! x;` -- and put `x` in the literal" acc)
+        r (lint.suspended_forces body);
+
 /// A module or a namespace written where a value belongs.
 let not_a_value c m shown span r =
     report_note c span ("`" + shown + "` is a module, not a value")
@@ -1721,7 +1735,7 @@ let rec check_expr c e r =
         // what needs an impure context. So the thunk's own frame permits
         // effects however pure the function around it is.
         [:thunk, x, span] => {
-            let started = begin_func "<thunk>" 0 false true false true span r;
+            let started = begin_func "<thunk>" 0 false true false true span (ctx_source c) r;
             let fi = list.nth 1 started;
             record (ctx_mi c) (ctx_source c) span [:thunk, fi]
                    (end_func fi (check_expr c x (list.head started)))
@@ -1747,7 +1761,7 @@ let rec check_expr c e r =
         // A lambda is not a declaration, so it cannot declare itself impure: it
         // inherits whether effects are allowed from where it is written.
         [:lambda, ps, body, span] => {
-            let started = begin_func "<lambda>" (list.length ps) false (impure_ok r) false false span r;
+            let started = begin_func "<lambda>" (list.length ps) false (impure_ok r) false false span (ctx_source c) r;
             let fi = list.nth 1 started;
             let bound = bind_params c ps (list.head started);
             record (ctx_mi c) (ctx_source c) span [:closure, fi] (end_func fi (check_expr c body bound))
@@ -1759,7 +1773,7 @@ let rec check_expr c e r =
         // to see, and saying so here is better than a mystery later.
         [:comp, impure, x, span] => {
             let outer = frames r;
-            let started = begin_func "<comp>" 0 impure impure false true span (set_frames [] r);
+            let started = begin_func "<comp>" 0 impure impure false true span (ctx_source c) (set_frames [] r);
             let fi = list.nth 1 started;
             let walked = end_func fi (check_expr c x (list.head started));
             record (ctx_mi c) (ctx_source c) span [:comp, fi, impure] (set_frames outer walked)
@@ -1849,7 +1863,7 @@ let rec check_block c stmts r =
                             let started = begin_func n (list.length ps)
                                                      (builtins.is_impure_name n)
                                                      (builtins.is_impure_name n)
-                                                     is_rec false span pre;
+                                                     is_rec false span (ctx_source c) pre;
                             let fi = list.nth 1 started;
                             let bound = bind_params c ps (list.head started);
                             record (ctx_mi c) (ctx_source c) span [:closure, fi]
@@ -2037,10 +2051,11 @@ let check_body l p r = {
     // that stands in for an unfilled virtual raises, and raising is an effect.
     let impure = match list.nth 3 p { () => decl_impure d, forced => forced };
     let started = begin_func (decl_name d) (list.length (decl_params d)) impure impure
-                             (decl_rec d) (list.is_empty (decl_params d)) (decl_span d) r;
+                             (decl_rec d) (list.is_empty (decl_params d)) (decl_span d) source r;
     let fi = list.nth 1 started;
-    let bound = lazy_accumulators_warned c (decl_name d) (decl_params d) (decl_body d)
-                    (bind_params c (decl_params d) (list.head started));
+    let bound = suspended_forces_warned c (decl_body d)
+                    (lazy_accumulators_warned c (decl_name d) (decl_params d) (decl_body d)
+                        (bind_params c (decl_params d) (list.head started)));
     let done = end_func fi (check_expr c (decl_body d) bound);
     done.[:bodies => (list.cons [mi, source, d, fi] (bodies_rev done))]
 };
@@ -2192,9 +2207,9 @@ let resolve_reachable! l declared roots = {
             // accumulator the queue is built in reverse in.
             let fi = list.nth 3 (list.head (bodies_rev resolved));
             resolved.[:global_recs => (list.map (fn g -> match g {
-                    [gi, n, :function, ()] if map.has gi stubbed => [gi, n, :function, fi],
-                    _ => g,
-                }) (r_global_recs resolved))]
+                [gi, n, :function, ()] if map.has gi stubbed => [gi, n, :function, fi],
+                _ => g,
+            }) (r_global_recs resolved))]
         },
     }
 };
@@ -2712,6 +2727,11 @@ let wrapper_of r mi source d = {
     // once and shared. Rewriting its uses into the call it came from would do
     // the work at every use instead.
     if list.is_empty params { () }
+    // A strict parameter is forced by the frame the rewrite removes, so a
+    // wrapper with one is not an identity: `let set_x !v r = r.[0 => v]` made
+    // into a `set` at the call site stored the argument suspended, and a
+    // strict record field was exactly as lazy as any other.
+    else if list.any ast.param_strict params { () }
     else {
         match decl_body d {
             [:apply, callee, args, _] => {
@@ -3206,7 +3226,7 @@ let check_fused c e shape r = {
     let r2 = match seed { [:expr, x] => check_expr c x r1, _ => r1 };
 
     let started = begin_func (fuse.loop_name stag) fuse.arity false (impure_ok r2)
-                             true false span r2;
+                             true false span (ctx_source c) r2;
     let fi = list.nth 1 started;
     // The three parameters exist whether or not anything names them, so the
     // frame is as wide as the loop's arity before a stage takes a slot.

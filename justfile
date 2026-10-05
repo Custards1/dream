@@ -96,6 +96,25 @@ mind: dreams
     mkdir -p build
     ./{{dreams}} -L mind/std mind/tool/main.dr --shebang -o build/mind
 
+# `ship`, the packager: a program and its files made into a .deb, an .rpm, an
+# Arch package, a release tarball, a Homebrew formula, a PKGBUILD and an
+# install script (ship/README.md).
+ship: dreams
+    mkdir -p build
+    ./{{dreams}} -L mind ship/main.dr --shebang -o build/ship
+
+# Dream itself, packaged every way `ship` knows, into dist/: the `[ship]`
+# sections of mind.toml say what goes in. The VM is staged by `cmake --install`
+# rather than copied from the build tree, since only the installed binary
+# looks for `libdream` beside it (`$ORIGIN/../lib`) rather than in this
+# checkout. `SOURCE_DATE_EPOCH` from the last commit makes the packages the
+# same bytes on every machine that builds this commit.
+package: vm dreams mind lucid ship
+    cmake -S . -B {{build_dir}} -DCMAKE_INSTALL_LIBDIR=lib >/dev/null
+    rm -rf build/stage
+    cmake --install {{build_dir}} --prefix build/stage >/dev/null
+    SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ./{{dream}} build/ship all
+
 # The language server. It imports `dreams` as a library, so it is the one
 # program here that is both built by the compiler and made of it.
 lucid: dreams
@@ -113,12 +132,13 @@ bootstrap: vm
     ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/main.dr
 
 # The seed must still reproduce itself from this source: what it builds must
-# build an identical third image. That equality is the whole guarantee -- it
+# be the seed again, and build an identical third image. That equality is the whole guarantee -- it
 # says the compiler in the tree and the compiler in the image agree.
 bootstrap-check: vm
     ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/main.dr
     ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/main.dr
     cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
+    @cmp -s {{seed}} /tmp/dreams-stage2.dream || { echo "the seed is stale: it builds a different compiler from this source -- copy /tmp/dreams-stage2.dream over {{seed}}"; exit 1; }
     @echo "the bootstrap image reproduces itself"
 
 # `mind`'s own tests: path handling, manifest reading, dependency specs.
@@ -154,6 +174,14 @@ compile FILE *ARGS: dreams
 # Type-, scope- and purity-check without writing an image.
 check FILE: dreams
     ./{{dreams}} {{FILE}} --no-emit
+
+# Lay files out in the house style, in place (dreams/fmt.dr says what that is).
+fmt +FILES: dreams
+    ./{{dreams}} --fmt {{FILES}}
+
+# Name the files `fmt` would change, and fail if there are any.
+fmt-check +FILES: dreams
+    ./{{dreams}} --fmt-check {{FILES}}
 
 # Show the execution trees a program compiles to.
 dump FILE: build
@@ -209,7 +237,7 @@ vscode:
 # --- testing ----------------------------------------------------------------
 
 # Everything.
-test: test-vm test-e2e test-console test-std test-build test-ffi test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg
+test: test-vm test-e2e test-console test-std test-build test-ffi test-image test-mind test-dreams test-dreams-corpus test-dreams-compile test-bootstrap test-lucid test-lucid-session test-examples test-tls test-pg test-ship
 
 # The same suites as `test`, run at once by `mind test`: the repository is a
 # workspace, and each suite is a check. See "Testing" in CLAUDE.md.
@@ -250,9 +278,15 @@ test-e2e: build
     dream/tests/e2e.sh
 
 # `std.ffi` and `std.foreign` against a C library built from dream/tests/ffi,
-# carried in the image as a payload. Skips on a machine with no C compiler.
+# carried in the image as a payload and found as a system library (`from
+# system`). Skips on a machine with no C compiler.
 test-ffi: build
     dream/tests/ffi/run.sh
+
+# `std.image` and the `image` declaration: one program calling into another
+# image, found by path, installed and carried as a payload.
+test-image: build
+    dream/tests/image/run.sh
 
 # Every example program, compiled and run, output checked against what is
 # recorded beside it. `just examples-bless` re-records after a deliberate change.
@@ -283,7 +317,7 @@ test-dreams: build
 # program, and following its imports would be asking something else.
 test-dreams-corpus: build
     @for f in mind/std/*.dr mind/std/build/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
-              dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr; do \
+              dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr ship/*.dr; do \
         ./{{dreams}} --parse "$f" || exit 1; \
     done
     @echo "every file in the corpus parses"
@@ -303,6 +337,7 @@ test-dreams-compile: build
     dream={{dream}} image={{image}} dreams/tests/units.sh
     python3 dreams/tests/macros.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/optional_types.py --dream {{dream}} --compiler {{image}}
+    python3 dreams/tests/bitwise.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/static_types.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/type_codegen.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/contracts.py --dream {{dream}} --compiler {{image}}
@@ -313,6 +348,12 @@ test-dreams-compile: build
 # promises. Needs `npm install` in editors/vscode first.
 test-vscode:
     cd editors/vscode && npm test
+
+# The Neovim plugin in a headless Neovim, against the server `just lucid`
+# builds: filetype, highlighting, indentation, and lucid attaching and
+# answering. Needs `nvim` on PATH.
+test-nvim: lucid
+    DREAM="$PWD/{{dream}}" timeout 120 nvim --headless --clean --cmd 'set rtp^=editors/nvim' -l editors/nvim/test/run.lua
 
 # `lucid`'s own tests: positions, framing, and the URI/path boundary.
 test-lucid: build
@@ -331,6 +372,13 @@ test-bootstrap: bootstrap-check
 test-std: build
     ./{{dreams}} mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
     ./{{dream}} /tmp/dream-std-tests.dream
+    python3 dreams/tests/binary.py --dream {{dream}} --compiler {{image}}
+
+# Binary layouts against reference integers and every finite IEEE binary16 value.
+test-binary: build
+    ./{{dreams}} mind/std/binary/tests.dr --test -L mind -o /tmp/dream-binary-tests.dream
+    ./{{dream}} /tmp/dream-binary-tests.dream
+    python3 dreams/tests/binary.py --dream {{dream}} --compiler {{image}}
 
 # std.tls: a server and its clients in one VM, and the VM against OpenSSL's
 # own client and server in both directions.
@@ -345,6 +393,16 @@ test-pg: build
     ./{{dream}} /tmp/dream-pg-tests.dream
     dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/contracts.sh
     dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/live.sh
+
+# `ship`: its units, then every package it makes from ship/tests/fixture
+# handed to the program that installs it -- dpkg, rpm, pacman, makepkg, ruby,
+# shellcheck -- each skipped, saying so, where this machine has not got it.
+# `nix-shell -p dpkg rpm pacman fakeroot ruby shellcheck --run 'just test-ship'`
+# has them all.
+test-ship: build
+    ./{{dreams}} ship/main.dr --test -L mind -o /tmp/dream-ship-tests.dream
+    ./{{dream}} /tmp/dream-ship-tests.dream
+    dream={{dream}} dreams={{image}} ship/tests/formats.sh
 
 # Malformed images must be rejected, never crashed on.
 fuzz ITERATIONS="400": build

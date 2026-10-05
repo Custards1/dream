@@ -63,3 +63,5 @@ f00f
 ["", "f", "fo", "foobar", (), (), (), ()]
 [32, 32, false, 0]
 :type_error
+[true, true, true, true, true]
+[:not_found, :wrong_kind]

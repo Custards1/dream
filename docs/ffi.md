@@ -35,13 +35,66 @@ not, and it will be run lazily, perhaps twice, perhaps never.
 
 Nothing is loaded until a name is first used, and a library is opened once per
 VM however many processes use it. `from` is a path the platform's loader
-understands, `embedded "name"` for a library the image carries (below), or an
+understands, `system "name"` for a library installed on the system (below),
+`embedded "name"` for a library the image carries (further below), or an
 expression in parentheses; without it, the library is the running program,
 which is the C library on any normal system.
 An expression is compiled inside the module the block makes, where only
-`std.ffi` and `std.foreign` are in scope; `foreign.shared_library "sqlite3" "0"`
-is the one to write for a system library, since it is `libsqlite3.so.0`,
-`libsqlite3.0.dylib` or `sqlite3.dll` depending on where it runs.
+`std.ffi` and `std.foreign` are in scope.
+
+## Finding a library on the system
+
+```dream
+foreign sqlite3 from system "sqlite3" "0" {
+    libversion : :void -> :cstr = sqlite3_libversion
+}
+```
+
+A library installed on the system is a different file on every platform, and in
+a different place on every distribution. It is `libsqlite3.so.0` where the
+loader looks on Debian, under Homebrew's prefix on macOS (which the loader
+never searches), and in a store path on NixOS. So `from system "sqlite3"` names
+the library rather than a file, and the VM searches for it the first time it is
+used:
+
+1. **`$DREAM_LIB_SQLITE3`**, the file itself: `DREAM_LIB_` and the name in
+   capitals, anything but a letter or digit made `_`. Whoever sets it is obeyed
+   exactly. If that file cannot be opened, that is the error, and nothing else
+   is tried.
+2. **`$DREAM_LIBRARY_PATH`**, a list of directories, joined as `PATH` is; then
+   each installation directory's `lib` (`std.install`).
+3. **The platform's loader**, by each exact name: rpath, `ld.so.cache`,
+   `LD_LIBRARY_PATH` and whatever else the system already knows.
+4. **The directories package managers use**: `/usr/local/lib`, Debian's
+   multiarch directories, `/usr/lib64`, `/usr/lib`, Linuxbrew; on macOS
+   `/opt/homebrew/lib`, `/usr/local/lib` and MacPorts; on both, the Nix
+   profiles.
+
+The names it looks for are the platform's: `libsqlite3.so` then any
+`libsqlite3.so.N`, newest first; `libsqlite3.dylib` and `libsqlite3.N.dylib`;
+`sqlite3.dll`, `libsqlite3.dll` and MinGW's `libsqlite3-N.dll`. A second string
+holds the library to one ABI version, the number in its soname:
+`system "sqlite3" "0"` is `libsqlite3.so.0` or `libsqlite3.so.0.*`, and never a
+`libsqlite3.so.1`, which would load and then not mean the same thing.
+
+When nothing is found, the error says what was looked for, where, and what to
+set:
+
+```
+cannot find the C library `sqlite3` (as libsqlite3.so.0, libsqlite3.so.0.*)
+  the system's loader: libsqlite3.so.0: cannot open shared object file: No such file or directory
+  nothing in: /usr/local/lib, /usr/lib/x86_64-linux-gnu, /usr/lib64, /usr/lib, ...
+Set $DREAM_LIB_SQLITE3 to the library's file, or add its directory to $DREAM_LIBRARY_PATH.
+```
+
+The same search is a value outside a declaration: `foreign.system "sqlite3"`,
+`foreign.system_version "sqlite3" "0"`. `foreign.any_of [foreign.embedded
+"sqlite", foreign.system "sqlite3"]` is the first of several that opens, so a
+program can carry its own copy for the machines that lack one. `foreign.locate!
+lib` answers `[:ok, file]` or `[:error, why]` without raising, for a program or
+tool that wants to report where a library came from. The search is described
+in Dream (`foreign.library_files`, `foreign.library_dirs`) and carried out by
+the VM ("Finding a library" in dream/src/ffi.cpp).
 
 ## Signatures are types
 
@@ -278,4 +331,5 @@ bounds.
 
 [dream/tests/ffi](../dream/tests/ffi) is a C library written to be wrapped,
 together with a program that exercises all of the above, under both the
-interpreter and the JIT (`just test-ffi`).
+interpreter and the JIT, and `system.dr`, the same library found as a system
+library each way a person can point at it (`just test-ffi`).

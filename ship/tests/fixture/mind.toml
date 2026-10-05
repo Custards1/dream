@@ -1,0 +1,37 @@
+# The package `ship`'s own tests make, of every kind: a script, a directory of
+# data with a path too long for ustar, a file left out, a configuration file,
+# a link, and a script run on install.
+[package]
+name = "hello"
+version = "1.2.0"
+description = "a greeting, packaged every way there is"
+
+[ship]
+release = 2
+license = "MIT"
+homepage = "https://example.org/hello"
+maintainer = "Ship Tests <ship@example.org>"
+arch = "all"
+description = "Hello prints a greeting.\n\nIt exists to be packaged."
+url = "https://example.org/releases/v{version}/{file}"
+
+[ship.files]
+"bin/hello" = "cmd/hello"
+"share/hello" = { src = "data", exclude = ["scratch"] }
+"/etc/hello/hello.conf" = "hello.conf"
+
+[ship.links]
+"bin/hi" = "hello"
+
+[ship.scripts]
+postinst = "scripts/postinst.sh"
+
+[ship.deb]
+depends = ["dash | bash"]
+section = "utils"
+
+[ship.rpm]
+depends = ["/bin/sh"]
+
+[ship.brew]
+test = "assert_match \"hello\", shell_output(\"#{bin}/hello\")"

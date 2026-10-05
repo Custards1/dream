@@ -996,13 +996,13 @@ let expand_work! l work = {
         // reader is looking at two of them. Both come out of one call, because
         // `sequential!` is impure and asking it twice would expand twice.
         let outcome = if complaints state == list.length (modules.diags l) {
-                [state, apply_items (loader state) (list.nth 2 batched)]
-            } else {
-                let seq = sequential! l;
-                [counted (put_meter (merge_meter (meter_of state) (meter_of seq)) state)
-                         :sequential 1,
-                 loader seq]
-            };
+            [state, apply_items (loader state) (list.nth 2 batched)]
+        } else {
+            let seq = sequential! l;
+            [counted (put_meter (merge_meter (meter_of state) (meter_of seq)) state)
+                     :sequential 1,
+             loader seq]
+        };
         publish_meter (list.head outcome) (modules.map_modules (fn m -> with_items m
             (list.map macro_let (modules.module_items m))) (list.nth 1 outcome))
     }

@@ -48,5 +48,32 @@ for tier in "" "--no-jit"; do
         fail=1
     fi
 done
+# The same library as one installed on the system: a plain shared object in a
+# directory of its own, found by `from system "sample"` through each way a
+# person can point at it, and not found -- with the reason -- when they do not.
+mkdir -p "$tmp/lib"
+case "$(uname -s)" in
+    Darwin) lib="$tmp/lib/libsample.dylib"; shared=-dynamiclib ;;
+    *) lib="$tmp/lib/libsample.so"; shared=-shared ;;
+esac
+"$cc" $shared -fPIC -O2 -o "$lib" "$here/sample.c" >"$tmp/build" 2>&1 || { cat "$tmp/build"; exit 1; }
+timeout 300 "$dream" "$dreams" -L "$root/mind" "$here/system.dr" -o "$tmp/system.dream" >"$tmp/build" 2>&1 \
+    || { cat "$tmp/build"; exit 1; }
+found="found libsample.so
+1
+3
+any_of takes the first that opens"
+for how in "DREAM_LIBRARY_PATH=$tmp/lib" "DREAM_LIB_SAMPLE=$lib" ""; do
+    if [ -n "$how" ]; then want="$found"; else want="not found
+says what to set
+any_of takes the first that opens"; fi
+    got=$(env -u DREAM_LIBRARY_PATH -u DREAM_LIB_SAMPLE $how timeout 20 "$dream" "$tmp/system.dream" 2>&1 \
+          | sed "s|$tmp/lib/libsample.dylib|libsample.so|")
+    if [ "$got" != "$want" ]; then
+        echo "FAIL ffi system library (${how:-nothing set})"
+        echo "$got" | head -20
+        fail=1
+    fi
+done
 [ "$fail" = 0 ] && echo "ffi: ok"
 exit "$fail"

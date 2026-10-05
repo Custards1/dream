@@ -18,7 +18,8 @@ namespace dream {
 std::atomic<uint64_t> g_thunk_counts[64];
 const bool g_probe_thunk = std::getenv("DREAM_PROBE_THUNK") != nullptr;
 
-bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out);
+bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out,
+                 Value* taken = nullptr);
 
 namespace {
 
@@ -34,6 +35,20 @@ struct ForceNest {
     ~ForceNest() { --p.force_nest; }
     ForceNest(const ForceNest&) = delete;
     ForceNest& operator=(const ForceNest&) = delete;
+};
+
+/// The machine loop now running on this C++ stack, for a collection under
+/// compiled code to scan up to (`Process::jit_stack_hi`). Its frame address
+/// is passed in rather than taken here, because it has to be the loop's.
+struct LoopStack {
+    Process& p;
+    void* const saved;
+    LoopStack(Process& proc, void* frame) : p(proc), saved(proc.loop_stack_hi) {
+        p.loop_stack_hi = frame;
+    }
+    ~LoopStack() { p.loop_stack_hi = saved; }
+    LoopStack(const LoopStack&) = delete;
+    LoopStack& operator=(const LoopStack&) = delete;
 };
 
 inline void eval_node(Process& p, uint32_t node, Value frame) {
@@ -360,7 +375,13 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             const int64_t before = p.reductions;
             const uint64_t before_total = p.total_reductions;
             const size_t stack_before = p.stack.size();
+            // The outermost compiled frame on this stack says where a scan of
+            // it ends: at the machine loop that is running this call. Inner
+            // ones, entered from forces under it, are inside that already.
+            void* const outer_hi = p.jit_stack_hi;
+            if (!outer_hi) p.jit_stack_hi = p.loop_stack_hi;
             Value r = fn(&p, frame, &status);
+            p.jit_stack_hi = outer_hi;
             // Clamped, because a nested force underneath this call may have
             // re-armed the budget (`Process::slice_spent`), which leaves more
             // in it than there was to start with.
@@ -889,8 +910,64 @@ bool concat_lists(Process& p, Value a, Value b, Value* out) {
     return true;
 }
 
+/// The bitwise operators, past the fixnum fast paths: an operand that is a
+/// bignum, a shift that leaves the fixnum range, or something that is not an
+/// integer at all.
+bool bitwise_arith(Process& p, Op op, Value a, Value b, Value* out) {
+    const char* name = op == Op::BitAnd ? "&" : op == Op::BitOr ? "|" : op == Op::BitXor ? "^"
+                     : op == Op::Shl ? "<<" : ">>";
+    if (!bigint::is_integer(a) || !bigint::is_integer(b)) {
+        *out = type_error(p, std::string("`") + name + "` needs integers, got " + describe(p, a) + " and " +
+                                 describe(p, b));
+        return false;
+    }
+    Heap& h = p.heap();
+    switch (op) {
+        case Op::BitAnd: *out = bigint::bit_and(h, a, b); return true;
+        case Op::BitOr: *out = bigint::bit_or(h, a, b); return true;
+        case Op::BitXor: *out = bigint::bit_xor(h, a, b); return true;
+        default: break;
+    }
+    if (bigint::compare(b, make_fixnum(0)) < 0) {
+        *out = raise_error(p, well_known(p.runtime()).out_of_bounds, std::string("a negative shift count for `") + name + "`");
+        return false;
+    }
+    if (op == Op::Shr) {
+        // A count past every bit leaves only the sign: 0 or -1.
+        int64_t k = 0;
+        if (!bigint::to_int64(b, &k)) k = INT64_MAX;
+        *out = bigint::shift_right(h, a, uint64_t(k));
+        return true;
+    }
+    // A left shift is as large as its count says. Past 2^32 bits -- half a
+    // gigabyte for the one number -- it is a mistake rather than a value, and
+    // is refused before it is allocated.
+    int64_t k = 0;
+    if (a == make_fixnum(0)) { *out = make_fixnum(0); return true; }
+    if (!bigint::to_int64(b, &k) || k > (int64_t(1) << 32)) {
+        *out = raise_error(p, well_known(p.runtime()).out_of_memory,
+                           "a left shift by " + bigint::to_string(b) + " bits is too large to make");
+        return false;
+    }
+    *out = bigint::shift_left(h, a, uint64_t(k));
+    return true;
+}
+
 bool arith(Process& p, Op op, Value a, Value b, Value* out) {
     const auto& wk = well_known(p.runtime());
+
+    if (op == Op::BitNot) {
+        if (!bigint::is_integer(a)) {
+            *out = type_error(p, "`~` needs an integer, got " + describe(p, a));
+            return false;
+        }
+        *out = bigint::bit_not(p.heap(), a);
+        return true;
+    }
+
+    if (op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor || op == Op::Shl || op == Op::Shr) {
+        return bitwise_arith(p, op, a, b, out);
+    }
 
     // Elementwise, and the reason this is a VM operation at all: `a * b` on
     // two tensors is one pass over packed numbers. Only reached once the
@@ -1550,6 +1627,27 @@ void finish_binary(Process& p, Op op, Value lhs, Value rhs) {
                     return;
                 }
                 break;
+            // Two fixnums' bits combine into a fixnum: both are sign-extended
+            // 63-bit numbers, and so is anything `&`, `|` or `^` makes of them.
+            case Op::BitAnd: ret(p, make_fixnum(x & y)); return;
+            case Op::BitOr: ret(p, make_fixnum(x | y)); return;
+            case Op::BitXor: ret(p, make_fixnum(x ^ y)); return;
+            case Op::Shl:
+                // Shifting left is multiplying by a power of two, and overflows
+                // the same way; a count past 62 always does, unless x is 0.
+                if (y >= 0 && y < 63 && !mul_overflow(x, int64_t(1) << y, &r) && fixnum_fits(r)) {
+                    ret(p, make_fixnum(r));
+                    return;
+                }
+                break;
+            case Op::Shr:
+                // Arithmetic, as C++20 defines `>>` of a negative number:
+                // floor division by 2^y, ending at -1 rather than 0.
+                if (y >= 0) {
+                    ret(p, make_fixnum(y >= 63 ? (x < 0 ? -1 : 0) : x >> y));
+                    return;
+                }
+                break;
             case Op::Eq: ret(p, make_bool(x == y)); return;
             case Op::Ne: ret(p, make_bool(x != y)); return;
             case Op::Lt: ret(p, make_bool(x < y)); return;
@@ -1683,6 +1781,13 @@ void finish_unary(Process& p, Op op, Value v, uint32_t type, uint32_t invert) {
     }
     if (op == Op::TypeIs) {
         ret(p, make_bool((surface_type(v) == dream_type(type)) != bool(invert)));
+        return;
+    }
+    if (op == Op::BitNot) {
+        // ~x is -x - 1, which for a fixnum is a fixnum.
+        if (is_fixnum(v)) { ret(p, make_fixnum(~fixnum_value(v))); return; }
+        if (bigint::is_big(v)) { ret(p, bigint::bit_not(p.heap(), v)); return; }
+        do_raise(p, type_error(p, "`~` needs an integer, got " + describe(p, v)));
         return;
     }
     if (op == Op::Neg) {
@@ -1928,6 +2033,7 @@ void step_eval(Process& p) {
         case Op::Force: eval_node(p, n.a, frame); return;
 
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::Eq: case Op::Ne: {
             Value lhs;
@@ -1957,7 +2063,7 @@ void step_eval(Process& p) {
             return;
         }
 
-        case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty: {
+        case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty: {
             Value v;
             if (!operand_value(p, img, n.a, frame, &v)) {
                 push_cont(p, ContKind::UnaryFinish, n.op, n.b, n.c, UNIT);
@@ -2227,9 +2333,90 @@ void step_return(Process& p, size_t floor) {
   }
 }
 
+/// The function a frame belongs to, or `NO_NODE` for a frame that has none
+/// to name -- one copied from another heap before its closure was.
+uint32_t frame_function(Value frame) {
+    if (!is_obj(frame, ObjType::Frame)) return NO_NODE;
+    Value cl = static_cast<FrameObj*>(as_obj(frame))->closure;
+    if (!is_obj(cl, ObjType::Closure)) return NO_NODE;
+    return static_cast<ClosureObj*>(as_obj(cl))->func;
+}
+
+/// Say where an error is being raised, the first time it is: which functions
+/// were running, innermost first, and which suspensions were being forced.
+///
+/// A lazy program's failure is rarely where it was written. The function that
+/// raised is the one whose frame is current, and a suspension being forced
+/// names the function that *made* it -- the place the value was written, and
+/// usually the line a reader wants, since that is the code that asked for the
+/// work and not the code that happened to need it first. Both are on the
+/// continuation stack already: a frame rides with most continuations, and an
+/// update carries the thunk it will overwrite. So locating an error is a walk
+/// down the top of that stack, and it costs nothing until something raises.
+///
+/// The answer is a list of fixnums, `fi + 1` for a function that was running
+/// and `-(fi + 1)` for one that made a value being forced, which
+/// `error_trace` turns into places from the image's function records. It is
+/// written once: a `catch` that raises the same error again keeps where it
+/// started, and a nested force that fails hands its outer machine an error
+/// that is already located, more precisely than the outer one could.
+///
+/// Granularity is the function, because that is what the image records: the
+/// optimizer shares identical nodes across the whole program, so a node has
+/// no one place to report.
+void locate_error(Process& p) {
+    Value v = resolve(p.result);
+    if (!is_obj(v, ObjType::ErrorBox)) return;
+    auto* e = static_cast<ErrorObj*>(as_obj(v));
+    if (e->where != UNIT || is_shared_obj(e)) return;
+
+    constexpr size_t kMaxEntries = 12;
+    constexpr size_t kMaxScan = 512;
+    int64_t found[kMaxEntries];
+    size_t n = 0;
+    auto note = [&](int64_t entry) {
+        if (n < kMaxEntries && (n == 0 || found[n - 1] != entry)) found[n++] = entry;
+    };
+    uint32_t fi = frame_function(p.frame);
+    if (fi != NO_NODE) note(int64_t(fi) + 1);
+    size_t scanned = 0;
+    for (size_t i = p.conts.size(); i > 0 && n < kMaxEntries && scanned < kMaxScan; --i, ++scanned) {
+        const Cont& c = p.conts.begin()[i - 1];
+        switch (c.kind) {
+            case ContKind::UpdateThunk: {
+                // A blackhole while it is forced, and still a thunk's shape.
+                Obj* o = as_obj(c.v1);
+                ObjType t = obj_type(o);
+                if (t != ObjType::Thunk && t != ObjType::Blackhole) break;
+                uint32_t made = frame_function(static_cast<ThunkObj*>(o)->frame);
+                if (made != NO_NODE) note(-(int64_t(made) + 1));
+                break;
+            }
+            case ContKind::IfBranch: case ContKind::BinRight: case ContKind::LogicRight:
+            case ContKind::BlockNext: case ContKind::Catch: case ContKind::NativeArgs:
+            case ContKind::IndexKey: case ContKind::IndexApply: case ContKind::GetWalk:
+            case ContKind::SetWalk: case ContKind::SwitchOn: case ContKind::SwitchKey:
+            case ContKind::EnterRetry: {
+                uint32_t at = frame_function(c.v1);
+                if (at != NO_NODE) note(int64_t(at) + 1);
+                break;
+            }
+            default: break;
+        }
+    }
+    if (n == 0) return;
+    // Built from the end. Nothing here collects, so `e` stays good.
+    Heap& h = p.heap();
+    Value list = NIL;
+    for (size_t i = n; i > 0; --i) list = h.make_cons(make_fixnum(found[i - 1]), list);
+    e->where = list;
+    h.remember_if_old(e, list);
+}
+
 /// Unwind to the nearest catch at or above `floor`. Returns false when the
 /// error escapes it.
 bool unwind(Process& p, size_t floor) {
+    locate_error(p);
     while (p.conts.size() > floor) {
         Cont c = p.conts.back();
         p.conts.pop_back();
@@ -2266,6 +2453,31 @@ bool unwind(Process& p, size_t floor) {
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
+
+std::vector<TracePlace> error_trace(Process& p, Value err) {
+    std::vector<TracePlace> out;
+    Value v = resolve(err);
+    if (!is_obj(v, ObjType::ErrorBox)) return out;
+    const Image& img = img_of(p);
+    for (Value cur = resolve(static_cast<ErrorObj*>(as_obj(v))->where);
+         is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
+        Value entry = resolve(static_cast<ConsObj*>(as_obj(cur))->head);
+        if (!is_fixnum(entry)) break;
+        int64_t n = fixnum_value(entry);
+        bool made = n < 0;
+        uint64_t fi = uint64_t(made ? -n : n) - 1;
+        if (fi >= img.func_count()) break;
+        const FuncRec& f = img.func(uint32_t(fi));
+        TracePlace place{made, img.str(f.name).str(), "", 0, 0};
+        if (f.source != 0 && f.source - 1 < img.string_count()) {
+            place.path = img.str(f.source - 1).str();
+            place.line = f.line;
+            place.col = f.col;
+        }
+        out.push_back(std::move(place));
+    }
+    return out;
+}
 
 /// `DREAM_PROBE_THUNK`: count the suspensions a run makes, by the kind of
 /// expression suspended, and report them with `--stats`.
@@ -2554,7 +2766,13 @@ static inline bool check_limits(Process& p, const WellKnownAtoms& wk,
     }
     // Checked after a collection has had its chance, so this fires only for a
     // process whose *live* data is too big, not one that merely allocates fast.
-    if (p.heap().bytes_allocated() > max_heap && p.heap().bytes_live() > max_heap / 2) {
+    //
+    // Once raised, it is not raised again until a collection has measured
+    // the live data afresh: what the last one found is stale the moment the
+    // error unwinds the frames that held it, and a `catch` must be able to run.
+    if (p.heap().bytes_allocated() > max_heap && p.heap().bytes_live() > max_heap / 2 &&
+        p.heap_limit_raised_at != p.heap().collections()) {
+        p.heap_limit_raised_at = p.heap().collections();
         raise_heap_limit(p, wk, max_heap);
         return true;
     }
@@ -2602,6 +2820,7 @@ inline void step_return_counted(Process& p, size_t floor) {
 }
 
 void run_process(Process& p, int64_t budget) {
+    LoopStack loop(p, __builtin_frame_address(0));
     p.reductions = budget;
     p.slice = budget;
     p.slice_spent = false;
@@ -2700,6 +2919,10 @@ bool apply_whnf(Process& p, Value callee, const Value* args, uint32_t argc, Valu
     return nested_whnf(p, callee, args, argc, out);
 }
 
+bool apply_whnf_taking(Process& p, Value callee, Value* args, uint32_t argc, Value* out) {
+    return nested_whnf(p, callee, args, argc, out, args);
+}
+
 Value literal_string_value(Process& p, uint32_t index) { return literal_string(p, index); }
 
 /// The nested machine loop behind `force_whnf` and `apply_whnf`: force `v`,
@@ -2707,8 +2930,10 @@ Value literal_string_value(Process& p, uint32_t index) { return literal_string(p
 /// primed the way `prime_apply` primes a fresh process. The arguments go on the
 /// value stack under an `ApplyTo`, where `do_apply` looks for them and where
 /// the collector can see them.
-bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out) {
+bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out,
+                 Value* taken) {
     ForceNest nest(p);
+    LoopStack loop(p, __builtin_frame_address(0));
     // Run a nested machine loop down to the current continuation depth.
     //
     // Whether it may collect is decided here and nowhere else. The caller
@@ -2742,6 +2967,7 @@ bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* o
 
     if (args) {
         for (uint32_t i = 0; i < argc; ++i) p.stack.push_back(args[i]);
+        if (taken) std::fill(taken, taken + argc, UNIT);
         push_cont(p, ContKind::ApplyTo, argc, 0, 0, UNIT);
     }
     enter(p, v);

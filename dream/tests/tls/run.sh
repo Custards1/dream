@@ -35,6 +35,11 @@ check() {  # name expected actual
     echo "tls: the suite did not compile"; sed 's/^/    /' "$tmp/build"; exit 1; }
 timeout 120 "$dream" "$tmp/tls.dream" "$here" || exit 1
 
+# std.http on top: HTTPS at both versions, ALPN choosing between them.
+"$dream" "$dreams" "$here/http.dr" -L mind -o "$tmp/http.dream" >"$tmp/build" 2>&1 || {
+    echo "tls: the HTTP suite did not compile"; sed 's/^/    /' "$tmp/build"; exit 1; }
+timeout 120 "$dream" "$tmp/http.dream" "$here" || exit 1
+
 if ! command -v openssl >/dev/null 2>&1; then
     echo "tls interop: skipped -- no openssl command"
     exit 0
@@ -122,6 +127,21 @@ for case in "revoked :certificate_revoked" "server :ok"; do
     got=$(timeout 20 "$dream" "$tmp/peer.dream" probe "$port" "$here" 2>&1 | head -1)
     check "a stapled OCSP response for the $1 certificate" "$2" "$got"
 done
+
+# HTTP/2 against a client that is not this VM's: curl, built with nghttp2,
+# negotiating h2 by ALPN. Skipped where curl cannot speak HTTP/2.
+if command -v curl >/dev/null 2>&1 && curl --version | grep -q HTTP2; then
+    timeout 30 "$dream" "$tmp/http.dream" serve "$here" >"$tmp/http_port" 2>&1 &
+    pids="$pids $!"
+    sleep 0.5
+    port=$(head -1 "$tmp/http_port")
+    got=$(timeout 10 curl -s --http2 --cacert "$here/ca.pem" -w ' %{http_version}' "https://localhost:$port/")
+    check "curl over HTTP/2, dream server" "HTTP/2 2" "$got"
+    got=$(head -c 300000 /dev/zero | tr '\0' 'x' | timeout 10 curl -s --http2 --cacert "$here/ca.pem" --data-binary @- "https://localhost:$port/echo" | wc -c | tr -d ' ')
+    check "curl uploading 300 KB over HTTP/2" "300000" "$got"
+else
+    echo "http/2 interop: skipped -- no curl with HTTP/2"
+fi
 
 echo "tls interop: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -45,6 +45,7 @@ DREAM
 cat > "$tmp/ws/helper.dr" <<'DREAM'
 let double n = n * 2;
 let triple n = n * 3;
+let label n = "item " + to_string n;
 DREAM
 cat > "$tmp/ws/app.dr" <<'DREAM'
 import std.console;
@@ -96,6 +97,13 @@ derived='import std.console;\nderive behavior;\n\nlet name self = \"app\";\n\nle
 # resolves it. Line 2 is the declaration, with `x` at column 14 and `y` at 17;
 # line 4 reaches an accessor at column 26.
 records='import std.console;\n\ngroup Point { x, y }\n\nlet main! = {\n    console.print! (Point.x (Point.make 1 2))\n};\n'
+# A buffer laid out two columns short, and the same buffer as it should be.
+unformatted='let main! = {\n  1\n};\n'
+formatted='let main! = {\n    1\n};\n'
+# A buffer with a binding whose type nobody wrote: `named` is `:string` by
+# `helper.label`'s body, which has no signature either. Line 4 binds it at
+# column 8, and line 5 reads it; `helper.label` is at line 4, column 23.
+hints='import std.console;\nimport helper;\n\nlet main! = {\n    let named = helper.label 21;\n    console.print! named\n};\n'
 navigation='import nav;\nimport nav.types as t;\nlet f : t.Count -> t.Count;\nlet f n = n;\nlet main! = t.value;\nlet other = nav.types.value;\n'
 
 {
@@ -127,6 +135,16 @@ navigation='import nav;\nimport nav.types as t;\nlet f : t.Count -> t.Count;\nle
     set -- $request
     msg '{"jsonrpc":"2.0","id":'"$1"',"method":"textDocument/definition","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":'"$2"',"character":'"$3"'}}}'
   done
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$unformatted"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":26,"method":"textDocument/formatting","params":{"textDocument":{"uri":"'"$uri"'"},"options":{"tabSize":4,"insertSpaces":true}}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$formatted"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":27,"method":"textDocument/formatting","params":{"textDocument":{"uri":"'"$uri"'"},"options":{"tabSize":4,"insertSpaces":true}}}'
+  msg '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"'"$uri"'"},"contentChanges":[{"text":"'"$hints"'"}]}}'
+  msg '{"jsonrpc":"2.0","id":28,"method":"textDocument/inlayHint","params":{"textDocument":{"uri":"'"$uri"'"},"range":{"start":{"line":0,"character":0},"end":{"line":10,"character":0}}}}'
+  msg '{"jsonrpc":"2.0","id":29,"method":"textDocument/rename","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":5,"character":20},"newName":"shown"}}'
+  msg '{"jsonrpc":"2.0","id":30,"method":"textDocument/rename","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":4,"character":24},"newName":"twofold"}}'
+  msg '{"jsonrpc":"2.0","id":31,"method":"textDocument/prepareRename","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":4,"character":24}}}'
+  msg '{"jsonrpc":"2.0","id":32,"method":"textDocument/rename","params":{"textDocument":{"uri":"'"$uri"'"},"position":{"line":4,"character":24},"newName":"twofold!"}}'
   msg '{"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}'
   msg '{"jsonrpc":"2.0","method":"exit","params":{}}'
 } > "$tmp/in"
@@ -162,6 +180,10 @@ has "the outline is missing"                     '"name":"main!"'
 # ever mentions it.
 has "an unsaved edit is not what gets compiled"  'has no member .missing'
 has "shutdown is not answered"                   '"id":5'
+# Formatting is the compiler's formatter on the buffer: one edit with the
+# whole text when it changes, and none when it is already laid out.
+has_in "formatting does not reindent the buffer"  26 'newText":"let main! = {\\n    1\\n};'
+has_in "a laid-out buffer is still edited"        27 '"result":\[\]'
 
 # Completion, asked twice. Request 6 sits on a bare name in a buffer that
 # parses, and must reach what a bare name reaches.
@@ -230,6 +252,21 @@ has_in "a package prefix does not lead to its manifest" 22 'nav/mind.toml'
 has_in "a package in an expression does not lead to its manifest" 23 'nav/mind.toml'
 has_in "a module in a package expression does not lead to its file" 24 'nav/types.dr'
 has_in "a package member does not lead to its declaration" 25 '"start":{"character":0,"line":1}'
+
+# Requests 28 to 32 are the checker's types and rename. The hint is the type
+# the checker gave `named`, from what `helper.label`'s body answers, placed
+# after the name.
+has_in "a binding has no type hint"                 28 '"label":": :string"'
+has_in "a type hint is not after the name"          28 '"character":13,"line":4'
+# A local is renamed where it is bound and where it is read, and nowhere else.
+has_in "a local is not renamed where it is bound"   29 '"start":{"character":8,"line":4}'
+has_in "a local is not renamed where it is read"    29 '"start":{"character":19,"line":5}'
+# A global is renamed in the file that declares it as well as this one.
+has_in "a global is not renamed where it is declared" 30 'helper\.dr'
+has_in "a global is not renamed where it is used"   30 '"start":{"character":23,"line":4}'
+has_in "prepareRename does not give the name"       31 '"placeholder":"label"'
+# Purity is spelling, so a rename may not add a `!`.
+has_in "a rename made a pure function impure"       32 'only an impure name ends with'
 
 if [ "$fail" -eq 0 ]; then
     echo "the language server answers a whole conversation"

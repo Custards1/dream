@@ -16,6 +16,7 @@
 #include "image.hpp"
 #include "interp.hpp"
 #include "jit.hpp"
+#include "os.hpp"
 #include "process.hpp"
 #include "runtime.hpp"
 #include "scheduler.hpp"
@@ -30,10 +31,12 @@ const char* USAGE =
     "usage: dream <image> [options]\n"
     "\n"
     "<image> is a file, that file with `.dream` added, or either of those in\n"
-    "$MINDV2_PATH -- so `dream mind` runs ./mind.dream, or the installed one.\n"
+    "the installation -- so `dream mind` runs ./mind.dream, or the installed one.\n"
+    "The installation is $MINDV2_PATH; or lib/dream beside the directory this\n"
+    "binary is in, as a package installs it; or ~/.mindv2.\n"
     "\n"
     "options:\n"
-    "  -x, --exec <name>    run <name>.dream from $MINDV2_PATH, not from here\n"
+    "  -x, --exec <name>    run <name>.dream from the installation, not from here\n"
     "  -e, --entry <name>   run this global instead of `main!`\n"
     "  -j, --workers <n>    scheduler threads (default: cores, capped at 8)\n"
     "      --dump           disassemble the image and exit\n"
@@ -45,7 +48,7 @@ const char* USAGE =
     "      --dump-jit <fn>  print the LLVM IR generated for a function, named or\n"
     "                       given as #N, its index -- generated functions share names\n"
     "      --mindv2         mindv2 path override\n"
-    "      --mindv2-path    print the effective $MINDV2_PATH and exit\n"
+    "      --mindv2-path    print the installation's directories and exit\n"
     "  -h, --help           show this message\n";
 // --- the image's target ---------------------------------------------------------
 //
@@ -199,6 +202,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
         case Op::Force:
         case Op::Neg:
         case Op::Not:
+        case Op::BitNot:
         case Op::TypeIs:
             dump_node(img, n.a, depth + 1, out);
             break;
@@ -234,6 +238,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
             if (n.c != NO_NODE) dump_node(img, n.c, depth + 1, out);
             break;
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::And: case Op::Or:
             dump_node(img, n.a, depth + 1, out);
@@ -274,74 +279,6 @@ void dump_image(const Image& img) {
 }  // namespace
 
 
-bool is_directory(const std::string& path) {
-    std::error_code ec;
-    return std::filesystem::is_directory(std::filesystem::path(std::u8string(path.begin(), path.end())), ec);
-}
-
-/// Where installed images live: the directories in `$MINDV2_PATH`, or
-/// `~/.mindv2` when that directory exists.
-///
-/// Returned by value throughout. The obvious way to write this -- keep a
-/// `const char*` and point it at a local string's `c_str()` -- leaves the
-/// pointer dangling the moment that string goes out of scope, which it does
-/// before the return. It survived only because a short string lives in the
-/// object itself and the stack slot happened to still hold the bytes.
-std::string home_dir() {
-    #if defined(_WIN32)
-    const char* home = std::getenv("USERPROFILE");
-    #else
-    const char* home = std::getenv("HOME");
-    #endif
-    // `getenv` answers null for a variable that is not set, and constructing a
-    // `std::string` from null is undefined rather than empty.
-    return home ? std::string(home) : std::string();
-}
-
-/// A leading `~` means the home directory -- here, rather than only in a shell.
-///
-/// The shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
-/// hides it inside quotes, so what arrives is a literal `~`. Nothing on disk is
-/// called that, so every lookup under it silently found nothing, which reads as
-/// "the image is not installed" when it is sitting right there. A path is not
-/// text to this program, so expanding it is this program's job.
-std::string expand_home(const std::string& path) {
-    if (path.empty() || path[0] != '~') return path;
-    if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;  // `~other`, a user
-    const std::string home = home_dir();
-    if (home.empty()) return path;
-    return home + path.substr(1);
-}
-
-/// `$MINDV2_PATH` is a list of directories, like PATH, not one directory: the
-/// toolchain wrapper sets it to what an installation ships in whatever store
-/// paths those live in, joined by the platform list separator, so the compiler
-/// image and the standard library can sit apart from each other. A plain
-/// `~/.mindv2` is a single-element list. Each element gets the `~` treatment
-/// here too, because a tilde inside a joined list is hidden from the shell.
-std::vector<std::string> mindv2_dirs(const std::string& path) {
-    std::vector<std::string> dirs;
-    if (path.empty()) return dirs;
-    const char sep =
-        #if defined(_WIN32)
-        ';'
-        #else
-        ':'
-        #endif
-        ;
-    std::size_t start = 0;
-    while (start <= path.size()) {
-        const std::size_t end = path.find(sep, start);
-        if (end == std::string::npos) {
-            dirs.push_back(expand_home(path.substr(start)));
-            break;
-        }
-        if (end > start) dirs.push_back(expand_home(path.substr(start, end - start)));
-        start = end + 1;
-    }
-    return dirs;
-}
-
 /// Resolve the image to run.
 ///
 /// `dream mind` should mean what `mind` means when it is typed on its own, so a
@@ -364,15 +301,12 @@ std::string skip_file(std::string& path, const std::string& MINDV2_PATH, bool* f
     const bool is_bare_name =
         path.find('/') == std::string::npos && path.find('\\') == std::string::npos;
 
-    std::vector<std::string> candidates{path, path + ".dream"};
-    if (is_bare_name && !MINDV2_PATH.empty()) {
-        for (const std::string& dir : mindv2_dirs(MINDV2_PATH)) {
-            candidates.push_back(dir + "/" + path);
-            candidates.push_back(dir + "/" + path + ".dream");
-        }
+    for (const std::string& candidate : {path, path + ".dream"}) {
+        if (is_file(candidate)) return candidate;
     }
-    for (const std::string& candidate : candidates) {
-        if (std::filesystem::exists(std::filesystem::path(std::u8string(candidate.begin(), candidate.end()))) && !is_directory(candidate)) return candidate;
+    if (is_bare_name) {
+        std::string found = installed_image(path, split_dir_list(MINDV2_PATH));
+        if (!found.empty()) return found;
     }
 
     *file_ok = false;
@@ -386,8 +320,8 @@ std::string skip_file(std::string& path, const std::string& MINDV2_PATH, bool* f
 /// which is what a path should mean; `-x lucid` says the installation is the
 /// only place to look, so a stray file next to the caller cannot shadow an
 /// installed program.
-std::string installed_image(const std::string& name, const std::string& MINDV2_PATH,
-                            bool* file_ok) {
+std::string installed_only(const std::string& name, const std::string& MINDV2_PATH,
+                           bool* file_ok) {
     *file_ok = true;
     if (MINDV2_PATH.empty()) {
         std::fprintf(stderr,
@@ -396,30 +330,13 @@ std::string installed_image(const std::string& name, const std::string& MINDV2_P
         *file_ok = false;
         return "";
     }
-    for (const std::string& dir : mindv2_dirs(MINDV2_PATH)) {
-        const std::string candidates[] = {
-            dir + "/" + name,
-            dir + "/" + name + ".dream",
-        };
-        for (const std::string& candidate : candidates) {
-            if (std::filesystem::exists(std::filesystem::path(std::u8string(candidate.begin(), candidate.end()))) && !is_directory(candidate)) return candidate;
-        }
+    std::string found = installed_image(name, split_dir_list(MINDV2_PATH));
+    if (found.empty()) {
+        std::fprintf(stderr, "dream: no installed image `%s` in %s\n", name.c_str(),
+                     MINDV2_PATH.c_str());
+        *file_ok = false;
     }
-    std::fprintf(stderr, "dream: no installed image `%s` in %s\n", name.c_str(),
-                 MINDV2_PATH.c_str());
-    *file_ok = false;
-    return "";
-}
-
-std::string get_mindv2_path() {
-    if (const char* from_env = std::getenv("MINDV2_PATH")) {
-        return std::string(from_env);
-    }
-    const std::string home = home_dir();
-    if (home.empty()) return "";
-    std::string candidate = home + "/.mindv2";
-    if (std::filesystem::exists(std::filesystem::path(std::u8string(candidate.begin(), candidate.end())))) return candidate;
-    return "";
+    return found;
 }
 
 int dream_main(int argc, char** argv) {
@@ -435,7 +352,7 @@ int dream_main(int argc, char** argv) {
     // `-x` has already resolved the image, so the working directory must not be
     // consulted for it again.
     bool installed = false;
-    std::string MINDV2_PATH = get_mindv2_path(); 
+    std::string MINDV2_PATH = install_path();
     
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -456,7 +373,7 @@ int dream_main(int argc, char** argv) {
             return 0;
         } else if (a == "-x" || a == "--exec") {
             bool ok = true;
-            path = installed_image(next("--exec"), MINDV2_PATH, &ok);
+            path = installed_only(next("--exec"), MINDV2_PATH, &ok);
             if (!ok) return 1;
             installed = true;
             past_image = true;
@@ -480,6 +397,14 @@ int dream_main(int argc, char** argv) {
             any_target = true;
         }else if (a == "-m" || a == "--mindv2") {
             MINDV2_PATH = expand_home(next("--mindv2"));
+            // Said for the program too, and for what it runs: an image that
+            // opens another by name (`std.image`'s `installed`) or finds the
+            // standard library looks where the VM that ran it looked.
+#ifdef _WIN32
+            _putenv_s("MINDV2_PATH", MINDV2_PATH.c_str());
+#else
+            ::setenv("MINDV2_PATH", MINDV2_PATH.c_str(), 1);
+#endif
         } else if (a == "--mindv2-path") {
             // The toolchain wrapper sets `$MINDV2_PATH` inside its own process,
             // so a caretaker (an editor extension, a shell script) cannot read

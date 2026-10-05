@@ -43,6 +43,10 @@ bool available(std::string* why);
 std::string device_name();
 /// Whether the device can hold `F64` buffers.
 bool has_f64();
+/// The device's memory in bytes, or 0 when no device has been set up.
+/// Asks nothing of OpenCL that is not already loaded: a program that never
+/// touched the GPU answers 0 without looking for one.
+size_t memory_bytes();
 
 size_t dtype_size(int dtype);
 
@@ -75,13 +79,20 @@ bool upload(Buffer* dst, int dtype, const double* src, size_t n, std::string* er
 /// A device buffer of `dtype` back into host doubles. Waits for every queued
 /// operation that writes it.
 bool download(Buffer* src, int dtype, double* dst, size_t n, std::string* err);
-/// `n` elements from `src` at element `offset` into the start of `dst`.
-bool copy(Buffer* src, int dtype, size_t offset, Buffer* dst, size_t n, std::string* err);
+/// `n` elements from `src` at element `offset` into `dst` at element
+/// `dst_offset`.
+bool copy(Buffer* src, int dtype, size_t offset, Buffer* dst, size_t n, std::string* err,
+          size_t dst_offset = 0);
+/// Rows of `src`, each `width` elements, gathered into `dst` in the order
+/// `rows` names them: row `r` of `dst` is row `rows[r]` of `src`.
+bool gather(int dtype, Buffer* src, const uint32_t* rows, size_t nrows, size_t width, Buffer* dst,
+            std::string* err);
 
-/// The sums of a fused program's values along an axis: the program's answer
-/// is `outer x len x inner`, and `out[o * inner + i]` is the sum over `a` of
-/// position `(o * len + a) * inner + i`.
-bool fused_axis(int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t* counts,
+/// A fused program's values folded along an axis by `op` (a `KRED_*`): the
+/// program's answer is `outer x len x inner`, and `out[o * inner + i]` folds
+/// position `(o * len + a) * inner + i` over every `a`, in order. The `ARG`
+/// forms store the position `a` the fold settled on.
+bool fused_axis(int op, int dtype, const FuseProgram& prog, Buffer* const* ins, const size_t* counts,
                 const size_t* rows, const double* consts, size_t outer, size_t len, size_t inner,
                 Buffer* out, std::string* err);
 /// A fused elementwise program (`FuseProgram`, tensor_kernels.hpp) computed
@@ -104,9 +115,38 @@ bool fused_reduce(int op, int dtype, const FuseProgram& prog, Buffer* const* ins
 bool fused_matmul(int dtype, const FuseProgram& prog, Operand a, Operand b, size_t M, size_t K,
                   size_t N, Buffer* const* ins, const size_t* counts, const size_t* rows,
                   const double* consts, Buffer* out, std::string* err);
+/// Whether `matmul` cuts a product of these sizes along K ("split-K" at
+/// `gpu::matmul`), which a product with a chain after it must then run as
+/// the product and the chain separately.
+bool splits_k(size_t M, size_t K, size_t N);
 /// `C = A x B`, M x K by K x N, C row-major.
 bool matmul(int dtype, Operand a, Operand b, Buffer* c, size_t M, size_t K, size_t N,
             std::string* err);
 bool transpose(int dtype, Buffer* in, Buffer* out, size_t rows, size_t cols, std::string* err);
+
+/// `batch` products at once: `C[b] = A[b] x B[b]`, each `M x K` by `K x N`,
+/// the batches one after another in each buffer.
+bool bmm(int dtype, Buffer* a, Buffer* b, Buffer* c, size_t batch, size_t M, size_t K, size_t N,
+         std::string* err);
+/// The numbers of `in` with their axes reordered: `out` has `rank` axes of
+/// lengths `dims`, and its element at coordinates `i` is `in`'s at offset
+/// `sum i[k] * strides[k]` -- the input's stride for whichever of its axes
+/// became axis `k`.
+bool permute(int dtype, Buffer* in, Buffer* out, size_t rank, const size_t* dims,
+             const size_t* strides, size_t count, std::string* err);
+
+/// The geometry of a sliding window over images `[n, h, w, c]`, channels
+/// last: a `kh x kw` window moved `stride` at a time over the image padded
+/// with `pad` zeros on every side, giving an `oh x ow` grid of windows.
+struct Window {
+    size_t n, h, w, c, kh, kw, stride, pad, oh, ow;
+};
+/// Every window's numbers as a row: `out` is `[n * oh * ow, kh * kw * c]`, a
+/// row per window in image, row, column order, and in each row the window's
+/// numbers in row, column, channel order. Padding reads as 0.
+bool im2col(int dtype, const Window& g, Buffer* in, Buffer* out, std::string* err);
+/// The reverse: each number of the images `[n, h, w, c]` is the sum of every
+/// place in `cols` that `im2col` would have copied it to.
+bool col2im(int dtype, const Window& g, Buffer* cols, Buffer* out, std::string* err);
 
 }  // namespace dream::gpu

@@ -1,0 +1,106 @@
+// Compression, by the programs every system already has.
+//
+// Writing gzip, xz or zstd in Dream would mean writing their checksums
+// without bitwise operators, and every machine that builds packages has the
+// programs. So a file is compressed in place by `gzip`, `xz` or `zstd`, each
+// run with what makes its output a function of its input alone:
+//
+// - `gzip -n`, which leaves out the file's name and time;
+// - `xz -T1`, since xz 5.6 compresses with every core by default and its
+//   output then depends on how many there were;
+// - `zstd`, which is single-threaded unless asked, and records no name.
+//
+// `auto` asks for the best a format reads that this machine can make; each
+// format says what it reads, in the order it prefers (`pick!`).
+
+import std.io;
+import std.list;
+import std.os;
+import std.str;
+
+type Compression = :none | :gzip | :xz | :zstd;
+
+let parse : :string -> [:ok, Compression | :auto] | [:error, :string];
+let parse name = match str.lower name {
+    "auto" => [:ok, :auto],
+    "none" => [:ok, :none],
+    "gzip" => [:ok, :gzip],
+    "gz" => [:ok, :gzip],
+    "xz" => [:ok, :xz],
+    "zstd" => [:ok, :zstd],
+    "zst" => [:ok, :zstd],
+    other => [:error, "unknown compression `" + other + "`: say auto, none, gzip, xz or zstd"],
+};
+
+let extension : Compression -> :string;
+let extension c = match c { :none => "", :gzip => ".gz", :xz => ".xz", :zstd => ".zst" };
+
+let program : Compression -> :string;
+let program c = match c { :none => "", :gzip => "gzip", :xz => "xz", :zstd => "zstd" };
+
+/// The level each is run at, which RPM records beside the name.
+let level : Compression -> :string;
+let level c = match c { :none => "", :gzip => "9", :xz => "6", :zstd => "19" };
+
+let name : Compression -> :string;
+let name c = match c { :none => "none", :gzip => "gzip", :xz => "xz", :zstd => "zstd" };
+
+/// The arguments that compress `path` into `path` + `extension c`, removing
+/// `path`.
+let arguments : Compression -> :string -> [:string];
+let arguments c path = match c {
+    :none => [],
+    :gzip => ["-n", "-9", "-f", path],
+    :xz => ["-T1", "-6", "-f", path],
+    :zstd => ["-q", "-19", "--rm", "-f", path],
+};
+
+/// Whether this machine can make `c`.
+let available! : Compression -> :bool;
+let available! c = match c {
+    :none => true,
+    _ => try! { (os.exec! (program c) ["--version"]).[:code] == 0 } catch e { false },
+};
+
+/// What to use for a format that reads `accepts`, best first, when the user
+/// asked for `wanted`: that one if the format reads it and it is here, or for
+/// `auto` the first of `accepts` that is here.
+let pick! : Compression | :auto -> [Compression] -> [:ok, Compression] | [:error, :string];
+let pick! wanted accepts = match wanted {
+    :auto => match list.filter available! accepts {
+        [] => [:error, "none of " + str.join_str ", " (list.map name accepts) + " is installed here"],
+        [c, ..] => [:ok, c],
+    },
+    c if not (list.contains c accepts) =>
+        [:error, name c + " cannot be used here: this format reads " + str.join_str ", " (list.map name accepts)],
+    c if not (available! c) => [:error, program c + " is not installed here"],
+    c => [:ok, c],
+};
+
+/// Compress the file at `path` in place, answering the new path.
+let file! : Compression -> :string -> [:ok, :string] | [:error, :string];
+let file! c path = match c {
+    :none => [:ok, path],
+    _ => {
+        let r = os.exec! (program c) (arguments c path);
+        if r.[:code] != 0 { [:error, program c + " failed on " + path + ": " + str.trim r.[:err]] }
+        else if not (io.exists! (path + extension c)) { [:error, program c + " did not write " + path + extension c] }
+        else { [:ok, path + extension c] }
+    },
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "every spelling"
+            $( test.eq! [[:ok, :auto], [:ok, :zstd], [:ok, :gzip], :error]
+                        [parse "auto", parse "zst", parse "GZIP", list.head (parse "lz4")] ),
+        test.case "reproducible arguments"
+            $( test.eq! [["-n", "-9", "-f", "a"], ["-T1", "-6", "-f", "a"]] [arguments :gzip "a", arguments :xz "a"] ),
+        test.case "a format that does not read it"
+            $( test.eq! :error (list.head (pick! :zstd [:gzip])) ),
+        test.case "none is always here"
+            $( test.eq! [:ok, :none] (pick! :none [:gzip, :none]) ),
+    ];
+}

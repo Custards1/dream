@@ -11,18 +11,25 @@
 
 namespace dream {
 
-/// Binary operations, in the order `+ - * / %` -- shared with the GPU's
-/// kernels, which switch on the same numbers.
-enum KernelOp : int { KOP_ADD = 0, KOP_SUB, KOP_MUL, KOP_DIV, KOP_MOD };
+/// Binary operations, `+ - * / %` first -- shared with the GPU's kernels,
+/// which switch on the same numbers. The rest are `std.tensor` functions
+/// rather than operators: the larger and smaller of two, a power, and the
+/// comparisons, which answer 1 where they hold and 0 where they do not, so
+/// that a mask is a tensor like any other and multiplies into a chain.
+enum KernelOp : int {
+    KOP_ADD = 0, KOP_SUB, KOP_MUL, KOP_DIV, KOP_MOD,
+    KOP_MAX, KOP_MIN, KOP_POW, KOP_LT, KOP_LE, KOP_GT, KOP_GE, KOP_EQ, KOP_NE,
+};
 
 /// Elementwise functions of one argument.
 enum KernelFn : int {
     KFN_NEG = 0, KFN_SQRT, KFN_EXP, KFN_LOG, KFN_ABS, KFN_TANH, KFN_SIN, KFN_COS,
-    KFN_RELU, KFN_SIGMOID,
+    KFN_RELU, KFN_SIGMOID, KFN_FLOOR, KFN_CEIL, KFN_ROUND, KFN_SIGN, KFN_ERF,
 };
 
-/// Reductions to one number.
-enum KernelReduce : int { KRED_SUM = 0, KRED_MIN, KRED_MAX };
+/// Reductions to one number, and along an axis. The two `ARG` forms are only
+/// along an axis: where along it the least or greatest value first is.
+enum KernelReduce : int { KRED_SUM = 0, KRED_MIN, KRED_MAX, KRED_ARGMIN, KRED_ARGMAX };
 
 /// A fused elementwise program (see `TensorExpr` in value.hpp): two bytes an
 /// instruction, an opcode and its argument, run on a stack.
@@ -39,11 +46,19 @@ enum KernelReduce : int { KRED_SUM = 0, KRED_MIN, KRED_MAX };
 ///   FUSE_PRODUCT  push the matrix product the program starts from, at `i`
 ///                 (see `TensorExpr::product_a`); at most one per program,
 ///                 and only where the answer is exactly as long as the product
+///   FUSE_LOADR a  push input `a & 7`, each of its numbers repeated `r`
+///                 times, where `r` is constant `a >> 3`: read at
+///                 `(i / r) % count`. What `tensor.repeat` defers to, so that
+///                 a value per row meets every number of its row -- a row's
+///                 maximum subtracted from it -- inside the chain, with
+///                 nothing stretched in memory
 ///
 /// The limits keep a program small enough that the CPU's evaluator keeps its
 /// whole stack in L1, and that a GPU kernel built from it has a short argument
 /// list. A chain that would pass one is computed and starts a new program.
-enum FuseCode : uint8_t { FUSE_LOAD = 0, FUSE_CONST, FUSE_BIN, FUSE_UN, FUSE_PRODUCT, FUSE_LOADT };
+enum FuseCode : uint8_t {
+    FUSE_LOAD = 0, FUSE_CONST, FUSE_BIN, FUSE_UN, FUSE_PRODUCT, FUSE_LOADT, FUSE_LOADR,
+};
 constexpr unsigned kFuseMaxInputs = 8, kFuseMaxConsts = 16, kFuseMaxCode = 64,
                    kFuseMaxDepth = 12;
 

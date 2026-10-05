@@ -18,6 +18,9 @@ cannot disagree, because its answers come from the same tables.
 | **Hover** | what a name resolved to, and which module it came from |
 | **Outline** | what a file declares |
 | **Completion** | a module's members after `.`, and the names in scope everywhere else |
+| **Formatting** | the compiler's formatter (`dreams --fmt`) on the buffer, so format-on-save works |
+| **Inlay hints** | the type the checker gave each `let` nobody wrote a signature for, after its name -- or after its parameters, where `let f x : t` would put it -- including what an unsigned function's body answers |
+| **Rename** | a local where it is bound and wherever that binder is the one in scope; a global at its declaration, its signature, every `import m.{name}` and every use, across the program the file is part of |
 
 It analyses the editor's **buffer**, not the file on disk -- the loader reads
 open documents from a map of path to text instead -- so it answers about the

@@ -65,6 +65,9 @@ enum class Op : uint8_t {
 #define DREAM_PRIMITIVE_ENUM(name, code, builtin, arity) name = code,
     DREAM_PRIMITIVES(DREAM_PRIMITIVE_ENUM)
 #undef DREAM_PRIMITIVE_ENUM
+    // The bitwise operators, on integers: `a & b`, `a | b`, `a ^ b`, `~a`,
+    // `a << b` and `a >> b`. Binary but for `BitNot`, whose operand is `a`.
+    BitAnd = 75, BitOr = 76, BitXor = 77, BitNot = 78, Shl = 79, Shr = 80,
     Count
 };
 
@@ -129,9 +132,13 @@ struct FuncRec {
     uint16_t slots;
     uint16_t n_captures;
     uint32_t captures_off;
-    uint32_t span_start;
-    uint32_t span_end;
-    uint32_t reserved;
+    /// Where the function was written: a 1-based line and column, and the
+    /// file as a `KSTR` index plus one, so that zero -- what an image written
+    /// before these fields existed holds -- means "not known". Read only to
+    /// say where an error was raised (`error_trace` in interp.cpp).
+    uint32_t line;
+    uint32_t col;
+    uint32_t source;
 };
 static_assert(sizeof(FuncRec) == 32, "function records are 32 bytes on disk");
 

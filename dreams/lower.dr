@@ -1649,6 +1649,20 @@ let place_captures caps l = {
 /// lowering knows which node its body turned out to be.
 let link_funcs r bodies l = link_funcs_from r bodies l 0;
 
+/// `[path, line, col]` where a function was written, from the places table,
+/// or `["", 0, 0]` where there is none -- a session's lowering, a function
+/// the compiler made up. The image keeps it so that an error can say which
+/// functions it was raised in (`locate_error` in dream/src/interp.cpp).
+let func_place : scope.Resolution -> :map -> [:string, :integer, :integer];
+let func_place r f = match (places r).[f.[:source else ()] else ()] {
+    () => ["", 0, 0],
+    [path, starts, src] => {
+        let span = f.[:span else ast.no_span];
+        let [line, col] = diag.place_in starts (ast.span_start (diag.origin_span src span));
+        [path, line, col]
+    },
+};
+
 /// `link_funcs`, from function index `from` onward, appending to an image
 /// `funcs` list the caller already carries. A session links only what one entry
 /// added, so the records before them -- and the capture runs their functions
@@ -1662,7 +1676,9 @@ let link_funcs_from r bodies l from = {
         let fi = list.nth 1 pair;
         let l0 = list.head acc;
         let named = strk (scope.func_name f) l0;
-        let placed = place_captures (scope.func_captures f) (list.head named);
+        let [path, line, col] = func_place r f;
+        let pathed = if line == 0 { [list.head named, -1] } else { strk path (list.head named) };
+        let placed = place_captures (scope.func_captures f) (list.head pathed);
         let flags = (if scope.func_impure f { ir.fn_impure } else { 0 })
                   + (if f.[:rec else false] { ir.fn_rec } else { 0 })
                   + (if f.[:thunk else false] { ir.fn_thunk } else { 0 })
@@ -1678,8 +1694,7 @@ let link_funcs_from r bodies l from = {
                  :slots => scope.func_slots f,
                  :n_captures => list.length (scope.func_captures f),
                  :captures_off => list.nth 1 placed,
-                 :span_start => ast.span_start (f.[:span else ast.no_span]),
-                 :span_end => ast.span_end (f.[:span else ast.no_span]) }
+                 :line => line, :col => col, :source => list.nth 1 pathed + 1 }
              (list.nth 1 acc)]
     }) [l, []] zip;
     [list.head built, list.reverse (list.nth 1 built)]
@@ -2626,6 +2641,6 @@ let dump l = {
                              + "@" + to_string (f.[:captures_off else 0]),
                    })
                 + "  body=" + to_string (f.[:body else ir.no_node])
-             }) (list.range 0 (list.length fs)))
+            }) (list.range 0 (list.length fs)))
             [ir.dump img])
 };

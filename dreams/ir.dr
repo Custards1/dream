@@ -21,7 +21,7 @@
 
 import std.list;
 import std.str;
-import std.dynamic.{fold,map}
+import std.dynamic.{fold, map}
 import std.char;
 
 // --- opcodes -------------------------------------------------------------------
@@ -123,6 +123,11 @@ let ops = [
     [:compare, 73, "compare"],
     /// `$"..{x}.."`: `a` = builtin id, kids are one list of the pieces.
     [:str_interp, 74, "str_interp"],
+
+    /// The bitwise operators on integers: `&`, `|`, `^`, `<<` and `>>` take
+    /// `a` and `b`; `~` takes `a`.
+    [:band, 75, "band"], [:bor, 76, "bor"], [:bxor, 77, "bxor"],
+    [:bnot, 78, "bnot"], [:shl, 79, "shl"], [:shr, 80, "shr"],
 
 ];
 

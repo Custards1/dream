@@ -17,6 +17,7 @@
 // import this framework. Depending on console would make that a cycle.
 import std.io;
 import std.os;
+import std.vm;
 
 let write! : :string -> :unit;
 let write! text = {
@@ -144,6 +145,24 @@ let fail! message = raise! message;
 
 // --- running ----------------------------------------------------------------
 
+/// Where a failing case raised, a few lines of it under the failure: enough to
+/// reach the case's own `$( .. )`, which is what made the value the check was
+/// forcing, past the check that raised. See "where it was raised" in
+/// std/error.dr, whose `place_line` this is written out again from because
+/// `std.error` reaches `std.list`, whose tests import this module.
+priv let raised_where! : :any -> :string;
+priv let raised_where! e = {
+    let line_of at = {
+        let [how, name, path, line, col] = at;
+        (if how == :made { "forcing a value made in `" } else { "in `" }) + name + "`"
+            + (if line == 0 { "" } else { " (" + path + ":" + to_string line + ":" + to_string col + ")" })
+    };
+    let rec lines places n = if _list_is_empty places || n == 0 { "" }
+                             else { "            " + line_of (places.[0]) + "\n"
+                                    + lines (_list_tail places) (n - 1) };
+    lines (_error_trace! e) 6
+};
+
 let run_cases! : :integer -> :integer -> [Case] -> [:integer, :integer];
 let rec run_cases! passed failed cases = {
     if _list_is_empty cases { [passed, failed] }
@@ -158,7 +177,8 @@ let rec run_cases! passed failed cases = {
             write! ("  ok    " + name + "\n")
             run_cases! (passed + 1) failed (_list_tail cases)
         } else {
-            write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n")
+            write! ("  FAIL  " + name + "\n          " + to_string outcome + "\n"
+                    + raised_where! outcome)
             run_cases! passed (failed + 1) (_list_tail cases)
         }
     }
@@ -189,16 +209,31 @@ let rec run_suites! !failed suites = {
     }
 };
 
-/// The usual entry point: run everything and print a summary.
-let main_of! : [Suite] -> :ok;
+/// The usual entry point: run everything, print a summary, and end the
+/// program with its verdict.
+///
+/// It ends by exiting rather than by returning, because a program is over
+/// only when every process in it is, and a case that fails halfway through
+/// never reaches its own teardown. A listener it left parked in `accept!` is
+/// owed an answer by the kernel, which is not a deadlock, so the run used to
+/// sit there after printing its summary -- indefinitely, and one run in
+/// several when the failure was a flaky one. What a case left behind is still
+/// worth knowing, so it is counted and said; it just no longer decides
+/// whether the suite ever finishes.
+let main_of! : [Suite] -> :never;
 let main_of! suites = {
     let failed = run_suites! 0 suites;
+    // This process is the one still counted.
+    let left = vm.processes! () - 1;
+    if left > 0 {
+        write! ("\n" + to_string left + " process(es) a case started were still running at the end\n")
+    }
     if failed > 0 {
         write! ("\n" + to_string failed + " test(s) failed\n")
-        raise! :tests_failed
+        os.exit! 1
     } else {
         write! "\nall tests passed\n"
-        :ok
+        os.exit! 0
     }
 };
 

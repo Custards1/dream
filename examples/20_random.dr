@@ -1,0 +1,50 @@
+// Randomness you can replay, and property tests that shrink.
+//
+// A generator's state is a value: every draw takes one and hands back the
+// next, so the same seed gives the same numbers on every machine, and a
+// generator of values -- `random.int 1 6` -- is just a draw waiting for its
+// state. `random.values` makes any of them an endless lazy list. The
+// functions ending in `!` read the operating system's secure generator
+// instead; they are what to use for tokens and keys, and not shown here,
+// since they are different every time.
+//
+// `std.property` checks a claim against generated values, and when one
+// breaks it, replays the draws that made it with smaller and smaller words
+// until it has the simplest case that still fails.
+import std.console;
+import std.error;
+import std.list;
+import std.property;
+import std.random;
+
+let rng = random.seed "dream";
+
+// A generator built from others: a name and an age.
+let person = random.map2 (fn name age -> %{ "name" => name, "age" => age })
+                         (random.pick ["Ada", "Grace", "Alan", "Edsger"]) (random.int 18 90);
+
+let main! = {
+    console.print! (list.take 10 (random.values (random.int 1 6) rng))
+    console.print! (random.sample (random.shuffle (list.range 1 10)) rng)
+    console.print! (random.sample (random.list_n 2 person) rng)
+    console.print! (random.sample random.uuid rng)
+    console.print! (random.sample (random.string_from "ACGT" 12) rng)
+
+    // Weighted choice, counted over many draws.
+    let loot = list.take 1000 (random.values (random.weighted [[90, :common], [9, :rare], [1, :legendary]]) rng);
+    console.print! (list.map (fn kind -> [kind, list.count (fn x -> x == kind) loot]) [:common, :rare, :legendary])
+
+    // Two independent streams from one, for two processes.
+    let [left, right] = random.split rng;
+    console.print! [random.sample (random.int 0 99) left, random.sample (random.int 0 99) right]
+
+    // A claim that holds, and two that do not. A failure is reported as
+    // the smallest list that breaks it, found by shrinking whatever list was
+    // first drawn -- with the seed, so it can be replayed.
+    let ints = random.list_of (random.int (0 - 100) 100);
+    let check! holds = try! { property.for_all_with! (property.seeded 7) ints holds; "holds" }
+                       catch e { error.payload e };
+    console.print! (check! (fn xs -> list.reverse (list.reverse xs) == xs))
+    console.print! (check! (fn xs -> list.all (fn x -> x < 42) xs))
+    console.print! (check! (fn xs -> list.sort xs == xs))
+};

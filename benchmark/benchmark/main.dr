@@ -48,7 +48,6 @@ let rec collatz_steps n =
 
 let fold = list.fold_strict;
 
-
 let collatz_total n = fold
     (fn acc x -> acc + collatz_steps x)
     0
@@ -139,7 +138,6 @@ let bench! name work = {
     console.error! (name + "\t" + to_string (after - before))
     x
 };
-
 
 let rec show! item vale = {
     let vali = strict! vale;

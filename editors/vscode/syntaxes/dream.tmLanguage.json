@@ -178,8 +178,8 @@
       "match": "\\b(spawn!|join!|send!|recv!|self!|raise!|strict!)|\\b(type_of|to_string|len)\\b"
     },
     "foreign": {
-      "comment": "A C library's header: `foreign name from \"lib\" {`, `from embedded \"name\"`, `from (expr)`, or no `from` at all. Its own rule rather than a word in `declaration`, because `from` and `embedded` are keywords only here.",
-      "match": "\\b(foreign)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(from)(?:\\s+(embedded)\\b)?)?",
+      "comment": "A library's header: a C library's, `foreign name from \"lib\" {`, `from system \"name\"`, `from embedded \"name\"`, `from (expr)`, or no `from` at all; or another image's, `image name from installed \"name\" {`, which always has one -- so `image` followed by a name is only a header when `from` comes next. Its own rule rather than a word in `declaration`, because `from`, `system`, `installed` and `embedded` are keywords only here.",
+      "match": "\\b(?:(foreign)\\s+([A-Za-z_][A-Za-z0-9_]*)|(image)\\s+([A-Za-z_][A-Za-z0-9_]*)(?=\\s+from\\b))(?:\\s+(from)(?:\\s+(system|installed|embedded)\\b)?)?",
       "captures": {
         "1": {
           "name": "keyword.declaration.dream"
@@ -191,6 +191,12 @@
           "name": "keyword.declaration.dream"
         },
         "4": {
+          "name": "entity.name.function.dream"
+        },
+        "5": {
+          "name": "keyword.declaration.dream"
+        },
+        "6": {
           "name": "keyword.declaration.dream"
         }
       }

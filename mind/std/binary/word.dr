@@ -1,0 +1,60 @@
+// Fixed-width word operations over Dream's arbitrary-precision integers.
+// Every width is explicit. Truncation only happens in these named operations;
+// binary.uint/sint writers instead reject a value that does not fit.
+// Results use the same error shape as std.binary.
+import std.binary as binary;
+import std.result;
+
+priv let valid width = type_of width == :integer && width >= 1 && width <= 524288;
+priv let fail message = result.error (binary.problem :invalid_argument 0 message);
+priv let mask width = (1 << width) - 1;
+priv let check width n = if not (valid width) { fail "word width must be 1..524288 bits" }
+    else if type_of n != :integer { fail "expected an integer" }
+    else { result.ok (n & mask width) };
+
+/// The low width bits, as a non-negative integer. Negative inputs wrap too.
+let unsigned width n = check width n;
+/// The low width bits, interpreted as two's complement.
+let signed width n = result.map (fn v -> if v & (1 << (width - 1)) == 0 { v } else { v - (1 << width) }) (check width n);
+
+/// Counts wrap modulo width. Negative counts rotate in the other direction.
+let rotate_left width count n =
+    if type_of count != :integer { fail "rotation count must be an integer" }
+    else { result.map (fn v -> {
+        let k = ((count % width) + width) % width;
+        ((v << k) | (v >> (width - k))) & mask width
+    }) (check width n) };
+let rotate_right width count n = if type_of count != :integer { fail "rotation count must be an integer" }
+    else { rotate_left width (-count) n };
+
+/// Extract width bits, where offset zero is the least significant bit.
+let extract offset width n =
+    if type_of offset != :integer || offset < 0 || type_of n != :integer { fail "expected a non-negative offset and an integer" }
+    else { check width (n >> offset) };
+
+/// Replace a field, preserving every other bit, including sign extension.
+let replace offset width field n =
+    if type_of offset != :integer || offset < 0 || offset > 524288 || not (valid width) {
+        fail "invalid field offset or width"
+    } else if type_of n != :integer || type_of field != :integer { fail "expected integer field and word" }
+    else if field < 0 || field > mask width { fail "replacement does not fit the field" }
+    else { result.ok ((n & ~(mask width << offset)) | (field << offset)) };
+
+let popcount width n = result.map (fn v -> {
+    let rec go !x !count = if x == 0 { count } else { go (x & (x - 1)) (count + 1) };
+    go v 0
+}) (check width n);
+
+let reverse width n = result.map (fn v -> {
+    let rec go !i !x !acc = if i == width { acc } else { go (i + 1) (x >> 1) ((acc << 1) | (x & 1)) };
+    go 0 v 0
+}) (check width n);
+
+let leading_zeros width n = result.map (fn v -> {
+    let rec go !i = if i == width || v & (1 << (width - i - 1)) != 0 { i } else { go (i + 1) };
+    go 0
+}) (check width n);
+let trailing_zeros width n = result.map (fn v -> {
+    let rec go !i !x = if i == width || x & 1 != 0 { i } else { go (i + 1) (x >> 1) };
+    go 0 v
+}) (check width n);

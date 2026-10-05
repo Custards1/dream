@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <filesystem>
 #include "windows.hpp"
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <cerrno>
@@ -208,10 +211,10 @@ std::string slurp(HANDLE pipe) {
 }
 
 void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
-               uint64_t pid, Scheduler* sched) {
+               uint64_t pid, uint64_t sched) {
     auto finish = [&] {
         job->done.store(true, std::memory_order_release);
-        if (sched) { sched->wake(pid); sched->note_io_wait(false); }
+        Scheduler::wake_external(sched, pid);
     };
     HANDLE out_read = nullptr, out_write = nullptr, err_read = nullptr, err_write = nullptr;
     HANDLE input = INVALID_HANDLE_VALUE;
@@ -333,8 +336,12 @@ std::string slurp(int fd) {
 }
 
 /// Spawn `argv`, collect both streams, reap, and wake `pid`.
+///
+/// The scheduler is named by its serial rather than held, because this thread
+/// can outlive it: a program may end while a child it started is still being
+/// reaped. See `Scheduler::serial`.
 void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
-               uint64_t pid, Scheduler* sched) {
+               uint64_t pid, uint64_t sched) {
     int out_pipe[2] = {-1, -1};
     int err_pipe[2] = {-1, -1};
     auto finish = [&] {
@@ -353,8 +360,7 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
             //
             // This way round the count is merely released a moment late, which
             // can only delay a real deadlock report, never invent one.
-            sched->wake(pid);
-            sched->note_io_wait(false);
+            Scheduler::wake_external(sched, pid);
         }
     };
 
@@ -607,7 +613,7 @@ NativeResult os_exec_with(Process& p, Value* args, int64_t timeout_ms, Value dir
         p.wait_reason.store(WaitReason::Io, std::memory_order_relaxed);
     }
     sched->note_io_wait(true);
-    job->worker = std::thread(run_child, job, std::move(argv), p.id(), sched);
+    job->worker = std::thread(run_child, job, std::move(argv), p.id(), sched->serial());
     return NativeResult::block();
 }
 
@@ -841,9 +847,147 @@ NativeResult os_replace(Process& p, Value, Value* args, uint32_t) {
                 std::string("cannot run `") + argv[0] + "`: " + std::strerror(errno));
 }
 
+/// `install_dirs! ()`: every directory the installation keeps things in, as
+/// the VM itself would search them for `dream NAME` -- `$MINDV2_PATH` split,
+/// or `~/.mindv2`, or nothing. See "the installation" in os.hpp.
+NativeResult os_install_dirs(Process& p, Value, Value*, uint32_t) {
+    return NativeResult::ok(string_list(p, install_dirs()));
+}
+
 }  // namespace
 
 void os_shutdown() { Jobs::get().drain(); }
+
+std::string home_dir() {
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    // `getenv` answers null for a variable that is not set, and constructing a
+    // `std::string` from null is undefined rather than empty.
+    return home ? std::string(home) : std::string();
+}
+
+/// The shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
+/// hides it inside quotes, so what arrives is a literal `~`. Nothing on disk is
+/// called that, so every lookup under it silently found nothing, which reads as
+/// "the image is not installed" when it is sitting right there. A path is not
+/// text to this program, so expanding it is this program's job.
+std::string expand_home(const std::string& path) {
+    if (path.empty() || path[0] != '~') return path;
+    if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;  // `~other`, a user
+    const std::string home = home_dir();
+    if (home.empty()) return path;
+    return home + path.substr(1);
+}
+
+/// A list rather than one directory: the toolchain wrapper sets
+/// `$MINDV2_PATH` to what an installation ships in whatever store paths those
+/// live in, so the compiler image and the standard library can sit apart. A
+/// plain `~/.mindv2` is a list of one. Each element gets the `~` treatment
+/// here too, because a tilde inside a joined list is hidden from the shell.
+std::vector<std::string> split_dir_list(const std::string& list) {
+    std::vector<std::string> dirs;
+    const char sep =
+#if defined(_WIN32)
+        ';';
+#else
+        ':';
+#endif
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        std::size_t end = list.find(sep, start);
+        if (end == std::string::npos) end = list.size();
+        if (end > start) dirs.push_back(expand_home(list.substr(start, end - start)));
+        start = end + 1;
+    }
+    return dirs;
+}
+
+/// Where the running binary is, with every link on the way resolved, or an
+/// empty path when the system will not say. `/usr/bin/dream` may be a link
+/// into `/usr/lib/dream/bin`, and it is the file's own place that says which
+/// installation it came with, not the name it was run by.
+std::filesystem::path own_executable() {
+    std::error_code ec;
+    std::filesystem::path exe;
+#if defined(_WIN32)
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (n == 0) return {};
+        if (n < buf.size()) {
+            buf.resize(n);
+            break;
+        }
+        buf.resize(buf.size() * 2);
+    }
+    exe = std::filesystem::path(buf);
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buf(size, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+    exe = std::filesystem::path(buf.c_str());
+#else
+    exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) return {};
+#endif
+    std::filesystem::path real = std::filesystem::canonical(exe, ec);
+    return ec ? exe : real;
+}
+
+/// The installation this VM was installed with: `lib/dream` beside the
+/// directory the binary is in, so `/usr/bin/dream` has `/usr/lib/dream` and a
+/// Homebrew keg or a tarball unpacked into `~/.local` has its own. That is
+/// the layout `ship` packages Dream in (the `[ship]` sections of the
+/// repository's mind.toml). A VM in a build tree has no such directory and
+/// answers `""`.
+std::string own_installation() {
+    const std::filesystem::path exe = own_executable();
+    if (exe.empty()) return "";
+    const std::filesystem::path dir = exe.parent_path().parent_path() / "lib" / "dream";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return "";
+    const std::u8string text = dir.u8string();
+    return std::string(text.begin(), text.end());
+}
+
+std::string install_path() {
+    if (const char* from_env = std::getenv("MINDV2_PATH")) return std::string(from_env);
+    // Before `~/.mindv2`: a packaged VM is one with its standard library and
+    // compiler beside it, and a `~/.mindv2` left from building by hand is
+    // older or newer than both -- the mismatch `just install-artifacts` warns
+    // about, where the installed `std` cannot build the installed compiler.
+    const std::string own = own_installation();
+    if (!own.empty()) return own;
+    const std::string home = home_dir();
+    if (home.empty()) return "";
+    std::string candidate = home + "/.mindv2";
+    std::error_code ec;
+    if (std::filesystem::is_directory(std::filesystem::path(std::u8string(candidate.begin(), candidate.end())), ec)) {
+        return candidate;
+    }
+    return "";
+}
+
+std::vector<std::string> install_dirs() { return split_dir_list(install_path()); }
+
+bool is_file(const std::string& path) {
+    std::error_code ec;
+    auto st = std::filesystem::status(std::filesystem::path(std::u8string(path.begin(), path.end())), ec);
+    return !ec && std::filesystem::exists(st) && !std::filesystem::is_directory(st);
+}
+
+std::string installed_image(const std::string& name, const std::vector<std::string>& dirs) {
+    for (const std::string& dir : dirs) {
+        for (const std::string& candidate : {dir + "/" + name, dir + "/" + name + ".dream"}) {
+            if (is_file(candidate)) return candidate;
+        }
+    }
+    return "";
+}
 
 ModuleDef make_os_module() {
     return ModuleDef{"std.os",
@@ -864,6 +1008,7 @@ ModuleDef make_os_module() {
                          {"now!", 1, 0b1, os_now},
                          {"pid!", 1, 0b1, os_pid},
                          {"platform", 1, 0b1, os_platform},
+                         {"install_dirs!", 1, 0b1, os_install_dirs},
                          {"arch", 1, 0b1, os_arch},
                          {"exit!", 1, 0b1, os_exit},
                      }};

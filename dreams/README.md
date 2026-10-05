@@ -23,7 +23,7 @@ itself.
 
 ```
 just bootstrap          # seed -> build/dreams.dream
-just bootstrap-check    # stage 2 and stage 3 are the same bytes
+just bootstrap-check    # the seed, stage 2 and stage 3 are the same bytes
 ```
 
 When you change the compiler, build it, then copy `build/dreams.dream` over
@@ -31,8 +31,8 @@ the seed. A change that adds atoms to the compiler can take two rounds: build
 again with each new image until one compiles the source into itself, and keep
 that one ("`mind/std/all.dr --test` is not byte-stable" in
 [docs/notes/macro-expansion.md](../docs/notes/macro-expansion.md) says why).
-`bootstrap-check` compares stage 2 with stage 3, not the seed with stage 2, so
-it will not notice a seed that has fallen behind.
+`bootstrap-check` fails on a seed that has fallen behind the source, and says
+which image to copy over it.
 
 ## The pipeline
 
@@ -83,6 +83,7 @@ What to do (the default is `--check`):
 | `--stats` | count what the program contains |
 | `--time` | compile the whole way and say what each stage cost |
 | `--repl` | an interactive session |
+| `--fmt FILE..`, `--fmt-check FILE..` | lay files out in the house style in place, or name the ones that would change |
 
 Where to look, and what to compile it as:
 
@@ -127,6 +128,7 @@ its text does; a runtime value does not. [`repl.dr`](repl.dr) and
 | `fuse.dr` | deforestation: `std.list` pipelines as loops |
 | `typecheck.dr`, `contract.dr` | signatures, and compile-time contracts |
 | `lint.dr` | warnings about programs that are correct and will still go wrong |
+| `fmt.dr` | the formatter: reindents by the grammar's own line rules, and proves the tree did not change |
 | `opt.dr` | sharing the finished arena |
 | `emit.dr` | the image writer ([docs/bytecode-format.md](../docs/bytecode-format.md)) |
 | `unit.dr` | compile units: the parts a build keeps |

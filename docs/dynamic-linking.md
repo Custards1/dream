@@ -16,6 +16,11 @@ exist:
   (builtins.cpp:1358-1359, `import_across`). A library is code, not data, so
   that path cannot deliver it.
 
+What exists today is the session half: `std.image` and the `image`
+declaration ([images.md](images.md)) open an image in a runtime of its own and
+call its functions with data, on top of `open_image!`'s sessions. Everything
+below is what it would take for a closure to cross as well, and is still a plan.
+
 The end state: `dream --library X.dream main.dream` loads `X` beside `main`, and
 a `vm.load_image!` builtin does the same from inside a running program. The
 loaded library's globals are ordinary values to the caller.

@@ -1,0 +1,87 @@
+name: Release
+
+# A tag `vX.Y.Z` makes Dream's packages and publishes them as that tag's
+# release: a .deb, an RPM and an Arch package for Linux x86_64, a tarball for
+# it and for macOS arm64, and from the tarballs a Homebrew formula, a PKGBUILD
+# for the AUR, install.sh and SHA256SUMS. `ship` makes all of it from the
+# `[ship]` sections of mind.toml (ship/README.md, "A release on several
+# machines"); each machine makes what only it can, and the Linux job, which
+# has every source, makes the rest once the macOS tarball has reached it.
+#
+# The VM is built without the JIT, as portable.yml builds it: that build
+# needs nothing but libffi and OpenSSL on every runner. A JIT release needs
+# LLVM's static archives on each one.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "the version to package, without the v"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install libffi openssl@3
+      - run: cmake -S . -B build-dream -DCMAKE_BUILD_TYPE=Release -DDREAM_ENABLE_JIT=OFF -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_PREFIX_PATH="$(brew --prefix libffi)"
+      - run: cmake --build build-dream --parallel 3
+      - run: cmake --install build-dream --prefix build/stage
+      - name: the compiler, the tools and the packager
+        run: |
+          mkdir -p build
+          build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/main.dr
+          build-dream/bin/dream build/dreams.dream -L mind/std mind/tool/main.dr --shebang -o build/mind
+          build-dream/bin/dream build/dreams.dream lucid/main.dr -L mind -L . -o build/lucid.dream
+          build-dream/bin/dream build/dreams.dream -L mind ship/main.dr --shebang -o build/ship
+      - run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) build-dream/bin/dream build/ship tarball --package-version "${VERSION#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.tar.gz
+
+  linux:
+    needs: macos
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev zlib1g-dev xz-utils zstd
+      - run: cmake -S . -B build-dream -DCMAKE_BUILD_TYPE=Release -DDREAM_ENABLE_JIT=OFF -DCMAKE_INSTALL_LIBDIR=lib
+      - run: cmake --build build-dream --parallel 4
+      - run: cmake --install build-dream --prefix build/stage
+      - name: the compiler, the tools and the packager
+        run: |
+          mkdir -p build
+          build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/main.dr
+          build-dream/bin/dream build/dreams.dream -L mind/std mind/tool/main.dr --shebang -o build/mind
+          build-dream/bin/dream build/dreams.dream lucid/main.dr -L mind -L . -o build/lucid.dream
+          build-dream/bin/dream build/dreams.dream -L mind ship/main.dr --shebang -o build/ship
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos
+          path: dist
+      - name: every package, then what is made from the tarballs
+        run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) build-dream/bin/dream build/ship all --package-version "${VERSION#v}"
+      - name: the packages install
+        run: |
+          sudo apt-get install -y ./dist/dream_*_amd64.deb
+          dream --mindv2-path
+          printf 'import std.console;\nlet main! = console.print! "hello";\n' > /tmp/hello.dr
+          (cd /tmp && dream -x dreams hello.dr -o hello.dream && test "$(dream hello.dream)" = hello)
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp dist/aur/PKGBUILD dist/PKGBUILD
+          cp dist/aur/.SRCINFO dist/SRCINFO
+          build-dream/bin/dream build/ship sums
+          find dist -maxdepth 1 -type f -print0 | sort -z \
+            | xargs -0 gh release create "v${VERSION#v}" --title "Dream ${VERSION#v}" --generate-notes

@@ -1,0 +1,780 @@
+// Parsers: small functions over text that combine into big ones.
+//
+//     import std.parse as p;
+//
+//     // "3, 4" -> [3, 4]
+//     let pair = p.succeed (fn a b -> [a, b])
+//         |> p.keep p.integer
+//         |> p.skip (p.symbol ",")
+//         |> p.keep p.integer;
+//
+//     p.run pair "3, 4"              // [:ok, [3, 4]]
+//     p.run pair "3; 4"              // [:error, error]: line 1, column 2: expected ","
+//
+//     // arithmetic, with precedence and associativity from a table
+//     let rec expr = p.operators (p.lexeme p.integer |> p.or (p.parens (p.lazy (fn () -> expr))))
+//         [[:left, [["+", fn a b -> a + b], ["-", fn a b -> a - b]]],
+//          [:left, [["*", fn a b -> a * b], ["/", fn a b -> a / b]]],
+//          [:prefix, [["-", fn a -> 0 - a]]]];
+//
+// **A parser is a function** from the text and a byte offset to a reply: the
+// value and the offset after it, or a failure. Everything here builds such a
+// function out of smaller ones, so a grammar is ordinary Dream -- named with
+// `let`, recursive through `lazy`, parameterised by ordinary arguments -- and
+// there is no grammar language to learn and nothing to generate. It is pure,
+// so a parser runs in a pure function and under `comp`.
+//
+// **Offsets are bytes**, as everywhere strings are concerned here, so a
+// parser moves with `str.span` and `str.find` -- loops the runtime runs --
+// rather than a character at a time. What reads a character decodes the
+// UTF-8 at the offset itself, so text that is not ASCII is read as
+// characters, never split.
+//
+// **Choice backtracks, and errors are the furthest failure.** `or` tries its
+// second parser at the same offset when the first fails, however far the
+// first got, so a grammar needs no lookahead annotations. What makes that
+// usable is the error: every failure records how far into the text it
+// happened and what was expected there, and the one reported is the one that
+// got furthest, with the expectations of every alternative that failed at
+// that same place merged -- `expected digit, "." or ")"`. Even a success
+// carries the furthest failure it stepped around (`many digit` stopped at
+// "x" because "x" is not a digit), so the parser after it can say so.
+//
+// **Pipelines read as the grammar.** `succeed f |> keep a |> skip b |> keep
+// c` applies `f` to what `a` and `c` produced, checking `b` between them, in
+// the order the text has them. It is Elm's parser idiom, and in Dream it is
+// just currying and `|>`.
+
+import std.char;
+import std.list;
+import std.map;
+import std.num;
+import std.result;
+import std.str;
+
+// --- replies -----------------------------------------------------------------------
+
+/// The furthest place something failed, and what would have done instead:
+/// `#[offset, expectations]`, each expectation a string (`"digit"`, `"\")\""`)
+/// or `[:message, text]` from `fail`.
+type Problem = #[:integer, [:any]];
+
+/// What a parser answers: `#[:ok, value, next, problem]`, `problem` the
+/// furthest failure stepped around on the way (or `()`), or `#[:fail, problem]`.
+type Reply a = #[:ok, a, :integer, :any] | #[:fail, Problem];
+
+/// A parser: the text and the byte offset to start at, to a reply.
+type Parser a = :string -> :integer -> Reply a;
+
+priv let ok : a -> :integer -> :any -> Reply a;
+priv let ok value at problem = #[:ok, value, at, problem];
+
+priv let fail_at : :integer -> :any -> Reply :any;
+priv let fail_at at expected = #[:fail, #[at, [expected]]];
+
+/// The furthest of two problems, merging what they expected when they are
+/// equally far.
+priv let merge : :any -> :any -> :any;
+priv let merge a b = match [a, b] {
+    [(), _] => b,
+    [_, ()] => a,
+    [#[ia, ea], #[ib, eb]] =>
+        if ia > ib { a } else if ib > ia { b } else { #[ia, ea + list.filter (fn e -> not (list.contains e ea)) eb] },
+};
+
+priv let reply_problem : Reply :any -> :any;
+priv let reply_problem r = match r { #[:ok, _, _, p] => p, #[:fail, p] => p };
+
+// --- running ------------------------------------------------------------------------
+
+/// What a failed parse says: where, and what it wanted.
+mapping Error {
+    offset : :integer
+    line : :integer
+    column : :integer
+    expected : [:string]
+    found : :string
+    message : :string
+}
+
+/// `[:ok, value]` when the parser reads the whole text, or `[:error, Error]`
+/// saying where and why it did not.
+let run : Parser a -> :string -> result.Of a :map;
+let run parser text = match (skip end parser) text 0 {
+    #[:ok, v, _, _] => result.ok v,
+    #[:fail, problem] => result.error (error_of text problem),
+};
+
+/// `run`, with the error as a message: `line 2, column 5: expected digit,
+/// found "x"`.
+let run_text : Parser a -> :string -> result.Of a :string;
+let run_text parser text = result.map_error describe (run parser text);
+
+/// The value and the offset after it, without requiring the parser to read
+/// everything: `[:ok, [value, next]]`.
+let run_prefix : Parser a -> :string -> :integer -> result.Of [a, :integer] :map;
+let run_prefix parser text at = match parser text at {
+    #[:ok, v, next, _] => result.ok [v, next],
+    #[:fail, problem] => result.error (error_of text problem),
+};
+
+/// Whether the parser reads the whole text.
+let matches : Parser :any -> :string -> :bool;
+let matches parser text = result.is_ok (run parser text);
+
+priv let error_of : :string -> Problem -> :map;
+priv let error_of text #[at, expectations] = {
+    let [line, column] = line_col text at;
+    let messages = list.filter (fn e -> type_of e == :list) expectations;
+    let wanted = list.unique (list.filter (fn e -> type_of e == :string) expectations);
+    let found = if at >= len text { "the end of the text" } else { quote (char_text text at) };
+    let message = match messages {
+        [[_, m], .._] => m,
+        [] => "expected " + one_of_text wanted + ", found " + found,
+    };
+    Error.make at line column wanted found message
+};
+
+priv let one_of_text : [:string] -> :string;
+priv let one_of_text names = match names {
+    [] => "something else",
+    [a] => a,
+    [a, b] => a + " or " + b,
+    _ => str.join_str ", " (list.take (list.length names - 1) names) + " or " + list.last names,
+};
+
+/// `line N, column M: message`.
+let describe : :map -> :string;
+let describe e = "line " + to_string (Error.line e) + ", column " + to_string (Error.column e) + ": " + Error.message e;
+
+/// The message with the line it happened on and a caret under the place:
+///
+///     line 1, column 9: expected digit, found "x"
+///       1 | (1 + 2 * x)
+///         |         ^
+let explain : :map -> :string -> :string;
+let explain e text = {
+    let at = Error.offset e;
+    let start = line_start text at;
+    let stop = str.upto "\n" at text;
+    let gutter = to_string (Error.line e);
+    let pad = str.repeat (len gutter) " ";
+    describe e + "\n  " + gutter + " | " + str.slice start (stop - start) text + "\n  " + pad + " | "
+        + str.repeat (Error.column e - 1) " " + "^"
+};
+
+/// The 1-based line and column (in characters) of a byte offset.
+let line_col : :string -> :integer -> [:integer, :integer];
+let line_col text at = {
+    let rec count_lines i !n = { let nl = str.find_from i "\n" text; if nl < 0 || nl >= at { n } else { count_lines (nl + 1) (n + 1) } };
+    let start = line_start text at;
+    [count_lines 0 1, str.length (str.slice start (at - start) text) + 1]
+};
+
+priv let line_start : :string -> :integer -> :integer;
+priv let rec line_start text at =
+    if at <= 0 { 0 } else if str.byte (at - 1) text == 10 { at } else { line_start text (at - 1) };
+
+priv let quote : :string -> :string;
+priv let quote s = match s { "\n" => "a line break", "\t" => "a tab", "\"" => "'\"'", _ => "\"" + s + "\"" };
+
+// --- characters ------------------------------------------------------------------------
+
+/// The character at byte `at` and its width in bytes, decoded from the UTF-8
+/// there: `[char, width]`, or `()` at the end. A malformed byte reads as
+/// U+FFFD, one byte wide, so a parser can step past it.
+let char_at : :string -> :integer -> :any;
+let char_at s at = {
+    let b0 = str.byte at s;
+    let cont k = str.byte (at + k) s % 64;
+    if b0 < 0 { () }
+    else if b0 < 128 { [char.of_code b0, 1] }
+    else if b0 >= 194 && b0 < 224 { [char.of_code ((b0 - 192) * 64 + cont 1), 2] }
+    else if b0 >= 224 && b0 < 240 { decoded ((b0 - 224) * 4096 + cont 1 * 64 + cont 2) 3 }
+    else if b0 >= 240 && b0 < 245 { decoded ((b0 - 240) * 262144 + cont 1 * 4096 + cont 2 * 64 + cont 3) 4 }
+    else { ['\u{FFFD}', 1] }
+};
+
+priv let decoded : :integer -> :integer -> [:any, :integer];
+priv let decoded code width =
+    if (code >= 55296 && code <= 57343) || code > 1114111 { ['\u{FFFD}', 1] } else { [char.of_code code, width] };
+
+priv let char_text : :string -> :integer -> :string;
+priv let char_text s at = match char_at s at { () => "", [c, w] => str.slice at w s };
+
+/// One character that `ok` accepts, called `name` in an error.
+let satisfy : :string -> (:char -> :bool) -> Parser :char;
+let satisfy name accept s at = match char_at s at {
+    [c, w] if accept c => ok c (at + w) (),
+    _ => fail_at at name,
+};
+
+/// Exactly this character.
+let char : :char -> Parser :char;
+let char c s at = satisfy (quote (str.of_chars [c])) (fn d -> d == c) s at;
+
+/// Any one character.
+let any_char : Parser :char;
+let any_char s at = satisfy "any character" (fn c -> true) s at;
+
+/// One character from `set`.
+let char_in : :string -> Parser :char;
+let char_in set s at = satisfy ("one of " + quote set) (fn c -> str.contains c set) s at;
+
+/// One character not in `set`.
+let char_not_in : :string -> Parser :char;
+let char_not_in set s at = satisfy ("anything but " + quote set) (fn c -> not (str.contains c set)) s at;
+
+let digit : Parser :char;
+let digit s at = satisfy "digit" char.is_digit s at;
+
+let letter : Parser :char;
+let letter s at = satisfy "letter" is_letter s at;
+
+priv let is_letter : :char -> :bool;
+priv let is_letter c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || char.code c >= 128;
+
+// --- text --------------------------------------------------------------------------------
+
+/// Exactly this text.
+let text : :string -> Parser :string;
+let text t s at = if str.slice at (len t) s == t { ok t (at + len t) () } else { fail_at at (quote t) };
+
+/// This text in any ASCII case; answers it as written in the input.
+let text_ci : :string -> Parser :string;
+let text_ci t s at = {
+    let got = str.slice at (len t) s;
+    if str.lower got == str.lower t { ok got (at + len t) () } else { fail_at at (quote t) }
+};
+
+/// The longest run, possibly empty, of bytes from `set` -- `span " \t"` --
+/// done by the runtime in one step. For ASCII sets.
+let span : :string -> Parser :string;
+let span set s at = { let stop = str.span set at s; ok (str.slice at (stop - at) s) stop () };
+
+/// The same, but at least one byte, called `name` when there is none.
+let span1 : :string -> :string -> Parser :string;
+let span1 name set s at = {
+    let stop = str.span set at s;
+    if stop == at { fail_at at name } else { ok (str.slice at (stop - at) s) stop #[stop, [name]] }
+};
+
+/// The characters, possibly none, that `keep` accepts.
+let take_while : (:char -> :bool) -> Parser :string;
+let take_while keep s at = { let stop = while_chars keep s at; ok (str.slice at (stop - at) s) stop () };
+
+/// At least one character that `keep` accepts.
+let take_while1 : :string -> (:char -> :bool) -> Parser :string;
+let take_while1 name keep s at = {
+    let stop = while_chars keep s at;
+    if stop == at { fail_at at name } else { ok (str.slice at (stop - at) s) stop #[stop, [name]] }
+};
+
+priv let while_chars : (:char -> :bool) -> :string -> :integer -> :integer;
+priv let rec while_chars keep s at = match char_at s at {
+    [c, w] if keep c => while_chars keep s (at + w),
+    _ => at,
+};
+
+/// Everything up to `delimiter`, which is not consumed; fails when it never
+/// comes.
+let until : :string -> Parser :string;
+let until delimiter s at = {
+    let found = str.find_from at delimiter s;
+    if found < 0 { fail_at (len s) (quote delimiter) } else { ok (str.slice at (found - at) s) found () }
+};
+
+/// Everything up to the end of the line, not including the line break.
+let rest_of_line : Parser :string;
+let rest_of_line s at = { let stop = str.upto "\n" at s; ok (str.slice at (stop - at) s) stop () };
+
+/// Everything that is left.
+let rest : Parser :string;
+let rest s at = ok (str.slice at (len s - at) s) (len s) ();
+
+/// The end of the text.
+let end : Parser :unit;
+let end s at = if at >= len s { ok () at () } else { fail_at at "the end of the text" };
+
+/// The current byte offset, consuming nothing.
+let position : Parser :integer;
+let position s at = ok at at ();
+
+// --- the usual tokens -------------------------------------------------------------------------
+
+/// Zero or more spaces, tabs and line breaks.
+let spaces : Parser :string;
+let spaces s at = span " \t\r\n" s at;
+
+/// At least one.
+let spaces1 : Parser :string;
+let spaces1 s at = span1 "white space" " \t\r\n" s at;
+
+/// `\n` or `\r\n`.
+let newline : Parser :string;
+let newline s at = or (text "\r\n") (text "\n") s at |> relabel at "a line break";
+
+/// Decimal digits, as written.
+let digits : Parser :string;
+let digits s at = span1 "digit" "0123456789" s at;
+
+/// A decimal integer, with an optional sign.
+let integer : Parser :integer;
+let integer s at = {
+    let b = str.byte at s;
+    let from = if b == 45 || b == 43 { at + 1 } else { at };
+    let stop = str.span "0123456789" from s;
+    if stop == from { fail_at at "an integer" }
+    else {
+        let n = whole_number (str.slice from (stop - from) s);
+        ok (if b == 45 { 0 - n } else { n }) stop #[stop, ["digit"]]
+    }
+};
+
+/// A non-negative decimal integer, no sign.
+let natural : Parser :integer;
+let natural s at = {
+    let stop = str.span "0123456789" at s;
+    if stop == at { fail_at at "a number" } else { ok (whole_number (str.slice at (stop - at) s)) stop #[stop, ["digit"]] }
+};
+
+/// A number as JSON writes one -- sign, digits, fraction, exponent -- as an
+/// integer when it has neither fraction nor exponent, otherwise a float.
+let number : Parser (:integer | :float) ;
+let number s at = {
+    let b = str.byte at s;
+    let from = if b == 45 { at + 1 } else { at };
+    let int_end = str.span "0123456789" from s;
+    if int_end == from { fail_at at "a number" }
+    else {
+        let frac_end = if str.byte int_end s == 46 && str.span "0123456789" (int_end + 1) s > int_end + 1 {
+            str.span "0123456789" (int_end + 1) s } else { int_end };
+        let e = str.byte frac_end s;
+        let exp_end = if e == 101 || e == 69 {
+            let sb = str.byte (frac_end + 1) s;
+            let digits_from = if sb == 43 || sb == 45 { frac_end + 2 } else { frac_end + 1 };
+            let de = str.span "0123456789" digits_from s;
+            if de > digits_from { de } else { frac_end }
+        } else { frac_end };
+        let written = str.slice at (exp_end - at) s;
+        if exp_end == int_end { ok (whole_number written) exp_end #[exp_end, ["digit"]] }
+        else { ok (match num.parse_float written { () => 0.0, f => f }) exp_end () }
+    }
+};
+
+/// Digits already checked to be digits, as their value.
+priv let whole_number : :string -> :integer;
+priv let whole_number written = match num.parse_int written { () => 0, n => n };
+
+/// A name as most languages write one: a letter or `_`, then letters,
+/// digits and `_`.
+let identifier : Parser :string;
+let identifier s at = match char_at s at {
+    [c, w] if is_letter c || c == '_' => {
+        let stop = while_chars (fn d -> is_letter d || char.is_digit d || d == '_') s (at + w);
+        ok (str.slice at (stop - at) s) stop ()
+    },
+    _ => fail_at at "a name",
+};
+
+/// A string in double quotes with JSON's escapes (`\n`, `\"`, `\\`, `é`),
+/// answering what it spells.
+let quoted : Parser :string;
+let quoted s at =
+    if str.byte at s != 34 { fail_at at "a quoted string" }
+    else { quoted_body s (at + 1) [] };
+
+priv let quoted_body : :string -> :integer -> [:string] -> Reply :string;
+priv let rec quoted_body s at acc = {
+    let stop = str.upto "\"\\" at s;
+    let piece = str.slice at (stop - at) s;
+    if stop >= len s { fail_at stop "a closing quote" }
+    else if str.byte stop s == 34 { ok (str.concat_all (list.reverse (piece :: acc))) (stop + 1) () }
+    else {
+        let e = str.byte (stop + 1) s;
+        let simple = match e { 110 => "\n", 116 => "\t", 114 => "\r", 98 => "\u{8}", 102 => "\u{c}",
+                               34 => "\"", 92 => "\\", 47 => "/", _ => () };
+        if simple != () { quoted_body s (stop + 2) (simple :: piece :: acc) }
+        else if e == 117 {
+            match hex_value (str.slice (stop + 2) 4 s) {
+                () => fail_at (stop + 2) "four hex digits",
+                code => quoted_body s (stop + 6) (str.of_chars [char.of_code code] :: piece :: acc),
+            }
+        } else { fail_at (stop + 1) "an escape" }
+    }
+};
+
+priv let hex_value : :string -> :any;
+priv let hex_value h =
+    if len h != 4 || str.span "0123456789abcdefABCDEF" 0 h != 4 { () }
+    else { list.fold (fn acc c -> acc * 16 + hex_digit c) 0 (str.chars h) };
+
+priv let hex_digit : :char -> :integer;
+priv let hex_digit c = match c {
+    _ if c >= '0' && c <= '9' => char.code c - 48,
+    _ if c >= 'a' && c <= 'f' => char.code c - 87,
+    _ => char.code c - 55,
+};
+
+// --- combining --------------------------------------------------------------------------------
+
+/// Always `value`, consuming nothing.
+let succeed : a -> Parser a;
+let succeed value s at = ok value at ();
+
+/// Always fails, saying `message`.
+let fail : :string -> Parser :any;
+let fail message s at = #[:fail, #[at, [[:message, message]]]];
+
+/// `p`, with its value changed by `f`.
+let map : (a -> b) -> Parser a -> Parser b;
+let map f p s at = match p s at {
+    #[:ok, v, next, pr] => ok (f v) next pr,
+    #[:fail, pr] => #[:fail, pr],
+};
+
+/// `p`, answering `value` instead: `keyword "true" |> to true`.
+let to : b -> Parser a -> Parser b;
+let to value p s at = map (fn _ -> value) p s at;
+
+/// Both, in order, combined by `f`.
+let map2 : (a -> b -> c) -> Parser a -> Parser b -> Parser c;
+let map2 f pa pb s at = match pa s at {
+    #[:ok, a, n1, pr1] => match pb s n1 {
+        #[:ok, b, n2, pr2] => ok (f a b) n2 (merge pr1 pr2),
+        #[:fail, pr2] => #[:fail, merge pr1 pr2],
+    },
+    #[:fail, pr] => #[:fail, pr],
+};
+
+let map3 : (a -> b -> c -> d) -> Parser a -> Parser b -> Parser c -> Parser d;
+let map3 f pa pb pc s at = map2 (fn g c -> g c) (map2 f pa pb) pc s at;
+
+/// The pipeline's step that keeps a value: `succeed f |> keep p` is `f`
+/// applied to what `p` read.
+let keep : Parser a -> Parser (a -> b) -> Parser b;
+let keep p pf s at = map2 (fn f v -> f v) pf p s at;
+
+/// The pipeline's step that only checks: `p` must match here, and what it
+/// read is dropped.
+let skip : Parser :any -> Parser a -> Parser a;
+let skip p pa s at = map2 (fn a _ -> a) pa p s at;
+
+/// `p`, then `q`, keeping what `q` read.
+let then : Parser b -> Parser a -> Parser b;
+let then q p s at = map2 (fn _ b -> b) p q s at;
+
+/// Every parser in order, their values as a list.
+let seq : [Parser :any] -> Parser [:any];
+let seq ps s at = match ps {
+    [] => ok [] at (),
+    [p, ..rest] => map2 (fn v vs -> v :: vs) p (seq rest) s at,
+};
+
+/// A parser chosen by a value already read: `and_then (fn n -> count n
+/// any_char) natural` reads a length and then that many characters.
+let and_then : (a -> Parser b) -> Parser a -> Parser b;
+let and_then f p s at = match p s at {
+    #[:ok, v, next, pr] => match (f v) s next {
+        #[:ok, v2, n2, pr2] => ok v2 n2 (merge pr pr2),
+        #[:fail, pr2] => #[:fail, merge pr pr2],
+    },
+    #[:fail, pr] => #[:fail, pr],
+};
+
+/// `p`, or when it fails, `q` from the same place. Written to read in a
+/// pipeline: `p |> or q`.
+let or : Parser a -> Parser a -> Parser a;
+let or q p s at = match p s at {
+    #[:fail, pr1] => match q s at {
+        #[:ok, v, next, pr2] => ok v next (merge pr1 pr2),
+        #[:fail, pr2] => #[:fail, merge pr1 pr2],
+    },
+    success => success,
+};
+
+/// The first of the parsers that matches.
+let choice : [Parser a] -> Parser a;
+let choice ps s at = match ps {
+    [] => fail_at at "something else",
+    [p] => p s at,
+    [p, ..rest] => or (choice rest) p s at,
+};
+
+/// `p`, or `()` without consuming anything.
+let optional : Parser a -> Parser (a | :unit);
+let optional p s at = or (succeed ()) p s at;
+
+/// `p`, or `value` without consuming anything.
+let default : a -> Parser a -> Parser a;
+let default value p s at = or (succeed value) p s at;
+
+/// As many as match, possibly none. Stops without consuming when `p` would
+/// match the empty text, so it cannot loop.
+let many : Parser a -> Parser [a];
+let many p s at = many_from p s at [] ();
+
+priv let many_from : Parser a -> :string -> :integer -> [a] -> :any -> Reply [a];
+priv let rec many_from p s at acc pr = match p s at {
+    #[:ok, v, next, pr2] if next > at => many_from p s next (v :: acc) (merge pr pr2),
+    #[:ok, _, _, pr2] => ok (list.reverse acc) at (merge pr pr2),
+    #[:fail, pr2] => ok (list.reverse acc) at (merge pr pr2),
+};
+
+/// At least one.
+let many1 : Parser a -> Parser [a];
+let many1 p s at = map2 (fn v vs -> v :: vs) p (many p) s at;
+
+/// Exactly `n`.
+let count : :integer -> Parser a -> Parser [a];
+let count n p s at = if n <= 0 { ok [] at () } else { map2 (fn v vs -> v :: vs) p (count (n - 1) p) s at };
+
+/// Zero or more `p`, with `sep` between them: `sep_by (symbol ",") integer`.
+let sep_by : Parser :any -> Parser a -> Parser [a];
+let sep_by sep p s at = or (succeed []) (sep_by1 sep p) s at;
+
+/// One or more `p`, with `sep` between them.
+let sep_by1 : Parser :any -> Parser a -> Parser [a];
+let sep_by1 sep p s at = map2 (fn v vs -> v :: vs) p (many (then p sep)) s at;
+
+/// Zero or more `p`, each followed by `terminator`.
+let end_by : Parser :any -> Parser a -> Parser [a];
+let end_by terminator p s at = many (skip terminator p) s at;
+
+/// `p` repeated until `stop` matches, which is consumed; the values of `p`.
+let many_till : Parser :any -> Parser a -> Parser [a];
+let many_till stop p s at = {
+    let rec go at2 acc pr = match stop s at2 {
+        #[:ok, _, next, pr2] => ok (list.reverse acc) next (merge pr pr2),
+        #[:fail, pr2] => match p s at2 {
+            #[:ok, v, next, pr3] => go next (v :: acc) (merge pr (merge pr2 pr3)),
+            #[:fail, pr3] => #[:fail, merge pr (merge pr2 pr3)],
+        },
+    };
+    go at [] ()
+};
+
+/// `p` between an opening and a closing parser, keeping what `p` read.
+let between : Parser :any -> Parser :any -> Parser a -> Parser a;
+let between open close p s at = skip close (then p open) s at;
+
+/// `p` in parentheses, with space allowed inside them.
+let parens : Parser a -> Parser a;
+let parens p s at = between (symbol "(") (symbol ")") p s at;
+
+/// `p` in square brackets.
+let brackets : Parser a -> Parser a;
+let brackets p s at = between (symbol "[") (symbol "]") p s at;
+
+/// `p` in braces.
+let braces : Parser a -> Parser a;
+let braces p s at = between (symbol "{") (symbol "}") p s at;
+
+/// `p` and the white space after it: how a token is read when space between
+/// tokens does not matter.
+let lexeme : Parser a -> Parser a;
+let lexeme p s at = skip spaces p s at;
+
+/// This text as a token: `lexeme (text t)`.
+let symbol : :string -> Parser :string;
+let symbol t s at = lexeme (text t) s at;
+
+/// This word as a token, and not the start of a longer name: `keyword "if"`
+/// does not match the front of `iffy`.
+let keyword : :string -> Parser :string;
+let keyword w s at = lexeme (skip (not_followed_by (satisfy "letter" (fn c -> is_letter c || char.is_digit c || c == '_'))) (text w)) s at;
+
+/// `p`, called `name` in an error when it fails where it started. A failure
+/// further in is left as it is, because what went wrong there is more use
+/// than the name of the thing that contained it.
+let label : :string -> Parser a -> Parser a;
+let label name p s at = p s at |> relabel at name;
+
+priv let relabel : :integer -> :string -> Reply :any -> Reply :any;
+priv let relabel at name r = match r {
+    #[:fail, #[where, _]] if where == at => #[:fail, #[at, [name]]],
+    #[:ok, v, next, #[where, _]] if where == at => ok v next #[at, [name]],
+    other => other,
+};
+
+/// `p`, forgetting what could have continued it where it stopped. A long
+/// repetition that ends where anything at all could have gone on otherwise
+/// reports every one of those things; after `quiet`, an error just past it
+/// names only what the grammar needed next. A failure *further in* than
+/// where `p` stopped -- a group left unclosed inside it -- is kept, because
+/// that is the error.
+let quiet : Parser a -> Parser a;
+let quiet p s at = match p s at {
+    #[:ok, v, next, #[where, e]] if where > next => ok v next #[where, e],
+    #[:ok, v, next, _] => ok v next (),
+    #[:fail, pr] => #[:fail, pr],
+};
+
+/// `p`'s value, consuming nothing.
+let lookahead : Parser a -> Parser a;
+let lookahead p s at = match p s at { #[:ok, v, _, _] => ok v at (), #[:fail, pr] => #[:fail, pr] };
+
+/// Succeeds, consuming nothing, only where `p` does not match.
+let not_followed_by : Parser :any -> Parser :unit;
+let not_followed_by p s at = match p s at {
+    #[:ok, _, _, _] => fail_at at "something else",
+    _ => ok () at (),
+};
+
+/// The text `p` read, instead of its value.
+let capture : Parser :any -> Parser :string;
+let capture p s at = match p s at {
+    #[:ok, _, next, pr] => ok (str.slice at (next - at) s) next pr,
+    #[:fail, pr] => #[:fail, pr],
+};
+
+/// `p`'s value with the byte offsets it was read between: `[value, from, to]`.
+let spanned : Parser a -> Parser [a, :integer, :integer];
+let spanned p s at = match p s at {
+    #[:ok, v, next, pr] => ok [v, at, next] next pr,
+    #[:fail, pr] => #[:fail, pr],
+};
+
+/// A parser built when it is first used, for a grammar that refers to
+/// itself: `let rec value = choice [.., brackets (sep_by comma (lazy (fn ()
+/// -> value)))]`.
+let lazy : (:unit -> Parser a) -> Parser a;
+let lazy make s at = (make ()) s at;
+
+/// `p`, and then a check of its value: `where_ok (fn n -> n <= 255) "a byte"
+/// natural` fails, saying "a byte", on 300.
+let where_ok : (a -> :bool) -> :string -> Parser a -> Parser a;
+let where_ok accept name p s at = match p s at {
+    #[:ok, v, next, pr] => if accept v { ok v next pr } else { fail_at at name },
+    #[:fail, pr] => #[:fail, pr],
+};
+
+/// `p`, whose value is a result: an `[:error, message]` fails the parse
+/// there with that message.
+let try_map : (a -> result.Of b :string) -> Parser a -> Parser b;
+let try_map f p s at = match p s at {
+    #[:ok, v, next, pr] => match f v {
+        [:ok, v2] => ok v2 next pr,
+        [:error, why] => #[:fail, #[at, [[:message, why]]]],
+    },
+    #[:fail, pr] => #[:fail, pr],
+};
+
+// --- operators -----------------------------------------------------------------------------------
+
+/// `p` separated by `op`, combined left to right: `1 - 2 - 3` is `(1 - 2) - 3`.
+/// `op` reads an operator and answers the function that combines its two sides.
+let chain_left : Parser (a -> a -> a) -> Parser a -> Parser a;
+let chain_left op p s at = match p s at {
+    #[:ok, first, next, pr] => {
+        let rec go acc at2 pr2 = match op s at2 {
+            #[:ok, f, n1, pr3] => match p s n1 {
+                #[:ok, v, n2, pr4] => go (f acc v) n2 (merge pr2 (merge pr3 pr4)),
+                #[:fail, pr4] => #[:fail, merge pr2 (merge pr3 pr4)],
+            },
+            #[:fail, pr3] => ok acc at2 (merge pr2 pr3),
+        };
+        go first next pr
+    },
+    #[:fail, pr] => #[:fail, pr],
+};
+
+/// The same, combined right to left: `2 ^ 3 ^ 2` is `2 ^ (3 ^ 2)`.
+let chain_right : Parser (a -> a -> a) -> Parser a -> Parser a;
+let chain_right op p s at = match p s at {
+    #[:ok, first, next, pr] => match op s next {
+        #[:ok, f, n1, pr2] => match chain_right op p s n1 {
+            #[:ok, rest, n2, pr3] => ok (f first rest) n2 (merge pr (merge pr2 pr3)),
+            #[:fail, pr3] => #[:fail, merge pr (merge pr2 pr3)],
+        },
+        #[:fail, pr2] => ok first next (merge pr pr2),
+    },
+    #[:fail, pr] => #[:fail, pr],
+};
+
+/// An expression grammar from a table of operators, loosest first. Each row
+/// is `[fixity, [[symbol, function], ..]]`, the fixity `:left`, `:right`,
+/// `:prefix` or `:postfix`; the operators are read as `symbol`s, so space is
+/// allowed around them, and `atom` is what they apply to -- usually a number
+/// or a name, or an expression in parentheses through `lazy`.
+///
+///     operators atom [[:left, [["+", add], ["-", sub]]],
+///                     [:left, [["*", mul]]],
+///                     [:right, [["^", pow]]],
+///                     [:prefix, [["-", negate]]]]
+let operators : Parser a -> [[:any]] -> Parser a;
+let operators atom table s at = (list.fold_right level atom table) s at;
+
+priv let level : [:any] -> Parser :any -> Parser :any;
+priv let level [fixity, ops] tighter = {
+    let op = choice (list.map (fn [sym, f] -> to f (symbol sym)) (longest_first ops));
+    match fixity {
+        :left => chain_left op tighter,
+        :right => chain_right op tighter,
+        :prefix => { let rec prefixed s at = or tighter (map2 (fn f v -> f v) op prefixed) s at; prefixed },
+        :postfix => map2 (fn v fs -> list.fold (fn acc f -> f acc) v fs) tighter (many op),
+    }
+};
+
+/// Operators sharing a prefix (`<` and `<=`) must try the longer first.
+priv let longest_first : [[:any]] -> [[:any]];
+priv let longest_first ops = list.sort_by (fn a b -> len (b.[0]) < len (a.[0])) ops;
+
+when test {
+    import std.test;
+
+    let pair = succeed (fn a b -> [a, b]) |> keep integer |> skip (symbol ",") |> keep integer;
+    let rec expr s at = operators (lexeme number |> or (parens (lazy (fn () -> expr))))
+        [[:left, [["+", fn a b -> a + b], ["-", fn a b -> a - b]]],
+         [:left, [["*", fn a b -> a * b], ["/", fn a b -> a / b]]],
+         [:right, [["^", fn a b -> pow a b]]],
+         [:prefix, [["-", fn a -> 0 - a]]]] s at;
+    let rec pow a b = if b <= 0 { 1 } else { a * pow a (b - 1) };
+    let calc t = run (then expr spaces) t;
+    let message r = match r { [:error, e] => Error.message e, _ => "" };
+    let where r = match r { [:error, e] => [Error.line e, Error.column e], _ => [] };
+
+    // A JSON reader in a dozen lines: the test that the pieces compose.
+    let rec json_value s at = lexeme (choice [
+        map (fn _ -> ()) (keyword "null"), to true (keyword "true"), to false (keyword "false"),
+        number, quoted,
+        brackets (sep_by (symbol ",") (lazy (fn () -> json_value))),
+        map map.from_pairs (braces (sep_by (symbol ",")
+            (succeed (fn k v -> [k, v]) |> keep (lexeme quoted) |> skip (symbol ":") |> keep (lazy (fn () -> json_value))))),
+    ]) s at;
+
+    let tests = [
+        test.case "a pipeline"                $( test.eq! [:ok, [3, 4]] (run pair "3, 4") ),
+        test.case "a pipeline's error"        $( test.eq! "expected digit or \",\", found \";\"" (message (run pair "3; 4")) ),
+        test.case "precedence"                $( test.eq! [:ok, 7] (calc "1 + 2 * 3") ),
+        test.case "left associativity"        $( test.eq! [:ok, 4] (calc "10 - 3 - 3") ),
+        test.case "right associativity"       $( test.eq! [:ok, 512] (calc "2 ^ 3 ^ 2") ),
+        test.case "prefix and parentheses"    $( test.eq! [:ok, 0 - 9] (calc "-(1 + 2) * 3") ),
+        test.case "where an error is"         $( test.eq! [1, 11] (where (calc "(1 + 2 * 3x")) ),
+        test.case "what was expected there"   $( test.eq! "expected digit, \"^\", \"*\", \"/\", \"+\", \"-\" or \")\", found \"x\""
+                                                   (message (calc "(1 + 2 * 3x")) ),
+        test.case "the end is required"       $( test.eq! "expected digit, \"^\", \"*\", \"/\", \"+\", \"-\" or the end of the text, found \")\""
+                                                   (message (calc "1 + 2)")) ),
+        test.case "explain draws a caret"     $( test.eq! "line 2, column 3: expected white space or a number, found \"x\"\n  2 | 4 x\n    |   ^"
+                                                   (match run (sep_by1 spaces1 natural) "1\n4 x" { [:error, e] => explain e "1\n4 x", _ => "" }) ),
+        test.case "JSON"                      $( test.eq! [:ok, %{ "a" => [1, 2.5, true, ()], "b" => "x\ny" }]
+                                                   (run (then json_value spaces) "{\"a\": [1, 2.5, true, null], \"b\": \"x\\ny\"}") ),
+        test.case "unicode is read as characters" $( test.eq! [:ok, "héllo"] (run (take_while1 "letter" is_letter) "héllo") ),
+        test.case "columns count characters"  $( test.eq! [1, 3] (where (run (text "é" |> then (text "a") |> then (text "b")) "éaX")) ),
+        test.case "keywords are whole words"  $( test.eq! [true, false] [matches (keyword "if") "if", matches (keyword "if") "iffy"] ),
+        test.case "many cannot loop"          $( test.eq! [:ok, []] (run (many (span "x")) "") ),
+        test.case "label names what failed"   $( test.eq! "expected a port, found \"x\"" (message (run (label "a port" natural) "x")) ),
+        test.case "where_ok checks a value"   $( test.eq! "expected a byte, found \"3\"" (message (run (where_ok (fn n -> n <= 255) "a byte" natural) "300")) ),
+        test.case "try_map reports a message" $( test.eq! "too big" (message (run (try_map (fn n -> if n > 9 { [:error, "too big"] } else { [:ok, n] }) natural) "10")) ),
+        test.case "until and capture"         $( test.eq! [:ok, ["key", "a = b"]]
+                                                   (run (seq [until " =", capture (seq [text " =", rest])] |> map (fn [k, r] -> [k, "a" + r])) "key = b") ),
+        test.case "many_till"                 $( test.eq! [:ok, ['a', 'b']] (run (many_till (text "-->") any_char) "ab-->") ),
+        test.case "numbers"                   $( test.eq! [:ok, [1, 0 - 2, 2.5, 100.0, 0.5]]
+                                                   (run (sep_by (symbol ",") number) "1, -2, 2.5, 1e2, 5E-1") ),
+        test.case "a quoted string's escapes" $( test.eq! [:ok, "a\"b\u{e9}"] (run quoted "\"a\\\"b\\u00e9\"") ),
+        test.case "an unclosed string"        $( test.eq! "expected a closing quote, found the end of the text" (message (run quoted "\"abc")) ),
+        test.case "lines and columns"         $( test.eq! [[1, 1], [2, 1], [2, 4]] [line_col "ab\ncd" 0, line_col "ab\ncd" 3, line_col "ab\ncde" 6] ),
+        test.case "spanned"                   $( test.eq! [:ok, ["ab", 1, 3]] (run (then (spanned (text "ab")) (text " ")) " ab") ),
+        test.case "postfix"                   $( test.eq! [:ok, 6] (run (operators natural [[:postfix, [["!", fn n -> n * 3]]]]) "2!") ),
+    ];
+}

@@ -653,24 +653,24 @@ priv let portal! : Conn -> :integer -> (a -> [:any] -> [[:any]] -> a) -> a -> [:
 priv let rec portal! conn batch step! !acc columns raw failure = {
     let message = try! { receive! conn } catch e { raise! (lost e) };
     match message {
-    [:row_description, cols] => portal! conn batch step! acc cols raw failure,
-    [:data_row, fields] => portal! conn batch step! acc columns (strict_cons fields raw) failure,
-    :portal_suspended => {
-        let next = portal_step! conn step! acc columns raw;
-        try! { write! conn (wire.execute "" batch + wire.flush) } catch e { raise! (lost e) }
-        portal! conn batch step! next columns [] failure
-    },
-    [:command_complete, _] => {
-        let next = portal_step! conn step! acc columns raw;
-        try! { write! conn wire.sync } catch e { raise! (lost e) }
-        portal! conn batch step! next columns [] failure
-    },
-    [:error_response, fields] => {
-        try! { write! conn wire.sync } catch e { raise! (lost e) }
-        portal! conn batch step! acc columns [] (errors.server fields)
-    },
-    [:ready, _] => if failure == () { acc } else { raise! failure },
-    _ => portal! conn batch step! acc columns raw failure,
+        [:row_description, cols] => portal! conn batch step! acc cols raw failure,
+        [:data_row, fields] => portal! conn batch step! acc columns (strict_cons fields raw) failure,
+        :portal_suspended => {
+            let next = portal_step! conn step! acc columns raw;
+            try! { write! conn (wire.execute "" batch + wire.flush) } catch e { raise! (lost e) }
+            portal! conn batch step! next columns [] failure
+        },
+        [:command_complete, _] => {
+            let next = portal_step! conn step! acc columns raw;
+            try! { write! conn wire.sync } catch e { raise! (lost e) }
+            portal! conn batch step! next columns [] failure
+        },
+        [:error_response, fields] => {
+            try! { write! conn wire.sync } catch e { raise! (lost e) }
+            portal! conn batch step! acc columns [] (errors.server fields)
+        },
+        [:ready, _] => if failure == () { acc } else { raise! failure },
+        _ => portal! conn batch step! acc columns raw failure,
     }
 };
 

@@ -1,12 +1,8 @@
 import std.console;
 
-
 let memory! name = recv!()|> console.writeln! "I got a c="
 
-
 let main! = {
-    
 
-    
     console.write! ("Hello from example" + to_string :atring)
 };

@@ -1,0 +1,61 @@
+// The tarballs of one release, found where they were made.
+//
+// A formula, a PKGBUILD and an install script all say "download this, check
+// it is this": a URL and a SHA-256 per system and machine. So they are made
+// after the tarballs, from the tarballs -- each build machine runs `ship
+// tarball`, the results are gathered into one directory, and `ship brew` (or
+// `pkgbuild`, or `installer`) reads them there. Nothing is ever written down
+// twice: the checksum in the formula is the checksum of the file beside it.
+//
+// The URL each will be published at is the manifest's `url`, with `{file}`
+// for its name -- `https://github.com/o/r/releases/download/v{version}/{file}`.
+
+import std.io;
+import std.list;
+import std.str;
+
+import compress;
+import spec;
+import spec.Spec;
+import tarball;
+
+/// One tarball: what it runs on, its name, where it will be, its digest.
+group Asset { os : :string, machine : :string, file : :string, url : :string, sha256 : :string }
+
+/// The systems and machines a release can have a tarball for, in the order a
+/// formula lists them.
+let platforms : [[:string, :string]] = [
+    ["macos", "aarch64"], ["macos", "x86_64"], ["linux", "aarch64"], ["linux", "x86_64"],
+];
+
+/// The template the URLs come from: `[ship.FORMAT] url`, then `[ship] url`.
+let url_template : Spec -> :string -> :string;
+let url_template sp format = spec.text sp format "url" "";
+
+/// Every tarball of this release in `dir`.
+let find! : Spec -> :string -> :string -> [:ok, [:any]] | [:error, :string];
+let find! sp format dir = match url_template sp format {
+    "" => [:error, format + ": set url in [ship] to where the tarballs will be published, with {file} for each one's name"],
+    template => {
+        let wanted = match Spec.arch sp {
+            :all => [["any", "any"]],
+            _ => platforms,
+        };
+        let found = list.filter (fn [os, machine] -> io.exists! (dir + "/" + tarball.file_for sp os machine :gzip)) wanted;
+        let assets = list.map (fn [os, machine] -> {
+            let name = tarball.file_for sp os machine :gzip;
+            Asset.make os machine name (spec.fill template (spec.vars sp).["file" => name].["os" => os].["arch" => machine])
+                       (io.digest! (dir + "/" + name))
+        }) found;
+        strict! assets
+        match assets {
+            [] => [:error, format + ": no tarballs of " + Spec.name sp + " " + Spec.version sp + " in " + dir
+                           + "; run `ship tarball` on each machine it is for, and gather them there"],
+            _ => [:ok, assets],
+        }
+    },
+};
+
+/// Only the ones for one system.
+let on : :string -> [:any] -> [:any];
+let on os assets = list.filter (fn a -> Asset.os a == os || Asset.os a == "any") assets;

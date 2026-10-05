@@ -1,0 +1,162 @@
+// Losses: how far a model's output is from what it should have been, as one
+// number to make smaller.
+//
+//     loss.mse prediction target
+//     loss.cross_entropy logits labels       // labels as classes or one-hot
+//     loss.of :binary_cross_entropy          // a loss by name
+//
+// **A loss takes the model's output and the target and answers a number**,
+// the mean over the batch. The output may be an autodiff variable
+// (`std.ml.ad`), and the answer then carries the way back; the target is a
+// constant. Everything is written with `ad`'s operations, so a loss of your
+// own is a function of the same shape and needs nothing registered.
+//
+// **The classification losses take logits** -- the raw scores, before a
+// softmax or a sigmoid -- because the loss and the squashing together have a
+// gradient that is simple and stable (`softmax z - y`), where taking the
+// logarithm of a probability that has already rounded to zero is not. So a
+// classifier's last layer is a plain `dense k`, and `ops.softmax` is for
+// reading its output as probabilities afterwards. These two are each one
+// operation (`ad.node`) with their gradient written out, rather than the
+// composition of a dozen: one pass forward, one fused pass back.
+//
+// **Classes or one-hot.** A classification target may be the class of each
+// example -- a vector of whole numbers, or a list -- or rows of
+// probabilities (one-hot, or smoothed). Classes are turned into rows here,
+// on the device the logits are on.
+
+import std.list;
+import std.ml.ad;
+import std.ml.ops;
+import std.tensor;
+
+/// What a loss is: the model's output, the target, and a number back.
+type Loss = :any -> :any -> :any;
+
+/// The target as a tensor on the device of `like`: lists are made tensors.
+priv let target_like : :tensor -> :any -> :any;
+priv let target_like like y = match type_of y {
+    :tensor => ops.like like y,
+    :float => y,
+    :integer => y,
+    _ => ops.like like (tensor.of_list y),
+};
+
+/// A classification target as rows of probabilities, `k` wide: one-hot rows
+/// for a vector (or list) of classes, and rows as they are otherwise.
+let as_rows : :tensor -> :any -> :tensor;
+let as_rows logits y = {
+    let k = (tensor.shape logits).[tensor.rank logits - 1];
+    let t = if type_of y == :tensor { y } else { tensor.of_list y };
+    if tensor.rank t == tensor.rank logits { ops.like logits t } else { ops.like logits (tensor.one_hot k t) }
+};
+
+/// The mean squared error.
+let mse : Loss;
+let mse pred y = { let d = ad.sub pred (target_like (ad.value pred) y); ad.mean (ad.mul d d) };
+
+/// The mean absolute error.
+let mae : Loss;
+let mae pred y = ad.mean (ad.abs (ad.sub pred (target_like (ad.value pred) y)));
+
+/// The Huber loss: squared within `delta` of the target and absolute beyond
+/// it, so that an outlier pulls with a bounded force.
+let huber : :float -> Loss;
+let huber delta pred y = {
+    let d = ad.sub pred (target_like (ad.value pred) y);
+    let a = ad.abs d;
+    let small = tensor.le (ad.value a) delta;
+    ad.mean (ad.where small (ad.scale 0.5 (ad.square d)) (ad.scale delta (ad.sub a (0.5 * delta))))
+};
+
+/// Softmax cross-entropy from logits `[n, k]` against classes or rows of
+/// probabilities: `mean (logsumexp z - sum (y * z))`.
+let cross_entropy : Loss;
+let cross_entropy logits y = cross_entropy_with 0.0 logits y;
+
+/// `cross_entropy` with label smoothing `eps`: each target row moved `eps` of
+/// the way toward uniform, which stops a classifier growing its logits
+/// without bound to be ever more certain.
+let cross_entropy_with : :float -> Loss;
+let cross_entropy_with eps logits y = {
+    let z = ad.value logits;
+    let k = (tensor.shape z).[tensor.rank z - 1];
+    let rows = as_rows z y;
+    let target = if eps > 0.0 { rows * (1.0 - eps) + eps / k } else { rows };
+    let n = tensor.size z / k;
+    let per = ops.logsumexp z - tensor.sum_axis (tensor.rank z - 1) (z * target);
+    let v = if type_of per == :tensor { tensor.sum per / n } else { per };
+    ad.node v [[logits, fn g -> (ops.softmax z - target) * (g / n)]]
+};
+
+/// Sigmoid cross-entropy from logits against targets in `[0, 1]`, each
+/// output its own yes-or-no question: `mean (softplus z - y * z)`.
+let binary_cross_entropy : Loss;
+let binary_cross_entropy logits y = {
+    let z = ad.value logits;
+    let t = target_like z y;
+    let t2 = if type_of t == :tensor && tensor.size t == tensor.size z { tensor.reshape (tensor.shape z) t } else { t };
+    let n = tensor.size z;
+    let sp = tensor.relu z + tensor.log (1.0 + tensor.exp (-(tensor.abs z)));
+    ad.node (tensor.sum (sp - t2 * z) / n) [[logits, fn g -> (tensor.sigmoid z - t2) * (g / n)]]
+};
+
+/// The negative log-likelihood of log-probabilities `[n, k]` (as
+/// `ad.log_softmax` makes them) against classes or rows.
+let nll : Loss;
+let nll logp y = {
+    let rows = as_rows (ad.value logp) y;
+    ad.neg (ad.scale (1.0 / ops.rows rows) (ad.sum (ad.mul logp rows)))
+};
+
+/// The hinge loss of scores against targets of -1 and 1: `mean (relu (1 -
+/// y * z))`.
+let hinge : Loss;
+let hinge pred y = ad.mean (ad.relu (ad.sub 1.0 (ad.mul pred (target_like (ad.value pred) y))));
+
+/// A loss by name: `:mse`, `:mae`, `:huber` (delta 1), `:cross_entropy`,
+/// `:binary_cross_entropy`, `:nll` or `:hinge`. A function is its own loss.
+let of : :any -> Loss;
+let of name = match name {
+    :mse => mse,
+    :mae => mae,
+    :huber => huber 1.0,
+    :cross_entropy => cross_entropy,
+    :binary_cross_entropy => binary_cross_entropy,
+    :nll => nll,
+    :hinge => hinge,
+    f => f,
+};
+
+when test {
+    import std.math;
+    import std.test;
+
+    let z = tensor.of_list [[2.0, -1.0, 0.5], [0.1, 0.2, 3.0]];
+    let classes = tensor.of_list [0, 2];
+
+    /// Whether `ad`'s gradient of `loss` at `z` agrees with central differences.
+    let checks l y = {
+        let f v = l v y;
+        tensor.maximum (tensor.abs (ad.grad f z - ad.numeric_grad f z 1.0e-5)) < 1.0e-6
+    };
+
+    let tests = [
+        test.case "mse" $( test.near! 1.0e-12 2.5 (mse (tensor.of_list [1, 2]) (tensor.of_list [0, 4])) ),
+        test.case "mae of a list target" $( test.near! 1.0e-12 1.5 (mae (tensor.of_list [1, 2]) [0, 4]) ),
+        test.case "cross entropy of classes equals one-hot rows"
+            $( test.near! 1.0e-12 (cross_entropy z classes) (cross_entropy z (tensor.one_hot 3 classes)) ),
+        test.case "cross entropy against the definition"
+            $( test.near! 1.0e-12 (0.5 * ((math.log (math.exp 2.0 + math.exp (-1.0) + math.exp 0.5) - 2.0)
+                                          + (math.log (math.exp 0.1 + math.exp 0.2 + math.exp 3.0) - 3.0)))
+                          (cross_entropy z classes) ),
+        test.case "cross entropy's gradient" $( test.true! (checks cross_entropy classes) ),
+        test.case "smoothed cross entropy's gradient" $( test.true! (checks (cross_entropy_with 0.1) classes) ),
+        test.case "binary cross entropy's gradient" $( test.true! (checks binary_cross_entropy (tensor.of_list [[1, 0, 1], [0, 0, 1]])) ),
+        test.case "huber's gradient" $( test.true! (checks (huber 1.0) (tensor.zeros [2, 3])) ),
+        test.case "nll of log_softmax is cross entropy"
+            $( test.near! 1.0e-12 (cross_entropy z classes) (nll (ops.log_softmax z) classes) ),
+        test.case "hinge" $( test.near! 1.0e-12 0.25 (hinge (tensor.of_list [0.5, 2.0]) [1, 1]) ),
+        test.case "a loss by name" $( test.near! 1.0e-12 2.5 ((of :mse) (tensor.of_list [1, 2]) (tensor.of_list [0, 4])) ),
+    ];
+}

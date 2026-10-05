@@ -25,6 +25,9 @@ inline bool is_tensor(Value v) { return is_obj(v, ObjType::Tensor); }
 /// of the other's, which repeats it), and against a number on either side.
 /// False with the error in `*out` when it raises.
 bool tensor_arith(Process& p, Op op, Value a, Value b, Value* out);
+/// The same for any `KernelOp` (tensor_kernels.hpp): the operators, and the
+/// `std.tensor` functions `max`, `min`, `pow` and the comparisons.
+bool tensor_binary(Process& p, int kop, Value a, Value b, Value* out);
 
 /// Compute a deferred tensor (see `TensorExpr`) and keep the answer in it;
 /// what `strict!` does to a tensor. False with the error when the device

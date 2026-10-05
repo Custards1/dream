@@ -316,6 +316,12 @@ struct ModuleObj : Obj {
 struct ErrorObj : Obj {
     Value kind;     // atom
     Value payload;  // arbitrary value
+    /// Where it was first raised, or `UNIT` until it has been: a list of
+    /// fixnums the machine fills in as it starts to unwind (`locate_error` in
+    /// interp.cpp). It is not part of the value -- equality, hashing and
+    /// `to_string` never look at it -- and it means something only to the
+    /// image that raised it, so crossing to another image leaves it behind.
+    Value where;
 };
 
 struct PidObj : Obj {

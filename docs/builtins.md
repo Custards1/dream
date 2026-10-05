@@ -155,6 +155,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 | `_tensor_matmul` | `a @ b` | `tensor\|list\|array → tensor\|list\|array → tensor\|float` | What `a @ b` is written as. See [`std.tensor`](#stdtensor). |
 | `_mailbox_peek!` · `_mailbox_take!` · `_await_message!` · `_deadline_in!` | `receive! { .. }` | | What `receive!` is written with: the `std.vm` natives of the same names (`_deadline_in! ms` is `vm.now_ns!` that many milliseconds on), as builtins so the syntax needs no import. |
 | `_match_fail` | a `match` no arm fits | `value → path → line → col → never` | Raises `:match_error` with `[value, path, line, col]`: one call per failure site, so a site costs one node and its kids. |
+| `_error_trace!` | `error.trace! e` | `error → list` | Where the error was first raised, innermost first: `[:in, name, path, line, col]` for a function running then, `[:made, ..]` for the function that made a value being forced. `[]` for one never raised. |
 | `_str_interp` | `$"..{x}.."` | `list → string` | Every element rendered as `to_string` renders it, joined: what an interpolated string is written as, lowered straight to the `str_interp` opcode. |
 | `_sort_keyed` | `list.sort_on key xs` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
@@ -263,6 +264,8 @@ import std.math;
 | `sqrt` | `number → float` | Square root. |
 | `abs` | `integer\|float → integer\|float` | Absolute value. Returns the same type as the input. |
 | `floor` | `integer\|float → integer` | Rounds down to the nearest integer. |
+| `exp` · `log` · `sin` · `cos` · `tan` · `tanh` · `atan` | `number → float` | The functions of a real variable. |
+| `pow x y` | `number → number → float` | `x` to the power `y`. |
 
 ---
 
@@ -291,7 +294,9 @@ tensor and a number on either side. The shapes must be equal, or one must be
 the trailing part of the other, which repeats it (a vector added to every row
 of a matrix). Unary `-` negates. `a @ b` is the matrix product: matrix by
 matrix, matrix by vector, vector by matrix, or vector by vector, which is the
-dot product and answers a float. `@` binds like `*`. `t.[i]` is an element of
+dot product and answers a float -- or a batch of matrices `[b, m, k]` by a batch
+`[b, k, n]` (each pair multiplied; one launch on the GPU) or by one matrix `[k,
+n]`. `@` binds like `*`. `t.[i]` is an element of
 a vector, or a copy of row `i` of anything larger; `len t` is the length of the
 first axis. `==` compares shapes and numbers.
 
@@ -341,8 +346,23 @@ tensor raises `:device_error`.
 | `at t indices` | `tensor → [integer] → float` | One element, one index per axis. |
 | `matmul a b` · `dot a b` · `outer a b` | `tensor → tensor → ..` | `a @ b`; `@` of two vectors only; every `a[i] * b[j]`. |
 | `sum` · `mean` · `minimum` · `maximum` · `norm` | `tensor → float` | Over every number. `norm` is the Euclidean length. |
-| `sum_axis axis t` | `integer → tensor → tensor` | Sums along one axis, which drops out of the shape. |
-| `sqrt` · `exp` · `log` · `abs` · `tanh` · `sin` · `cos` · `relu` · `sigmoid` | `tensor → tensor` | Elementwise. |
+| `sum_axis axis t` | `integer → tensor → tensor` | Sums along one axis, which drops out of the shape. A vector's is a number. |
+| `max_axis` · `min_axis` | `integer → tensor → tensor` | The largest or smallest along one axis, which drops out. |
+| `argmax_axis` · `argmin_axis` | `integer → tensor → tensor` | Where along the axis the largest or smallest first is, as numbers (so they stay on the GPU); a vector's is an integer. |
+| `sqrt` · `exp` · `log` · `abs` · `tanh` · `sin` · `cos` · `relu` · `sigmoid` · `floor` · `ceil` · `round` · `sign` · `erf` | `tensor → tensor` | Elementwise. `round` takes a half away from zero. |
+| `max a b` · `min a b` · `pow a b` | `tensor\|number → tensor\|number → tensor` | Elementwise, broadcast and fused as the operators are. (One argument's `maximum` and `minimum` are the reductions.) |
+| `lt` · `le` · `gt` · `ge` · `eq` · `ne` | `tensor\|number → tensor\|number → tensor` | Elementwise comparisons answering 1 where they hold and 0 where not: a mask, which multiplies into a chain. |
+| `fill_like t x` | `tensor → number → tensor` | `t`'s shape, where `t` is, every number `x`. Free on the GPU: nothing is uploaded. |
+| `repeat n t` | `integer → tensor → tensor` | `t` with a new last axis of length `n`, each number repeated along it: a value per row stretched across the row. Read in place by a chain, so `x - repeat k (max_axis 1 x)` is one pass. |
+| `slice start count t` | `integer → integer → tensor → tensor` | Rows `start` to `start + count` of the first axis. |
+| `take rows t` | `[integer]\|tensor → tensor → tensor` | The rows named, in that order, any row any number of times. One gather on the GPU. |
+| `concat ts` | `[tensor] → tensor` | Joined along the first axis; the rest of the shapes must agree. |
+| `one_hot n classes` | `integer → [integer]\|tensor → tensor` | A row per class, `n` wide, 1 at the class. |
+| `permute axes t` | `[integer] → tensor → tensor` | The axes reordered: axis `k` of the answer is axis `axes[k]` of `t`. |
+| `im2col kh kw stride pad x` | `integer → integer → integer → integer → tensor → tensor` | Every `kh x kw` window of images `[n, h, w, c]` (channels last), moved `stride` at a time over them padded with `pad` zeros, as a row: `[n * oh * ow, kh * kw * c]`. A convolution is one `@` of these rows by the kernel. |
+| `col2im shape kh kw stride pad cols` | `[integer] → .. → tensor → tensor` | The reverse: images of `shape` whose each number is the sum of the places `im2col` copied it to. |
+| `normal seed shape` | `integer → [integer] → tensor` | Standard normal numbers, the same for the same seed everywhere. |
+| `to_bytes t` · `of_bytes shape bytes` | `tensor → string` · `[integer] → string → tensor` | The numbers as little-endian doubles, and back, exactly. |
 | `gpu t` · `gpu64 t` | `tensor → tensor` | Onto the GPU as float32 or float64. Raises `:no_gpu` naming what is missing. |
 | `host t` | `tensor → tensor` | Back onto the host. |
 | `gpu_available ()` · `gpu_name ()` | `unit → ..` | Whether a GPU can be used, and its name (or `()`). |
@@ -410,6 +430,11 @@ import std.io;
 | `copy!` | `from:string → to:string → unit` | `to` becomes a copy of `from`, with its permissions, replacing it if it is there: a file of its own, so that what edits one later cannot reach the other. |
 | `link!` | `from:string → to:string → atom` | `to` becomes another name for `from`: a hard link (`:linked`), or a copy where one cannot be made (`:copied`). `to` must not exist yet. For a file nothing will write to again, such as another build step's output. |
 | `chmod!` | `path:string → mode:integer → unit` | Set the permission bits, `0o755` being `493`. On Windows only the owner's write bit means anything, and the rest are accepted and ignored. |
+| `mode!` | `path:string → integer \| unit` | The permission bits of what the path leads to, as `chmod!` takes them (`0o755` is `493`); `()` when nothing is there. Windows reports only its read-only attribute: `0o666` or `0o444`, plus execute bits for a directory or a program. |
+| `lstat!` | `path:string → [size:integer, modified:integer, kind:atom] \| unit` | `stat!` of the name itself rather than where it leads: a symbolic link answers `:link`, its size the length of its target, and a dangling one is still there. Anything else answers what `stat!` does. |
+| `is_link!` | `path:string → bool` | Whether the name is a symbolic link, dangling or not. |
+| `symlink!` | `target:string → to:string → unit` | `to` becomes a symbolic link holding `target` as written, in `ln -s`'s order. A relative target is read from the link's directory and need not exist; `to` must not. On Windows it needs developer mode or the privilege, and otherwise raises `:permission_denied`. |
+| `read_link!` | `path:string → string` | The target a symbolic link holds, as written rather than resolved. `:wrong_kind` when the path is not a link. |
 | `walk!` | `dir:string → list of string` | Every file under `dir`, relative to it with `/` between the parts, sorted. Directories are walked and not listed, and a link to a directory is not followed, so a tree that links into itself is still finite. |
 
 ### Error atoms
@@ -492,7 +517,7 @@ On Windows SChannel does its cryptography outside the process, so a PKCS#12 iden
 
 ## `std.crypto`
 
-Hashes, MACs, key derivation and randomness, done by the machine. Dream has no bitwise operators, so any of these written in Dream is thousands of reductions per block; here each is one call. Everything is **bytes in, bytes out**: a digest, a MAC or a derived key is a string of raw bytes, ready to be the next step's key or salt, and `hex`/`base64` spell one for printing. The hashes are written out in the VM (`dream/src/digest.cpp`), not taken from the TLS library, so they are the same on every platform.
+Hashes, MACs, key derivation and randomness, done by the machine. Writing these in Dream costs thousands of reductions per block; here each is one call. Everything is **bytes in, bytes out**: a digest, a MAC or a derived key is a string of raw bytes, ready to be the next step's key or salt, and `hex`/`base64` spell one for printing. The hashes are written out in the VM (`dream/src/digest.cpp`), not taken from the TLS library, so they are the same on every platform.
 
 Where the algorithm is a parameter it is an atom: `:md5`, `:sha1`, `:sha256`, `:sha384` or `:sha512`. Anything else raises `:type_error`.
 
@@ -509,6 +534,7 @@ crypto.equal expected_mac given_mac            // constant time
 |------|-----------|-------------|
 | `md5`, `sha1`, `sha256`, `sha384`, `sha512` | `string → string` | The digest, as raw bytes (16, 20, 32, 48, 64). |
 | `digest` | `alg → string → string` | The same, with the hash chosen by the caller. |
+| `digest_file!` | `alg → path → string` | The digest of a file's contents, read by the VM a block at a time, so a file of any size costs the heap nothing. Raises `:not_found`, `:wrong_kind` (a directory) or `:permission_denied`. |
 | `hmac` | `alg → key → message → string` | HMAC (RFC 2104). |
 | `pbkdf2` | `alg → password → salt → iterations → length → string` | PBKDF2 with HMAC (RFC 8018). The key's padding is hashed once, so each round costs two compressions. |
 | `hkdf` | `alg → key → salt → info → length → string` | HKDF extract-and-expand (RFC 5869). An empty salt is the RFC's default. |
@@ -537,6 +563,7 @@ import std.os;
 | `args!` | `unit → list of string` | The command-line arguments that follow the image name. |
 | `env!` | `name:string → string\|unit` | The value of an environment variable, or `unit` if unset. |
 | `set_env!` | `name:string → value:string → unit` | Sets an environment variable for the current process. |
+| `install_dirs!` | `unit → list of string` | Every directory of the installation, as the VM searches them for `dream NAME`: `$MINDV2_PATH` split and `~`-expanded, or `~/.mindv2` when that is unset and exists, or `[]`. `std.install` is the module to use. |
 
 ### Directories
 
@@ -612,6 +639,7 @@ These report figures for the **calling** process.
 | `share!` | `value → value` | The same value, forced all the way down and moved into the runtime's shared area. From then on a `spawn!`, `send!` or `join!` carrying it copies a pointer rather than the value. |
 | `wire_encode` | `value → string` | The value, forced all the way down, in `std.wire`'s format, byte for byte what `std.wire`'s Dream writer produces, and thousands of times faster: `std.wire.encode` is this. A map is written in the order `compare` puts its keys; what is not data is written as its `to_string`. |
 | `wire_decode` | `string → [:ok, value] \| [:error, string]` | One `std.wire` message, read whole. Never raises. Trailing bytes, a truncated field, an integer past 63 bits and an atom this program does not have are all `[:error, why]` -- an atom is looked up, never made. `std.wire.decode` is this. |
+| `regex_run` | `code:string → subject:string → from:integer → mode:integer → value` | Run a pattern `std.regex` compiled (`Regex.code`) over a string: mode 0 answers whether it matches, 1 the first match at or after `from` as an array of capture offsets (unit for none), 2 every match as a list of those, 3 how many there are, 4 the match starting exactly at `from`. A lazy DFA and a Pike VM, linear in the text; engines are cached per worker. `std.regex` is the interface; dream/src/regex.cpp is the design. |
 | `share_arenas` | `[funcs, parts, invented_from, filled, edges, runs, part_base] → [nodes, kids, funcs]` | The compiler's `opt.optimize_parts`: a program's parts, each an arena already shared within itself, hash-consed into one -- constants renamed through each part's pools, functions and invented globals moved past the parts before, a settled `comp` placeholder read from part 0. Step for step the walk `opt.optimize_parts_by_hand` writes in Dream, which `opt`'s tests hold it to; the opcode tables are the compiler's, handed in. |
 | `node_section` | `[nodes, op_codes] → string` | An image's NODE section: each node `[op, flags, a, b, c]` as `u8 opcode, u8 flags, u16 0` and three indices, `:none` as all ones, the opcode from the compiler's table. The bytes `emit.node_bytes` writes, which `emit`'s tests hold it to. |
 | `index_section` | `list → string` | An image's KIDS section: each index as a little-endian `u32`, `:none` as all ones. The bytes `emit.index` writes. |
@@ -691,6 +719,9 @@ argument.
 | `open_image!` | `string → integer` | Load an image and **keep** it, answering a handle that names it. |
 | `call_image!` | `integer → string → string → list → value` | Call `module.member` in an open image with the arguments in the list, and answer what it produced. |
 | `close_image!` | `integer → bool` | Free an open image. `false` when the handle named none; closing twice is not an error. |
+| `image_function` | `image → string → integer → fn` | A function in another image as a Dream function of that many arguments, named with a `!`; see [images.md](images.md). The image is opened once per runtime, on first use. |
+| `pure_image_function` | same | The same, named without one: for a function with no effects. |
+| `locate_image!` | `image → [:ok, file] \| [:error, why]` | Where an image descriptor is found, or why it is not. |
 
 `eval_image!` is for one image and one question: the image *is* the expression.
 The other three are for one image and many questions — a package's macros,
@@ -737,12 +768,15 @@ let puts! = ffi.function () "puts" [:cstr] :int;
 | `function` | `library → symbol → [arg type] → result type → fn` | A C function as a Dream function of its arguments -- every one that is not `[:out, t]`. Named `symbol!`, so the runtime treats calling it as an effect; bind it to a `!` name. |
 | `pure_function` | same | The same, named `symbol`: for a C function with no effects, which a pure function may call. |
 | `call!` | `fn → [args] → value` | A foreign function applied to a list -- what lets a function and its arguments travel in one message. |
+| `locate!` | `library → [:ok, file] \| [:error, why]` | Open a library and say which file it came from, or what was tried. |
 
 Both constructors are pure and lazy: nothing is loaded until the function is
 made, and a library is opened once per VM. A library is a path, `()` or `""`
-for the running program (the C library on any normal system), or
+for the running program (the C library on any normal system),
 `[:payload, name]` / `[:payload, index]` for one carried in the image by
-`dreams --payload NAME=FILE`.
+`dreams --payload NAME=FILE`, `[:search, name, files, dirs]` for one installed
+on the system (`foreign.system` makes it; [ffi.md](ffi.md#finding-a-library-on-the-system)
+is the search), or `[:any, libraries]` for the first of several that opens.
 
 **Types.** Scalars: `:void` (result only), `:bool`, `:i8`…`:i64`, `:u8`…`:u64`,
 `:f32`, `:f64`, and C's own names, whose widths are the platform's: `:char`,
@@ -1301,6 +1335,7 @@ thing here that imposes one, and it costs a sort every time.
 | `sorted_keys m` | The keys in order, for output that has to be stable. |
 | `put m k v` · `remove m k` | A new map with that key set or gone. |
 | `update default f m k` | Apply `f` to what is there, or to `default`. Counting is `update 0 (fn n -> n + 1)`. |
+| `put_strict k v m` · `update_strict default f k m` | `put` and `update` that force the value before storing it, so it does not hold the frame that computed it -- or the map, when the frame held that. |
 | `put_new m k v` | Add only if absent, so a fold keeps the first. |
 | `map_values f m` · `filter keep m` · `fold f init m` | Over the pairs. `fold` sees `acc k v`. |
 | `without m other` | Every key of `m` that `other` does not have. |
@@ -1360,6 +1395,7 @@ match error.kind e {
 | `new k p` | An error as a value, without raising it — how a pure function *returns* a typed failure. |
 | `raise_as! k p` | Raise one of a named kind. The typed form of `raise!`, which otherwise wraps everything in `:error`. |
 | `rethrow! e` | Re-raise unchanged, which is what keeps the original kind readable. |
+| `trace! e` · `trace_lines! e` | Where it was first raised: the functions running, innermost first, and the ones that made each value being forced -- in a lazy program usually the line that matters, since a value fails where it is needed and not where it was written. The lines are what an uncaught error is printed with, and what `std.test` prints under a case that failed. A place is a function's, not a line within it. |
 
 ### `std.proc`
 
@@ -1519,8 +1555,10 @@ run of equal SQL once for `exec_many!`. Use `RETURNING` for generated keys;
 PostgreSQL outcomes have `:last_id` set to `()`. See [pg](../mind/std/sql/pg/README.md).
 
 `std.sql.sqlite` is the SQLite driver. It binds the system's
-libsqlite3 through `std.foreign`, and the library is found the way the platform's
-loader finds one (on Nix, `nix-shell` puts it on `LD_LIBRARY_PATH`).
+libsqlite3 through `std.foreign` as `from system "sqlite3" "0"`, which searches
+the loader's path and the directories package managers use; where it is
+somewhere else, `$DREAM_LIB_SQLITE3` names the file and `$DREAM_LIBRARY_PATH`
+adds a directory.
 `sqlite.open! path`, `sqlite.memory! ()`, and `sqlite.open_with! path
 %{ :readonly, :busy_timeout, :foreign_keys, :place }`, where `:place` may be a
 `foreign.start!` server to own the database. `sqlite.available! ()` says

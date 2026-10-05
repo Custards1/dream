@@ -48,7 +48,9 @@
 // **Callbacks** run Dream while C is on the stack, so they have rules of their
 // own; see `Callback` below.
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -63,12 +65,16 @@
 #include "bigint.hpp"
 #include "builtins.hpp"
 #include "interp.hpp"
+#include "os.hpp"
 #include "process.hpp"
 #include "runtime.hpp"
 
 #include "windows.hpp"
 #ifndef _WIN32
 #include <dlfcn.h>
+#ifdef __linux__
+#include <link.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 #ifdef __linux__
@@ -323,6 +329,7 @@ ffi_type* ffi_type_for(Kind k) {
 
 struct Library {
     std::string label;  // for messages
+    std::string where;  // the file it came from, as well as that is known
     void* handle = nullptr;
 };
 
@@ -441,20 +448,218 @@ void* dl_open_bytes(const char* data, uint64_t len, const std::string& name, std
     return h;
 }
 
-/// The library a descriptor names, opened once per VM.
-///
-///   `()` or `""`             this program: the VM and everything linked into
-///                            it, which is the C library on any normal system
-///   `"libm.so.6"`            a shared library, found the way the platform's
-///                            loader finds one
-///   `[:payload, "name"]`     a library carried in this image's payload, by the
-///   `[:payload, 0]`          name `--payload NAME=FILE` gave it or by index
-Library* library_of(Process& p, Value desc, Err* e) {
-    Value v;
-    if (!force(p, desc, &v, e)) return nullptr;
+const char* const DESCRIPTORS =
+    "a library is a path, `()` for this program, `[:payload, name]`, `[:search, name, files, dirs]` "
+    "or `[:any, libraries]`";
+
+// ---------------------------------------------------------------------------
+// Finding a library
+// ---------------------------------------------------------------------------
+//
+// A path handed to the platform's loader is how a library used to be named,
+// and it is the wrong question for a library installed on the system: the
+// file is `libsqlite3.so.0` on one machine, `libsqlite3.so` on another that
+// only has the development package, `libsqlite3.0.dylib` under Homebrew's
+// prefix -- which macOS's loader never searches -- and on NixOS in no
+// directory any loader knows about. A program that guessed one name failed on
+// the others with a message that said nothing about where it had looked.
+//
+// So a library may be a *search*, `[:search, name, files, dirs]`: the names
+// its file goes by on this platform, best first, and the directories worth
+// trying when the loader does not know it. Both are worked out in Dream
+// (`foreign.system`), where the knowledge about platforms can be read and
+// tested; what is done here is the looking, because looking is an effect and
+// a library descriptor is a value. The order:
+//
+//   1. `$DREAM_LIB_<NAME>`, the file itself. A person who says exactly which
+//      file is obeyed exactly: if it cannot be opened that is the error, and
+//      nothing else is tried behind their back.
+//   2. every directory of `$DREAM_LIBRARY_PATH`, then each installation
+//      directory's `lib` -- what someone set up on purpose.
+//   3. the platform's loader, by each name: rpath, `ld.so.cache`,
+//      `LD_LIBRARY_PATH` and the rest of what the system already knows.
+//   4. the directories the search names, in order.
+//
+// A name may end in a version wildcard, `libsqlite3.so.*`, which in a
+// directory means the highest version there. The loader cannot be asked that,
+// so it is only tried with the names that are spelled out.
+//
+// When nothing is found the error says every place that was tried and what
+// to set, because "cannot open libsqlite3.so.0" was the whole of what a person
+// used to get, and it is no help at all to someone whose copy is in
+// /opt/homebrew/lib.
+
+/// `DREAM_LIB_` and the name, upper-cased, anything not a letter or a digit
+/// made `_`: `DREAM_LIB_SQLITE3`, `DREAM_LIB_GTK_4`.
+std::string override_variable(const std::string& name) {
+    std::string out = "DREAM_LIB_";
+    for (char c : name) {
+        out += std::isalnum(static_cast<unsigned char>(c))
+                   ? char(std::toupper(static_cast<unsigned char>(c)))
+                   : '_';
+    }
+    return out;
+}
+
+/// Version strings compared as dotted numbers, so `1.10` is newer than `1.9`.
+bool newer_version(const std::string& a, const std::string& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+        auto part = [](const std::string& s, size_t* at) {
+            uint64_t n = 0;
+            bool any = false;
+            while (*at < s.size() && std::isdigit(static_cast<unsigned char>(s[*at]))) {
+                n = n * 10 + uint64_t(s[*at] - '0');
+                ++*at;
+                any = true;
+            }
+            while (*at < s.size() && !std::isdigit(static_cast<unsigned char>(s[*at]))) ++*at;
+            return any ? n : 0;
+        };
+        uint64_t x = part(a, &i), y = part(b, &j);
+        if (x != y) return x > y;
+    }
+    return false;
+}
+
+/// The files in `dir` that `pattern` -- a name with one `*` in it -- matches,
+/// newest version first.
+std::vector<std::string> matching(const std::string& dir, const std::string& pattern) {
+    std::vector<std::pair<std::string, std::string>> found;  // version, path
+    size_t star = pattern.find('*');
+    std::string before = pattern.substr(0, star), after = pattern.substr(star + 1);
+    std::error_code ec;
+    std::filesystem::directory_iterator it(std::filesystem::path(std::u8string(dir.begin(), dir.end())), ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        auto u8 = it->path().filename().u8string();
+        std::string file(u8.begin(), u8.end());
+        if (file.size() < before.size() + after.size()) continue;
+        if (file.compare(0, before.size(), before) != 0) continue;
+        if (file.compare(file.size() - after.size(), after.size(), after) != 0) continue;
+        std::string version = file.substr(before.size(), file.size() - before.size() - after.size());
+        if (version.empty() || !std::isdigit(static_cast<unsigned char>(version[0]))) continue;
+        found.emplace_back(version, dir + "/" + file);
+    }
+    std::sort(found.begin(), found.end(),
+              [](const auto& a, const auto& b) { return newer_version(a.first, b.first); });
+    std::vector<std::string> out;
+    for (auto& f : found) out.push_back(f.second);
+    return out;
+}
+
+/// Where the loader actually found a library it was given by name. On Linux
+/// the link map says; elsewhere the name is the honest answer.
+std::string loaded_from(void* handle, const std::string& name) {
+#if defined(__linux__)
+    struct link_map* map = nullptr;
+    if (::dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0 && map && map->l_name && *map->l_name) {
+        return map->l_name;
+    }
+#endif
+    (void)handle;
+    return name;
+}
+
+struct Search {
+    std::string name;
+    std::vector<std::string> files;
+    std::vector<std::string> dirs;
+};
+
+/// Run a search: the handle and the file it came from, or the reason nothing
+/// was found, which names every place that was tried.
+void* run_search(const Search& s, std::string* where, std::string* why) {
+    const std::string variable = override_variable(s.name);
+    if (const char* exact = std::getenv(variable.c_str()); exact && *exact) {
+        std::string path = expand_home(exact);
+        void* h = dl_open(path);
+        if (h) {
+            *where = path;
+            return h;
+        }
+        *why = "$" + variable + " names `" + path + "`, which cannot be opened: " + last_dl_error();
+        return nullptr;
+    }
+
+    std::vector<std::string> failures;  // found, but would not open
+    std::vector<std::string> looked;    // directories with nothing in them
+    auto in_dir = [&](const std::string& dir) -> void* {
+        for (const std::string& file : s.files) {
+            std::vector<std::string> paths;
+            if (file.find('*') != std::string::npos) {
+                paths = matching(dir, file);
+            } else if (is_file(dir + "/" + file)) {
+                paths.push_back(dir + "/" + file);
+            }
+            for (const std::string& path : paths) {
+                if (void* h = dl_open(path)) {
+                    *where = path;
+                    return h;
+                }
+                failures.push_back(path + ": " + last_dl_error());
+            }
+        }
+        looked.push_back(dir);
+        return nullptr;
+    };
+
+    std::vector<std::string> chosen;
+    if (const char* extra = std::getenv("DREAM_LIBRARY_PATH")) {
+        for (const std::string& d : split_dir_list(extra)) chosen.push_back(d);
+    }
+    for (const std::string& d : install_dirs()) chosen.push_back(d + "/lib");
+    for (const std::string& dir : chosen) {
+        if (void* h = in_dir(dir)) return h;
+    }
+
+    std::string loader_said;
+    for (const std::string& file : s.files) {
+        if (file.find('*') != std::string::npos) continue;
+        if (void* h = dl_open(file)) {
+            *where = loaded_from(h, file);
+            return h;
+        }
+        if (loader_said.empty()) loader_said = last_dl_error();
+    }
+
+    for (const std::string& d : s.dirs) {
+        if (void* h = in_dir(expand_home(d))) return h;
+    }
+
+    std::string names;
+    for (const std::string& f : s.files) names += (names.empty() ? "" : ", ") + f;
+    std::string text = "cannot find the C library `" + s.name + "` (as " + names + ")";
+    text += "\n  the system's loader: " + (loader_said.empty() ? std::string("not asked") : loader_said);
+    if (!looked.empty()) {
+        std::string dirs;
+        for (const std::string& d : looked) dirs += (dirs.empty() ? "" : ", ") + d;
+        text += "\n  nothing in: " + dirs;
+    }
+    for (const std::string& f : failures) text += "\n  found but could not open " + f;
+    text += "\nSet $" + variable + " to the library's file, or add its directory to $DREAM_LIBRARY_PATH.";
+    *why = text;
+    return nullptr;
+}
+
+/// A list of strings, forced, or false with `what` said.
+bool string_items(Process& p, Value v, std::vector<std::string>* out, Err* e, const char* what) {
+    std::vector<Value> items;
+    if (!list_items(p, v, &items, e, what)) return false;
+    for (Value item : items) {
+        std::string s;
+        if (!str_value(item, &s)) return say(e, std::string(what) + " must be a list of strings");
+        out->push_back(std::move(s));
+    }
+    return true;
+}
+
+/// Open what one descriptor names, or the cached library it already opened.
+Library* open_library(Process& p, Value v, Err* e) {
     std::string key, label, path;
     const char* bytes = nullptr;
     uint64_t length = 0;
+    Search search;
+    bool searching = false;
     if (is_unit(v)) {
         key = "self:";
         label = "<this program>";
@@ -465,40 +670,55 @@ Library* library_of(Process& p, Value desc, Err* e) {
     } else if (is_obj(v, ObjType::Cons)) {
         std::vector<Value> items;
         if (!list_items(p, v, &items, e, "a library")) return nullptr;
-        if (items.size() != 2 || !is_atom(items[0]) || atom_text(p, items[0]) != "payload") {
-            say(e, "a library is a path, `()` for this program, or `[:payload, name]`");
-            return nullptr;
-        }
-        const Image& img = p.runtime().image();
-        int64_t index = -1;
-        std::string name;
-        if (is_fixnum(items[1])) {
-            index = fixnum_value(items[1]);
-            name = std::to_string(index);
-        } else if (str_value(items[1], &name)) {
-            index = img.data_index(name);
-            if (index < 0) {
-                say(e, "this image carries no payload called `" + name +
-                           "`; build it with `--payload " + name + "=FILE`");
+        std::string tag = !items.empty() && is_atom(items[0]) ? atom_text(p, items[0]) : "";
+        if (tag == "search" && items.size() == 4) {
+            if (!str_value(items[1], &search.name)) {
+                say(e, "a library search needs the library's name");
                 return nullptr;
             }
+            if (!string_items(p, items[2], &search.files, e, "a search's file names")) return nullptr;
+            if (!string_items(p, items[3], &search.dirs, e, "a search's directories")) return nullptr;
+            searching = true;
+            key = "search:" + search.name;
+            for (const std::string& f : search.files) key += "\n" + f;
+            key += "\n";
+            for (const std::string& d : search.dirs) key += "\n" + d;
+            label = "the C library `" + search.name + "`";
+        } else if (tag == "payload" && items.size() == 2) {
+            const Image& img = p.runtime().image();
+            int64_t index = -1;
+            std::string name;
+            if (is_fixnum(items[1])) {
+                index = fixnum_value(items[1]);
+                name = std::to_string(index);
+            } else if (str_value(items[1], &name)) {
+                index = img.data_index(name);
+                if (index < 0) {
+                    say(e, "this image carries no payload called `" + name +
+                               "`; build it with `--payload " + name + "=FILE`");
+                    return nullptr;
+                }
+            } else {
+                say(e, "a payload library is named by a string or an index");
+                return nullptr;
+            }
+            if (index < 0 || uint64_t(index) >= img.data_count()) {
+                say(e, "this image carries no payload " + std::to_string(index));
+                return nullptr;
+            }
+            bytes = img.data_bytes(uint32_t(index));
+            length = img.data_length(uint32_t(index));
+            // The address of the bytes, not the index: two images in one VM (an
+            // embedder, a compile-time session) have two payload 0s.
+            key = "payload:" + std::to_string(reinterpret_cast<uintptr_t>(bytes));
+            label = "payload `" + name + "`";
+            path = name;
         } else {
-            say(e, "a payload library is named by a string or an index");
+            say(e, DESCRIPTORS);
             return nullptr;
         }
-        if (index < 0 || uint64_t(index) >= img.data_count()) {
-            say(e, "this image carries no payload " + std::to_string(index));
-            return nullptr;
-        }
-        bytes = img.data_bytes(uint32_t(index));
-        length = img.data_length(uint32_t(index));
-        // The address of the bytes, not the index: two images in one VM (an
-        // embedder, a compile-time session) have two payload 0s.
-        key = "payload:" + std::to_string(reinterpret_cast<uintptr_t>(bytes));
-        label = "payload `" + name + "`";
-        path = name;
     } else {
-        say(e, "a library is a path, `()` for this program, or `[:payload, name]`");
+        say(e, DESCRIPTORS);
         return nullptr;
     }
 
@@ -506,19 +726,70 @@ Library* library_of(Process& p, Value desc, Err* e) {
     std::lock_guard<std::mutex> g(reg.mutex);
     auto it = reg.libs.find(key);
     if (it != reg.libs.end()) return it->second.get();
-    std::string why;
-    void* h = bytes ? dl_open_bytes(bytes, length, path, &why) : dl_open(path);
+    std::string why, where = path;
+    void* h = nullptr;
+    if (searching) {
+        h = run_search(search, &where, &why);
+    } else if (bytes) {
+        h = dl_open_bytes(bytes, length, path, &why);
+    } else {
+        h = dl_open(path);
+        if (h && !path.empty()) where = loaded_from(h, path);
+        if (!h) why = "cannot open " + label + ": " + last_dl_error();
+    }
     if (!h) {
-        if (!bytes) why = last_dl_error();
-        say(e, "cannot open " + label + ": " + why);
+        say(e, bytes ? "cannot open " + label + ": " + why : why);
         return nullptr;
     }
     auto lib = std::make_unique<Library>();
     lib->label = label;
+    lib->where = path.empty() && !searching ? "<this program>" : bytes ? label : where;
     lib->handle = h;
     Library* out = lib.get();
     reg.libs.emplace(key, std::move(lib));
     return out;
+}
+
+/// The library a descriptor names, opened once per VM.
+///
+///   `()` or `""`               this program: the VM and everything linked
+///                              into it, which is the C library on any
+///                              normal system
+///   `"libm.so.6"`              a shared library, found the way the
+///                              platform's loader finds one
+///   `[:payload, "name"]`       a library carried in this image's payload, by
+///   `[:payload, 0]`            the name `--payload NAME=FILE` gave it or by
+///                              index
+///   `[:search, n, files, dirs]`  a library installed on the system; see
+///                              "Finding a library" above
+///   `[:any, [lib, ..]]`        the first of these that opens, so a program
+///                              can carry its own copy and prefer the
+///                              system's, or the other way round
+Library* library_of(Process& p, Value desc, Err* e) {
+    Value v;
+    if (!force(p, desc, &v, e)) return nullptr;
+    if (is_obj(v, ObjType::Cons)) {
+        std::vector<Value> items;
+        if (!list_items(p, v, &items, e, "a library")) return nullptr;
+        if (items.size() == 2 && is_atom(items[0]) && atom_text(p, items[0]) == "any") {
+            std::vector<Value> choices;
+            if (!list_items(p, items[1], &choices, e, "`any`'s libraries")) return nullptr;
+            std::string why;
+            for (Value choice : choices) {
+                Err one;
+                if (Library* lib = library_of(p, choice, &one)) return lib;
+                if (one.raised) {
+                    *e = one;
+                    return nullptr;
+                }
+                why += "\n" + one.text;
+            }
+            say(e, choices.empty() ? std::string("`any` was given no libraries to choose from")
+                                   : "none of the libraries could be opened:" + why);
+            return nullptr;
+        }
+    }
+    return open_library(p, v, e);
 }
 
 /// A destructor, looked up in the library first and then in the process: a
@@ -1216,6 +1487,22 @@ NativeResult ffi_function(Process& p, Value callee, Value* args, uint32_t) {
     return bind_in(p, lib, args[1], args[2], args[3], pure);
 }
 
+/// `locate! lib`: where a library is, by opening it -- `[:ok, file]`, or
+/// `[:error, why]` with the same account of what was tried that a binding
+/// would raise. Opening is the only honest answer: a file that is there but
+/// built for another machine is not a library this program can use.
+NativeResult ffi_locate(Process& p, Value, Value* args, uint32_t) {
+    Err e;
+    Library* lib = library_of(p, args[0], &e);
+    if (!lib && e.raised) return NativeResult::raise(e.value);
+    Value tag = make_atom(p.runtime().intern_atom(lib ? "ok" : "error"));
+    std::string said = lib ? lib->where : e.text;
+    Value text = p.heap().make_string(said.data(), uint32_t(said.size()));
+    Pin kept(p, text);
+    Value rest = p.heap().make_cons(kept.get(), NIL);
+    return NativeResult::ok(p.heap().make_cons(tag, rest));
+}
+
 /// `call! f args`: a foreign function applied to a list. What a library server
 /// does with a request, and what lets a function value and its arguments
 /// travel in one message.
@@ -1508,6 +1795,7 @@ ModuleDef make_ffi_module() {
                          {"function", 4, 0b0010, ffi_function, 0},
                          {"pure_function", 4, 0b0010, ffi_function, 1},
                          {"call!", 2, 0b01, ffi_call},
+                         {"locate!", 1, 0b0, ffi_locate},
                          {"release!", 1, 0b0, ffi_release},
                          {"alive!", 1, 0b0, ffi_alive},
                          {"owned!", 1, 0b0, ffi_owned},

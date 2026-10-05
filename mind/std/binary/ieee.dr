@@ -1,0 +1,63 @@
+// Implementation support for binary16/32. Conversion is performed on the
+// binary64 representation, with integer rounding, so subnormals, signed zero,
+// ties and overflow do not depend on logarithms or host floating rounding.
+import std.num;
+import std.str;
+import std.result;
+
+priv let raw64 value = {
+    let data = num.float_bytes value;
+    let rec go !i !acc = if i < 0 { acc } else { go (i - 1) ((acc << 8) | str.byte i data) };
+    go 7 0
+};
+
+priv let round_shift n shift = if shift <= 0 { n << (-shift) } else {
+    let q = n >> shift;
+    let remainder = n & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    q + if remainder > half || (remainder == half && q & 1 == 1) { 1 } else { 0 }
+};
+
+/// Internal: eb/fb are (5,10) or (8,23).
+let to_bits eb fb value =
+    if type_of value != :float && type_of value != :integer { result.error "expected a number" }
+    else {
+        let raw = raw64 value;
+        let sign = (raw >> 63) << (eb + fb);
+        let exponent = (raw >> 52) & 2047;
+        let fraction = raw & ((1 << 52) - 1);
+        let bias = (1 << (eb - 1)) - 1;
+        let max_exp = (1 << eb) - 1;
+        let e = exponent - 1023 + bias;
+        let sig = fraction | (1 << 52);
+        let magnitude =
+            if exponent == 2047 { (max_exp << fb) | (if fraction == 0 { 0 } else { 1 << (fb - 1) }) }
+            else if exponent == 0 { 0 }
+            else if e <= 0 { round_shift sig (53 - fb - e) }
+            else if e >= max_exp { max_exp << fb }
+            else {
+                let rounded = round_shift sig (52 - fb);
+                // A carry from the significand advances the exponent.
+                if rounded == (1 << (fb + 1)) { (e + 1) << fb }
+                else { (e << fb) | (rounded & ((1 << fb) - 1)) }
+            };
+        result.ok (sign | magnitude)
+    };
+
+let from_bits eb fb raw = {
+    let sign = (raw >> (eb + fb)) << 63;
+    let exponent = (raw >> fb) & ((1 << eb) - 1);
+    let fraction = raw & ((1 << fb) - 1);
+    let bias = (1 << (eb - 1)) - 1;
+    let magnitude =
+        if exponent == (1 << eb) - 1 { (2047 << 52) | (fraction << (52 - fb)) }
+        else if exponent != 0 { ((exponent - bias + 1023) << 52) | (fraction << (52 - fb)) }
+        else if fraction == 0 { 0 }
+        else {
+            let rec normalize !n !e = if n & (1 << fb) != 0 {
+                ((e + 1023) << 52) | ((n & ((1 << fb) - 1)) << (52 - fb))
+            } else { normalize (n << 1) (e - 1) };
+            normalize fraction (1 - bias)
+        };
+    num.float_of_bytes (str.of_int_le 8 (sign | magnitude))
+};

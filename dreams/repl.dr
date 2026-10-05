@@ -208,7 +208,7 @@ let is_command text = str.starts_with ":" (str.trim text);
 /// the text rather than importing the file, because a REPL wants what is *in*
 /// the file at the top level, and an import would only bring the module in
 /// under a name.
-let command_argument text = str.trim (str.slice (str.find " " text) 
+let command_argument text = str.trim (str.slice (str.find " " text)
                                                 (str.byte_length text - str.find " " text)
                                                 text);
 

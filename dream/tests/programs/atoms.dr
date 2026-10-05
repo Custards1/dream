@@ -15,7 +15,6 @@
 // answers must not move when they are.
 import std.console;
 
-
 let show! label v = console.print! (label + to_string v);
 
 /// The names this program writes as atoms. Printed rather than merely

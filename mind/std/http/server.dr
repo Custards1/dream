@@ -1,0 +1,865 @@
+// An HTTP/1.1 server: a handler from `Request` to `Response`, served.
+//
+//     import std.http;
+//     import std.http.server;
+//
+//     let show_user req = match lookup (http.param "id" req) {
+//         () => http.not_found,
+//         user => http.json user,
+//     };
+//
+//     let main! = {
+//         let app = server.router
+//             |> server.get "/" (fn req -> http.html "<h1>hello</h1>")
+//             |> server.get "/users/:id" show_user
+//             |> server.post "/users" create_user!
+//             |> server.get "/static/*path" (server.files! "public");
+//         let s = server.serve! 8080 (server.logged! (log.named "http" log.new) app);
+//         ..
+//     };
+//
+// **A handler is a function**, from a request to a response, and that is
+// all the server needs. A router is a value that becomes one (`handler`), and
+// middleware is a function that takes a handler and answers another, so they
+// stack with `|>`. A handler may be pure -- most are -- or impure, named with a
+// `!` and handed over by name; build a table of impure handlers in the
+// impure function that starts the server, since a pure value cannot hold one.
+// A handler can also answer a string (sent as text) or `()` (204).
+//
+// **One process per connection.** A connection is read, a request at a time,
+// in a process of its own, so a slow client or a slow handler holds up nobody
+// else, and a handler that raises fails only its own request: the client gets
+// a 500, the error goes to the logger if there is one, and the connection
+// carries on. Connections are kept alive as HTTP/1.1 says, and closed after
+// `idle` with nothing arriving -- a watchdog per connection closes the socket
+// from outside, which is also what stops a client that sends its headers one
+// byte a minute. Bodies past `max_body` are refused with a 413 before they are
+// read.
+//
+// **HTTPS** is `options.https`: a PKCS#12 identity, as `std.tls` takes one.
+// A client that asks for HTTP/2 in the handshake gets it, as does one that
+// opens with HTTP/2's preface in clear text (`std.http.h2`); its requests
+// reach the same handler as everyone else's, each in a process of its own.
+//
+// **Bodies can be streams**, both ways. A response whose `stream` is a lazy
+// list or a pull function is sent chunked as it is made -- `http.stream`,
+// and `http.event_stream` for server-sent events -- and with `stream_bodies`
+// a request's body is handed to its handler a piece at a time as it pulls.
+// A handler can also take a connection over entirely with a 101 and an
+// `upgrade`, which is how `std.http.websocket` serves WebSockets.
+
+import std.crypto;
+import std.error;
+import std.file;
+import std.io;
+import std.list;
+import std.log;
+import std.map;
+import std.net;
+import std.proc;
+import std.str;
+import std.streams;
+import std.time;
+import std.tls;
+import std.http;
+import std.http.h2;
+import std.http.url;
+
+// --- serving -------------------------------------------------------------------------
+
+/// How to serve: the port (0 to have the system choose), the largest body and
+/// headers accepted, how long a connection may go without progress (a
+/// handler that has not answered counts), a TLS identity
+/// (`%{ :identity => pkcs12_bytes, :password => ".." }`) for HTTPS, a
+/// `log.Logger` for errors (and nothing else -- `logged!` is the access log),
+/// the `Server` header, and whether request bodies reach the handler as a
+/// stream (`stream_bodies`): then a request's `body` is empty and its
+/// `stream` hands the body over a piece at a time as the handler pulls it
+/// (`http.pull!`, `http.body_text!`), so an upload of any size is read as it
+/// arrives, and `max_body` still bounds it. `http2` lets a client speak
+/// HTTP/2: over TLS when it asks for `h2`, and in clear text when it opens
+/// with HTTP/2's preface ("prior knowledge"). Bodies over HTTP/2 arrive whole.
+mapping Options {
+    port : :integer = 8080
+    max_body : :integer = 10485760
+    max_header : :integer = 65536
+    idle : :integer = 30000000000
+    https : :any = ()
+    logger : :any = ()
+    name : :string = "dream"
+    stream_bodies : :bool = false
+    http2 : :bool = true
+}
+
+/// A running server: its listening socket, the port it is on, and the
+/// process accepting connections.
+mapping Server {
+    !listener : :any
+    !port : :integer
+    !acceptor : :any
+}
+
+let defaults : :map;
+let defaults = Options.new ();
+
+/// Serve `app` -- a handler or a router -- on `port`, in the background.
+let serve! : :integer -> :any -> :map;
+let serve! port app = serve_with! (Options.set_port port defaults) app;
+
+let serve_with! : :map -> :any -> :map;
+let serve_with! options app = {
+    let listener = net.listen! (Options.port options);
+    let handle = handler app;
+    let acceptor = spawn! $( accept_loop! listener handle options );
+    Server.make listener (net.port! listener) acceptor
+};
+
+/// The port a server is listening on: the one asked for, or the one the
+/// system chose for 0.
+let port : :map -> :integer;
+let port s = Server.port s;
+
+/// `http://127.0.0.1:PORT`, for a client in the same program -- a test.
+let local_url : :map -> :string;
+let local_url s = "http://127.0.0.1:" + to_string (Server.port s);
+
+/// Stop accepting connections. Ones already open finish what they are doing.
+let stop! : :map -> :unit;
+let stop! s = { try! { io.close! (Server.listener s) } catch e { () }; () };
+
+/// Serve in the foreground: what a program whose whole job is the server
+/// ends its `main!` with. Answers only if the listener is closed.
+let run! : :integer -> :any -> :any;
+let run! port app = { let s = serve! port app; join! (Server.acceptor s) };
+
+priv let accept_loop! : :any -> :any -> :map -> :atom;
+priv let rec accept_loop! listener handle options =
+    match try! { let sock = net.accept! listener; [:ok, sock] } catch e { [:error, e] } {
+        [:ok, sock] => {
+            spawn! $( connection! sock handle options )
+            accept_loop! listener handle options
+        },
+        // `stop!` closes the listener under the parked accept, which is how
+        // this loop learns it is over.
+        [:error, _] => :stopped,
+    };
+
+priv let connection! : :any -> :any -> :map -> :unit;
+priv let connection! sock handle options = {
+    let peer = try! { net.peer! sock } catch e { "" };
+    let me = self! ();
+    let watchdog = spawn! $( watch! sock (Options.idle options) me );
+    let secured = match Options.https options {
+        () => true,
+        tls_opts => {
+            let offered = if Options.http2 options && not (map.has :alpn tls_opts) { tls_opts.[:alpn => ["h2", "http/1.1"]] } else { tls_opts };
+            try! { tls.accept! sock offered; true } catch e { false }
+        },
+    };
+    let agreed_h2 = secured && Options.https options != () && match try! { tls.info! sock } catch e { () } {
+        () => false,
+        info => info.[:alpn else ()] == "h2",
+    };
+    if agreed_h2 {
+        // HTTP/2 by ALPN: the client's preface comes first.
+        match try! { let got = http.read_exact! (http.reader sock) 24; strict! got; [:ok, got] } catch e { [:error, e] } {
+            [:ok, [p, r]] => if p == h2.preface { serve_h2! sock r handle options peer watchdog },
+            _ => (),
+        }
+    } else if secured { requests! sock (http.reader sock) handle options peer watchdog }
+    send! watchdog :done
+    try! { io.close! sock } catch e { () }
+    ()
+};
+
+/// End the connection when it has made no progress for `idle`: close the
+/// socket and stop the process serving it. The connection says `:active`
+/// after reading each request and `:done` when it is finished, so what this
+/// catches is a client that has gone quiet and a handler that has not
+/// answered -- a request must be answered within `idle` too.
+priv let watch! : :any -> :integer -> :process -> :unit;
+priv let rec watch! sock idle conn = match proc.recv_within! (time.to_milliseconds idle) {
+    [:ok, :active] => watch! sock idle conn,
+    [:ok, _] => (),
+    _ => {
+        try! { io.close! sock } catch e { () }
+        proc.kill! conn :idle
+        ()
+    },
+};
+
+priv let requests! : :any -> :any -> :any -> :map -> :string -> :any -> :unit;
+priv let rec requests! sock r handle options peer watchdog =
+    // Forced inside the `try!`: a request is built lazily, and a malformed
+    // one must fail here, where it can be answered with a 400, rather than
+    // in the handler, where it would be a 500.
+    match try! { let got = read_request! sock r options peer; strict! got; [:ok, got] } catch e { [:error, e] } {
+        [:ok, ()] => (),
+        [:ok, [:h2, r2]] => serve_h2! sock r2 handle options peer watchdog,
+        [:ok, [req, r2, body_proc]] => {
+            send! watchdog :active
+            let resp = finish! (answer! handle req options) req options;
+            let keep = keep_alive req resp;
+            let head = http.Request.method req == "HEAD";
+            let sent = try! { send_response! sock req resp keep head watchdog; true } catch e { false };
+            // A protocol switch hands the connection over for good: the
+            // watchdog stands down, since a WebSocket may rightly be quiet for
+            // hours, and whatever it was switched to runs until it is done.
+            match http.Response.upgrade resp {
+                () => (),
+                take_over => if sent && http.Response.status resp == 101 {
+                    send! watchdog :done
+                    try! { take_over sock r2; () } catch e { () }
+                },
+            }
+            // A streamed request body must be read to its end before the next
+            // request can be: its process drains what the handler left and
+            // hands back the reader.
+            let after = match body_proc {
+                () => r2,
+                b => { send! b [:finish, self! ()]; receive! { [:body_reader, r3] => r3, [:body_failed] => (), after 30000 => () } },
+            };
+            if sent && keep && after != () && http.Response.upgrade resp == ()
+               && (http.Response.stream resp == () || http.Request.version req != "HTTP/1.0") {
+                requests! sock after handle options peer watchdog
+            }
+        },
+        [:error, e] => {
+            // A malformed or oversized request gets an answer before the
+            // connection closes; one that died mid-read (the client went, or
+            // the watchdog closed it) does not, there being nobody to tell.
+            let code = match error.kind e { :too_large => 413, :bad_message => 400, _ => 0 };
+            if code > 0 {
+                let resp = finish! (http.status_only code) (http.Request.new ()) options |> http.with_header "connection" "close";
+                try! { streams.write_all! sock (http.encode_response resp false); () } catch e2 { () }
+            }
+        },
+    };
+
+/// HTTP/2 on this connection, answering each request as an HTTP/1.1 one would
+/// be: the same handler, the same 500 for a raise, the same headers added.
+priv let serve_h2! : :any -> :any -> :any -> :map -> :string -> :any -> :unit;
+priv let serve_h2! sock r handle options peer watchdog =
+    h2.serve! sock r (respond_h2! handle options peer) (Options.max_body options) (still_going! watchdog);
+
+priv let respond_h2! : :any -> :map -> :string -> :map -> :map;
+priv let respond_h2! handle options peer req = {
+    let with_peer = http.Request.set_peer peer req;
+    finish! (answer! handle with_peer options) with_peer options
+};
+
+/// Write a response: whole, with its length, or as its stream comes, chunked
+/// (or, to an HTTP/1.0 client, until the connection closes). Each piece of a
+/// stream tells the watchdog the connection is still making progress, so an
+/// event stream can run as long as it has things to say.
+priv let send_response! : :any -> :map -> :map -> :bool -> :bool -> :any -> :unit;
+priv let send_response! sock req resp keep head watchdog = {
+    let resp2 = if keep { resp } else { http.with_header "connection" "close" resp };
+    match http.Response.stream resp2 {
+        () => { streams.write_all! sock (http.encode_response resp2 head); () },
+        s => {
+            let chunked = http.Request.version req != "HTTP/1.0";
+            streams.write_all! sock (http.encode_stream_head resp2 chunked)
+            if not head { http.write_stream! sock s chunked (still_going! watchdog) }
+        },
+    }
+};
+
+priv let still_going! : :any -> :unit -> :unit;
+priv let still_going! watchdog u = { send! watchdog :active; () };
+
+/// The next request, or `()` when the client closed the connection between
+/// requests: `[request, reader, body process or ()]`.
+priv let read_request! : :any -> :any -> :map -> :string -> :any;
+priv let read_request! sock r options peer = match http.read_head! r (Options.max_header options) {
+    () => (),
+    // HTTP/2 with prior knowledge: its preface reads as a request line
+    // `PRI * HTTP/2.0` and an empty header block, and then `SM` and a blank line.
+    [start, _, r2] if start == "PRI * HTTP/2.0" && Options.http2 options => {
+        let [tail, r3] = http.read_exact! r2 6;
+        if tail != "SM\r\n\r\n" { raise! (error.new :bad_message "not HTTP/2's preface") }
+        [:h2, r3]
+    },
+    [start, headers, r2] => {
+        let [method, target, version] = match str.split " " start {
+            [m, t, v] if str.starts_with "HTTP/1." v => [m, t, v],
+            _ => raise! (error.new :bad_message ("not a request line: " + start)),
+        };
+        let msg = %{ :headers => headers };
+        // A client that asked to be told before it sends a large body is told.
+        if str.lower (http.header "expect" msg |> or_empty) == "100-continue" {
+            streams.write_all! sock "HTTP/1.1 100 Continue\r\n\r\n"
+        }
+        let [path, query] = split_target target;
+        let base = http.Request.new ()
+            |> http.Request.set_method method |> http.Request.set_url target |> http.Request.set_path path
+            |> http.Request.set_query query |> http.Request.set_headers headers
+            |> http.Request.set_version version |> http.Request.set_peer peer;
+        let state = http.body_state! headers false;
+        match state { [:exact, n] if n > Options.max_body options => raise! (error.new :too_large "a body larger than the limit"), _ => () }
+        if Options.stream_bodies options && state != [:exact, 0] {
+            let me = self! ();
+            let b = spawn! $( body_server! r2 state (Options.max_body options) me );
+            [http.Request.set_stream (body_pull! b) base, r2, b]
+        } else {
+            let [body, r3] = http.read_body! r2 headers false (Options.max_body options);
+            [http.Request.set_body body base, r3, ()]
+        }
+    },
+};
+
+/// The process that owns a streamed request body: it reads a piece when the
+/// handler asks for one, and when the handler is done reads whatever it did
+/// not, so the connection is ready for the next request.
+priv let body_server! : :any -> :any -> :integer -> :process -> :unit;
+priv let rec body_server! r state left owner = receive! {
+    [:next, from] => match try! { let got = http.next_piece! r state; strict! got; [:ok, got] } catch e { [:error, e] } {
+        [:ok, [(), st2, r2]] => { send! from [:body_piece, ()]; body_server! r2 st2 left owner },
+        [:ok, [piece, st2, r2]] => if len piece > left {
+            send! from [:body_error, error.new :too_large "a body larger than the limit"]
+            body_server! r2 [:done] 0 owner
+        } else { send! from [:body_piece, piece]; body_server! r2 st2 (left - len piece) owner },
+        [:error, e] => { send! from [:body_error, e]; body_server! r [:done] 0 owner },
+    },
+    [:finish, from] => match try! { let got = http.fold_body! r state left () (fn acc piece -> acc); strict! got; [:ok, got] } catch e { [:error, e] } {
+        [:ok, [_, r2]] => { send! from [:body_reader, r2]; () },
+        [:error, _] => { send! from [:body_failed]; () },
+    },
+};
+
+/// The next piece of a streamed request body, from its process.
+priv let body_pull! : :process -> :unit -> :any;
+priv let body_pull! b u = {
+    send! b [:next, self! ()]
+    receive! {
+        [:body_piece, piece] => piece,
+        [:body_error, e] => raise! e,
+    }
+};
+
+priv let or_empty : (:string | :unit) -> :string;
+priv let or_empty v = match v { () => "", t => t };
+
+/// `/a/b?x=1` as `["/a/b", %{ "x" => "1" }]`. An absolute URL, which a
+/// client talking to a proxy sends, is read the same way.
+priv let split_target : :string -> [:string, :map];
+priv let split_target target = {
+    let local = if str.starts_with "/" target || target == "*" { target }
+                else { match url.parse target { [:ok, u] => url.target u, _ => target } };
+    let q = str.upto "?" 0 local;
+    let path = str.slice 0 q local;
+    let query = if q < len local { url.query_map (url.Url.new () |> url.Url.set_query (str.slice (q + 1) (len local) local)) } else { %{} };
+    [path, query]
+};
+
+/// The handler's answer, as a response: a raise becomes a 500 (and goes to
+/// the logger), a string a text response, `()` a 204.
+priv let answer! : :any -> :map -> :map -> :map;
+priv let answer! handle req options = try! {
+    let out = handle req;
+    strict! out
+    match type_of out {
+        :map => if map.has :status out { out } else { http.json out },
+        :string => http.text out,
+        :unit => http.no_content,
+        _ => http.text (to_string out),
+    }
+} catch e {
+    match Options.logger options {
+        () => (),
+        lg => log.at! lg :error "handler raised" %{ :method => http.Request.method req, :path => http.Request.path req,
+                                                    :error => e },
+    }
+    http.status_only 500
+};
+
+/// The headers every response gets unless the handler set them.
+priv let finish! : :map -> :map -> :map -> :map;
+priv let finish! resp req options = {
+    let with_date = if http.header "date" resp == () { http.with_header "date" (time.http_date (time.now! ())) resp } else { resp };
+    if http.header "server" with_date == () { http.with_header "server" (Options.name options) with_date } else { with_date }
+};
+
+/// Whether the connection stays open after this exchange.
+priv let keep_alive : :map -> :map -> :bool;
+priv let keep_alive req resp = {
+    let asked = str.lower (or_empty (http.header "connection" req));
+    let answered = str.lower (or_empty (http.header "connection" resp));
+    if str.contains_str "close" answered || str.contains_str "close" asked { false }
+    else if http.Request.version req == "HTTP/1.0" { str.contains_str "keep-alive" asked }
+    else { true }
+};
+
+// --- routing ----------------------------------------------------------------------------
+
+/// A table of routes, tried in order: each a method (or `"*"`), a pattern's
+/// segments, and a handler; and what answers when none matches.
+mapping Router {
+    routes : [:any] = []
+    fallback : :any = ()
+}
+
+/// An empty router.
+let router : :map;
+let router = Router.new ();
+
+/// A route. In a pattern, `:name` matches one segment and `*name` the rest of
+/// the path; both are decoded and put in the request's `params`, where
+/// `http.param` reads them. A trailing `/` does not matter.
+let route : :string -> :string -> :any -> :map -> :map;
+let route method pattern handle r = Router.set_routes (Router.routes r + [[str.upper method, segments pattern, handle]]) r;
+
+let get : :string -> :any -> :map -> :map;
+let get pattern handle r = route "GET" pattern handle r;
+let post : :string -> :any -> :map -> :map;
+let post pattern handle r = route "POST" pattern handle r;
+let put : :string -> :any -> :map -> :map;
+let put pattern handle r = route "PUT" pattern handle r;
+let patch : :string -> :any -> :map -> :map;
+let patch pattern handle r = route "PATCH" pattern handle r;
+let delete : :string -> :any -> :map -> :map;
+let delete pattern handle r = route "DELETE" pattern handle r;
+/// A route for every method.
+let any : :string -> :any -> :map -> :map;
+let any pattern handle r = route "*" pattern handle r;
+
+/// What answers a request no route matches; a 404 otherwise.
+let fallback : :any -> :map -> :map;
+let fallback handle r = Router.set_fallback handle r;
+
+/// Every route of `inner` under a prefix: `mount "/api" api_router`.
+let mount : :string -> :map -> :map -> :map;
+let mount prefix inner r = {
+    let pre = segments prefix;
+    Router.set_routes (Router.routes r + list.map (fn [m, segs, h] -> [m, pre + segs, h]) (Router.routes inner)) r
+};
+
+priv let segments : :string -> [:string];
+priv let segments path = list.filter (fn s -> s != "") (str.split "/" path);
+
+/// A router as a handler; a handler as itself.
+let handler : :any -> :any;
+let handler app = if type_of app == :map && map.has :routes app { dispatch app } else { app };
+
+/// Find the route for a request and run it: 405 with an `Allow` header when
+/// the path matches only routes for other methods, and a HEAD answered by
+/// the GET route when there is no HEAD one.
+let dispatch : :map -> :map -> :any;
+let dispatch r req = {
+    let method = http.Request.method req;
+    let path_segs = list.map url.decode (segments (http.Request.path req));
+    let matching = list.filter (fn route -> match_path (route.[1]) path_segs %{} != ()) (Router.routes r);
+    let for_method m = list.filter (fn route -> route.[0] == m || route.[0] == "*") matching;
+    let chosen = match for_method method {
+        [] => if method == "HEAD" { for_method "GET" } else { [] },
+        found => found,
+    };
+    match chosen {
+        [[_, pattern, handle], .._] => handle (http.Request.set_params (match_path pattern path_segs %{}) req),
+        [] => if matching != [] {
+            http.status_only 405 |> http.with_header "allow" (str.join_str ", " (list.unique (list.map (fn route -> route.[0]) matching)))
+        } else {
+            match Router.fallback r { () => http.not_found, handle => handle req }
+        },
+    }
+};
+
+/// The parameters a pattern binds against a path, or `()` when it does not match.
+priv let match_path : [:string] -> [:string] -> :map -> :any;
+priv let rec match_path pattern path params = match [pattern, path] {
+    [[], []] => params,
+    [[p, ..ps], _] if str.starts_with "*" p => params.[str.slice 1 (len p) p => str.join_str "/" path],
+    [[], _] => (),
+    [_, []] => (),
+    [[p, ..ps], [s, ..ss]] =>
+        if str.starts_with ":" p { match_path ps ss params.[str.slice 1 (len p) p => s] }
+        else if p == s { match_path ps ss params }
+        else { () },
+};
+
+// --- static files ---------------------------------------------------------------------------
+
+/// A handler that serves the files under `dir`: the path is the route's
+/// `*path` parameter when there is one, otherwise the request's path. A
+/// directory serves its `index.html`. Nothing outside `dir` can be named --
+/// a `..` segment is a 404 -- and the content type comes from the extension.
+let files! : :string -> :map -> :map;
+let files! dir req = {
+    let rel = match http.param "path" req { () => list.map url.decode (segments (http.Request.path req)), p => segments p };
+    if list.any (fn s -> s == ".." || s == "." || str.contains '\\' s || str.contains '\u{0}' s) rel { http.not_found }
+    else {
+        let base = dir + "/" + str.join_str "/" rel;
+        let path = if io.is_dir! base { base + "/index.html" } else { base };
+        match file.read! path {
+            () => http.not_found,
+            bytes => http.respond 200 bytes |> http.with_header "content-type" (mime_type path),
+        }
+    }
+};
+
+/// The content type of a file, by its extension.
+let mime_type : :string -> :string;
+let mime_type path = {
+    let dot = last_index "." path;
+    let ext = if dot < 0 { "" } else { str.lower (str.slice (dot + 1) (len path) path) };
+    match ext {
+        "html" => "text/html; charset=utf-8", "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8", "js" => "text/javascript; charset=utf-8", "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json", "txt" => "text/plain; charset=utf-8", "md" => "text/markdown; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8", "xml" => "application/xml", "svg" => "image/svg+xml",
+        "png" => "image/png", "jpg" => "image/jpeg", "jpeg" => "image/jpeg", "gif" => "image/gif", "webp" => "image/webp",
+        "ico" => "image/x-icon", "avif" => "image/avif", "pdf" => "application/pdf", "wasm" => "application/wasm",
+        "woff" => "font/woff", "woff2" => "font/woff2", "ttf" => "font/ttf", "otf" => "font/otf",
+        "mp4" => "video/mp4", "webm" => "video/webm", "mp3" => "audio/mpeg", "ogg" => "audio/ogg", "wav" => "audio/wav",
+        "zip" => "application/zip", "gz" => "application/gzip", "tar" => "application/x-tar",
+        _ => "application/octet-stream",
+    }
+};
+
+priv let last_index : :string -> :string -> :integer;
+priv let last_index needle s = {
+    let rec go from best = { let at = str.find_from from needle s; if at < 0 { best } else { go (at + 1) at } };
+    go 0 (0 - 1)
+};
+
+// --- middleware -------------------------------------------------------------------------------
+//
+// Each takes its configuration and a handler, and is itself a handler once
+// both are given: `app |> server.cors "*" |> server.logged! lg`.
+
+/// An access log: one event per request at `:info` -- method, path, status,
+/// how long it took and who asked -- through `lg`.
+let logged! : :map -> :any -> :map -> :map;
+let logged! lg app req = {
+    let start = time.monotonic! ();
+    let resp = (handler app) req;
+    strict! resp
+    let status = resp.[:status else 200];
+    log.at! lg (if status >= 500 { :error } else if status >= 400 { :warn } else { :info })
+           (http.Request.method req + " " + http.Request.path req)
+           %{ :status => status, :took => time.format_duration (time.monotonic! () - start), :peer => http.Request.peer req }
+    resp
+};
+
+/// CORS: lets pages from `origins` (`"*"`, or a list of origins) call this
+/// server, answering the browser's preflight `OPTIONS` itself.
+let cors : :any -> :any -> :map -> :map;
+let cors origins app req = {
+    let origin = http.header "origin" req;
+    let allowed = match origins { "*" => if origin == () { "*" } else { "*" }, os => if list.contains origin os { origin } else { () } };
+    let decorate resp = match allowed {
+        () => resp,
+        a => resp |> http.with_header "access-control-allow-origin" a |> http.with_header "vary" "Origin",
+    };
+    if http.Request.method req == "OPTIONS" && http.header "access-control-request-method" req != () {
+        decorate (http.no_content
+            |> http.with_header "access-control-allow-methods" "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            |> http.with_header "access-control-allow-headers" (match http.header "access-control-request-headers" req { () => "*", h => h })
+            |> http.with_header "access-control-max-age" "86400")
+    } else { decorate ((handler app) req) }
+};
+
+/// These headers on every response that does not set them itself.
+let with_headers : :any -> :any -> :map -> :map;
+let with_headers pairs app req = {
+    let resp = (handler app) req;
+    let ps = if type_of pairs == :map { map.pairs pairs } else { pairs };
+    list.fold (fn r [k, v] -> if http.header k r == () { http.with_header k v r } else { r }) resp ps
+};
+
+/// HTTP Basic authentication: `check user password` decides, and anyone it
+/// refuses gets a 401 asking for credentials for `realm`.
+let basic_auth : :string -> (:string -> :string -> :bool) -> :any -> :map -> :map;
+let basic_auth realm check app req = {
+    let refuse = http.status_only 401 |> http.with_header "www-authenticate" ("Basic realm=\"" + realm + "\"");
+    match http.header "authorization" req {
+        () => refuse,
+        value => if not (str.starts_with "Basic " value) { refuse }
+                 else {
+                     match crypto.unbase64 (str.slice 6 (len value) value) {
+                         () => refuse,
+                         decoded => {
+                             let colon = str.find ":" decoded;
+                             if colon < 0 { refuse }
+                             else if check (str.slice 0 colon decoded) (str.slice (colon + 1) (len decoded) decoded) {
+                                 (handler app) (http.Request.set_context ((http.Request.context req).[:user => str.slice 0 colon decoded]) req)
+                             } else { refuse }
+                         },
+                     }
+                 },
+    }
+};
+
+/// Answer a request with a handler or router, as the server would, with no
+/// socket: for tests.
+let call! : :any -> :map -> :map;
+let call! app req = finish! (answer! (handler app) req defaults) req defaults;
+
+when test {
+    import std.agent;
+    import std.test;
+    import std.result;
+    import std.vm;
+
+    let hello req = http.text ("hello, " + (match http.query_value "name" req { () => "world", n => n }));
+    let app = router
+        |> get "/" hello
+        |> get "/users/:id" (fn req -> http.json %{ "id" => http.param "id" req })
+        |> post "/echo" (fn req -> http.respond 200 (http.body req) |> http.with_header "content-type" (or_empty (http.header "content-type" req)))
+        |> get "/files/*rest" (fn req -> http.text (or_empty (http.param "rest" req)))
+        |> get "/boom" (fn req -> http.text (to_string (1 / 0)))
+        |> get "/string" (fn req -> "just a string")
+        |> mount "/api" (router |> get "/ping" (fn req -> http.text "pong"));
+
+    let raw! port text = {
+        let sock = net.connect! "127.0.0.1" port;
+        streams.write_all! sock text
+        let [out, _] = http.read_to_end! (http.reader sock) 1000000;
+        io.close! sock
+        out
+    };
+
+    let tests = [
+        test.case "routing and params" $( test.eq! ["{\"id\":\"42\"}", "a/b c", "pong"]
+            [http.body (call! app (http.request "GET" "/" |> http.Request.set_path "/users/42")),
+             http.body (call! app (http.Request.new () |> http.Request.set_path "/files/a/b%20c")),
+             http.body (call! app (http.Request.new () |> http.Request.set_path "/api/ping/"))] ),
+        test.case "404 and 405" $( test.eq! [404, 405, "POST"]
+            [http.status (call! app (http.Request.new () |> http.Request.set_path "/nope")),
+             http.status (call! app (http.Request.new () |> http.Request.set_method "GET" |> http.Request.set_path "/echo")),
+             http.header "allow" (call! app (http.Request.new () |> http.Request.set_method "DELETE" |> http.Request.set_path "/echo"))] ),
+        test.case "HEAD falls back to GET" $( test.eq! 200 (http.status (call! app (http.Request.new () |> http.Request.set_method "HEAD"))) ),
+        test.case "a raising handler is a 500" $( test.eq! 500 (http.status (call! app (http.Request.new () |> http.Request.set_path "/boom"))) ),
+        test.case "a string is text" $( test.eq! ["just a string", "text/plain; charset=utf-8"]
+            { let r = call! app (http.Request.new () |> http.Request.set_path "/string"); [http.body r, http.header "content-type" r] } ),
+        test.case "cors answers a preflight" $( test.eq! [204, "*"]
+            { let r = call! (cors "*" app) (http.Request.new () |> http.Request.set_method "OPTIONS"
+                                                     |> http.with_header "origin" "http://a" |> http.with_header "access-control-request-method" "POST");
+              [http.status r, http.header "access-control-allow-origin" r] } ),
+        test.case "basic auth" $( {
+            let guarded = basic_auth "x" (fn u p -> u == "ada" && p == "pw") app;
+            test.eq! [401, 200]
+                [http.status (call! guarded (http.Request.new ())),
+                 http.status (call! guarded (http.with_basic_auth "ada" "pw" (http.Request.new ())))]
+        } ),
+        test.case "mime types" $( test.eq! ["text/css; charset=utf-8", "image/png", "application/octet-stream"]
+            [mime_type "a/b.css", mime_type "x.PNG", mime_type "noext"] ),
+
+        // Over a real socket.
+        test.case "a real exchange" $( {
+            let s = serve! 0 app;
+            let got = http.get_text! (local_url s + "/?name=dream");
+            stop! s
+            test.eq! [:ok, "hello, dream"] got
+        } ),
+        test.case "a JSON round trip" $( {
+            let s = serve! 0 app;
+            let got = match http.post_json! (local_url s + "/echo") %{ "a" => [1, 2] } { [:ok, r] => http.body_json r, e => e };
+            stop! s
+            test.eq! [:ok, %{ "a" => [1, 2] }] got
+        } ),
+        test.case "keep-alive answers two requests on one connection" $( {
+            let s = serve! 0 app;
+            let out = raw! (port s) "GET /users/1 HTTP/1.1\r\nHost: x\r\n\r\nGET /users/2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            stop! s
+            test.eq! [true, true] [str.contains_str "{\"id\":\"1\"}" out, str.contains_str "{\"id\":\"2\"}" out]
+        } ),
+        test.case "a chunked request body" $( {
+            let s = serve! 0 app;
+            let out = raw! (port s) "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+            stop! s
+            test.true! (str.ends_with "\r\n\r\nhello world" out)
+        } ),
+        test.case "a malformed request is a 400" $( {
+            let s = serve! 0 app;
+            let out = raw! (port s) "NONSENSE\r\n\r\n";
+            stop! s
+            test.true! (str.starts_with "HTTP/1.1 400 Bad Request" out)
+        } ),
+        test.case "an oversized body is a 413" $( {
+            let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_max_body 10) app;
+            let out = raw! (port s) "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n";
+            stop! s
+            test.true! (str.starts_with "HTTP/1.1 413" out)
+        } ),
+        test.case "HTTP/1.0 closes by default" $( {
+            let s = serve! 0 app;
+            let out = raw! (port s) "GET / HTTP/1.0\r\n\r\n";
+            stop! s
+            test.true! (str.contains_str "Connection: close" out)
+        } ),
+        test.case "an idle connection is closed" $( {
+            let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_idle (time.milliseconds 50)) app;
+            let sock = net.connect! "127.0.0.1" (port s);
+            let start = time.monotonic! ();
+            let got = io.read! sock 100;
+            io.close! sock
+            stop! s
+            test.eq! ["", true] [got, time.monotonic! () - start < time.seconds 5]
+        } ),
+        test.case "redirects are followed" $( {
+            let hops = router |> get "/a" (fn req -> http.redirect "/b") |> get "/b" (fn req -> http.redirect_with 307 "/c?x=1")
+                              |> get "/c" (fn req -> http.text ("at c " + or_empty (http.query_value "x" req)));
+            let s = serve! 0 hops;
+            let got = http.get! (local_url s + "/a");
+            stop! s
+            match got {
+                [:ok, r] => test.eq! ["at c 1", local_url s + "/c?x=1"] [http.body r, http.Response.url r],
+                other => test.fail! other,
+            }
+        } ),
+        test.case "too many redirects" $( {
+            let loop_app = router |> get "/" (fn req -> http.redirect "/");
+            let s = serve! 0 loop_app;
+            let got = http.send! (http.request "GET" (local_url s + "/") |> http.with_redirects 3);
+            stop! s
+            test.eq! :too_many_redirects (error.kind (result.reason () got))
+        } ),
+        test.case "a client timeout" $( {
+            let slow = router |> get "/" (fn req -> http.text (to_string (list.length (list.from 1))));
+            let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_idle (time.milliseconds 300)) slow;
+            let got = http.send! (http.request "GET" (local_url s + "/") |> http.with_timeout (time.milliseconds 100));
+            stop! s
+            test.eq! :timeout (error.kind (result.reason () got))
+            // The server gives up on the handler too, once `idle` has passed.
+            test.eq! 2 (test.eventually! (fn () -> vm.processes! ()) (fn n -> n <= 2) test.patience)
+        } ),
+        test.case "a streamed response arrives whole, chunked" $( {
+            let s = serve! 0 (router |> get "/" (fn req -> http.stream (list.map (fn n -> to_string n + ",") (list.range 0 1000))));
+            let got = http.get_text! (local_url s);
+            let out = raw! (port s) "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            stop! s
+            test.eq! [true, true] [result.or_else "" got == str.concat_all (list.map (fn n -> to_string n + ",") (list.range 0 1000)),
+                                   str.contains_str "Transfer-Encoding: chunked" out]
+        } ),
+        test.case "a stream made by a function, with effects" $( {
+            let counter = agent.start! 0;
+            let next! u = agent.get_and_update! counter (fn n -> [if n < 3 { "piece " + to_string n + ";" } else { () }, n + 1]);
+            let streaming! req = http.stream next!;
+            let s = serve! 0 (router |> get "/" streaming!);
+            let got = http.get_text! (local_url s);
+            stop! s
+            agent.stop! counter
+            test.eq! [:ok, "piece 0;piece 1;piece 2;"] got
+        } ),
+        test.case "server-sent events" $( {
+            let s = serve! 0 (router |> get "/events" (fn req -> http.event_stream ["hello", %{ "event" => "tick", "data" => "1\n2", "id" => 7 }]));
+            let out = raw! (port s) "GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            stop! s
+            test.eq! [true, true, true] [str.contains_str "text/event-stream" out, str.contains_str "data: hello\n\n" out,
+                                         str.contains_str "event: tick\nid: 7\ndata: 1\ndata: 2\n\n" out]
+        } ),
+        test.case "a streamed upload" $( {
+            let s = serve! 0 app;
+            let got = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_stream ["one ", "two ", "three"]);
+            stop! s
+            test.eq! [:ok, "one two three"] (result.map http.body got)
+        } ),
+        test.case "a request body streamed to the handler" $( {
+            let measure! req = http.text (to_string (len (http.body_text! req)));
+            let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_stream_bodies true) (router |> post "/" measure!);
+            let big = str.repeat 300000 "abcd";
+            let first = http.post! (local_url s) big;
+            let chunked = http.send! (http.request "POST" (local_url s) |> http.with_stream (list.replicate 50 (str.repeat 1000 "z")));
+            stop! s
+            test.eq! [[:ok, "1200000"], [:ok, "50000"]] [result.map http.body first, result.map http.body chunked]
+        } ),
+        test.case "a handler that ignores a streamed body leaves the connection usable" $( {
+            let ignore req = http.text "ignored";
+            let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_stream_bodies true) (router |> post "/" ignore |> get "/" ignore);
+            let out = raw! (port s) "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            stop! s
+            test.eq! 2 (list.length (str.split "ignored" out) - 1)
+        } ),
+        test.case "download! writes a file a piece at a time" $( {
+            let s = serve! 0 (router |> get "/" (fn req -> http.stream (list.replicate 64 (str.repeat 1024 "d"))));
+            let path = "/tmp/dream-http-download-" + to_string (time.now! ());
+            let got = http.download! (local_url s) path;
+            let written = file.read! path;
+            stop! s
+            io.remove! path
+            test.eq! [[:ok, 65536], 65536] [got, len (match written { () => "", t => t })]
+        } ),
+        test.case "a client reuses its connection" $( {
+            let s = serve! 0 (router |> get "/who" (fn req -> http.text (http.Request.peer req)));
+            let c = http.client_with! %{ :base => local_url s };
+            let first = http.call! c (http.request "GET" "/who");
+            let second = http.call! c (http.request "GET" "/who");
+            let plain = http.get! (local_url s + "/who");
+            http.close_client! c
+            stop! s
+            test.eq! [true, true] [result.is_ok first && first == second, result.map http.body plain != result.map http.body first]
+        } ),
+        test.case "a client's base URL and headers" $( {
+            let s = serve! 0 (router |> get "/api/v1/users" (fn req -> http.text (or_empty (http.header "x-token" req))));
+            let c = http.client_with! %{ :base => local_url s + "/api/v1", :headers => [["X-Token", "secret"]] };
+            let got = http.call! c (http.request "GET" "/users");
+            http.close_client! c
+            stop! s
+            test.eq! [:ok, "secret"] (result.map http.body got)
+        } ),
+        test.case "a pooled connection the server closed is replaced" $( {
+            let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_idle (time.milliseconds 100)) app;
+            let c = http.client_with! %{ :base => local_url s };
+            let first = http.call! c (http.request "GET" "/");
+            time.sleep! (time.milliseconds 400)
+            let second = http.call! c (http.request "GET" "/");
+            http.close_client! c
+            stop! s
+            test.eq! [:ok, :ok] [first.[0], second.[0]]
+        } ),
+        // HTTP/2, in clear text by prior knowledge so that no certificate is needed.
+        test.case "HTTP/2: a request and its answer" $( {
+            let s = serve! 0 (router |> get "/" (fn req -> http.text (http.Request.version req)) |> get "/boom" (fn req -> http.text (to_string (1 / 0))));
+            let h2_get! path = http.send! (http.request "GET" (local_url s + path) |> http.Request.set_options %{ :http2 => :prior_knowledge });
+            let ok = h2_get! "/";
+            let boom = h2_get! "/boom";
+            let missing = h2_get! "/nope";
+            stop! s
+            test.eq! [[:ok, "HTTP/2"], [:ok, 500], [:ok, 404]] [result.map http.body ok, result.map http.status boom, result.map http.status missing]
+        } ),
+        test.case "HTTP/2: bodies past the flow-control window, both ways" $( {
+            let s = serve! 0 app;
+            let big = str.repeat 300000 "0123456789";
+            let got = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_body big |> http.Request.set_options %{ :http2 => :prior_knowledge });
+            stop! s
+            test.eq! [:ok, true] (result.map (fn r -> http.body r == big) got)
+        } ),
+        test.case "HTTP/2: streams out and in" $( {
+            let s = serve! 0 (router |> get "/" (fn req -> http.stream (list.map (fn n -> to_string n + ";") (list.range 0 300))) |> post "/echo" (fn req -> http.text (http.body req)));
+            let opts = %{ :http2 => :prior_knowledge };
+            let down = http.send! (http.request "GET" (local_url s) |> http.Request.set_options opts);
+            let up = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_stream ["x", "y", "z"] |> http.Request.set_options opts);
+            stop! s
+            test.eq! [[:ok, str.concat_all (list.map (fn n -> to_string n + ";") (list.range 0 300))], [:ok, "xyz"]]
+                     [result.map http.body down, result.map http.body up]
+        } ),
+        test.case "HTTP/2: many requests at once over one connection" $( {
+            let s = serve! 0 (router |> get "/who" (fn req -> http.text (http.Request.peer req)));
+            let c = http.client_with! %{ :base => local_url s, :http2 => :prior_knowledge };
+            let first = http.call! c (http.request "GET" "/who");
+            let all = proc.parallel! (list.map (fn i -> $( http.call! c (http.request "GET" "/who") )) (list.range 0 30));
+            http.close_client! c
+            stop! s
+            test.eq! [30, 1, true] [list.length (list.filter (fn r -> result.is_ok r) all),
+                                    list.length (list.unique (list.map (fn r -> result.map http.body r) all)),
+                                    list.head all == first]
+        } ),
+        test.case "static files, and nothing outside them" $( {
+            let dir = "/tmp/dream-http-static-" + to_string (time.now! ());
+            io.mkdir_all! (dir + "/sub")
+            file.write! (dir + "/sub/a.css") "body {}"
+            file.write! (dir + "/index.html") "<p>home</p>"
+            let s = serve! 0 (router |> get "/s/*path" (files! dir) |> get "/" (files! dir));
+            let css = http.get! (local_url s + "/s/sub/a.css");
+            let home = http.get_text! (local_url s + "/");
+            let escape = http.get! (local_url s + "/s/../../etc/passwd");
+            let encoded = http.get! (local_url s + "/s/%2e%2e/%2e%2e/etc/passwd");
+            stop! s
+            io.remove_all! dir
+            test.eq! [[:ok, ["body {}", "text/css; charset=utf-8"]], [:ok, "<p>home</p>"], 404, 404]
+                     [result.map (fn r -> [http.body r, http.header "content-type" r]) css, home,
+                      result.or_else 0 (result.map http.status escape), result.or_else 0 (result.map http.status encoded)]
+        } ),
+    ];
+}

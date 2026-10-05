@@ -1,0 +1,91 @@
+// cpio, in the "new ASCII" (`newc`) form: the payload of an RPM.
+//
+// Each member is a 110-byte header of thirteen eight-digit hexadecimal fields,
+// the name and a NUL padded to four bytes, then the data padded to four
+// bytes; `TRAILER!!!` ends the archive. Unlike tar the mode field carries the
+// file's type as well as its permissions, and a link's data is its target.
+//
+// RPM matches payload members to the header's file list by name, and joins
+// hard links by inode, so the inode written here is the file's index in that
+// list -- one number per file, the same one `rpm.dr` puts in FILEINODES.
+
+import std.list;
+import std.str;
+
+import bytes;
+import item;
+import item.{Item};
+import out;
+
+/// The type bits `stat` puts above the permissions.
+let type_bits : Item -> :integer;
+let type_bits i = match i {
+    [:dir, _, _] => 0o040000,
+    [:link, _, _] => 0o120000,
+    _ => 0o100000,
+};
+
+let header : :integer -> :integer -> :integer -> :integer -> :integer -> :string -> :string;
+let header ino mode nlink epoch size name = {
+    let f = fn n -> bytes.hex 8 n;
+    let namesize = str.byte_length name + 1;
+    let head = "070701" + f ino + f mode + f 0 + f 0 + f nlink + f epoch + f size + f 0 + f 0 + f 0 + f 0
+               + f namesize + f 0 + name + "\0";
+    head + bytes.zeros (bytes.padding 4 (str.byte_length head))
+};
+
+/// One member, numbered `ino`, onto `h`.
+let member! : :any -> :integer -> [:integer, Item] -> :unit;
+let member! h epoch [ino, i] = {
+    let size = match i { [:dir, _, _] => 0, _ => item.size i };
+    let nlink = if item.is_dir i { 2 } else { 1 };
+    out.write! h (header ino (type_bits i + item.mode i % 4096) nlink epoch size (item.path i))
+    match i {
+        [:file, _, _, source, n] => out.copy_exactly! h source n,
+        [:text, _, _, data] => out.write! h data,
+        [:link, _, target] => out.write! h target,
+        _ => (),
+    }
+    out.write! h (bytes.zeros (bytes.padding 4 size))
+};
+
+/// A whole archive onto `h`: each `[inode, item]`, then the trailer.
+let write! : :any -> :integer -> [[:integer, Item]] -> :unit;
+let write! h epoch members = {
+    let rec each! ms = match ms {
+        [] => (),
+        [m, ..rest] => {
+            member! h epoch m
+            each! rest
+        },
+    };
+    each! members
+    out.write! h (header 0 0 1 0 0 "TRAILER!!!")
+};
+
+/// How many bytes `write!` puts down: RPM records it as the payload's size.
+let size_of : [[:integer, Item]] -> :integer;
+let size_of members = {
+    let one = fn [ino, i] -> {
+        let size = match i { [:dir, _, _] => 0, _ => item.size i };
+        str.byte_length (header ino 0 1 0 size (item.path i)) + size + bytes.padding 4 size
+    };
+    list.fold_strict (fn !acc m -> acc + one m) 0 members + str.byte_length (header 0 0 1 0 0 "TRAILER!!!")
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a header and its name are padded to four bytes"
+            $( {
+                let h = header 1 0o100644 1 0 5 "./a";
+                test.eq! [116, "070701", "00000001", "000081a4", "00000004"]
+                         [str.byte_length h, str.slice 0 6 h, str.slice 6 8 h, str.slice 14 8 h, str.slice 94 8 h]
+            } ),
+        test.case "the trailer"
+            $( test.eq! 124 (str.byte_length (header 0 0 1 0 0 "TRAILER!!!")) ),
+        test.case "the size of an archive"
+            $( test.eq! [116 + 8 + 124] [size_of [[1, item.Item.text "./a" 420 "hello"]]] ),
+    ];
+}

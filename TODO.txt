@@ -48,3 +48,102 @@ Follow-ups from 1, 2 and 5:
   KB, and a self-compile ~4% faster (2.03-2.09 s -> 1.94-1.99 s).
 - Done: 3, freeing shared values -- vm.release! and vm.collect_shared!, a
   region per share and a census ("Freeing what was shared" in docs/gc.md).
+
+
+Next round (2026-10-03), most valuable first.
+
+1. Fix the known flakes first. Worked through 2026-10-04:
+   - std.remote "a restarted server is still reachable" (~1 in 24): FIXED.
+     The test's `settle!` took the gap where the registry has dropped the
+     dead pid and the new child has not registered (`()`) for "settled".
+   - std tests hang after their summary (~1 in 10): FIXED. Caught under
+     gdb: a failing case had skipped its teardown and left a listener in
+     `accept!`. The runner (`std.test.main_of!`) now ends with `os.exit!`
+     and says how many processes a case left running.
+   - scheduler shutdown use-after-free: FIXED. The child reaper and the IO
+     poller held a `Scheduler*` and could wake into one already destroyed;
+     they now hold its serial and go through `Scheduler::wake_external`,
+     which finds nothing once it is gone. effects_once under TSan: 0/30.
+   - comp_failed under load: does not reproduce, with the old VM or the
+     new one (0 in 288 concurrent contracts runs, 3 `mind test`s). Its two
+     causes used to share a message; it now says whether the expression
+     raised (and what) or its scheduler stalled, for next time.
+   - effects_once hang (~1 in 100): does not reproduce, old VM or new
+     (0 in 350 each, JIT on and off). Probably fixed by an earlier change.
+   - bootstrap-check now also compares the seed with stage 2: FIXED.
+
+2. Make the laziness trap hard to fall into, in the language.
+   A lazy value stored in a map pins every earlier version of it; that has
+   been found five times, and `[:ok, strict! x]` does not do what it reads as.
+   - strict record fields: `struct P { !x, y }`, forced by make/new/set_x
+   - a strict-valued map (forces on insert), as ir.settled/scope.forced do
+   - a lint for `strict!` in a value position (list literal, argument)
+   Done (2026-10-03): `!x` fields in group/struct/mapping; map.put_strict
+   and map.update_strict; a warning for `strict!` as a literal's element,
+   which found std.registry's `init!` doing exactly that. Strict fields
+   turned up a compiler bug on the way: scope.dr's wrapper rewrite replaced
+   `let f !v r = r.[0 => v]` by its `set` at the call site and dropped the
+   force; a function with a strict parameter is no longer a wrapper.
+   opt.dr's `keep` (TODO.md "What to do next" item 4): forcing the
+   unshareable node before storing it was measured and changed nothing --
+   map branches/entries 0.66 either way (it was 1.5 before ir.settled),
+   peak and image identical -- so it was not kept. The 0.66 is not there.
+
+3. Better errors at run time.
+   Attach to a raised error the span it was raised at, and the span where
+   the thunk that raised it was *created*, not only where it was forced.
+   Done (2026-10-04): an error remembers where it was first raised -- the
+   functions running, innermost first, and the functions that made each
+   value being forced (`locate_error` in interp.cpp, a walk of the top of
+   the continuation stack at the first unwind). The places are functions':
+   FUNC records now carry a line, column and file, in what were an unread
+   byte span and a reserved word. An uncaught error prints them a line
+   each; `error.trace!`/`trace_lines!` (builtin `_error_trace!`) answer
+   them; std.test prints six under a failed case. Not a node's place,
+   because opt shares identical nodes program-wide; and a tail call takes
+   its caller's frame with it, so a test case's own `$( )` is often gone.
+
+4. Let types flow through unannotated code, as warnings.
+   Infer an unsigned function's result from its body so std's signatures
+   reach further. Report what that finds as warnings, keeping "code no
+   signature touches is never rejected" for errors.
+   Done (2026-10-04): the check runs twice; the first also answers what
+   each unsigned body answers (literals widened, `()` of a sometimes-
+   something answer dropped), the second holds every body naming one of
+   those, and what only it finds is a warning. The repository had two,
+   both fixed (target.dr's arch lists, cc.Target.kind). Cost: `types`
+   183 -> 355 ms sequential, self-compile 2.17 -> 2.34 s -- not yet
+   reduced. "What an unsigned function answers" in static-types.md.
+
+5. Allocation in the VM.
+   Frames are ~40% of allocation. A body that makes no closure or thunk
+   referring to its frame could keep that frame on a stack. Measure first.
+
+6. Tooling.
+   - a formatter. Done (2026-10-04): `dreams --fmt`/`--fmt-check`,
+     `just fmt`, and textDocument/formatting in lucid (dreams/fmt.dr). It
+     keeps every line, reindents by the grammar's own line rules, keeps a
+     block anchored where this codebase anchors blocks, and refuses to write
+     unless the file parses to the same tree. Idempotent over the whole
+     repository; 17 files would change, ~120 lines, almost all real fixes.
+     Not run over the repository yet. Left: turning if/else-if chains into
+     `match`, which needs the tree rather than the text.
+   - lucid: inlay hints from the checker's types, rename. Done
+     (2026-10-04): textDocument/inlayHint, prepareRename and rename;
+     "Inlay hints and rename" in docs/notes/lucid.md.
+
+Already planned, and in the right order:
+   - .libdream / a package at a time. Its reason, "12,800 declarations
+     still do not fit", was measured again on 2026-10-04 and is gone:
+     25,600 declarations in one module compile under the default cap, and
+     51,200 over 64 modules in 16 s. What is left is one module of 51,200,
+     whose parse outgrows 1 GB, and dividing by package cannot move that
+     ("Where the wall is now" in docs/notes/compiler-scaling.md). Deferred
+     until linking rather than recompiling is wanted for its own sake.
+   - a JIT that can allocate. Done (2026-10-04): compiled code already
+     allocated; what it could not do was let anything collect underneath
+     it. Now a collection under compiled code scans the machine stack and
+     pins what it points at in place -- no generated code changes, so no
+     hot-path cost. Self-compile 1.04 GB held against 2.16, same time,
+     same image. "Collecting under compiled code" in docs/gc.md.
+   - freeing what vm.share! shared. Done (vm.release!, see above).

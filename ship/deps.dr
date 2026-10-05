@@ -1,0 +1,91 @@
+// A dependency, written once and spelled for each format.
+//
+// `depends = ["libffi >= 3.4", "openssl"]` is read here into a name, an
+// operator and a version, and each format writes it its own way:
+//
+//     Debian    libffi (>= 3.4)
+//     RPM       libffi, flags GREATER|EQUAL, 3.4  -- three columns of the header
+//     Arch      libffi>=3.4
+//     Homebrew  depends_on "libffi"                -- a formula has no versions
+//
+// Debian's own spelling, `libffi (>= 3.4)`, and its `>>` and `<<` are read too,
+// so a list written for `[ship.deb]` reads as written. A Debian alternative
+// (`a | b`) has no equivalent in the others and is passed to Debian as it is.
+
+import std.list;
+import std.result;
+import std.str;
+
+/// `name`, and `op` and `version` when it constrains one; `op` is `""` when
+/// any version will do, and otherwise one of `<`, `<=`, `=`, `>=`, `>`.
+group Dep { name : :string, op : :string = "", version : :string = "" }
+
+let operators : [:string] = ["<", "<=", "=", ">=", ">"];
+
+/// Debian's two-character spellings, and `==`, as the operators they mean.
+let normal_op : :string -> :string;
+let normal_op op = match op { ">>" => ">", "<<" => "<", "==" => "=", o => o };
+
+let parse : :string -> [:ok, :any] | [:error, :string];
+let parse text = {
+    let t = str.trim text;
+    let at = str.upto "<>=" 0 t;
+    let name = str.trim (str.filter (fn c -> c != '(') (str.slice 0 at t));
+    let rest = str.slice at (str.byte_length t - at) t;
+    let op_end = str.span "<>=" 0 rest;
+    let op = normal_op (str.slice 0 op_end rest);
+    let version = str.trim (str.filter (fn c -> c != ')') (str.slice op_end (str.byte_length rest - op_end) rest));
+    if str.is_empty name || str.contains_str " " name || str.contains_str "|" t {
+        [:error, "dependency `" + text + "`: write it as `name`, or `name >= version`"]
+    }
+    else if str.is_empty op { [:ok, Dep.new name] }
+    else if not (list.contains op operators) { [:error, "dependency `" + text + "`: `" + op + "` is not an operator"] }
+    else if str.is_empty version { [:error, "dependency `" + text + "`: `" + op + "` what version?"] }
+    else { [:ok, Dep.make name op version] }
+};
+
+/// The Debian spelling: `>` and `<` are `>>` and `<<` there, since a bare `<`
+/// once meant `<=` and dpkg still reads it that way.
+let deb : :any -> :string;
+let deb d = match Dep.op d {
+    "" => Dep.name d,
+    op => Dep.name d + " (" + (match op { ">" => ">>", "<" => "<<", o => o }) + " " + Dep.version d + ")",
+};
+
+/// RPM's sense flags: LESS is 2, GREATER 4, EQUAL 8.
+let rpm_flags : :string -> :integer;
+let rpm_flags op = match op { "<" => 2, "<=" => 10, "=" => 8, ">=" => 12, ">" => 4, _ => 0 };
+
+let pacman : :any -> :string;
+let pacman d = Dep.name d + Dep.op d + Dep.version d;
+
+/// A whole list for Debian, where an alternative passes through untouched.
+let deb_list : [:string] -> [:ok, :string] | [:error, :string];
+let deb_list ds = {
+    let one = fn d -> if str.contains_str "|" d { [:ok, str.trim d] } else { result.map deb (parse d) };
+    result.map (fn xs -> str.join_str ", " xs) (result.all (list.map one ds))
+};
+
+let parse_all : [:string] -> [:ok, [:any]] | [:error, :string];
+let parse_all ds = result.all (list.map parse ds);
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "every spelling reads the same"
+            $( test.eq! [["libffi", ">=", "3.4"], ["libffi", ">=", "3.4"], ["libffi", ">=", "3.4"], ["libc6", "", ""]]
+                        (list.map (fn t -> result.or_else [] (parse t)) ["libffi >= 3.4", "libffi (>= 3.4)", "libffi>=3.4", " libc6 "]) ),
+        test.case "Debian's strict operators"
+            $( test.eq! [["a", ">", "1"], ["a", "<", "2"]] [result.or_else [] (parse "a (>> 1)"), result.or_else [] (parse "a << 2")] ),
+        test.case "mistakes"
+            $( test.eq! [:error, :error, :error] (list.map (fn t -> list.head (parse t)) ["", "a >=", "a => 2"]) ),
+        test.case "each format's spelling"
+            $( test.eq! ["a (>= 1)", "a (>> 1)", "a", "a>=1"]
+                        [deb (Dep.make "a" ">=" "1"), deb (Dep.make "a" ">" "1"), deb (Dep.new "a"), pacman (Dep.make "a" ">=" "1")] ),
+        test.case "a Debian list, alternatives as written"
+            $( test.eq! [:ok, "libc6 (>= 2.31), libssl3 | libssl1.1"] (deb_list ["libc6 >= 2.31", "libssl3 | libssl1.1"]) ),
+        test.case "RPM's flags"
+            $( test.eq! [0, 12, 8, 2] (list.map rpm_flags ["", ">=", "=", "<"]) ),
+    ];
+}

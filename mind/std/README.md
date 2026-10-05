@@ -50,6 +50,7 @@ learn.
 | `codec` | the generic half: everything a format gets once it can spell a value |
 | `json` | JSON, parsed and rendered |
 | `wire` | every Dream value, exactly, as bytes |
+| `binary`, `binary.word`, `binary.io` | checked binary layouts, fixed-width word operations and transport adapters ([guide](../../docs/binary.md)) |
 | `record` | records on a wire: a declared value's named form, and the way back |
 | `toml` | the TOML `mind.toml` uses |
 | `version` | versions, and which versions a requirement accepts (`^1.2`, `>=0.3, <0.5`) |
@@ -77,6 +78,18 @@ learn.
 | `payload` | the files an image carries (`dreams --payload`) |
 | `sql` | SQL for any database: fragments, query builders, dialects, a pool, and SQLite |
 | `sql.pg` | a PostgreSQL client in pure Dream ([README](sql/pg/README.md)) |
+
+**Machine learning** ([docs/notes/ml.md](../../docs/notes/ml.md))
+
+| | |
+|---|---|
+| `ml` | `fit!`, `predict`, `classify`, `evaluate`, `save!` and `load!`: the training loop, on the GPU when it pays |
+| `ml.ad` | reverse-mode autodiff of any function of tensors and numbers |
+| `ml.nn` | layers and models: dense, conv2d and pooling, attention and transformer blocks, RNN/GRU/LSTM, embeddings, norms, dropout |
+| `ml.loss`, `ml.metrics` | what training minimizes, and what is reported |
+| `ml.optim` | SGD, Adam, AdamW, RMSProp, Adagrad, clipping, learning-rate schedules |
+| `ml.data` | datasets: batches, shuffles, splits and folds, scalers, CSV, synthetic sets |
+| `ml.init`, `ml.tree`, `ml.ops` | initial weights, parameter trees, and the tensor compositions the rest share |
 
 **Writing programs**
 

@@ -101,6 +101,50 @@ source must also satisfy the seed's checker: a change that makes the checker
 accept something the seed rejects lands in two steps -- the checker first,
 reseeded, and only then the source that relies on it.
 
+## What an unsigned function answers: inferred, and only ever a warning
+
+Added 2026-10-04. A signature reached only the code that named it directly,
+and most code names functions that have none -- so `let label n = "item " +
+to_string n` was `:any` to every caller, and `half (label 3)` with `half :
+:integer -> :integer` passed. Now the check runs **twice**. The first is the
+check as it was, and the walk it makes of each unsigned body already returns
+what the body answers (`check_decl_inferring`). Those answers become the uses
+of their globals, parameters still `:any`, and a second check holds every
+body that names one of them (`check_again`). What only the second finds is a
+**warning** with a note saying how it was found (`typecheck.warned`); an
+error is still only what a signature promised, so rule 1 holds.
+
+What an answer is loosened to (`answer_type`): literals widened all the way
+down -- a body answering `1` answers an integer -- except atoms, which are
+tags; anything mentioning a type variable dropped; and **the `()` of an answer
+that is sometimes something else dropped**. The last is the one that decides
+whether this is usable. Without it the repository had forty warnings, every
+one a test helper's `match parse xs { [:ok, c] => c, _ => () }` handed to a
+typed function -- the same "nothing there" `solve` already declines to report
+for `map.get () k m + 1`. With it the whole repository, compiler, `std`,
+`mind`, `lucid`, examples and every `when test`, had two, and both were worth
+fixing: `target.dr` read a list containing `()` after testing for one (the
+arch functions now answer a list, empty for unknown), and `cc.Target.kind`
+was `:atom` where it meant `Kind`.
+
+One round, not a fixed point: what an unsigned function answers is computed
+seeing every other unsigned function as `:any`. A second round would reach
+further for another whole check.
+
+**Cost.** The second check is a check of most bodies again -- a body is
+skipped only when it names no newly typed global, and in a program written
+mostly without signatures most bodies name one. On a self-compile `types`
+went 183 ms to 355 ms sequentially (`--time`), and the parallel build 2.17 s
+to 2.34 s. Measured, not yet reduced; the obvious next step is to recheck
+only the positions where a type is consumed (a typed call's argument, an
+operand, a scrutinee), which the skip test does not yet distinguish.
+
+**Found on the way:** `solve` learnt nothing from a union, so `list.contains
+:map ks` with `ks` a union of lists solved `a` as `:map` and held every list
+to it -- an error a signature-only program could hit too. A union whose
+members all have `p`'s shape now solves member by member; one with a member of
+another shape is left alone, so the message about it is still `[a]`.
+
 ## Compile-time contracts: a refinement run against a value the compiler has
 
 Added 2026-09-25. A `where` in a named type used to be checked as its base,

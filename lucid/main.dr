@@ -27,6 +27,7 @@
 import std.cli;
 import std.console;
 
+import std.install;
 import std.io;
 import std.json;
 import std.list;
@@ -34,10 +35,12 @@ import std.map;
 import std.os;
 import std.str;
 
+import dreams.fmt;
 import dreams.path;
 
 import analysis;
 import complete;
+import pos;
 import rpc;
 
 let version = "0.1.0";
@@ -144,6 +147,9 @@ let capabilities =
                             "hoverProvider" => true,
                             "definitionProvider" => true,
                             "documentSymbolProvider" => true,
+                            "documentFormattingProvider" => true,
+                            "inlayHintProvider" => true,
+                            "renameProvider" => %{ "prepareProvider" => true },
                             "completionProvider" =>
                                 %{ "triggerCharacters" => ["."] } },
        "serverInfo" => %{ "name" => "lucid", "version" => version } };
@@ -164,6 +170,13 @@ let roots_from p = {
 };
 
 let answer! out id result = rpc.write_message! out (rpc.response id result);
+
+/// `[:ok, result]` answered, `[:error, why]` refused: an LSP request failure,
+/// whose message an editor shows.
+let refusable! out id outcome = match outcome {
+    [:ok, result] => answer! out id result,
+    [:error, why] => rpc.write_message! out (rpc.error_response id (0 - 32803) why),
+};
 
 /// One request or notification. Answers `[:go, state]` or `[:exit, code]`.
 let handle! out s m = {
@@ -246,6 +259,48 @@ let handle! out s m = {
             [:go, carrying a s]
         },
 
+        // The types the checker gave the bindings nobody wrote one for, in
+        // the lines on screen. See "inlay hints" in analysis.dr.
+        "textDocument/inlayHint" => {
+            let a = analysed! s path;
+            let range = p.["range" else (%{})];
+            let first = (range.["start" else (%{})]).["line" else 0];
+            let last = (range.["end" else (%{})]).["line" else 1000000000];
+            answer! out (rpc.id m) (analysis.inlay_hints a first last)
+            [:go, carrying a s]
+        },
+
+        // Rename, asked first whether the cursor is on something that can be
+        // renamed and then for the edit. A refusal is an error response, which
+        // is what makes a client show the reason rather than nothing.
+        "textDocument/prepareRename" => {
+            let a = analysed! s path;
+            refusable! out (rpc.id m) (analysis.prepare_rename_at a (line_of p) (character_of p))
+            [:go, carrying a s]
+        },
+        "textDocument/rename" => {
+            let a = analysed! s path;
+            refusable! out (rpc.id m)
+                (analysis.rename_at a (line_of p) (character_of p) (p.["newName" else ""]))
+            [:go, carrying a s]
+        },
+
+        // The compiler's formatter, on the buffer as it is. One edit that
+        // replaces the whole document, which is what a formatter that keeps
+        // every line has to say anyway, and nothing at all when the buffer
+        // is already laid out or does not parse -- the diagnostics already
+        // say why, and an editor that formats on save must still save.
+        "textDocument/formatting" => {
+            let text = ((docs s)).[path else ""];
+            let edits = match fmt.format text {
+                [:ok, out] => if out == text { [] }
+                              else { [%{ "range" => pos.range text 0 (str.byte_length text), "newText" => out }] },
+                _ => [],
+            };
+            answer! out (rpc.id m) edits
+            [:go, s]
+        },
+
         // A request must be answered even when it is not understood, or the
         // client waits for it forever. A notification must not be.
         _ => {
@@ -295,29 +350,10 @@ let usage = cli.usage "lucid" "a language server for Dream"
 let stdlib_roots! () =
     match os.env! "MIND_STDLIB" {
         () => match os.env! "DREAM_PACKAGES" {
-            () => match installed_std! () { () => [], d => [d] },
+            () => match install.holding! "std" { () => [], d => [d] },
             p => [path.expand_home! p],
         },
         p => [path.expand_home! p],
-    };
-
-let installed_std! () =
-    match os.env! "MINDV2_PATH" {
-        () => match path.home! () {
-            () => (),
-            h => first_with_std! [path.join h ".mindv2"],
-        },
-        v => first_with_std! (str.split (match os.platform () { :windows => ";", _ => ":" }) v),
-    };
-
-let rec first_with_std! dirs =
-    match dirs {
-        [] => (),
-        ["", ..rest] => first_with_std! rest,
-        [d, ..rest] => {
-            let dir = path.expand_home! d;
-            if io.is_dir! (path.join dir "std") { dir } else { first_with_std! rest }
-        },
     };
 
 let main! =

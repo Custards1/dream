@@ -8,6 +8,10 @@
 import std.agent;
 import std.array;
 import std.atom;
+import std.binary;
+import std.binary.io as binary_io;
+import std.binary.word;
+import std.binary.tests as binary_tests;
 import std.build;
 import std.build.cc;
 import std.build.cc.cmake;
@@ -29,14 +33,40 @@ import std.console;
 import std.error;
 import std.file;
 import std.foreign;
+import std.http;
+import std.http.h2;
+import std.http.hpack;
+import std.http.pool as http_pool;
+import std.http.reader as http_reader;
+import std.http.server as http_server;
+import std.http.stream as http_stream;
+import std.http.url;
+import std.http.websocket;
+import std.image;
+import std.install;
 import std.json;
 import std.list;
+import std.log;
 import std.map;
+import std.ml;
+import std.ml.ad;
+import std.ml.data;
+import std.ml.init;
+import std.ml.loss;
+import std.ml.metrics;
+import std.ml.nn;
+import std.ml.ops;
+import std.ml.optim;
+import std.ml.tree;
 import std.num;
 import std.payload;
 import std.macros;
+import std.parse;
 import std.proc;
+import std.property;
+import std.random;
 import std.record;
+import std.regex;
 import std.registry;
 import std.remote;
 import std.result;
@@ -51,6 +81,9 @@ import std.str;
 import std.streams;
 import std.supervisor;
 import std.test;
+import std.time;
+import std.time.calendar;
+import std.time.zone;
 import std.toml;
 import std.version;
 import std.wire;
@@ -61,14 +94,16 @@ let version = "0.1.0";
 
 /// The modules this build provides.
 let modules : [:string];
-let modules = ["std.agent", "std.array", "std.atom", "std.build", "std.build.cc", "std.build.cc.cmake",
+let modules = ["std.agent", "std.array", "std.atom", "std.binary", "std.binary.io", "std.binary.word", "std.build", "std.build.cc", "std.build.cc.cmake",
                "std.build.cc.gnu", "std.build.cc.msvc", "std.build.cc.steps", "std.build.check",
                "std.build.command", "std.build.dream", "std.build.fetch", "std.build.probe",
                "std.build.run", "std.build.tool", "std.char", "std.cli",
-               "std.codec", "std.console", "std.error", "std.file", "std.json", "std.list",
-               "std.map", "std.macros", "std.num", "std.payload", "std.proc", "std.record", "std.registry", "std.remote",
+               "std.codec", "std.console", "std.error", "std.file", "std.http", "std.http.h2", "std.http.hpack", "std.http.pool", "std.http.reader", "std.http.server", "std.http.stream", "std.http.url", "std.http.websocket",
+               "std.json", "std.list", "std.log", "std.map", "std.macros", "std.ml", "std.ml.ad", "std.ml.data", "std.ml.init", "std.ml.loss",
+               "std.ml.metrics", "std.ml.nn", "std.ml.ops", "std.ml.optim", "std.ml.tree", "std.num", "std.parse", "std.payload", "std.proc",
+               "std.property", "std.random", "std.record", "std.regex", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.sql", "std.sql.lint", "std.sql.pg", "std.sql.pool", "std.sql.sqlite", "std.str", "std.streams",
-               "std.supervisor", "std.test", "std.toml", "std.types", "std.wire"];
+               "std.supervisor", "std.test", "std.time", "std.time.calendar", "std.time.zone", "std.toml", "std.types", "std.wire"];
 
 // --- the tests std.record cannot hold ----------------------------------------
 //

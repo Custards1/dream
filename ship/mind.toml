@@ -1,0 +1,7 @@
+# ship: a Dream program, its files and its manifest, made into what each
+# platform installs -- .deb, .rpm, an Arch package, a Homebrew formula, a
+# release tarball and the script that installs it. README.md says how.
+[package]
+name = "ship"
+version = "0.1.0"
+src = "."

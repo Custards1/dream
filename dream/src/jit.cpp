@@ -470,8 +470,9 @@ bool op_is_supported(Op op) {
         case Op::Local:
         case Op::If: case Op::Block: case Op::Force:
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
-        case Op::And: case Op::Or: case Op::Neg: case Op::Not: case Op::TypeIs:
+        case Op::And: case Op::Or: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs:
         // Data. See "Lists, arrays and maps" and "Lazy positions" below.
         case Op::ConstStr: case Op::Global:
         case Op::ListIsEmpty: case Op::ListTail: case Op::Cons:
@@ -687,8 +688,14 @@ public:
         // in the body has just been accounted for -- so this is checked rather
         // than argued, because the argument is about the compiler and this file
         // is not.
-        if (reads_beyond_params_) return a;
-        if (!bindings_substitutable()) return a;
+        if (reads_beyond_params_) {
+            why(img_.node(f_.body), "a slot no parameter or binding owns");
+            return a;
+        }
+        if (!bindings_substitutable()) {
+            why(img_.node(f_.body), "a binding that cannot be written where it is read");
+            return a;
+        }
 
         // Which arguments are evaluated.
         //
@@ -849,8 +856,15 @@ private:
         const Node& n = img_.node(node);
         Op op = Op(n.op);
 
-        if (op == Op::Apply || is_primitive(op)) return check_apply(node, n, depth);
-        if (!op_is_supported(op)) return false;
+        if (op == Op::Apply || is_primitive(op)) {
+            if (check_apply(node, n, depth)) return true;
+            why(n, kind_at(node) == CallKind::Refused ? "a call this tier cannot make" : "an argument");
+            return false;
+        }
+        if (!op_is_supported(op)) {
+            why(n, "an operation this tier does not emit");
+            return false;
+        }
         // An integer too big for a fixnum is a boxed constant the emitter has
         // no way to name, so it is refused here rather than there -- same
         // reason as the two ops missing from the list above.
@@ -904,10 +918,11 @@ private:
                     if (!check(stmt, depth + 1)) return false;
                 }
                 return true;
-            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs:
             case Op::ListIsEmpty: case Op::ListTail:
                 return check(n.a, depth + 1);
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             case Op::And: case Op::Or:
                 return check(n.a, depth + 1) && check(n.b, depth + 1);
@@ -923,6 +938,19 @@ private:
                 return true;
         }
     }
+
+    /// `DREAM_JIT_WHY=1` says, for each function refused, the first node that
+    /// refused it -- which is what to change in a library that wants a loop
+    /// compiled. Reported innermost first, once per function.
+    void why(const Node& n, const char* what) {
+        static const bool on = std::getenv("DREAM_JIT_WHY") != nullptr;
+        if (!on || said_why_) return;
+        said_why_ = true;
+        StringRef name = img_.str(img_.func(fi_).name);
+        std::fprintf(stderr, "; jit why fn#%u %.*s: %s (%s)\n", fi_, int(name.len), name.data, what,
+                     op_name(Op(n.op)));
+    }
+    bool said_why_ = false;
 
     /// This function calling itself with a full argument list. In tail position
     /// it becomes a loop back-edge; anywhere else a machine call, which is what
@@ -1075,7 +1103,10 @@ private:
             // load_slot remembers the forced value. Other strict bindings need
             // real stored values and remain outside this tier.
             const Node& value = img_.node(n.b);
-            if (Op(value.op) != Op::Local || value.a >= f_.arity) return false;
+            if (Op(value.op) != Op::Local || value.a >= f_.arity) {
+                why(value, "a strict `let`, or a `match` on something other than a parameter");
+                return false;
+            }
         }
         // Into a parameter's slot, or past the end of the frame: neither is
         // something the compiler emits, and neither has a meaning here.
@@ -1159,10 +1190,11 @@ private:
                 }
                 return c;
             }
-            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs:
             case Op::ListIsEmpty: case Op::ListTail:
                 return 1 + expand_cost(n.a, depth + 1, calls);
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             case Op::And: case Op::Or:
                 return 1 + expand_cost(n.a, depth + 1, calls) +
@@ -1235,12 +1267,13 @@ private:
                             ? 0
                             : (strict_of(n.b, depth + 1) & strict_of(n.c, depth + 1)));
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
                 return strict_of(n.a, depth + 1) | strict_of(n.b, depth + 1);
             case Op::And: case Op::Or:
                 // Short-circuiting: only the left operand is certain.
                 return strict_of(n.a, depth + 1);
-            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs:
             case Op::ListIsEmpty: case Op::ListTail:
                 return strict_of(n.a, depth + 1);
             case Op::Get: case Op::Set:
@@ -1364,9 +1397,10 @@ private:
                 }
                 out.push_back(n.a);
                 return true;
-            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs: case Op::ListIsEmpty:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs: case Op::ListIsEmpty:
                 return force_order(n.a, depth + 1, out);
             case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
                 return force_order(n.a, depth + 1, out) && force_order(n.b, depth + 1, out);
             case Op::ListTail:
@@ -1562,7 +1596,7 @@ private:
                     if (last || (sn.flags & F_STRICT)) collect_calls(stmt, depth + 1, last && tail);
                 }
                 return;
-            case Op::Force: case Op::Neg: case Op::Not: case Op::TypeIs:
+            case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs:
             case Op::ListIsEmpty: case Op::ListTail:
                 collect_calls(n.a, depth + 1);
                 return;
@@ -1587,6 +1621,7 @@ private:
                 collect_calls(n.b, depth + 1);
                 return;
             case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
             case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             case Op::And: case Op::Or: case Op::Set:
                 collect_calls(n.a, depth + 1);
@@ -2981,7 +3016,7 @@ void Emitter::mark_refs(uint32_t idx, int depth) {
             return;
         }
         case Op::Field: case Op::Force: case Op::TypeIs: case Op::ListTail:
-        case Op::ListIsEmpty: case Op::Neg: case Op::Not:
+        case Op::ListIsEmpty: case Op::Neg: case Op::Not: case Op::BitNot:
             mark_refs(n.a, depth + 1);
             return;
         case Op::Bind:
@@ -2989,6 +3024,7 @@ void Emitter::mark_refs(uint32_t idx, int depth) {
             return;
         case Op::Try: case Op::Cons:
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::And: case Op::Or:
             mark_refs(n.a, depth + 1);
@@ -3642,7 +3678,7 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
         case Op::If: return conditional(n, tail);
         case Op::Block: return block(n, tail);
         case Op::And: case Op::Or: return logic(n);
-        case Op::Neg: case Op::Not: return unary(n);
+        case Op::Neg: case Op::Not: case Op::BitNot: return unary(n);
         DREAM_PRIMITIVE_CASES
         case Op::Apply: return apply(idx, n);
         case Op::ConstStr: return tag(b_.CreateCall(rt_literal_str_, {proc_, i32c(int(n.a))}));
@@ -3659,6 +3695,7 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
             if (tail && accumulate_ && steps_.count(idx)) return add_step(n);
             return binary(n);
         case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
             return binary(n);
         default:
@@ -3947,11 +3984,11 @@ Emitter::JV Emitter::unary(const Node& n) {
     // Negation is `0 - x`, which is what the interpreter reaches for too --
     // and it is a subtraction rather than a sign flip because the two differ
     // on zero: `0 - 0.0` is `0.0` where `fneg 0.0` is `-0.0`.
-    if (x.dbl) return flt(b_.CreateFSub(llvm::ConstantFP::get(dbl_, 0.0), x.v));
+    if (x.dbl && Op(n.op) != Op::BitNot) return flt(b_.CreateFSub(llvm::ConstantFP::get(dbl_, 0.0), x.v));
 
     // The integer case: -(2x+1) as a tagged value is 2 - v, with an overflow
     // check.
-    llvm::Value* v = x.v;
+    llvm::Value* v = box(x);
     auto* fast_bb = bb("neg.fast");
     auto* slow_bb = bb("neg.slow");
     auto* join_bb = bb("neg.end");
@@ -3964,14 +4001,21 @@ Emitter::JV Emitter::unary(const Node& n) {
     llvm::Value* fastv = b_.CreateExtractValue(pair, 0);
     llvm::Value* ovf = b_.CreateExtractValue(pair, 1);
     auto* fast_ok = bb("neg.fast.ok");
-    b_.CreateCondBr(ovf, slow_bb, fast_ok);
+    if (Op(n.op) == Op::BitNot) {
+        // Complement the payload bits while retaining the fixnum tag.
+        fastv = b_.CreateXor(v, i64(uint64_t(-2)));
+        b_.CreateBr(fast_ok);
+    } else {
+        b_.CreateCondBr(ovf, slow_bb, fast_ok);
+    }
     b_.SetInsertPoint(fast_ok);
     b_.CreateBr(join_bb);
 
     b_.SetInsertPoint(slow_bb);
     llvm::Value* out = entry_alloca(i64_);
     llvm::Value* ok = guarded(
-        rt_arith_, {proc_, i32c(int(Op::Sub)), i64(make_fixnum(0)), v, out});
+        rt_arith_, {proc_, i32c(int(Op(n.op) == Op::BitNot ? Op::BitNot : Op::Sub)),
+                    Op(n.op) == Op::BitNot ? v : i64(make_fixnum(0)), v, out});
     llvm::Value* slowv = b_.CreateLoad(i64_, out);
     auto* slow_end = b_.GetInsertBlock();
     auto* raise_bb = bb("neg.raise");
@@ -3996,9 +4040,11 @@ Emitter::JV Emitter::binary(const Node& n) {
     const bool is_order = (op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge);
     const bool is_cmp = is_order || op == Op::Eq || op == Op::Ne;
     const bool is_arith = !is_cmp && op != Op::And && op != Op::Or;
+    const bool is_bits = op == Op::BitAnd || op == Op::BitOr || op == Op::BitXor ||
+                         op == Op::Shl || op == Op::Shr;
 
     if (av.dbl || bv.dbl) {
-        if (is_arith) return float_arith(op, av, bv);
+        if (is_arith && !is_bits) return float_arith(op, av, bv);
         if (is_order) return float_order(op, av, bv);
         // `==` and `!=` fall through to the tagged path on purpose. Two float
         // boxes that are the *same object* are equal in this language whatever
@@ -4034,6 +4080,35 @@ Emitter::JV Emitter::binary(const Node& n) {
             default: c = b_.CreateICmpNE(a, bb_); break;
         }
         fastv = b_.CreateSelect(c, i64(TRUE_V), i64(FALSE_V));
+        fast_end = b_.GetInsertBlock();
+        b_.CreateBr(join_bb);
+    } else if (is_bits) {
+        llvm::Value* x = b_.CreateAShr(a, 1);
+        llvm::Value* y = b_.CreateAShr(bb_, 1);
+        if (op == Op::BitAnd) fastv = b_.CreateAnd(a, bb_);
+        else if (op == Op::BitOr) fastv = b_.CreateOr(a, bb_);
+        else if (op == Op::BitXor) fastv = b_.CreateOr(b_.CreateXor(a, bb_), i64(1));
+        else {
+            auto* count_ok = bb("bits.count.ok");
+            b_.CreateCondBr(b_.CreateICmpSLT(y, i64(0)), slow_bb, count_ok);
+            b_.SetInsertPoint(count_ok);
+            if (op == Op::Shr) {
+                // Clamp before shifting: LLVM shifts by 64 or more are poison.
+                llvm::Value* count = b_.CreateSelect(b_.CreateICmpUGT(y, i64(63)), i64(63), y);
+                fastv = b_.CreateOr(b_.CreateShl(b_.CreateAShr(x, count), 1), i64(1));
+            } else {
+                auto* small = bb("bits.left.small");
+                b_.CreateCondBr(b_.CreateICmpULT(y, i64(63)), small, slow_bb);
+                b_.SetInsertPoint(small);
+                // Shift the tagged payload; reversing it detects fixnum overflow.
+                llvm::Value* payload = b_.CreateAnd(a, i64(uint64_t(-2)));
+                llvm::Value* shifted = b_.CreateShl(payload, y);
+                auto* fits = bb("bits.left.fits");
+                b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateAShr(shifted, y), payload), fits, slow_bb);
+                b_.SetInsertPoint(fits);
+                fastv = b_.CreateOr(shifted, i64(1));
+            }
+        }
         fast_end = b_.GetInsertBlock();
         b_.CreateBr(join_bb);
     } else if (op == Op::Div || op == Op::Mod) {
@@ -4179,10 +4254,14 @@ Emitter::JV Emitter::apply(uint32_t idx, const Node& n) {
 /// callee is free not to look at them; and the answer is forced, because this
 /// is an evaluated position. A reduction is spent for the `Apply` node.
 ///
-/// What it costs is a nested machine loop per call with the heap pinned. The
-/// loop's own reductions come off the same budget; when they exhaust the slice
-/// the helper leaves it at zero, so the compiled loop around the call yields at
-/// its next back-edge rather than running on under a pin.
+/// What it costs is a nested machine loop per call. The loop may collect --
+/// the machine stack is scanned for what this frame holds, see
+/// `Process::jit_stack_hi` -- and the helper clears `items` once the arguments
+/// are on the value stack, because nothing here reads it again and a scan
+/// would otherwise keep them alive for as long as the call ran. The loop's
+/// own reductions come off the same budget; when they exhaust the slice the
+/// helper leaves it at zero, so the compiled loop around the call yields at
+/// its next back-edge.
 Emitter::JV Emitter::closure_call(const Node& n) {
     JV callee = node(n.a);
     if (failed_ || !callee.v) return none();
@@ -4986,7 +5065,17 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
                              const Image& img, uint32_t func_index, const std::string& name) {
     PeerSet peers(rt, img);
     Analysis root = Analyzer(rt, img, func_index, &peers, 0).run();
-    if (!root.compilable || !peers.sound(root)) return nullptr;
+    // `DREAM_JIT_WHY` (see `Analyzer::why`) for the refusals made here.
+    static const bool say = std::getenv("DREAM_JIT_WHY") != nullptr;
+    auto refuse = [&](const char* what) -> llvm::Function* {
+        if (say) {
+            StringRef n = img.str(img.func(func_index).name);
+            std::fprintf(stderr, "; jit why fn#%u %.*s: %s\n", func_index, int(n.len), n.data, what);
+        }
+        return nullptr;
+    };
+    if (!root.compilable) return nullptr;
+    if (!peers.sound(root)) return refuse("a function it calls was refused (`DREAM_JIT_WHY` names it)");
 
     PeerFns fns;
     for (const auto& member : peers.members) {
@@ -5012,7 +5101,7 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
     for (const auto& member : peers.members) {
         const PeerFn& pf = fns[member.first];
         Emitter generic(ctx, mod, rt, img, member.first, member.second, &fns, pf.generic);
-        if (!generic.emit(pf.generic->getName().str())) return nullptr;
+        if (!generic.emit(pf.generic->getName().str())) return refuse("the emitter refused a function it calls");
         if (pf.typed) {
             Analysis t = member.second;
             t.float_slots = pf.typed_slots;
@@ -5021,7 +5110,8 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
             if (!typed.emit(pf.typed->getName().str())) return nullptr;
         }
     }
-    return Emitter(ctx, mod, rt, img, func_index, root, &fns).emit(name);
+    llvm::Function* f = Emitter(ctx, mod, rt, img, func_index, root, &fns).emit(name);
+    return f ? f : refuse("the emitter refused it");
 }
 
 }  // namespace
@@ -5314,20 +5404,25 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     // `DREAM_JIT_TRACE=1` prints every compile, whether it was taken and what
     // LLVM charged for it -- the number that decided compiling in the
     // background, and the one to read before widening the tier again.
+    // The function's name is printed beside its index, as `--profile` names
+    // it, so that a trace says which of a library's functions the tier took.
     struct Trace {
         uint32_t fi;
         CompiledFn* result;
+        const Image* img;
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Trace() {
             static const bool on = std::getenv("DREAM_JIT_TRACE") != nullptr;
             if (!on) return;
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t0).count();
-            std::fprintf(stderr, "; jit fn#%u %s %.2f ms\n", fi, *result ? "compiled" : "refused", ms);
+            StringRef name = img->str(img->func(fi).name);
+            std::fprintf(stderr, "; jit fn#%u %.*s %s %.2f ms\n", fi, int(name.len), name.data,
+                         *result ? "compiled" : "refused", ms);
         }
     };
     CompiledFn traced = nullptr;
-    Trace trace{func_index, &traced};
+    Trace trace{func_index, &traced, &impl_->rt.image()};
 
     const Image& img = impl_->rt.image();
     if (!impl_->ensure_jit(error)) return nullptr;

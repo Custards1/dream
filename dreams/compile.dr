@@ -176,49 +176,73 @@ let share_elsewhere! p = {
 /// positions, and `typecheck.concluded` lays them back in order. With a unit
 /// cache, a part resolved in parts is checked once for a given walk and given
 /// checker tables, and read back after (`check_unit!`).
+///
+/// Twice, as `typecheck.checked_twice` checks: the first time against the
+/// signatures, which also says what each unsigned body answers, and the second
+/// against those answers as well -- in parts again, with a checker made from
+/// what all the parts of the first said. See "what an unsigned function
+/// answers" in typecheck.dr.
 let analyze_parallel! l r comps cache = {
     let kd = vm.share! (typecheck.prepared l r comps);
     let k = list.head kd;
-    let tables = match cache { () => (), _ => unit.digest (typecheck.tables k) };
+    let first = checked_in_parts! :first cache [k] r;
+    let found = list.map (fn one -> list.nth 1 one) first;
+    let said = list.map (fn one -> list.head one) first;
+    let again = match typecheck.inferring k found {
+        () => list.map (fn _ -> []) said,
+        k2 => checked_in_parts! :second cache [k, vm.share! k2] r,
+    };
+    strict! (typecheck.concluded k r (list.nth 1 kd) said again)
+};
+
+/// Every body's answer to one of the two checks, in the order of the bodies:
+/// `how` is `:first` or `:second` (`check_bodies`), and `ks` the checkers it
+/// asks -- the one, or the first and the one made from what it inferred. Each
+/// kept under a kind of its own, since the two answer different things about
+/// the same walk.
+let checked_in_parts! how cache ks r = {
+    let tables = match cache { () => (), _ => unit.digest (typecheck.tables (list.last ks)) };
     strict! tables
+    let kind = match how { :first => "check", _ => "infer" };
     let key_of pr = match tables {
         () => (),
-        digest => match scope.unit_key pr { () => (), walk => unit.key ["check", walk, digest] },
+        digest => match scope.unit_key pr { () => (), walk => unit.key [kind, walk, digest] },
     };
     let work = match scope.parts r {
         () => {
             let all = scope.bodies r;
             let numbered = list.zip (list.range 0 (list.length all)) all;
-            list.map (fn j -> [k, list.filter (fn nb -> list.head nb % lower.part_count == j) numbered, ()])
+            list.map (fn j -> [ks, list.filter (fn nb -> list.head nb % lower.part_count == j) numbered, ()])
                      (list.range 0 lower.part_count)
         },
-        walked => list.map (fn pr -> [typecheck.with_resolution k pr, scope.part_bodies pr, key_of pr]) walked,
+        walked => list.map (fn pr -> [list.map (fn k -> typecheck.with_resolution k pr) ks,
+                                      scope.part_bodies pr, key_of pr]) walked,
     };
     strict! work
-    let running = strict! (list.map (fn w -> check_elsewhere! (match list.nth 2 w { () => (), _ => cache })
+    let running = strict! (list.map (fn w -> check_elsewhere! how (match list.nth 2 w { () => (), _ => cache })
                                                               (list.nth 2 w) (list.head w) (list.nth 1 w)) work);
     let said = list.concat (strict! (list.map (fn pr -> join! pr) running));
-    let ordered = list.map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said);
-    strict! (typecheck.concluded k r (list.nth 1 kd) ordered)
+    list.map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said)
 };
 
 /// A process checking some bodies against a shared checker. Its own function
 /// for the reason `share_elsewhere!` is, and its cache and key strict for the
 /// reason `lower.part_elsewhere!`'s are.
-let check_elsewhere! !cache !key k slice = spawn! $( vm.share! (check_unit! cache key k slice) );
+let check_elsewhere! how !cache !key ks slice = spawn! $( vm.share! (check_unit! how cache key ks slice) );
 
 /// What some bodies said, or what they said the last time they were checked
 /// against the same walk and the same tables. Kept with positions counted from
 /// the part's first body, as a walk is, so a body added to an earlier module
 /// does not make every later part's check a stranger.
-let check_unit! cache key k slice = match [cache, slice] {
-    [(), _] => check_bodies k slice,
-    [_, []] => check_bodies k slice,
+let check_unit! how cache key ks slice = match [cache, slice] {
+    [(), _] => check_bodies how ks slice,
+    [_, []] => check_bodies how ks slice,
     [_, [[from, .._], .._]] => {
-        let said = match unit.recall! cache "check" key {
+        let kind = match how { :first => "check", _ => "infer" };
+        let said = match unit.recall! cache kind key {
             () => {
-                let fresh = check_bodies k (unit.shifted (0 - from) slice);
-                unit.keep! cache "check" key fresh
+                let fresh = check_bodies how ks (unit.shifted (0 - from) slice);
+                unit.keep! cache kind key fresh
                 fresh
             },
             kept => kept,
@@ -227,7 +251,13 @@ let check_unit! cache key k slice = match [cache, slice] {
     },
 };
 
-let check_bodies k slice = list.map (fn nb -> [list.head nb, typecheck.check_decl k (list.nth 1 nb) []]) slice;
+/// `[position, answer]` for each body: the first check's answer is
+/// `[diagnostics, inferred]` (`typecheck.check_decl_inferring`), the second's
+/// the diagnostics alone (`typecheck.check_again`).
+let check_bodies how ks slice = match how {
+    :first => list.map (fn nb -> [list.head nb, typecheck.check_decl_inferring (list.head ks) (list.nth 1 nb) []]) slice,
+    _ => list.map (fn nb -> [list.head nb, typecheck.check_again (list.head ks) (list.nth 1 ks) (list.nth 1 nb)]) slice,
+};
 
 /// What a program's signatures and contracts say is wrong with it, given what
 /// the earlier stages said. Nothing, when they already found an error or the

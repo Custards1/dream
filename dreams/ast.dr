@@ -127,6 +127,7 @@ let binops = [
     [:or_or, :or], [:and_and, :and],
     [:eq_eq, :eq], [:bang_eq, :ne], [:lt, :lt], [:le, :le], [:gt, :gt], [:ge, :ge],
     [:colon_colon, :cons],
+    [:bar, :bor], [:caret, :bxor], [:amp, :band], [:lt_lt, :shl], [:gt_gt, :shr],
     [:plus, :add], [:minus, :sub], [:star, :mul], [:slash, :div], [:percent, :mod],
     [:at, :matmul],
 ];
@@ -134,14 +135,22 @@ let binops = [
 /// Loosest to tightest, matching the table in the language reference. `|>` is
 /// looser than all of these and is handled on its own, and application binds
 /// tighter than any of them.
+///
+/// The bitwise operators sit where Python puts them, between the comparisons
+/// and arithmetic, so `x & 1 == 0` tests the low bit and `1 << n - 1` shifts by
+/// `n - 1`; and above `::`, so `n & 1 :: bits` puts the bit on the front.
 let precedence op =
     match op {
         :or  => 0,
         :and => 1,
         :eq  => 2, :ne => 2, :lt => 2, :le => 2, :gt => 2, :ge => 2,
         :cons => 3,
-        :add => 4, :sub => 4,
-        :mul => 5, :div => 5, :mod => 5, :matmul => 5,
+        :bor => 4,
+        :bxor => 5,
+        :band => 6,
+        :shl => 7, :shr => 7,
+        :add => 8, :sub => 8,
+        :mul => 9, :div => 9, :mod => 9, :matmul => 9,
         _    => 0 - 1,
     };
 
@@ -169,6 +178,9 @@ let infix_of token_kind =
         :star    => :mul, :slash   => :div,
         :percent => :mod, :at      => :matmul,
         :colon_colon => :cons,
+        :bar     => :bor, :caret   => :bxor,
+        :amp     => :band,
+        :lt_lt   => :shl, :gt_gt   => :shr,
         _ => (),
     };
 
@@ -283,6 +295,15 @@ let array_union_d name params variants members span = [:union_decl, name, params
 ///
 /// where a C type is written in the type grammar and read by `syntax`.
 let foreign_d name library entries span = [:foreign_decl, name, library, entries, span];
+/// `image name from source { .. }`: another Dream image, which the loader
+/// rewrites into a module of functions bound in it (`syntax.image_decl`).
+/// `source` is the expression that names it. An entry is
+///
+///     [:image_function, name, type, target, span]
+///
+/// where `target` is `module.member` in the image, or a bare member of its
+/// top-level module.
+let image_d name source entries span = [:image_decl, name, source, entries, span];
 
 let variant name span fields = [name, span, fields];
 let variant_name v = list.nth 0 v;
@@ -374,8 +395,9 @@ when test {
             $( test.eq! [:add, :eq, ()]
                         [infix_of :plus, infix_of :eq_eq, infix_of :ident] ),
         test.case "binary precedence follows the parser ladder"
-            $( test.eq! [0, 1, 2, 3, 4, 5, -1]
+            $( test.eq! [0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 9, -1]
                         [precedence :or, precedence :and, precedence :eq, precedence :cons,
+                         precedence :bor, precedence :bxor, precedence :band, precedence :shl, precedence :shr,
                          precedence :add, precedence :mul, precedence :unknown] ),
         test.case "a declaration records recursion and parameters"
             $( test.eq! [:let, "go", [["n", [4, 5]]], [:name, "n", [8, 9]], true, [0, 9]]
@@ -491,6 +513,11 @@ let rec show e =
                       "(struct " + s + str.join_str "" (list.map (fn f ->
                           " (" + list.nth 0 f + " " + show (list.nth 2 f) + ")") fs) + ")",
                   [:c_function, f, t, sym, _] => "(" + f + " " + show t + " " + sym + ")",
+              }) entries) + ")",
+        [:image_decl, n, src, entries, _] =>
+            "(image " + n + " " + show src
+            + str.join_str "" (list.map (fn e -> match e {
+                  [:image_function, f, t, target, _] => " (" + f + " " + show t + " " + target + ")",
               }) entries) + ")",
         [:let_p, pattern, b, _] => "(let " + show_pattern pattern + " " + show b + ")",
         [:import, segments, alias, names, _] =>

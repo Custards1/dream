@@ -189,9 +189,11 @@ dream::Value dream_rt_thunk(dream::Process* p, uint32_t node, dream::Value frame
 /// Apply a closure -- or any value that can be applied -- to `argc` arguments
 /// as they stand, and force the answer to weak head normal form. 1 with the
 /// answer, 0 with the error, and 2 -- having done nothing -- when the callee is
-/// impure and the call has to be the interpreter's. A nested machine loop,
-/// pinned like a force.
+/// impure and the call has to be the interpreter's. A nested machine loop
+/// that may collect, as a force may: the arguments are taken onto the value
+/// stack and `args` cleared, so the caller's array does not keep them alive
+/// once the callee has let them go (`apply_whnf_taking`).
 int dream_rt_apply(dream::Process* p, dream::Value callee, uint32_t argc,
-                   const dream::Value* args, dream::Value* out);
+                   dream::Value* args, dream::Value* out);
 
 }  // extern "C"

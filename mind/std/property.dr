@@ -1,0 +1,283 @@
+// Property tests: a claim checked against a hundred generated cases, and the
+// smallest case that breaks it.
+//
+//     import std.property;
+//     import std.random;
+//
+//     let ints = random.list_of (random.int (-1000) 1000);
+//
+//     let tests = [
+//         property.check "reversing twice changes nothing" ints
+//             (fn xs -> list.reverse (list.reverse xs) == xs),
+//         property.check "sorting keeps the length" ints
+//             (fn xs -> list.length (list.sort xs) == list.length xs),
+//     ];
+//
+// A claim is a function of the generated value that answers `true` -- or that
+// raises, so `test.eq!` and the other assertions work in one written as
+// `let holds xs = ..`. When a case breaks it, the report is not that case
+// but the simplest one found that still does, which is usually small enough
+// to see the bug in at a glance:
+//
+//     FAIL  sum is below 100
+//           falsified by [100] after 4 cases (shrunk 23 times; DREAM_SEED=1771208934)
+//
+// **Shrinking works on what was drawn, not on what was made.** Every
+// generator in `std.random` turns words from its `Rng` into a value, and an
+// `Rng` can be a tape of words to replay (`random.of_tape`). So a failing case
+// is replayed as the tape that made it, and the tape is shrunk -- shortened,
+// cut, zeroed, its words made smaller -- keeping each change under which the
+// claim still fails. Because every draw is written so that a smaller word
+// gives a simpler value, a smaller tape is a simpler case: the list loses
+// elements, the integers move toward the low end of their range, `one_of`
+// moves toward its first choice. This is Hypothesis's idea, and its point is
+// that **no generator needs a shrinker of its own**: one built with `map`,
+// `and_then` or `delay`, however elaborate, shrinks the same way and never
+// shrinks to a value it could not have made.
+//
+// **Runs are reproducible.** Each run's seed is printed with a failure, and
+// `DREAM_SEED=n` makes every property use it, so a failure seen once can be
+// replayed until it is fixed.
+
+import std.error;
+import std.list;
+import std.num;
+import std.os;
+import std.random;
+import std.test;
+
+/// How a property is run: how many cases, from which seed (`()` for
+/// `$DREAM_SEED` or a random one), and how many replays the shrinker may
+/// spend looking for a smaller case.
+mapping Options {
+    runs : :integer = 100
+    seed : :any = ()
+    shrink_budget : :integer = 2000
+}
+
+let defaults : :map;
+let defaults = Options.new ();
+
+/// A test case: `holds` checked against `runs` values from `gen`.
+let check : :string -> random.Gen :any -> (:any -> :any) -> test.Case;
+let check name gen holds = check_with defaults name gen holds;
+
+let check_with : :map -> :string -> random.Gen :any -> (:any -> :any) -> test.Case;
+let check_with options name gen holds = test.case name $( for_all_with! options gen holds );
+
+/// `options` with a different number of runs: `property.runs 1000`.
+let runs : :integer -> :map;
+let runs n = Options.set_runs n defaults;
+
+/// `options` with a fixed seed.
+let seeded : :any -> :map;
+let seeded s = Options.set_seed s defaults;
+
+/// Check the property here, raising with the smallest counterexample when it
+/// fails: for use inside a case of your own.
+let for_all! : random.Gen :any -> (:any -> :any) -> :ok;
+let for_all! gen holds = for_all_with! defaults gen holds;
+
+let for_all_with! : :map -> random.Gen :any -> (:any -> :any) -> :ok;
+let for_all_with! options gen holds = {
+    let base = match Options.seed options {
+        () => match os.env! "DREAM_SEED" {
+            () => random.int! 0 2147483647,
+            text => match num.parse_int text { () => text, n => n },
+        },
+        s => s,
+    };
+    run_cases! options gen holds base 0
+};
+
+priv let run_cases! : :map -> random.Gen :any -> (:any -> :any) -> :any -> :integer -> :ok;
+priv let rec run_cases! options gen holds base i =
+    if i >= Options.runs options { :ok }
+    else {
+        let tape = random.values random.next (random.seed [base, i]);
+        match attempt! gen holds tape {
+            [:pass, _] => run_cases! options gen holds base (i + 1),
+            [:broken_generator, e] => raise! ("the generator raised: " + error.describe e + " (DREAM_SEED=" + to_string base + ")"),
+            [:fail, value, why, used] => {
+                let [small, why2, shrinks] = shrink! gen holds (list.take used tape) [value, why] 0 (Options.shrink_budget options);
+                raise! ("falsified by " + to_string small + " after " + to_string (i + 1) + " case"
+                        + (if i == 0 { "" } else { "s" })
+                        + " (shrunk " + to_string shrinks + " time" + (if shrinks == 1 { "" } else { "s" })
+                        + "; DREAM_SEED=" + to_string base + "): " + why2)
+            },
+        }
+    };
+
+/// Run the generator on a tape and the claim on what it made:
+/// `[:pass, used]`, `[:fail, value, why, used]` or `[:broken_generator, e]`,
+/// where `used` is how many words the generator read.
+priv let attempt! : random.Gen :any -> (:any -> :any) -> [:integer] -> :any;
+priv let attempt! gen holds tape = {
+    let drawn = try! {
+        let [value, after] = gen (random.of_tape tape);
+        let used = random.tape_used after;
+        strict! value
+        [:ok, value, used]
+    } catch e { [:error, e] };
+    match drawn {
+        [:error, e] => [:broken_generator, e],
+        [:ok, value, used] => {
+            let verdict = try! {
+                let answer = holds value;
+                strict! answer
+                if answer == false { [:fail, "the property answered false"] } else { [:pass] }
+            } catch e { [:fail, describe e] };
+            match verdict {
+                [:pass] => [:pass, used],
+                [:fail, why] => [:fail, value, why, used],
+            }
+        },
+    }
+};
+
+/// An assertion's message as it was written, rather than wrapped as an error.
+priv let describe : :any -> :string;
+priv let describe e = if error.kind e == :error && type_of (error.payload e) == :string { error.payload e } else { error.describe e };
+
+/// The smallest failing tape reachable from `tape` by the moves below, taking
+/// the first that still fails each time, until none does or the budget is
+/// spent: `[value, why, shrinks]`.
+///
+/// Two kinds of move. `candidates` are structural -- shorter tapes, runs cut
+/// or zeroed -- and are tried one at a time. When none of them helps, each
+/// word is lowered by halving the distance to the smallest value that still
+/// fails, which finds a boundary like `n < 1000` in thirty-odd replays where
+/// stepping down one at a time would take a billion.
+priv let shrink! : random.Gen :any -> (:any -> :any) -> [:integer] -> [:any] -> :integer -> :integer -> [:any];
+priv let rec shrink! gen holds tape best !shrinks !budget =
+    match first_failing! gen holds tape (candidates tape) budget {
+        [:found, smaller, value, why, left] => shrink! gen holds smaller [value, why] (shrinks + 1) left,
+        [:none, left] => match lower_each! gen holds tape 0 left {
+            [:found, smaller, value, why, left2] => shrink! gen holds smaller [value, why] (shrinks + 1) left2,
+            [:none, _] => [best.[0], best.[1], shrinks],
+        },
+    };
+
+/// The first word, from position `i`, that can be made smaller with the
+/// claim still failing, made as small as it can be.
+priv let lower_each! : random.Gen :any -> (:any -> :any) -> [:integer] -> :integer -> :integer -> :any;
+priv let rec lower_each! gen holds tape i !budget =
+    if i >= list.length tape || budget <= 0 { [:none, budget] }
+    else {
+        let w = list.nth i tape;
+        let with_word v = list.take i tape + [v] + list.drop (i + 1) tape;
+        match bisect! gen holds with_word 0 w () budget {
+            [(), left] => lower_each! gen holds tape (i + 1) left,
+            [[value, why, used, v], left] => {
+                let trimmed = list.take used (with_word v);
+                strict! trimmed
+                [:found, trimmed, value, why, left]
+            },
+        }
+    };
+
+/// The smallest `v` in `[lo, hi)` for which the claim fails on
+/// `with_word v`, assuming that if it fails for one it fails for every larger
+/// one -- true of a word read by `int`, and near enough for the rest. `found`
+/// is the best failure so far, `()` before there is one.
+priv let bisect! : random.Gen :any -> (:any -> :any) -> (:integer -> [:integer]) -> :integer -> :integer -> :any -> :integer -> :any;
+priv let rec bisect! gen holds with_word lo hi found !budget =
+    if lo >= hi || budget <= 0 { [found, budget] }
+    else {
+        let mid = (lo + hi) / 2;
+        match attempt! gen holds (with_word mid) {
+            [:fail, value, why, used] => bisect! gen holds with_word lo mid [value, why, used, mid] (budget - 1),
+            _ => bisect! gen holds with_word (mid + 1) hi found (budget - 1),
+        }
+    };
+
+priv let first_failing! : random.Gen :any -> (:any -> :any) -> [:integer] -> [[:integer]] -> :integer -> :any;
+priv let rec first_failing! gen holds tape cands !budget =
+    if budget <= 0 { [:none, 0] }
+    else {
+        match cands {
+            [] => [:none, budget],
+            [c, ..rest] =>
+                if not (simpler c tape) { first_failing! gen holds tape rest budget }
+                else {
+                    match attempt! gen holds c {
+                        [:fail, value, why, used] => {
+                            let trimmed = list.take used c;
+                            strict! trimmed
+                            [:found, trimmed, value, why, budget - 1]
+                        },
+                        _ => first_failing! gen holds tape rest (budget - 1),
+                    }
+                },
+        }
+    };
+
+/// Shortlex: fewer words, or as many and smaller at the first difference.
+priv let simpler : [:integer] -> [:integer] -> :bool;
+priv let simpler a b = {
+    let la = list.length a;
+    let lb = list.length b;
+    la < lb || (la == lb && compare a b < 0)
+};
+
+/// Smaller tapes to try, roughly most promising first: shorter ones, then
+/// runs of words cut out, then runs zeroed. Lazy, so a shrink that succeeds
+/// early never builds the rest. Making one word smaller is `lower_each!`'s,
+/// by bisection: as a candidate here, `w - 1` nearly always still fails, and
+/// a shrinker that takes it spends its whole budget a word at a time.
+priv let candidates : [:integer] -> [[:integer]];
+priv let candidates tape = {
+    let n = list.length tape;
+    let positions k = list.range 0 (n - k + 1);
+    let chunk_sizes = list.filter (fn k -> k <= n) [8, 4, 2, 1];
+    let truncations = list.map (fn k -> list.take k tape) (list.unique [0, n / 2, n - 1]);
+    let deletions = list.flat_map (fn k -> list.map (fn i -> list.take i tape + list.drop (i + k) tape) (positions k)) chunk_sizes;
+    let zeroings = list.flat_map (fn k -> list.map (fn i -> list.take i tape + list.replicate k 0 + list.drop (i + k) tape)
+                                                   (list.filter (fn i -> list.any (fn w -> w != 0) (list.take k (list.drop i tape))) (positions k)))
+                                 chunk_sizes;
+    truncations + deletions + zeroings
+};
+
+/// A few values from a generator, to see what it makes.
+let examples! : :integer -> random.Gen :any -> [:any];
+let examples! n gen = list.take n (random.values gen (random.new! ()));
+
+when test {
+    import std.str;
+
+    let ints = random.list_of (random.int (0 - 1000) 1000);
+
+    /// The message a failing property raises.
+    let failure! gen holds = try! { for_all_with! (seeded 7) gen holds; "" } catch e { describe e };
+
+    let tests = [
+        check "reversing twice changes nothing" ints (fn xs -> list.reverse (list.reverse xs) == xs),
+        check_with (runs 300) "sorting is idempotent" ints (fn xs -> list.sort (list.sort xs) == list.sort xs),
+        test.case "a false claim shrinks to the boundary" $( {
+            let why = failure! (random.int 0 1000000) (fn n -> n < 1000);
+            test.true! (str.starts_with "falsified by 1000 " why)
+        } ),
+        test.case "a list shrinks to one element" $( {
+            let why = failure! ints (fn xs -> list.sum xs < 500);
+            test.true! (str.starts_with "falsified by [500] " why)
+        } ),
+        test.case "an assertion's message is kept" $( {
+            let check_len! xs = test.eq! 0 (list.length xs);
+            let why = failure! ints check_len!;
+            test.true! (str.starts_with "falsified by [0] " why && str.ends_with ": expected 0, got 1" why)
+        } ),
+        test.case "a mapped generator shrinks through the map" $( {
+            let pairs = random.map2 (fn a b -> [a, b]) (random.int 0 100) (random.int 0 100);
+            // Either [0, 51] or [51, 0]: one word at a time cannot move the
+            // total from one side to the other, and both are as small.
+            let why = failure! pairs (fn [a, b] -> a + b <= 50);
+            test.true! (str.starts_with "falsified by [0, 51] " why || str.starts_with "falsified by [51, 0] " why)
+        } ),
+        test.case "the seed is in the report" $( test.true! (str.contains_str "DREAM_SEED=7" (failure! ints (fn xs -> false))) ),
+        test.case "a broken generator is said to be" $( {
+            let broken = random.map (fn n -> n / 0) (random.int 0 9);
+            test.true! (str.starts_with "the generator raised" (failure! broken (fn n -> true)))
+        } ),
+        test.case "examples" $( test.eq! 5 (list.length (examples! 5 ints)) ),
+    ];
+}

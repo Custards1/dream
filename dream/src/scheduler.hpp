@@ -132,6 +132,30 @@ public:
     /// the same handshake a message arriving uses.
     void wake(uint64_t pid);
 
+    /// The number that names this scheduler to threads it does not own.
+    ///
+    /// The IO poller and a child process's reaper finish on their own threads,
+    /// at a moment nothing orders against this scheduler going away: a program
+    /// can end, and its `Scheduler` -- a local in `dream_main`, or in a
+    /// compile-time evaluation -- be destroyed, while a child it started is
+    /// still being reaped. They used to hold a `Scheduler*` and woke into
+    /// freed memory then (ThreadSanitizer: `enqueue` reading `workers_` after
+    /// the destructor). So they hold this instead, and reach the scheduler
+    /// only through `wake_external`, which finds nothing once the scheduler is
+    /// gone. A serial rather than the pointer, because the next scheduler is
+    /// often built at the same address -- the compile-time ones are locals,
+    /// one after another -- and a stale pointer would wake into that.
+    uint64_t serial() const { return serial_; }
+
+    /// `wake(pid)` and then `note_io_wait(false)` on the scheduler `serial`
+    /// names, in that order (see `run_child` in os.cpp), or nothing if it no
+    /// longer exists.
+    static void wake_external(uint64_t serial, uint64_t pid);
+
+    /// `note_io_wait(false)`, `count` times, on the scheduler `serial` names,
+    /// or nothing if it no longer exists.
+    static void release_io_waits(uint64_t serial, size_t count);
+
     /// A process is waiting on something outside the scheduler -- a descriptor
     /// the poller is watching. Such a process is not deadlocked even though
     /// nothing in the system can run: the kernel still owes it an answer.
@@ -160,6 +184,8 @@ public:
     bool deadlocked() const { return deadlocked_.load(); }
 
 private:
+    uint64_t serial_ = 0;
+
     struct Worker {
         std::mutex mutex;
         std::deque<std::shared_ptr<Process>> queue;

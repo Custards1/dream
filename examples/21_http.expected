@@ -1,0 +1,8 @@
+hello, world
+[:ok, "hello, dream"]
+[:ok, %{"name" => "Ada", "id" => 1}]
+[:ok, 404]
+[:error, :status]
+[201, [:ok, %{"created" => "Grace"}]]
+[200, true, "{\"id\":1,\"name\":\"Ada\"}"]
+[405, "POST"]

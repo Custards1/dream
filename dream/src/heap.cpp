@@ -179,6 +179,7 @@ Heap::Block* Heap::new_block(size_t bytes, bool exact) {
     b->big = false;
     b->dead = false;
     b->evacuate = false;
+    b->pinned = false;
     block_bytes_ += size;
     if (block_bytes_ > peak_block_bytes_) {
         peak_block_bytes_ = block_bytes_;
@@ -231,10 +232,15 @@ void Heap::free_blocks(Block* b) {
 }
 
 void Heap::free_nursery() {
-    for (Block* b : nursery_) free_block(b);
-    nursery_.clear();
+    // But a block holding a pinned object, which stays: see `hold_pinned_blocks`.
+    size_t kept = 0;
+    for (Block* b : nursery_) {
+        if (b->pinned) nursery_[kept++] = b; else free_block(b);
+    }
+    nursery_.resize(kept);
     nursery_at_ = 0;
     nursery_bytes_ = 0;
+    nursery_held_ = 0;
 }
 
 Obj* Heap::carve(size_t sz) {
@@ -313,6 +319,7 @@ Obj* Heap::carve_big(size_t sz) {
         b->size = pb.size;
         b->dead = false;
         b->evacuate = false;
+        b->pinned = false;
         big_pool_bytes_ -= b->size;
     }
     // Exactly the class, not the heap's minimum block. That minimum is for
@@ -572,10 +579,11 @@ Value Heap::make_pap(Value fn, uint32_t nargs) {
     return from_obj(o);
 }
 
-Value Heap::make_error(Value kind, Value payload) {
-    auto* o = static_cast<ErrorObj*>(alloc_bare(ObjType::ErrorBox, 2 * sizeof(Value)));
+Value Heap::make_error(Value kind, Value payload, Value where) {
+    auto* o = static_cast<ErrorObj*>(alloc_bare(ObjType::ErrorBox, 3 * sizeof(Value)));
     o->kind = kind;
     o->payload = payload;
+    o->where = where;
     return from_obj(o);
 }
 
@@ -661,6 +669,9 @@ void Heap::reap_external(bool full) {
             // Promoted: the copy is the object now, and the stub is about to
             // be nursery space again.
             external_[keep++] = as_obj(forward_target(o));
+        } else if (gc & GC_PINNED) {
+            // Young and not copied out, because a compiled frame holds it.
+            external_[keep++] = o;
         } else if (gc & GC_YOUNG) {
             // Young and not copied out: nothing reached it.
             drop(o);
@@ -675,7 +686,13 @@ void Heap::reap_external(bool full) {
     // it found the memory held by old objects, which only a major can judge.
     // A major settles the question either way.
     external_major_ = !full && before >= external_trigger_ && external_bytes_ * 2 > before;
-    external_trigger_ = std::max(external_bytes_ * 2, external_bytes_ + kExternalSlack);
+    //
+    // The doubling is capped by the device. GPU memory is not the heap's to
+    // grow: a training loop makes a gigabyte of temporaries a second on the
+    // device, and with the trigger at twice what survived, the peaks between
+    // collections grew until an 8 GB card ran out (`external_budget`).
+    const size_t doubled = std::min(external_bytes_ * 2, external_budget());
+    external_trigger_ = std::max(doubled, external_bytes_ + kExternalSlack);
 }
 
 Value Heap::make_pid(uint64_t id) {
@@ -710,6 +727,10 @@ struct Heap::GcCtx {
     /// balances them through the round's shared stack.
     std::vector<Obj*>* q = nullptr;
     std::vector<Obj*> own;
+    /// Whether the object being scanned has a field naming a pinned young
+    /// object, and the old ones found to. See `GC_PINNED`.
+    bool met_pinned = false;
+    std::vector<Obj*> pin_refs;
     /// Objects still to scan before this thread next asks whether anyone else
     /// has run out of work. Checking on every object would put a shared
     /// counter on the hottest loop in the collector to answer a question whose
@@ -1129,6 +1150,13 @@ void Heap::forward_slow(GcCtx& c, Value* slot) {
         if (observe_round_) shared_observe(o, observe_round_);
         return;
     }
+    // Pinned: young, and staying where a compiled frame can find it. The slot
+    // keeps it, and if the slot is in an old object that object is owed to
+    // the next minor's remembered set -- it now points at a young one.
+    if (gc & GC_PINNED) {
+        c.met_pinned = true;
+        return;
+    }
     // A young object is copied to old space and the slot rewritten to the
     // copy. A forwarded one is a young object already copied this cycle; its
     // first payload word holds the copy, so sharing survives promotion.
@@ -1284,6 +1312,7 @@ inline void for_each_slot(Obj* o, ObjType type, F&& visit) {
             auto* e = static_cast<ErrorObj*>(o);
             visit(&e->kind);
             visit(&e->payload);
+            visit(&e->where);
             break;
         }
         case ObjType::Module: {
@@ -1307,12 +1336,24 @@ void Heap::scan_object(GcCtx& c, Obj* o) {
     // Each reference is either forwarded (the copying collector: promote a
     // young one, mark an old one, fold an indirection) or, when `Con`, merely
     // marked -- the concurrent mark's whole scan.
+    // A root that named a pinned object set it too, and roots are nobody's.
+    if constexpr (!Con) c.met_pinned = false;
     for_each_slot(o, read_type<Par>(o), [&](Value* slot) {
         if constexpr (Con)
             mark_ref(c, read_slot<Par>(slot));
         else
             forward_in<Par, Con>(c, slot);
     });
+    // Once per object, however many of its fields named one: a record per
+    // field went back on the remembered set as that many entries, each of
+    // which was scanned and recorded again, and the set doubled at every
+    // minor -- 33 million entries in a self-compile, and a 759 ms minor.
+    if constexpr (!Con) {
+        if (c.met_pinned) {
+            c.met_pinned = false;
+            if (!(read_gc<Par>(o) & GC_YOUNG)) c.pin_refs.push_back(o);
+        }
+    }
 }
 
 void Heap::forward(Value* slot) {
@@ -1550,6 +1591,7 @@ bool Heap::trace_in_parallel(RootSource& roots, bool minor) {
             root_ctx_ = &c;
             roots.visit_roots(*this);
             root_ctx_ = nullptr;
+            trace_pinned<true>(c);
         }
         if (minor) {
             // The remembered set divides by index. An object logged twice is
@@ -1575,6 +1617,7 @@ bool Heap::trace_in_parallel(RootSource& roots, bool minor) {
     if (ran) {
         for (GcCtx& c : round.ctxs) {
             merge_free_lists(c.free_head, c.free_tail);
+            pin_refs_.insert(pin_refs_.end(), c.pin_refs.begin(), c.pin_refs.end());
             allocated_ += c.allocated;
             promoted_bytes_ += c.promoted;
             total_allocated_ += c.total;
@@ -1602,12 +1645,191 @@ void Heap::trace_alone(RootSource& roots, bool minor) {
     root_ctx_ = &c;
     roots.visit_roots(*this);
     root_ctx_ = nullptr;
+    trace_pinned<false>(c);
     if (minor) {
         for (Obj* o : remembered_) scan_object<false, false>(c, o);
     }
     drain<false, false>(c);
     promoted_bytes_ += c.promoted;
     total_allocated_ += c.total;
+    pin_refs_.insert(pin_refs_.end(), c.pin_refs.begin(), c.pin_refs.end());
+}
+
+// ---------------------------------------------------------------------------
+// Collecting under compiled code
+// ---------------------------------------------------------------------------
+//
+// See `set_conservative_roots` for what this is and docs/gc.md for why. What
+// follows is the mechanics, in the order a collection meets them: find the
+// objects, keep them where they are, trace from them, and give their nursery
+// blocks to old space.
+
+void Heap::pin_conservative(bool full) {
+    pinned_.clear();
+    pinned_blocks_.clear();
+    pin_refs_.clear();
+    if (!cons_lo_) return;
+    const uint64_t started = now_nanos();
+
+    // Every block's used extent, sorted, so that a word is placed by a binary
+    // search. Built afresh: this runs once per collection under compiled code,
+    // and a table kept up to date would cost every block that is ever made.
+    struct Range {
+        uintptr_t lo, hi;
+        Block* b;
+    };
+    std::vector<Range> ranges;
+    ranges.reserve(nursery_.size() + 64);
+    auto add = [&](Block* b) {
+        if (!b->used) return;
+        const auto lo = reinterpret_cast<uintptr_t>(b->data);
+        ranges.push_back({lo, lo + b->used, b});
+    };
+    for (Block* b : nursery_) add(b);
+    // Old space only for a full collection. A minor moves no old object and
+    // marks none, and what an old object points at in the nursery it reaches
+    // through the remembered set, as it would interpreted -- so a word naming
+    // one asks nothing of a minor, and finding its object would be a walk of
+    // an old block for every such word, at every minor. That walk was the
+    // first version's, and it made a self-compile two and a half times slower.
+    if (full) {
+        for (Block* b = blocks_; b; b = b->next) add(b);
+    }
+    std::sort(ranges.begin(), ranges.end(),
+              [](const Range& x, const Range& y) { return x.lo < y.lo; });
+
+    // The words that land in a block, as (block, address), sorted so that
+    // each block is walked once however many words point into it. A nursery
+    // block is one run of objects with no index, so finding the object an
+    // address is inside is a walk from the block's start.
+    std::vector<std::pair<size_t, uintptr_t>> hits;
+    for (const uintptr_t* w = cons_lo_; w < cons_hi_; ++w) {
+        const uintptr_t a = *w;
+        auto it = std::upper_bound(ranges.begin(), ranges.end(), a,
+                                   [](uintptr_t key, const Range& r) { return key < r.lo; });
+        if (it == ranges.begin()) continue;
+        --it;
+        if (a >= it->hi) continue;
+        hits.push_back({size_t(it - ranges.begin()), a});
+    }
+    std::sort(hits.begin(), hits.end());
+
+    size_t i = 0;
+    while (i < hits.size()) {
+        const Range& r = ranges[hits[i].first];
+        Block* b = r.b;
+        size_t pos = 0;
+        Obj* last = nullptr;
+        for (; i < hits.size() && hits[i].first == size_t(&r - ranges.data()); ++i) {
+            const uintptr_t at = hits[i].second - r.lo;
+            // Step to the object that holds `at`. The hits are in address
+            // order, so the walk only ever goes forward.
+            Obj* o = nullptr;
+            while (pos < b->used) {
+                auto* here = reinterpret_cast<Obj*>(b->data + pos);
+                if (at < pos + here->bytes) {
+                    o = here;
+                    break;
+                }
+                pos += here->bytes;
+            }
+            if (!o || o == last) continue;
+            last = o;
+            const uint8_t gc = o->gc;
+            // A hole on a free list, or what a word left over from a call long
+            // returned happens to point at: nothing to keep.
+            if (gc & (GC_FREE | GC_FORWARDED | GC_PINNED)) continue;
+            if (gc & GC_YOUNG) {
+                // Left where it stands and left young. Promoting it in place
+                // was the first version, and it was wrong in a way worth
+                // knowing: the object a compiled loop holds is usually the
+                // thunk it is forcing, which is updated a moment later to
+                // point at what it produced -- an old object pointing at the
+                // young, remembered, and every minor after that promoted
+                // whatever had been produced since. A young pinned object
+                // makes no such edge. The next collection judges it like any
+                // other: copied out if it is still reached, gone if not.
+                o->gc = uint8_t(GC_YOUNG | GC_PINNED);
+                if (!b->pinned) {
+                    b->pinned = true;
+                    pinned_blocks_.push_back(b);
+                }
+            } else if (b->evacuate) {
+                // An old object never moves except by evacuation, so keeping
+                // its block out of this one is all keeping it takes. The block
+                // is left off the free lists until the next sweep, which is
+                // what the choice had already arranged.
+                b->evacuate = false;
+            }
+            pinned_.push_back(o);
+        }
+    }
+    if (gc_trace())
+        std::fprintf(stderr,
+                     "; under compiled code: %zu words, %zu pinned, %zu blocks held, %.3f ms\n",
+                     size_t(cons_hi_ - cons_lo_), pinned_.size(), pinned_blocks_.size(),
+                     double(now_nanos() - started) / 1e6);
+}
+
+template <bool Par>
+void Heap::trace_pinned(GcCtx& c) {
+    for (Obj* o : pinned_) {
+        if (!(o->gc & GC_YOUNG) && full_trace_) {
+            // Marks the object itself, an `Indirect` included -- a compiled
+            // frame may hold the indirection rather than what it leads to.
+            mark_object<Par>(c, from_obj(o));
+        } else if (!is_atom_object(o->type)) {
+            // Its fields, as a remembered object's are: a young pinned object
+            // is never marked, because the sweep never sees the nursery, and
+            // a minor marks nothing.
+            scan_object<Par, false>(c, o);
+        }
+    }
+}
+
+void Heap::hold_pinned_blocks() {
+    for (Block* b : pinned_blocks_) {
+        // Everything here but the pinned is dead or the stub of something
+        // promoted, and stays in the block until the next collection empties
+        // it. Inert, so that a stale word on a later scan cannot bring one
+        // back: its fields name objects that have moved or been overwritten.
+        for (size_t pos = 0; pos < b->used;) {
+            auto* o = reinterpret_cast<Obj*>(b->data + pos);
+            pos += o->bytes;
+            if (!(o->gc & GC_PINNED)) o->gc = GC_FREE;
+        }
+        // Held, so still allocated -- but not new allocation, which is what
+        // `nursery_bytes_` measures and a minor is due on. Counted there, a
+        // held block made the next minor due the moment this one ended.
+        nursery_held_ += b->used;
+        allocated_ += b->used;
+        b->pinned = false;
+    }
+    pinned_blocks_.clear();
+    // A survivor that points at a pinned object is an old object pointing at
+    // a young one, which is exactly what the remembered set is for. Once
+    // each: an object scanned twice -- remembered twice, say -- is recorded
+    // twice, and the next minor would scan it twice and record it twice more.
+    std::sort(pin_refs_.begin(), pin_refs_.end());
+    pin_refs_.erase(std::unique(pin_refs_.begin(), pin_refs_.end()), pin_refs_.end());
+    remembered_.insert(remembered_.end(), pin_refs_.begin(), pin_refs_.end());
+    pin_refs_.clear();
+}
+
+void Heap::forward_pin_refs() {
+    if (!fixing_refs_) return;
+    // An evacuation may have moved one of them; the stub names the copy until
+    // the sweep frees its block.
+    for (Obj*& o : pin_refs_) {
+        if (o->gc == GC_FORWARDED) o = as_obj(forward_target(o));
+    }
+    // And a pinned young object may point at something it moved. The sweep
+    // rewrites those references in every live object it walks, and it never
+    // walks the nursery -- so these are rewritten here, or keep naming a stub
+    // in a block about to be handed back.
+    for (Obj* o : pinned_) {
+        if (o->gc & GC_YOUNG) fix_refs(o);
+    }
 }
 
 void Heap::collect(RootSource& roots) {
@@ -1630,6 +1852,7 @@ void Heap::grow_nursery_if_crowded(size_t promoted, size_t looked_at) {
 
 void Heap::major_collect(RootSource& roots) {
     const uint64_t started = now_nanos();
+    pin_conservative(true);
 
     // Mark. `forward` promotes every reachable young object -- copying it to
     // old space -- and marks the old ones. The roots are grey before anything
@@ -1643,6 +1866,7 @@ void Heap::major_collect(RootSource& roots) {
     // blocks the last sweep chose are emptied into the holes of the rest,
     // and the sweep below rewrites the references as it passes them.
     evacuate(roots);
+    forward_pin_refs();
     const uint64_t marked = now_nanos();
 
     // Sweep. Every old block's chunk headers tile the block, so one walk over
@@ -1653,6 +1877,7 @@ void Heap::major_collect(RootSource& roots) {
     if (!sweep_in_parallel()) sweep();
     free_nursery();
     remembered_.clear();
+    hold_pinned_blocks();
 
     ++collections_;
     ++major_collections_;
@@ -1692,6 +1917,7 @@ void Heap::minor_collect(RootSource& roots) {
     const uint64_t promoted_before = promoted_bytes_;
     const size_t looked_at = nursery_bytes_;
     const size_t remembered_n = remembered_.size();
+    pin_conservative(false);
 
     // Trace. Roots have their young values promoted directly; each remembered
     // old object is scanned so a young value it was made to point at is
@@ -1704,11 +1930,17 @@ void Heap::minor_collect(RootSource& roots) {
     // Every nursery block is now dead space; reset them all and rewind to the
     // first, so the next bump allocation refills the blocks we already have.
     // (They are kept, not freed -- the process will fill them again at once.)
-    for (Block* b : nursery_) b->used = 0;
+    // A block holding a pinned object is the exception, and is counted again
+    // by `hold_pinned_blocks`.
+    for (Block* b : nursery_) {
+        if (!b->pinned) b->used = 0;
+    }
     nursery_at_ = 0;
-    allocated_ -= nursery_bytes_;
+    allocated_ -= nursery_bytes_ + nursery_held_;
     nursery_bytes_ = 0;
+    nursery_held_ = 0;
     remembered_.clear();
+    hold_pinned_blocks();
 
     ++collections_;
     ++minor_collections_;
@@ -1860,6 +2092,9 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
     // heap's memory, and the sweep below is about to reconsider all of it.
     marking_ = false;
     GcPool::instance().join();
+    // Only now: a helper may still have been claiming marks until the join,
+    // and pinning writes the same byte.
+    pin_conservative(true);
 
     // The snapshot was read while the helpers were still running, so it may
     // name young objects this finalize is about to move. Let it go before the
@@ -1892,9 +2127,11 @@ void Heap::finalize_concurrent_mark(RootSource& roots) {
     // The helpers are joined and the last of the graph has been traced, so
     // this is the same moment as a stopped major's: see `major_collect`.
     evacuate(roots);
+    forward_pin_refs();
     if (!sweep_in_parallel()) sweep();
     free_nursery();
     remembered_.clear();
+    hold_pinned_blocks();
     ++collections_;
     ++major_collections_;
     ++concurrent_marks_;
@@ -2386,9 +2623,16 @@ struct VerifyWalk {
             return problem("object at " + addr(o) + " is not 8-byte aligned");
         }
         if (!owns(o, sizeof(Obj))) {
-            return problem("pointer " + addr(o) + " does not land in this heap");
+            std::string via = "a root";
+            if (is_ptr(parent)) {
+                Obj* pp = as_obj(parent);
+                via = addr(pp) + " type " + std::to_string(static_cast<int>(pp->type)) +
+                      " gc " + std::to_string(static_cast<int>(pp->gc));
+            }
+            return problem("pointer " + addr(o) + " does not land in this heap (reached from " +
+                           via + ")");
         }
-        if (no_young && (o->gc & GC_YOUNG)) {
+        if (no_young && (o->gc & GC_YOUNG) && !(o->gc & GC_PINNED)) {
             std::string via = "root";
             if (is_ptr(parent)) {
                 Obj* pp = as_obj(parent);
@@ -2522,6 +2766,7 @@ struct VerifyWalk {
                     auto* e = static_cast<ErrorObj*>(o);
                     push(e->kind, v);
                     push(e->payload, v);
+                    push(e->where, v);
                     break;
                 }
                 case ObjType::Module:
@@ -2627,6 +2872,9 @@ std::string Heap::verify_internal(RootSource& roots, bool no_young) {
     for (Block* b : nursery_) add_range(b);
     std::sort(walk.ranges.begin(), walk.ranges.end());
     for (Value v : collected) walk.push(v, 0);
+    // What a collection under compiled code pinned is as much a root as the
+    // process's own, and has to have come through it as sound.
+    for (Obj* o : pinned_) walk.push(from_obj(o), 0);
     walk.run();
     return walk.error;
 }
@@ -2883,7 +3131,8 @@ Value copy_object(Dest& dest, Value v, CopySeen& seen) {
             auto* src = static_cast<ErrorObj*>(o);
             Value kind = copy_value(dest, src->kind, seen);
             Value payload = copy_value(dest, src->payload, seen);
-            return dest.make_error(kind, payload);
+            Value where = copy_value(dest, src->where, seen);
+            return dest.make_error(kind, payload, where);
         }
         case ObjType::Module: {
             auto* src = static_cast<ModuleObj*>(o);
@@ -3308,10 +3557,11 @@ Value SharedArea::make_map_leaf(uint64_t hash, Value key, Value value, Value nex
     return from_obj(o);
 }
 
-Value SharedArea::make_error(Value kind, Value payload) {
-    auto* o = static_cast<ErrorObj*>(alloc(ObjType::ErrorBox, 2 * sizeof(Value)));
+Value SharedArea::make_error(Value kind, Value payload, Value where) {
+    auto* o = static_cast<ErrorObj*>(alloc(ObjType::ErrorBox, 3 * sizeof(Value)));
     o->kind = kind;
     o->payload = payload;
+    o->where = where;
     return from_obj(o);
 }
 

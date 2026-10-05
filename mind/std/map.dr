@@ -74,6 +74,22 @@ let remove k m = _map_remove m k;
 let update : v -> (v -> v) -> k -> %{ k => v } -> %{ k => v };
 let update default f k m = m.[k => (f (m.[k else default]))];
 
+/// `put` and `update` that force the value before storing it.
+///
+/// A value stored suspended holds its frame, and when that frame holds the
+/// map -- a table built up in a loop, a cache keyed by what it has already
+/// seen -- the map holds every version of itself. Nothing reads wrong; the
+/// program just keeps all of it, and `--stats` shows it as map branches far
+/// outnumbering map entries ("A lazy value stored in a map pins the map it was
+/// made in" in docs/notes/compiler-scaling.md). These force the value as far
+/// as its outermost constructor, as a strict parameter does: enough to cut
+/// the value loose from a frame that only computed it, not a walk of all of
+/// it.
+let put_strict : k -> v -> %{ k => v } -> %{ k => v };
+let put_strict k !v m = m.[k => v];
+let update_strict : v -> (v -> v) -> k -> %{ k => v } -> %{ k => v };
+let update_strict default f k m = put_strict k (f (m.[k else default])) m;
+
 /// Add only if the key is absent, so a fold over pairs keeps the first.
 let put_new : k -> v -> %{ k => v } -> %{ k => v };
 let put_new k v m = if _map_has m k { m } else { m.[k => v] };
@@ -145,6 +161,13 @@ when test {
         test.case "update an existing key"  $( test.eq! 2 (get 0 :a (update 0 (fn n -> n + 1) :a m)) ),
         test.case "update a missing key starts from the default"
             $( test.eq! 1 (get 0 :zz (update 0 (fn n -> n + 1) :zz m)) ),
+        test.case "put_strict forces the value"
+            $( test.raises! $( size (put_strict :a (1 / 0) m) ) ),
+        test.case "put leaves the value suspended"
+            $( test.eq! 3 (size (put :c (1 / 0) m)) ),
+        test.case "update_strict forces what f answers"
+            $( test.raises! $( size (update_strict 0 (fn n -> n / 0) :a m) ) ),
+        test.case "update_strict"          $( test.eq! 2 (get 0 :a (update_strict 0 (fn n -> n + 1) :a m)) ),
         test.case "put_new keeps the first" $( test.eq! 1 (get 0 :a (put_new :a 9 m)) ),
         test.case "map_values"             $( test.eq! [10, 20]
                                                 (list.map (fn k -> get 0 k (map_values (fn v -> v * 10) m))

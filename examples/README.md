@@ -41,6 +41,11 @@ Read them in order the first time; each assumes the ones before it.
 | [`15_remote.dr`](15_remote.dr) | `std.remote`: the same server over a socket, client and server in one program |
 | [`16_registry.dr`](16_registry.dr) | `std.registry`: a name for a server, so a supervisor and a listener compose |
 | [`17_tensors.dr`](17_tensors.dr) | `std.tensor`: elementwise arithmetic, `@`, fusion, and the GPU when there is one |
+| [`18_time.dr`](18_time.dr) | `std.time`: instants and durations as integers, zones, calendar arithmetic, formats |
+| [`19_text.dr`](19_text.dr) | `std.parse` and `std.regex`: grammars from functions, patterns checked while compiling |
+| [`20_random.dr`](20_random.dr) | `std.random` and `std.property`: replayable generators, and counterexamples that shrink |
+| [`21_http.dr`](21_http.dr) | `std.http`: a router, a server and a client in one program |
+| [`22_ml.dr`](22_ml.dr) | `std.ml`: a classifier and a regression trained from scratch, a hand-written gradient, parameters as data |
 
 ## The packages
 

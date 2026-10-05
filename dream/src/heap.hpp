@@ -60,6 +60,10 @@ constexpr uint8_t GC_BUSY = 32;
 /// collector ever sets or clears a bit of it, and every trace stops at it --
 /// it is not this heap's to mark, move or free, and nothing under it can be.
 constexpr uint8_t GC_SHARED = 64;
+/// A nursery object a conservative root pinned (`Heap::set_conservative_roots`):
+/// young, and not to be copied. Only set while a collection is running; the
+/// object is an ordinary young one again once it ends.
+constexpr uint8_t GC_PINNED = 128;
 
 class Heap;
 class SharedArea;
@@ -95,6 +99,10 @@ void shared_census_walk(Value v, uint64_t round);
 void* tensor_handle(const TensorObj* t);
 void retain_external(Obj* o);
 void release_external(Obj* o);
+/// The most external memory a heap should let accumulate before it collects,
+/// whatever the doubling rule says: a quarter of the GPU's memory once a GPU
+/// is in use, and no bound before then. Defined beside the tensors.
+size_t external_budget();
 
 /// Supplies the roots for a collection. Implemented by Process.
 struct RootSource {
@@ -155,7 +163,7 @@ public:
     Value make_thunk(uint32_t node, Value frame);
     Value make_frame(Value closure, uint32_t nslots);
     Value make_pap(Value fn, uint32_t nargs);
-    Value make_error(Value kind, Value payload);
+    Value make_error(Value kind, Value payload, Value where = UNIT);
     Value make_pid(uint64_t id);
     /// A bignum with room for `limbs` limbs, uninitialised: the caller writes
     /// them and sets `len` and `neg`. See `bigint::finish`.
@@ -201,7 +209,9 @@ public:
     /// still holding. `allocated_` counts both generations, because it is what
     /// says how full the heap is; this is the half a major is about.
     size_t old_bytes() const {
-        return allocated_ >= nursery_bytes_ ? allocated_ - nursery_bytes_ : 0;
+        // A held nursery block (`nursery_held_`) is young memory too.
+        const size_t young = nursery_bytes_ + nursery_held_;
+        return allocated_ >= young ? allocated_ - young : 0;
     }
 
     /// Old space past the threshold the last full collection fitted to it.
@@ -291,6 +301,34 @@ public:
     /// overlap, so a heap does not drift on with a finished mark behind it.
     bool mark_done() const { return mark_done_.load(std::memory_order_relaxed); }
 
+    /// The machine stack of a process collecting underneath JIT-compiled
+    /// code, as the words from `lo` up to `hi`. The next collection pins in
+    /// place every object one of those words points into, and `clear` ends it.
+    ///
+    /// A compiled frame keeps its values in machine registers and stack
+    /// slots, which nothing can find precisely and nothing may rewrite. So the
+    /// collection that runs under one does not move what such a frame could
+    /// be holding: any word that lands inside an object of this heap -- its
+    /// start or anywhere in it, because a compiled loop may keep only a field
+    /// address -- is treated as naming that object. A young one stays young
+    /// and stays put (`GC_PINNED`), in a nursery block the collection does not
+    /// empty; the next collection judges it like any other young object. An
+    /// old one is kept out of the evacuation. Everything they point at is
+    /// traced and moved as usual, because the collector rewrites the fields of
+    /// a pinned object and never the word that pinned it. A word that is not
+    /// a pointer at all, but looks like one, keeps something alive for one
+    /// collection more; that is the whole cost of guessing. "Collecting under
+    /// compiled code" in docs/gc.md.
+    void set_conservative_roots(const void* lo, const void* hi) {
+        cons_lo_ = static_cast<const uintptr_t*>(lo);
+        cons_hi_ = static_cast<const uintptr_t*>(hi);
+    }
+    void clear_conservative_roots() {
+        cons_lo_ = cons_hi_ = nullptr;
+        for (Obj* o : pinned_) o->gc &= uint8_t(~GC_PINNED);
+        pinned_.clear();
+    }
+
     /// Hand one root to the collector: mark what `*slot` holds, and rewrite
     /// the slot when promotion moves it. This is the entry point a
     /// `RootSource` uses, and the only one; the scanner reaches the same code
@@ -331,6 +369,9 @@ public:
     size_t bytes_allocated() const { return allocated_; }
     size_t bytes_live() const { return live_after_gc_; }
     uint64_t collections() const { return collections_; }
+    /// Memory held outside the heap by objects in it: GPU buffers, a
+    /// bignum's limbs.
+    size_t external_bytes() const { return external_bytes_; }
     uint64_t major_collections() const { return major_collections_; }
     uint64_t minor_collections() const { return minor_collections_; }
     /// Rounds that were divided across the helper threads rather than run on
@@ -472,6 +513,9 @@ private:
         /// the rest. None of its holes are on a free list and nothing is carved
         /// from its tail, so nothing new lands in it while it waits.
         bool evacuate;
+        /// A nursery block holding an object a conservative root pinned. The
+        /// collection running now leaves it as it is rather than emptying it.
+        bool pinned;
     };
 
     /// One collector thread's private state for the length of one collection.
@@ -555,6 +599,22 @@ private:
     /// and its private carve block, so that promotion needs no lock per
     /// object.
     template <bool Par> Obj* gc_carve(GcCtx& c, uint32_t sz);
+    /// Find what the conservative roots point into and pin it; see
+    /// `set_conservative_roots`. The first thing every collection does, so
+    /// that nothing it then does can move a pinned object. `full` for one that
+    /// marks old space; a minor looks only at the nursery.
+    void pin_conservative(bool full);
+    /// The pinned objects as roots of the trace now running in `c`: their
+    /// fields traced, and an old one marked in a full trace.
+    template <bool Par> void trace_pinned(GcCtx& c);
+    /// The end of a collection that pinned anything young: what is left in
+    /// each pinned block besides the pinned objects is made inert, and the old
+    /// objects that point at them go on the remembered set for the next minor.
+    /// `allocated_` is left counting the held blocks, and `nursery_held_`.
+    void hold_pinned_blocks();
+    /// After an evacuation, point `pin_refs_` at where its objects went, and
+    /// the pinned young objects' fields at where theirs did.
+    void forward_pin_refs();
     /// Drain the thread's own queue, taking from and giving to the round's
     /// shared stack, until every thread has run out of work at once.
     template <bool Par, bool Con> void drain(GcCtx& c);
@@ -653,6 +713,19 @@ private:
     /// Old objects the mutator has been made to point at young ones. Drained
     /// (not deduplicated) by scanning each entry at the next minor collection.
     std::vector<Obj*> remembered_;
+    /// See `set_conservative_roots`. Null outside a collection under compiled
+    /// code, which is every collection but those.
+    const uintptr_t* cons_lo_ = nullptr;
+    const uintptr_t* cons_hi_ = nullptr;
+    /// What they pinned, for the length of one collection; the nursery blocks
+    /// it holds; and the old objects found pointing at a pinned young one,
+    /// which are owed to the next minor's remembered set.
+    std::vector<Obj*> pinned_;
+    std::vector<Block*> pinned_blocks_;
+    std::vector<Obj*> pin_refs_;
+    /// What the held blocks had in them when they were held: allocated, and
+    /// left out of `nursery_bytes_`. See `hold_pinned_blocks`.
+    size_t nursery_held_ = 0;
     size_t allocated_ = 0;
     uint64_t total_allocated_ = 0;
     size_t peak_live_ = 0;
@@ -935,7 +1008,7 @@ public:
     Value make_array(uint32_t len);
     Value make_map_branch(uint32_t nslots);
     Value make_map_leaf(uint64_t hash, Value key, Value value, Value next);
-    Value make_error(Value kind, Value payload);
+    Value make_error(Value kind, Value payload, Value where = UNIT);
     Value make_module(uint32_t import_index, Value name);
     Value make_closure(uint32_t func, uint32_t ncaps);
     Value make_pap(Value fn, uint32_t nargs);

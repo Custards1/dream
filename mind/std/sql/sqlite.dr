@@ -8,10 +8,11 @@
 //     sql.query! db (sql.select [] |> sql.from "notes")
 //     sql.close! db
 //
-// The library is the system's (`libsqlite3.so.0`, or what `foreign.shared_library`
-// says it is called elsewhere), found the way the platform's loader finds one --
-// so on a system that keeps it somewhere unusual, `LD_LIBRARY_PATH` is how to
-// say where.
+// The library is the system's: ABI version 0, under whatever name and in
+// whichever directory this platform keeps it (`foreign.system_version`). On a
+// system that keeps it somewhere no search would think of,
+// `DREAM_LIB_SQLITE3=/path/to/libsqlite3.so` says which file, and
+// `DREAM_LIBRARY_PATH` adds a directory to look in.
 //
 // A database handle is owned by the process that opened it, as every
 // `std.foreign` resource is, and a statement is owned by its database: closing
@@ -30,7 +31,7 @@ import std.sql;
 import std.sql.lint;
 import std.str;
 
-foreign sqlite3 from (foreign.shared_library "sqlite3" "0") {
+foreign sqlite3 from system "sqlite3" "0" {
     resource Db = sqlite3_close_v2
     resource Stmt = sqlite3_finalize
 

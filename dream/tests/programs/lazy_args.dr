@@ -15,7 +15,6 @@
 // crossed.
 import std.console;
 
-
 /// Never looks at its argument. Under call-by-need nothing in it is evaluated.
 let ignore x = 42;
 

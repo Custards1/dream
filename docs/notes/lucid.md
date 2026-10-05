@@ -202,3 +202,28 @@ is no use to a server, so completion on `len` could show nothing but `len`.
 `builtins.signatures` is that comment moved into the program, as a map rather
 than a second list so that adding a name and forgetting its line is a failing
 test.
+
+## Inlay hints and rename (2026-10-04)
+
+**A hint is the checker's own type.** `typecheck.hints` checks the whole
+program once for what each unsigned function answers (the first half of
+"what an unsigned function answers" in docs/notes/static-types.md), then walks
+this file's bodies again with `Checker.hints` on, and `statement` drops a
+`[:hint, ..]` into the diagnostics it already threads whenever it binds a
+`let` with no signature. So a hint is the type every later statement is
+checked against, and cannot disagree with a diagnostic. Not shown: `:any`,
+the type of a literal written right there, and `:unit` for an action. It costs
+a whole check per request, which on the compiler's own files is about what a
+diagnostics refresh costs.
+
+**Rename has two kinds of target, found differently.** A global is a module
+and a name, and its uses are a scan of `scope.refs`, decoded from the key
+(`scope.ref_key`); a member is recorded at the head of its chain, so the
+segment itself is found in the text. The declaration, the signature and an
+`import m.{name}` are not uses and are read off the declarations. A local is a
+binder: the resolver records a capture with no binder, and records nothing at
+all for a pipeline stage it staged (`scope.staging` writes the stage where it
+is read), so a local's identity is `locals_at`'s innermost binder of the name
+-- the syntax's scoping, which completion already transcribes. Not handled:
+a name inherited through `derive` (renamed in the base only), a record's
+generated members, and modules outside the program rooted at the open file.

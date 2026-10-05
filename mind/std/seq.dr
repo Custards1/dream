@@ -19,7 +19,6 @@
 // (from 1)` has to work on an infinite list, and it cannot if it goes through a
 // fold.
 
-
 // --- the hole ---------------------------------------------------------------
 
 /// Combine every element into an accumulator, left to right:

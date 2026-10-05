@@ -7,8 +7,7 @@
 // two text spellings of bytes a PostgreSQL conversation uses (hex for `bytea`,
 // base64 for SCRAM), and exclusive-or.
 //
-// **There are no bitwise operators in Dream**, and exclusive-or is the one
-// operation a password exchange cannot do without. So it is a table: sixteen
+// Exclusive-or uses a table predating Dream's bitwise operators: sixteen
 // by sixteen answers for a pair of nibbles, built once, and a byte is two
 // lookups. That is cheap enough for SCRAM's four thousand rounds of HMAC and
 // needs nothing from the VM. `std.sql.pg.crypto` builds AND and OR the same way for

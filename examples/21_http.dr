@@ -1,0 +1,65 @@
+// HTTP: a server and a client in one program.
+//
+// A handler is a function from a `Request` to a `Response`, both of them
+// records, so most of a web service is pure functions that can be called
+// without a socket. A router is a value that becomes a handler, and
+// middleware is a function from a handler to another, so they stack with
+// `|>`. The client answers `[:ok, response]` or `[:error, e]`: a 404 is a
+// response, and only a failure to get one is an error.
+import std.console;
+import std.error;
+import std.result;
+import std.str;
+import std.http;
+import std.http.server;
+
+// Pure handlers: request in, response out.
+let hello req = http.text ("hello, " + (match http.query_value "name" req { () => "world", n => n }));
+let show_user req = match http.param "id" req {
+    "1" => http.json %{ "id" => 1, "name" => "Ada" },
+    _ => http.not_found,
+};
+let create_user req = match http.body_json req {
+    [:ok, %{ "name" => name }] => http.json %{ "created" => name } |> http.with_status 201,
+    _ => http.bad_request "expected {\"name\": ..}",
+};
+
+let main! = {
+    let app = server.router
+        |> server.get "/" hello
+        |> server.get "/users/:id" show_user
+        |> server.post "/users" create_user
+        |> server.get "/old" (fn req -> http.redirect "/users/1");
+
+    // A handler can be tried with no server at all.
+    console.print! (http.body (server.call! app (http.Request.new ())))
+
+    // And then served, on a port the system picks.
+    let s = server.serve! 0 (server.cors "*" app);
+    let base = server.local_url s;
+
+    console.print! (http.get_text! (base + "/?name=dream"))
+    console.print! (http.get_json! (base + "/users/1"))
+    console.print! (http.get! (base + "/users/2") |> result.map http.status)
+    console.print! (http.get_text! (base + "/users/2") |> result.map_error error.kind)
+
+    // POST a JSON body; the 201 and its body come back.
+    match http.post_json! (base + "/users") %{ "name" => "Grace" } {
+        [:ok, resp] => console.print! [http.status resp, http.body_json resp],
+        [:error, e] => console.print! (error.describe e),
+    }
+
+    // Redirects are followed, and the response says where it ended up.
+    match http.get! (base + "/old") {
+        [:ok, resp] => console.print! [http.status resp, str.ends_with "/users/1" (http.Response.url resp), http.body resp],
+        [:error, e] => console.print! (error.describe e),
+    }
+
+    // A method the route does not take is a 405 that says which it does.
+    match http.send! (http.request "DELETE" (base + "/users")) {
+        [:ok, resp] => console.print! [http.status resp, http.header "allow" resp],
+        [:error, e] => console.print! (error.describe e),
+    }
+
+    server.stop! s
+};

@@ -1,0 +1,733 @@
+// Reverse-mode automatic differentiation over tensors.
+//
+//     import std.ml.ad;
+//
+//     let loss params = {
+//         let h = ad.relu (ad.add (ad.matmul x params.["w"]) params.["b"]);
+//         ad.mean (ad.mul h h)
+//     };
+//     let [value, grads] = ad.value_and_grad loss %{"w" => w, "b" => b};
+//     grads.["w"]                              // d loss / d w, shaped like w
+//
+// **A variable is a value with a way back.** `Var.ad_node value parents` holds
+// what was computed and, for each operand it was computed from that is
+// itself a variable, a function from the gradient arriving at this node to
+// the gradient it sends to that operand. Every function here takes variables
+// *or* plain tensors and numbers: a plain operand is a constant, sends
+// nothing back, and an operation whose operands are all constants answers a
+// plain value, so constants fold away and never enter the graph. A model is
+// written once and runs with gradients or without them.
+//
+// **A node is known by where it is, not by what it holds.** The backward
+// pass needs to visit each node once, after everything that used it, and to
+// add up what arrives at a node used twice -- `h` in `mul h h`, or the input
+// of a residual block. A map keyed by a variable keys it by identity (an
+// array is compared by identity as a map key, and the key keeps its hash
+// across collections), so a set of visited nodes and a table of gradients
+// are ordinary maps, and the whole pass is pure: no counter threaded through
+// the forward computation, no tape, nothing mutated. A graph is walked depth
+// first into an order where every node comes before its operands, and the
+// gradients flow down that order.
+//
+// **The arithmetic is `std.tensor`'s**, so it fuses: the backward of
+// `relu (w @ x + b)` is a mask and a product, deferred, and runs as one pass
+// (or kernel) where it is read. Where operands are -- host or GPU -- is where
+// their gradients are computed; a mask or a table this file has to make on
+// the host (`take`'s scatter) is moved to its gradient's device first.
+//
+// **Broadcasting is undone on the way back.** `x + b` with `x` a matrix and
+// `b` a row repeats `b` down `x`; `b`'s gradient is therefore the sum of
+// those rows (`unbroadcast`). A number combined with a tensor gets the sum of
+// the whole gradient.
+//
+// **Scalars are floats.** `sum`, `mean` and the losses answer a number, and
+// a number's gradient is a number. The functions of one variable work on a
+// number by running on a one-element tensor.
+
+import std.list;
+import std.map;
+import std.math;
+import std.ml.ops;
+import std.ml.tree;
+import std.tensor;
+
+// --- variables ----------------------------------------------------------------------
+
+/// A value in a computation that gradients flow back through: what was
+/// computed, and, for each operand that is a variable, the operand and the
+/// function from this node's gradient to that operand's share of it.
+union struct Var { ad_node(value : :any, parents : [:any]) }
+
+/// A variable with no operands: a parameter, which a gradient is taken with
+/// respect to. Each call makes a different one, however equal the values.
+let param : :any -> Var;
+let param x = Var.ad_node x [];
+
+/// Whether `x` is a variable rather than a plain tensor or number.
+let is_var : :any -> :bool;
+let is_var x = type_of x == :array && len x == 3 && x.[0] == :ad_node;
+
+/// What `x` holds: a variable's value, or `x` itself.
+let value : :any -> :any;
+let value x = if is_var x { x.[1] } else { x };
+
+/// `x` as a constant: its value, with nothing flowing back through it.
+let stop : :any -> :any;
+let stop x = value x;
+
+priv let parents_of : :any -> [:any];
+priv let parents_of n = n.[2];
+
+/// The result of an operation: `v`, remembering the operands among `links`
+/// (`[operand, back]` pairs) that are variables. With none, `v` itself.
+///
+/// This is how a new operation is defined: compute its value from the
+/// operands' `value`s, and give each operand a function from the gradient of
+/// the result to that operand's gradient. `std.ml.loss` defines its fused
+/// losses this way.
+let node : :any -> [:any] -> :any;
+let node v links = node_of v (variable_links links);
+
+priv let node_of : :any -> [:any] -> :any;
+priv let node_of v kept = match kept { [] => v, _ => Var.ad_node v kept };
+
+/// The links whose operand is a variable.
+priv let variable_links : [:any] -> [:any];
+priv let variable_links links = match links {
+    [] => [],
+    [link, ..rest] => if is_var link.[0] { link :: variable_links rest } else { variable_links rest },
+};
+
+// --- undoing a broadcast -------------------------------------------------------------
+
+/// The gradient `g` of a result, cut down to the shape of the operand `like`
+/// that was broadcast into it: a row repeated down a matrix gets the sum of
+/// the matrix's rows, and a number the sum of everything.
+let unbroadcast : :any -> :any -> :any;
+let unbroadcast g like = unbroadcast_kinds (type_of like) (type_of g) g like;
+
+priv let unbroadcast_kinds : :atom -> :atom -> :any -> :any -> :any;
+priv let unbroadcast_kinds like_kind g_kind g like = match like_kind {
+    :tensor => if g_kind != :tensor { tensor.fill_like like g }
+               else if tensor.shape g == tensor.shape like { g }
+               else { fold_rows g like },
+    _ => if g_kind == :tensor { tensor.sum g } else { g },
+};
+
+/// `g` summed down to `like`'s shape, which is the trailing part of its own.
+priv let fold_rows : :tensor -> :tensor -> :tensor;
+priv let fold_rows g like = {
+    let n = tensor.size like;
+    tensor.reshape (tensor.shape like) (tensor.sum_axis 0 (tensor.reshape [tensor.size g / n, n] g))
+};
+
+// --- arithmetic ------------------------------------------------------------------------
+
+/// `a + b`, broadcasting as `+` does.
+let add : :any -> :any -> :any;
+let add a b = {
+    let va = value a;
+    let vb = value b;
+    node (va + vb) [[a, fn g -> unbroadcast g va], [b, fn g -> unbroadcast g vb]]
+};
+
+/// `a - b`.
+let sub : :any -> :any -> :any;
+let sub a b = {
+    let va = value a;
+    let vb = value b;
+    node (va - vb) [[a, fn g -> unbroadcast g va], [b, fn g -> unbroadcast (-g) vb]]
+};
+
+/// `a * b`, elementwise.
+let mul : :any -> :any -> :any;
+let mul a b = {
+    let va = value a;
+    let vb = value b;
+    node (va * vb) [[a, fn g -> unbroadcast (g * vb) va], [b, fn g -> unbroadcast (g * va) vb]]
+};
+
+/// `a / b`, elementwise.
+let div : :any -> :any -> :any;
+let div a b = {
+    let va = value a;
+    let vb = value b;
+    node (va / vb) [[a, fn g -> unbroadcast (g / vb) va], [b, fn g -> unbroadcast (-g * va / (vb * vb)) vb]]
+};
+
+/// `-x`.
+let neg : :any -> :any;
+let neg x = node (-(value x)) [[x, fn g -> -g]];
+
+/// `x * c` for a constant number `c`: a scale, with one operand to differentiate.
+let scale : :float -> :any -> :any;
+let scale c x = node (value x * c) [[x, fn g -> g * c]];
+
+/// `x * x`.
+let square : :any -> :any;
+let square x = { let v = value x; node (v * v) [[x, fn g -> 2.0 * g * v]] };
+
+/// `x` to the constant power `c`.
+let pow : :any -> :float -> :any;
+let pow x c = unary (fn t -> tensor.pow t c) (fn g t _ -> g * c * tensor.pow t (c - 1.0)) x;
+
+// --- functions of one variable ------------------------------------------------------------
+
+/// A function of one variable: `fwd` computes it on a tensor, and `bwd g x y`
+/// is the gradient sent back given the gradient `g` of the answer, the input
+/// `x` and the answer `y`. A number runs as a one-element tensor.
+let unary : (:tensor -> :tensor) -> (:any -> :tensor -> :tensor -> :any) -> :any -> :any;
+let unary fwd bwd x = {
+    let v = value x;
+    if type_of v == :tensor {
+        let y = fwd v;
+        node y [[x, fn g -> bwd g v y]]
+    } else {
+        let t = tensor.of_list [v];
+        let y = fwd t;
+        node (tensor.sum y) [[x, fn g -> tensor.sum (bwd (tensor.of_list [g]) t y)]]
+    }
+};
+
+let exp : :any -> :any;
+let exp x = unary tensor.exp (fn g _ y -> g * y) x;
+
+let log : :any -> :any;
+let log x = unary tensor.log (fn g t _ -> g / t) x;
+
+let sqrt : :any -> :any;
+let sqrt x = unary tensor.sqrt (fn g _ y -> g * 0.5 / y) x;
+
+let abs : :any -> :any;
+let abs x = unary tensor.abs (fn g t _ -> g * tensor.sign t) x;
+
+let sin : :any -> :any;
+let sin x = unary tensor.sin (fn g t _ -> g * tensor.cos t) x;
+
+let cos : :any -> :any;
+let cos x = unary tensor.cos (fn g t _ -> -g * tensor.sin t) x;
+
+let tanh : :any -> :any;
+let tanh x = unary tensor.tanh (fn g _ y -> g * (1.0 - y * y)) x;
+
+let sigmoid : :any -> :any;
+let sigmoid x = unary tensor.sigmoid (fn g _ y -> g * y * (1.0 - y)) x;
+
+/// `max x 0`.
+let relu : :any -> :any;
+let relu x = unary tensor.relu (fn g t _ -> g * tensor.gt t 0.0) x;
+
+/// `x` where it is positive and `a * x` where it is not.
+let leaky_relu : :float -> :any -> :any;
+let leaky_relu a x = unary
+    (fn t -> tensor.max t (t * a))
+    (fn g t _ -> g * (a + (1.0 - a) * tensor.gt t 0.0)) x;
+
+/// `x` where it is positive and `exp x - 1` where it is not.
+let elu : :any -> :any;
+let elu x = unary
+    (fn t -> ops.where (tensor.gt t 0.0) t (tensor.exp (tensor.min t 0.0) - 1.0))
+    (fn g t y -> g * ops.where (tensor.gt t 0.0) 1.0 (y + 1.0)) x;
+
+/// The Gaussian error linear unit, `x * P(X <= x)` for a standard normal `X`,
+/// exactly (by `erf`), not the `tanh` approximation.
+let gelu : :any -> :any;
+let gelu x = unary
+    (fn t -> 0.5 * t * (1.0 + tensor.erf (t * 0.7071067811865476)))
+    (fn g t _ -> g * (0.5 * (1.0 + tensor.erf (t * 0.7071067811865476))
+                      + t * 0.3989422804014327 * tensor.exp (-0.5 * t * t))) x;
+
+/// `x * sigmoid x`, also called swish.
+let silu : :any -> :any;
+let silu x = unary
+    (fn t -> t * tensor.sigmoid t)
+    (fn g t _ -> { let s = tensor.sigmoid t; g * (s + t * s * (1.0 - s)) }) x;
+
+/// `log (1 + exp x)`, without overflow: `relu x + log (1 + exp (-|x|))`.
+let softplus : :any -> :any;
+let softplus x = unary
+    (fn t -> tensor.relu t + tensor.log (1.0 + tensor.exp (-(tensor.abs t))))
+    (fn g t _ -> g * tensor.sigmoid t) x;
+
+/// `x` held to `[lo, hi]`; the gradient passes only where it was inside.
+let clip : :float -> :float -> :any -> :any;
+let clip lo hi x = unary (ops.clip lo hi) (fn g t _ -> g * tensor.ge t lo * tensor.le t hi) x;
+
+/// The larger of `a` and `b` at each position; a tie sends the gradient to `a`.
+let maximum : :any -> :any -> :any;
+let maximum a b = {
+    let va = value a;
+    let vb = value b;
+    let take_a = tensor.ge va vb;
+    node (tensor.max va vb)
+        [[a, fn g -> unbroadcast (g * take_a) va], [b, fn g -> unbroadcast (g * (1.0 - take_a)) vb]]
+};
+
+/// The smaller of `a` and `b` at each position; a tie sends the gradient to `a`.
+let minimum : :any -> :any -> :any;
+let minimum a b = {
+    let va = value a;
+    let vb = value b;
+    let take_a = tensor.le va vb;
+    node (tensor.min va vb)
+        [[a, fn g -> unbroadcast (g * take_a) va], [b, fn g -> unbroadcast (g * (1.0 - take_a)) vb]]
+};
+
+/// `a` where `mask` is 1 and `b` where it is 0, the mask a constant.
+let where : :any -> :any -> :any -> :any;
+let where mask a b = {
+    let m = value mask;
+    let va = value a;
+    let vb = value b;
+    node (ops.where m va vb)
+        [[a, fn g -> unbroadcast (g * m) va], [b, fn g -> unbroadcast (g * (1.0 - m)) vb]]
+};
+
+// --- products and shapes ------------------------------------------------------------------
+
+/// `a @ b`: a matrix or vector product, or a batch of them, as `@` takes
+/// them.
+let matmul : :any -> :any -> :any;
+let matmul a b = {
+    let va = value a;
+    let vb = value b;
+    let ra = tensor.rank va;
+    let rb = tensor.rank vb;
+    let back_a g = match [ra, rb] {
+        [2, 2] => g @ tensor.transpose vb,
+        [3, 3] => g @ tensor.permute [0, 2, 1] vb,
+        [3, 2] => g @ tensor.transpose vb,
+        [1, 2] => vb @ g,
+        [2, 1] => tensor.outer g vb,
+        _ => g * vb,
+    };
+    let back_b g = match [ra, rb] {
+        [2, 2] => tensor.transpose va @ g,
+        [3, 3] => tensor.permute [0, 2, 1] va @ g,
+        [3, 2] => {
+            // One matrix shared by the batch: its gradient sums over every
+            // row of every batch, which is the product of the rows.
+            let [bs, m, k] = tensor.shape va;
+            tensor.transpose (tensor.reshape [bs * m, k] va) @ tensor.reshape [bs * m, tensor.size g / (bs * m)] g
+        },
+        [1, 2] => tensor.outer va g,
+        [2, 1] => tensor.transpose va @ g,
+        _ => g * va,
+    };
+    node (va @ vb) [[a, back_a], [b, back_b]]
+};
+
+/// A matrix transposed.
+let transpose : :any -> :any;
+let transpose x = node (tensor.transpose (value x)) [[x, tensor.transpose]];
+
+/// The axes reordered, as `tensor.permute`.
+let permute : [:integer] -> :any -> :any;
+let permute axes x = {
+    let inverse = list.map (fn k -> list.index_of k axes) (list.range 0 (len axes));
+    node (tensor.permute axes (value x)) [[x, tensor.permute inverse]]
+};
+
+/// The same numbers in a new shape.
+let reshape : [:integer] -> :any -> :any;
+let reshape shape x = {
+    let v = value x;
+    node (tensor.reshape shape v) [[x, fn g -> tensor.reshape (tensor.shape v) g]]
+};
+
+/// `x` with its first axis kept and the rest flattened.
+let flatten : :any -> :any;
+let flatten x = { let v = value x; let n = ops.rows v; reshape [n, tensor.size v / n] x };
+
+/// The rows of `x` named by `indices`, as `tensor.take`. A row taken twice
+/// gets both gradients: the way back is a product with the one-hot matrix of
+/// the indices, transposed, which adds them -- and is a product, so it runs
+/// on the GPU when `x` is there.
+let take : :any -> :any -> :any;
+let take indices x = {
+    let v = value x;
+    let n = ops.rows v;
+    let back g = {
+        let m = ops.rows g;
+        let hot = ops.like g (tensor.one_hot n indices);
+        tensor.reshape (tensor.shape v) (tensor.transpose hot @ tensor.reshape [m, tensor.size g / m] g)
+    };
+    node (tensor.take indices v) [[x, back]]
+};
+
+/// Rows `start` to `start + count` of `x`.
+let slice : :integer -> :integer -> :any -> :any;
+let slice start count x = {
+    let v = value x;
+    let n = ops.rows v;
+    let back g = {
+        let zeros k = tensor.slice 0 k (tensor.fill_like v 0.0);
+        let before = if start > 0 { [zeros start] } else { [] };
+        let after = if start + count < n { [zeros (n - start - count)] } else { [] };
+        tensor.concat (before + [g] + after)
+    };
+    node (tensor.slice start count v) [[x, back]]
+};
+
+/// Tensors joined along their first axis.
+let concat : [:any] -> :any;
+let concat xs = {
+    let vs = list.map value xs;
+    let starts = list.reverse (list.fold (fn acc v -> (acc.[0] + ops.rows v) :: acc) [0] vs);
+    let links = list.map (fn [x, [at, v]] -> [x, fn g -> tensor.slice at (ops.rows v) g])
+        (list.zip xs (list.zip starts vs));
+    node (tensor.concat vs) links
+};
+
+/// `x` with a new last axis of length `n`, each number repeated along it.
+let repeat : :integer -> :any -> :any;
+let repeat n x = {
+    let v = value x;
+    node (tensor.repeat n v) [[x, fn g -> tensor.sum_axis (tensor.rank g - 1) g]]
+};
+
+/// Every `kh x kw` window of images `[n, h, w, c]` as a row, as
+/// `tensor.im2col`; the gradient goes back through `tensor.col2im`, which
+/// adds up what each number contributed to every window it was in.
+let im2col : :integer -> :integer -> :integer -> :integer -> :any -> :any;
+let im2col kh kw stride pad x = {
+    let v = value x;
+    node (tensor.im2col kh kw stride pad v) [[x, fn g -> tensor.col2im (tensor.shape v) kh kw stride pad g]]
+};
+
+// --- reductions --------------------------------------------------------------------------
+
+/// The sum of every number, as a float.
+let sum : :any -> :any;
+let sum x = {
+    let v = value x;
+    if type_of v == :tensor { node (tensor.sum v) [[x, fn g -> tensor.fill_like v g]] } else { x }
+};
+
+/// The mean of every number, as a float.
+let mean : :any -> :any;
+let mean x = {
+    let v = value x;
+    if type_of v == :tensor { scale (1.0 / tensor.size v) (sum x) } else { x }
+};
+
+/// A gradient `g` of a fold along `axis` of the tensor `v`, sent back to
+/// every position the fold read: repeated along the axis that dropped out. A
+/// vector's fold is a number, which meets `v` as it is.
+let spread : :integer -> :tensor -> :any -> :any;
+let spread axis v g = {
+    let shape = tensor.shape v;
+    let r = len shape;
+    let n = shape.[axis];
+    match [type_of g, axis == r - 1, axis == 0] {
+        [:tensor, true, _] => tensor.repeat n g,
+        // The first axis: `g` is the trailing part of `v`'s shape, which
+        // broadcasting repeats down it.
+        [:tensor, _, true] => tensor.fill_like v 0.0 + g,
+        [:tensor, _, _] => {
+            // A middle axis: `g` as `[outer, inner]`, each row tiled `n`
+            // times. `repeat` repeats each number in place, so it is applied
+            // to the transpose, whose rows are the columns of `g`:
+            // `[inner, outer]` repeated is `[inner, outer * n]`, and its
+            // transpose is the `[outer * n, inner]` that is wanted.
+            let inner = list.fold_strict (fn !a b -> a * b) 1 (list.drop (axis + 1) shape);
+            let outer = tensor.size g / inner;
+            let turned = tensor.transpose (tensor.reshape [outer, inner] g);
+            let tiled = tensor.reshape [inner, outer * n] (tensor.repeat n turned);
+            tensor.reshape shape (tensor.transpose tiled)
+        },
+        _ => tensor.fill_like v g,
+    }
+};
+
+/// Sums along `axis`, which drops out of the shape.
+let sum_axis : :integer -> :any -> :any;
+let sum_axis axis x = {
+    let v = value x;
+    node (tensor.sum_axis axis v) [[x, fn g -> spread axis v g]]
+};
+
+/// Means along `axis`, which drops out of the shape.
+let mean_axis : :integer -> :any -> :any;
+let mean_axis axis x = scale (1.0 / (tensor.shape (value x)).[axis]) (sum_axis axis x);
+
+/// The largest value along `axis`; the gradient goes to where it was (to
+/// every place, on a tie).
+let max_axis : :integer -> :any -> :any;
+let max_axis axis x = {
+    let v = value x;
+    let m = tensor.max_axis axis v;
+    node m [[x, fn g -> spread axis v g * tensor.eq v (spread axis v m)]]
+};
+
+// --- along the last axis -------------------------------------------------------------------
+
+/// Each row as probabilities.
+let softmax : :any -> :any;
+let softmax x = {
+    let y = ops.softmax (value x);
+    node y [[x, fn g -> y * (g - ops.row_sum (g * y))]]
+};
+
+/// The logarithm of `softmax`, computed without the overflow.
+let log_softmax : :any -> :any;
+let log_softmax x = {
+    let v = value x;
+    let y = ops.log_softmax v;
+    node y [[x, fn g -> g - tensor.exp y * ops.row_sum g]]
+};
+
+/// `log (sum (exp x))` of each row.
+let logsumexp : :any -> :any;
+let logsumexp x = {
+    let v = value x;
+    node (ops.logsumexp v) [[x, fn g -> ops.stretch v g * ops.softmax v]]
+};
+
+/// Each row normalized to mean 0 and variance 1, with `eps` added to the
+/// variance: layer normalization's core, without its scale and shift.
+let normalize : :float -> :any -> :any;
+let normalize eps x = {
+    let v = value x;
+    let [axis, n] = [tensor.rank v - 1, (tensor.shape v).[tensor.rank v - 1]];
+    let mu = ops.stretch v (tensor.sum_axis axis v / n);
+    let c = v - mu;
+    let inv = 1.0 / tensor.sqrt (ops.stretch v (tensor.sum_axis axis (c * c) / n) + eps);
+    let y = c * inv;
+    // d/dx of (x - mean) / sd, per row: (g - mean g - y * mean (g * y)) / sd.
+    let back g = inv * (g - ops.stretch v (tensor.sum_axis axis g / n)
+                          - y * ops.stretch v (tensor.sum_axis axis (g * y) / n));
+    node y [[x, back]]
+};
+
+// --- the backward pass ---------------------------------------------------------------
+
+// The walks below run every training step over every node of the graph, so
+// they are written for the JIT: each loop is a top-level function that calls
+// itself, its accumulators strict and everything it needs passed in, with no
+// lambda made and nothing captured from an enclosing function -- the shapes
+// the tier refuses (`DREAM_JIT_WHY=1` says which, when one is).
+
+/// Every variable `out` was computed from, each before its operands: depth
+/// first, a node emitted once all of its operands have been.
+priv let topo : :any -> [:any];
+priv let topo out = topo_walk [[:enter, out]] %{} [];
+
+/// The depth-first walk: `stack` holds `[:enter, n]` for a node still to
+/// visit and `[:emit, n]` for one whose operands are all pushed.
+priv let topo_walk : [:any] -> %{:any => :bool} -> [:any] -> [:any];
+priv let topo_walk stack !seen !order = match stack {
+    [] => order,
+    [[:emit, n], ..rest] => topo_walk rest seen (n :: order),
+    [[:enter, n], ..rest] =>
+        if seen.[n else false] { topo_walk rest seen order }
+        else { topo_walk (push_operands (parents_of n) ([:emit, n] :: rest)) seen.[n => true] order },
+};
+
+/// `[:enter, operand]` for each of `links` pushed onto `stack`.
+priv let push_operands : [:any] -> [:any] -> [:any];
+priv let push_operands links !stack = match links {
+    [] => stack,
+    [[p, _], ..rest] => push_operands rest ([:enter, p] :: stack),
+};
+
+/// `grads` with `c` added to what `p` has, forced as it is stored, so that a
+/// table of gradients holds values and not the chains that make them.
+priv let accumulate : :any -> :any -> %{:any => :any} -> %{:any => :any};
+priv let accumulate p c grads = add_into p c grads.[p else ()] grads;
+
+priv let add_into : :any -> :any -> :any -> %{:any => :any} -> %{:any => :any};
+priv let add_into p c old grads = match old { () => store p c grads, _ => store p (old + c) grads };
+
+priv let store : :any -> :any -> %{:any => :any} -> %{:any => :any};
+priv let store p !total grads = grads.[p => total];
+
+/// The gradient `g` of a node sent down each of its `links`.
+priv let send : :any -> [:any] -> %{:any => :any} -> %{:any => :any};
+priv let send g links !grads = match links {
+    [] => grads,
+    [[p, back], ..rest] => send g rest (accumulate p (back g) grads),
+};
+
+/// The gradients flowing down `nodes`, in order: a node's gradient, once
+/// every user of it has added theirs, is sent to its operands and dropped.
+/// A parameter -- a node with no operands -- keeps its gradient.
+priv let flow : [:any] -> %{:any => :any} -> %{:any => :any};
+priv let flow nodes !grads = match nodes {
+    [] => grads,
+    [n, ..rest] => flow rest (flow_node n (parents_of n) grads),
+};
+
+/// One node's gradient sent on, when it is not a parameter and has one.
+priv let flow_node : :any -> [:any] -> %{:any => :any} -> %{:any => :any};
+priv let flow_node n links grads = match links {
+    [] => grads,
+    _ => send_from n links grads.[n else ()] grads,
+};
+
+priv let send_from : :any -> [:any] -> :any -> %{:any => :any} -> %{:any => :any};
+priv let send_from n links g grads = match g { () => grads, _ => map.remove n (send g links grads) };
+
+/// The gradient of `out` with respect to every variable it was computed
+/// from, as a map keyed by the variables. `seed` is the gradient arriving at
+/// `out` itself -- 1 for a loss.
+let backward : :any -> :any -> %{:any => :any};
+let backward out seed = if is_var out { flow (topo out) (store out seed %{}) } else { %{} };
+
+/// The gradient a table holds for the variable `x` made of parameter `p`:
+/// zeros where `p` was not used.
+priv let grad_in : %{:any => :any} -> :any -> :any -> :any;
+priv let grad_in g p x = zero_if_none p g.[x else ()];
+
+priv let zero_if_none : :any -> :any -> :any;
+priv let zero_if_none p d = match d {
+    () => if type_of p == :tensor { tensor.fill_like p 0.0 } else { 0.0 },
+    _ => d,
+};
+
+/// The gradient `out` was seeded with when it is a loss: 1, as a number or a
+/// tensor of ones shaped like it.
+priv let ones_for : :any -> :any;
+priv let ones_for v = if type_of v == :tensor { tensor.fill_like v 1.0 } else { 1.0 };
+
+/// `f params` and its gradient with respect to every tensor and number in
+/// `params` (a tree; `std.ml.tree`), as a tree of the same shape. A parameter
+/// `f` does not use has a gradient of zeros.
+let value_and_grad : (:any -> :any) -> :any -> [:any, :any];
+let value_and_grad f params = {
+    let vars = tree.map_numeric param params;
+    let out = f vars;
+    let v = value out;
+    let g = backward out (ones_for v);
+    [v, tree.map2 (grad_in g) params vars]
+};
+
+/// `value_and_grad` for an `f` that answers `[loss, aux]`: the loss's value,
+/// the gradient of the loss, and the value of `aux` -- whatever else the
+/// forward pass computed that is wanted afterwards, such as the model's
+/// output for a metric, without running the model twice.
+let value_grad_aux : (:any -> [:any, :any]) -> :any -> [:any, :any, :any];
+let value_grad_aux f params = {
+    let vars = tree.map_numeric param params;
+    let [out, aux] = f vars;
+    let v = value out;
+    let g = backward out (ones_for v);
+    [v, tree.map2 (grad_in g) params vars, value aux]
+};
+
+/// The gradient of `f` at `params`, without its value.
+let grad : (:any -> :any) -> :any -> :any;
+let grad f params = (value_and_grad f params).[1];
+
+/// The gradient of `f` at `params` estimated by central differences, one
+/// number at a time: slow and approximate, and what a hand-written gradient
+/// is checked against. `params` must be on the host.
+let numeric_grad : (:any -> :any) -> :any -> :float -> :any;
+let numeric_grad f params h = {
+    let at path i delta = bump path i delta params;
+    let one path x = match type_of x {
+        :tensor => {
+            let n = tensor.size x;
+            let diffs = list.map (fn i -> (value (f (at path i h)) - value (f (at path i (-h)))) / (2.0 * h)) (list.range 0 n);
+            tensor.reshape (tensor.shape x) (tensor.of_list diffs)
+        },
+        _ => (value (f (at path 0 h)) - value (f (at path 0 (-h)))) / (2.0 * h),
+    };
+    rebuild params (list.map (fn [path, x] -> [path, one path x]) (tree.paths params))
+};
+
+/// `t` with number `i` of the leaf at `path` moved by `delta`.
+priv let bump : [:any] -> :integer -> :float -> :any -> :any;
+priv let bump path i delta t = match path {
+    [] => match type_of t {
+        :tensor => {
+            let flat = tensor.to_list (tensor.reshape [tensor.size t] t);
+            tensor.reshape (tensor.shape t) (tensor.of_list (list.map (fn [j, x] -> if j == i { x + delta } else { x }) (list.enumerate flat)))
+        },
+        _ => t + delta,
+    },
+    [k, ..rest] => match type_of t {
+        :list => list.map (fn [j, x] -> if j == k { bump rest i delta x } else { x }) (list.enumerate t),
+        _ => t.[k => bump rest i delta t.[k]],
+    },
+};
+
+/// A tree shaped like `t` with the leaves at the given paths replaced.
+priv let rebuild : :any -> [[[:any], :any]] -> :any;
+priv let rebuild t pairs = list.fold (fn acc [path, x] -> replace path x acc) t pairs;
+
+priv let replace : [:any] -> :any -> :any -> :any;
+priv let replace path x t = match path {
+    [] => x,
+    [k, ..rest] => match type_of t {
+        :list => list.map (fn [j, y] -> if j == k { replace rest x y } else { y }) (list.enumerate t),
+        _ => t.[k => replace rest x t.[k]],
+    },
+};
+
+when test {
+    import std.test;
+
+    let x = tensor.of_list [[0.5, -1.2, 2.0], [1.5, 0.3, -0.7]];
+    let w = tensor.of_list [[0.1, -0.4], [0.7, 0.2], [-0.3, 0.9]];
+    let b = tensor.of_list [0.05, -0.1];
+
+    /// Whether the gradient of `f` agrees with central differences.
+    let checks f p = {
+        let got = grad f p;
+        let want = numeric_grad f p 1.0e-5;
+        let diff a e = match type_of a { :tensor => tensor.maximum (tensor.abs (a - e)), _ => math.abs (a - e) };
+        list.all (fn [path, g] -> diff g (tree.at path want) < 1.0e-6) (tree.paths got)
+    };
+
+    let tests = [
+        test.case "a constant is not a variable" $( test.false! (is_var (add x x)) ),
+        test.case "value_and_grad of a sum" $( test.eq! (tensor.fill_like x 1.0) (grad sum x) ),
+        test.case "the gradient of x * x is 2x"
+            $( test.eq! (2.0 * x) (grad (fn v -> sum (mul v v)) x) ),
+        test.case "a node used twice gets both gradients"
+            $( test.eq! (8.0 * x) (grad (fn v -> { let h = add v v; sum (mul h h) }) x) ),
+        test.case "an unused parameter has zeros"
+            $( test.eq! 0.0 (tensor.sum ((grad (fn p -> sum p.["a"]) %{"a" => x, "b" => b}).["b"])) ),
+        test.case "a dense layer"
+            $( test.true! (checks (fn p -> mean (square (tanh (add (matmul x p.["w"]) p.["b"])))) %{"w" => w, "b" => b}) ),
+        test.case "the activations"
+            $( test.true! (checks (fn v -> sum (add (add (relu v) (sigmoid v)) (add (gelu v) (add (silu v) (add (softplus v) (add (elu v) (leaky_relu 0.1 v))))))) x) ),
+        test.case "exp, log, sqrt, pow, abs"
+            $( test.true! (checks (fn v -> sum (add (log (add (exp v) 1.0)) (add (sqrt (add (abs v) 0.5)) (pow (abs v) 3.0)))) x) ),
+        test.case "division and subtraction with broadcasting"
+            $( test.true! (checks (fn p -> sum (div (sub x p.["r"]) (add (square p.["r"]) 1.0))) %{"r" => tensor.of_list [1.0, 2.0, 3.0]}) ),
+        test.case "softmax"
+            $( test.true! (checks (fn v -> sum (mul (softmax v) x)) x) ),
+        test.case "log_softmax and logsumexp"
+            $( test.true! (checks (fn v -> add (sum (mul (log_softmax v) x)) (sum (logsumexp v))) x) ),
+        test.case "sum_axis and max_axis along each axis"
+            $( test.true! (checks (fn v -> add (sum (square (sum_axis 0 v))) (add (sum (max_axis 1 v)) (sum (mean_axis 1 v)))) x) ),
+        test.case "a middle axis"
+            $( test.true! (checks (fn v -> sum (square (sum_axis 1 v))) (tensor.reshape [2, 3, 1] x |> tensor.reshape [1, 3, 2])) ),
+        test.case "take, slice, concat"
+            $( test.true! (checks (fn v -> sum (square (concat [take [1, 1, 0] v, slice 1 1 v]))) x) ),
+        test.case "reshape, transpose, repeat"
+            $( test.true! (checks (fn v -> sum (mul (repeat 2 (reshape [6] (transpose v))) (tensor.ones [6, 2]))) x) ),
+        test.case "matrix by vector and vector by matrix"
+            $( test.true! (checks (fn p -> add (sum (square (matmul x p.["v"]))) (sum (square (matmul p.["u"] x)))) %{"v" => tensor.of_list [1.0, -2.0, 0.5], "u" => tensor.of_list [0.3, 0.6]}) ),
+        test.case "im2col, through a convolution"
+            $( test.true! (checks (fn k -> sum (square (matmul (im2col 2 2 1 1 (tensor.reshape [1, 3, 2, 1] x)) k))) (tensor.of_list [[0.3], [-0.2], [0.5], [0.1]])) ),
+        test.case "the gradient of im2col with a stride"
+            $( test.true! (checks (fn v -> sum (square (im2col 2 2 2 0 (reshape [2, 2, 2, 1] (concat [v, scale 0.5 v]))))) (tensor.of_list [[0.5, -1.0, 2.0, 0.25]])) ),
+        test.case "max along a middle axis"
+            $( test.true! (checks (fn v -> sum (square (max_axis 1 (reshape [2, 3, 2] v)))) (tensor.of_list [[0.5, -1.2, 2.0, 1.5, 0.3, -0.7], [0.1, 0.9, -0.4, 0.6, 1.1, -0.2]])) ),
+        test.case "a batch of products"
+            $( test.true! (checks (fn p -> sum (square (matmul p.["a"] (permute [0, 2, 1] p.["b"])))) %{"a" => tensor.reshape [2, 3, 2] (tensor.random 1 [12]), "b" => tensor.reshape [2, 4, 2] (tensor.random 2 [16])}) ),
+        test.case "a batch by one matrix"
+            $( test.true! (checks (fn p -> sum (square (matmul p.["a"] p.["w"]))) %{"a" => tensor.reshape [2, 3, 2] (tensor.random 1 [12]), "w" => tensor.random 3 [2, 5]}) ),
+        test.case "permute" $( test.true! (checks (fn v -> sum (mul (permute [2, 0, 1] (reshape [1, 2, 3] v)) (tensor.reshape [3, 1, 2] (tensor.range 6)))) x) ),
+        test.case "normalize"
+            $( test.true! (checks (fn v -> sum (mul (normalize 1.0e-5 v) x)) (x * 2.0 + 1.0)) ),
+        test.case "maximum, minimum, clip"
+            $( test.true! (checks (fn v -> sum (add (maximum v 0.2) (add (minimum v 0.1) (clip (-1.0) 1.0 v)))) x) ),
+        test.case "scalars"
+            $( test.near! 1.0e-9 6.0 (grad (fn v -> mul v (mul v v)) (tensor.sum (tensor.sqrt [2.0]))) ),
+        test.case "a function of a number" $( test.near! 1.0e-12 1.0 (grad (fn v -> exp v) 0.0) ),
+    ];
+}

@@ -1,0 +1,99 @@
+// What each format calls a machine.
+//
+// One architecture has a different name in nearly every format: the 64-bit
+// x86 is `amd64` to Debian and `x86_64` to RPM, Arch and the kernel, and the
+// 64-bit ARM is `arm64` to Debian and Apple and `aarch64` to the rest. A
+// package of nothing but Dream images and text runs anywhere a VM does, and
+// says so in a fourth spelling each: `all`, `noarch`, `any`. A manifest names
+// one in any of those spellings and gets the right one in every format.
+
+import std.list;
+import std.os;
+import std.str;
+
+type Arch = :x86_64 | :aarch64 | :all;
+type Os = :linux | :macos | :windows;
+
+/// The architecture this VM was built for, which is the one a native program
+/// it ships has to match.
+let native : :unit -> Arch | :unit;
+let native () = match os.arch () {
+    :x86_64 => :x86_64,
+    :aarch64 => :aarch64,
+    _ => (),
+};
+
+let host_os : :unit -> Os | :unit;
+let host_os () = match os.platform () {
+    :linux => :linux,
+    :macos => :macos,
+    :windows => :windows,
+    _ => (),
+};
+
+priv let arch_names : %{:string => Arch} = %{
+    "x86_64" => :x86_64, "amd64" => :x86_64, "x64" => :x86_64,
+    "aarch64" => :aarch64, "arm64" => :aarch64,
+    "all" => :all, "any" => :all, "noarch" => :all,
+};
+
+priv let os_names : %{:string => Os} = %{
+    "linux" => :linux, "macos" => :macos, "darwin" => :macos, "osx" => :macos, "windows" => :windows,
+};
+
+/// A machine in any format's spelling, or `native` for this one.
+let parse_arch : :string -> [:ok, Arch] | [:error, :string];
+let parse_arch name = match str.lower name {
+    "native" => match native () {
+        () => [:error, "this VM does not know what machine it runs on; set `arch` in [ship] or pass --arch"],
+        a => [:ok, a],
+    },
+    n => match arch_names.[n else ()] {
+        () => [:error, "unknown architecture `" + name + "`: say x86_64, aarch64, all or native"],
+        a => [:ok, a],
+    },
+};
+
+let parse_os : :string -> [:ok, Os] | [:error, :string];
+let parse_os name = match str.lower name {
+    "native" => match host_os () {
+        () => [:error, "this VM does not know what system it runs on; pass --os"],
+        o => [:ok, o],
+    },
+    n => match os_names.[n else ()] {
+        () => [:error, "unknown system `" + name + "`: say linux, macos or windows"],
+        o => [:ok, o],
+    },
+};
+
+let deb : Arch -> :string;
+let deb a = match a { :x86_64 => "amd64", :aarch64 => "arm64", :all => "all" };
+
+let rpm : Arch -> :string;
+let rpm a = match a { :x86_64 => "x86_64", :aarch64 => "aarch64", :all => "noarch" };
+
+let pacman : Arch -> :string;
+let pacman a = match a { :x86_64 => "x86_64", :aarch64 => "aarch64", :all => "any" };
+
+/// The name `uname -m` prints, which is what an install script compares.
+let uname : Arch -> :string;
+let uname a = match a { :x86_64 => "x86_64", :aarch64 => "aarch64", :all => "any" };
+
+let os_name : Os -> :string;
+let os_name o = match o { :linux => "linux", :macos => "macos", :windows => "windows" };
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "every spelling of a machine"
+            $( test.eq! [[:ok, :x86_64], [:ok, :aarch64], [:ok, :all], [:ok, :x86_64]]
+                        [parse_arch "amd64", parse_arch "ARM64", parse_arch "noarch", parse_arch "x86_64"] ),
+        test.case "an unknown machine is an error"
+            $( test.eq! :error (list.head (parse_arch "sparc")) ),
+        test.case "each format's name"
+            $( test.eq! [["amd64", "x86_64", "x86_64"], ["all", "noarch", "any"]]
+                        [[deb :x86_64, rpm :x86_64, pacman :x86_64], [deb :all, rpm :all, pacman :all]] ),
+    ];
+
+}

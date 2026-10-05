@@ -133,7 +133,7 @@ let batch_image low contracts = {
     let fi = list.length (ir.funcs p1);
     let record = %{ :name => name, :body => list.nth 1 made, :arity => 0, :flags => 0,
                     :slots => 1, :n_captures => 0, :captures_off => 0,
-                    :span_start => 0, :span_end => 0 };
+                    :line => 0, :col => 0, :source => 0 };
     let p2 = p1.[:funcs => (ir.funcs p1 + [record])];
     // Cut down to what the predicates can reach, as a `comp`'s image is: the
     // rest of the program is a stub each, and was most of what a batch cost --

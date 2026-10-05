@@ -1,0 +1,79 @@
+// What goes into an archive: the one shape every writer here reads.
+//
+// A package is a list of these, and each format only renames them -- `./usr/`
+// for a .deb, `usr/` for Arch, `dream-0.1.0/` at the top of a tarball -- before
+// handing them to tar or cpio. A file is never read until the writer reaches
+// it: an item names its source and its size, and the bytes are copied from
+// disk to the archive a chunk at a time, because the largest thing Dream ships
+// is a 100 MB shared library and the heap is the wrong place for it.
+//
+// `text` is the other kind of file: one `ship` writes itself (a control file,
+// `.PKGINFO`), small, and held whole.
+
+import std.list;
+import std.str;
+
+union Item {
+    file(path : :string, mode : :integer, source : :string, size : :integer)
+    text(path : :string, mode : :integer, data : :string)
+    dir(path : :string, mode : :integer)
+    link(path : :string, target : :string)
+}
+
+let path : Item -> :string;
+let path i = match i {
+    [:file, p, _, _, _] => p,
+    [:text, p, _, _] => p,
+    [:dir, p, _] => p,
+    [:link, p, _] => p,
+};
+
+/// The permission bits. A link has none of its own: every system that reads
+/// one reports 0777.
+let mode : Item -> :integer;
+let mode i = match i {
+    [:file, _, m, _, _] => m,
+    [:text, _, m, _] => m,
+    [:dir, _, m] => m,
+    [:link, _, _] => 0o777,
+};
+
+/// The bytes it holds once installed; a link holds its target's name.
+let size : Item -> :integer;
+let size i = match i {
+    [:file, _, _, _, n] => n,
+    [:text, _, _, d] => str.byte_length d,
+    [:dir, _, _] => 0,
+    [:link, _, t] => str.byte_length t,
+};
+
+/// The same item under another name.
+let renamed : (:string -> :string) -> Item -> Item;
+let renamed f i = match i {
+    [:file, p, m, s, n] => Item.file (f p) m s n,
+    [:text, p, m, d] => Item.text (f p) m d,
+    [:dir, p, m] => Item.dir (f p) m,
+    [:link, p, t] => Item.link (f p) t,
+};
+
+let is_dir : Item -> :bool;
+let is_dir i = match i { [:dir, _, _] => true, _ => false };
+
+/// The permission bits most things are installed with: a program and a
+/// directory, and everything else.
+let executable : :integer = 0o755;
+let regular : :integer = 0o644;
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "every item has a path, a mode and a size"
+            $( test.eq! [["a", 493, 7], ["b", 420, 2], ["c/", 493, 0], ["d", 511, 3]]
+                        (list.map (fn i -> [path i, mode i, size i])
+                                  [Item.file "a" 493 "src" 7, Item.text "b" 420 "hi", Item.dir "c/" 493,
+                                   Item.link "d" "abc"]) ),
+        test.case "renaming keeps the rest"
+            $( test.eq! [:file, "./a", 493, "src", 7] (renamed (fn p -> "./" + p) (Item.file "a" 493 "src" 7)) ),
+    ];
+}

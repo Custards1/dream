@@ -705,6 +705,7 @@ set(DREAM_SOURCES
   src/io.cpp
   src/digest.cpp
   src/crypto.cpp
+  src/regex.cpp
   src/bigint.cpp
   src/os.cpp
   src/scheduler.cpp
@@ -1181,6 +1182,17 @@ set_target_properties(
   C_STANDARD 11)
 
 include(GNUInstallDirs)
+
+# An installed `dream` finds `libdream` in `../lib` beside it, wherever the
+# installation is put -- a package's /usr, a Homebrew keg, a tarball unpacked
+# into ~/.local -- as `mind build vm` already links it (std.build.cc, gnu.dr).
+# Only the installed copy: the one in the build tree keeps CMake's absolute
+# path, and nothing that runs from there changes.
+if(APPLE)
+  set_target_properties(dream_cli PROPERTIES INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+elseif(UNIX)
+  set_target_properties(dream_cli PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+endif()
 
 install(
   TARGETS dream dream_cli

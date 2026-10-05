@@ -1,0 +1,321 @@
+// HPACK (RFC 7541): how HTTP/2 writes headers small.
+//
+// A header block is a sequence of instructions against two tables -- a fixed
+// one of 61 common headers, and a dynamic one each side builds as it goes --
+// and literal strings, often Huffman-coded. This module is both ends of it,
+// for `std.http.h2`:
+//
+//     let d = hpack.decoder 4096;
+//     match hpack.decode d block { [:ok, [headers, d2]] => .., [:error, why] => .. }
+//     hpack.encode [[":status", "200"], ["content-type", "text/html"]]
+//
+// **Decoding is complete**: every representation, the dynamic table with its
+// evictions and size updates, and Huffman strings. Huffman is decoded a bit
+// at a time down a binary tree --
+// built from the code table while the program is compiled (`comp`), so a
+// program carries the tree rather than building it -- and a bit is a
+// division. Header strings are short, so that is cheap.
+//
+// **Encoding is simple on purpose**: a header in the static table is sent as
+// its index, a header whose name is there as that index and a literal value,
+// and anything else as two literals -- never indexed into the dynamic table
+// and never Huffman-coded. That gives up a few bytes per header against an
+// encoder that remembers, and in return the encoder has no state, so the
+// peer's table never needs managing and header blocks can be made by any
+// process in any order.
+
+import std.array;
+import std.list;
+import std.map;
+import std.result;
+import std.str;
+
+// --- the tables -------------------------------------------------------------------------
+
+/// RFC 7541 Appendix A, entry 1 first.
+priv let static_entries : #[[:string]];
+priv let static_entries = #[[":authority", ""], [":method", "GET"], [":method", "POST"], [":path", "/"], [":path", "/index.html"], [":scheme", "http"], [":scheme", "https"], [":status", "200"], [":status", "204"], [":status", "206"], [":status", "304"], [":status", "400"], [":status", "404"], [":status", "500"], ["accept-charset", ""], ["accept-encoding", "gzip, deflate"], ["accept-language", ""], ["accept-ranges", ""], ["accept", ""], ["access-control-allow-origin", ""], ["age", ""], ["allow", ""], ["authorization", ""], ["cache-control", ""], ["content-disposition", ""], ["content-encoding", ""], ["content-language", ""], ["content-length", ""], ["content-location", ""], ["content-range", ""], ["content-type", ""], ["cookie", ""], ["date", ""], ["etag", ""], ["expect", ""], ["expires", ""], ["from", ""], ["host", ""], ["if-match", ""], ["if-modified-since", ""], ["if-none-match", ""], ["if-range", ""], ["if-unmodified-since", ""], ["last-modified", ""], ["link", ""], ["location", ""], ["max-forwards", ""], ["proxy-authenticate", ""], ["proxy-authorization", ""], ["range", ""], ["referer", ""], ["refresh", ""], ["retry-after", ""], ["server", ""], ["set-cookie", ""], ["strict-transport-security", ""], ["transfer-encoding", ""], ["user-agent", ""], ["vary", ""], ["via", ""], ["www-authenticate", ""]];
+
+/// RFC 7541 Appendix B: each symbol's code and its length in bits, symbol 256 being EOS.
+priv let huffman_codes : [[:integer]];
+priv let huffman_codes = [[8184, 13], [8388568, 23], [268435426, 28], [268435427, 28], [268435428, 28], [268435429, 28], [268435430, 28], [268435431, 28], [268435432, 28], [16777194, 24], [1073741820, 30], [268435433, 28], [268435434, 28], [1073741821, 30], [268435435, 28], [268435436, 28], [268435437, 28], [268435438, 28], [268435439, 28], [268435440, 28], [268435441, 28], [268435442, 28], [1073741822, 30], [268435443, 28], [268435444, 28], [268435445, 28], [268435446, 28], [268435447, 28], [268435448, 28], [268435449, 28], [268435450, 28], [268435451, 28], [20, 6], [1016, 10], [1017, 10], [4090, 12], [8185, 13], [21, 6], [248, 8], [2042, 11], [1018, 10], [1019, 10], [249, 8], [2043, 11], [250, 8], [22, 6], [23, 6], [24, 6], [0, 5], [1, 5], [2, 5], [25, 6], [26, 6], [27, 6], [28, 6], [29, 6], [30, 6], [31, 6], [92, 7], [251, 8], [32764, 15], [32, 6], [4091, 12], [1020, 10], [8186, 13], [33, 6], [93, 7], [94, 7], [95, 7], [96, 7], [97, 7], [98, 7], [99, 7], [100, 7], [101, 7], [102, 7], [103, 7], [104, 7], [105, 7], [106, 7], [107, 7], [108, 7], [109, 7], [110, 7], [111, 7], [112, 7], [113, 7], [114, 7], [252, 8], [115, 7], [253, 8], [8187, 13], [524272, 19], [8188, 13], [16380, 14], [34, 6], [32765, 15], [3, 5], [35, 6], [4, 5], [36, 6], [5, 5], [37, 6], [38, 6], [39, 6], [6, 5], [116, 7], [117, 7], [40, 6], [41, 6], [42, 6], [7, 5], [43, 6], [118, 7], [44, 6], [8, 5], [9, 5], [45, 6], [119, 7], [120, 7], [121, 7], [122, 7], [123, 7], [32766, 15], [2044, 11], [16381, 14], [8189, 13], [268435452, 28], [1048550, 20], [4194258, 22], [1048551, 20], [1048552, 20], [4194259, 22], [4194260, 22], [4194261, 22], [8388569, 23], [4194262, 22], [8388570, 23], [8388571, 23], [8388572, 23], [8388573, 23], [8388574, 23], [16777195, 24], [8388575, 23], [16777196, 24], [16777197, 24], [4194263, 22], [8388576, 23], [16777198, 24], [8388577, 23], [8388578, 23], [8388579, 23], [8388580, 23], [2097116, 21], [4194264, 22], [8388581, 23], [4194265, 22], [8388582, 23], [8388583, 23], [16777199, 24], [4194266, 22], [2097117, 21], [1048553, 20], [4194267, 22], [4194268, 22], [8388584, 23], [8388585, 23], [2097118, 21], [8388586, 23], [4194269, 22], [4194270, 22], [16777200, 24], [2097119, 21], [4194271, 22], [8388587, 23], [8388588, 23], [2097120, 21], [2097121, 21], [4194272, 22], [2097122, 21], [8388589, 23], [4194273, 22], [8388590, 23], [8388591, 23], [1048554, 20], [4194274, 22], [4194275, 22], [4194276, 22], [8388592, 23], [4194277, 22], [4194278, 22], [8388593, 23], [67108832, 26], [67108833, 26], [1048555, 20], [524273, 19], [4194279, 22], [8388594, 23], [4194280, 22], [33554412, 25], [67108834, 26], [67108835, 26], [67108836, 26], [134217694, 27], [134217695, 27], [67108837, 26], [16777201, 24], [33554413, 25], [524274, 19], [2097123, 21], [67108838, 26], [134217696, 27], [134217697, 27], [67108839, 26], [134217698, 27], [16777202, 24], [2097124, 21], [2097125, 21], [67108840, 26], [67108841, 26], [268435453, 28], [134217699, 27], [134217700, 27], [134217701, 27], [1048556, 20], [16777203, 24], [1048557, 20], [2097126, 21], [4194281, 22], [2097127, 21], [2097128, 21], [8388595, 23], [4194282, 22], [4194283, 22], [33554414, 25], [33554415, 25], [16777204, 24], [16777205, 24], [67108842, 26], [8388596, 23], [67108843, 26], [134217702, 27], [67108844, 26], [67108845, 26], [134217703, 27], [134217704, 27], [134217705, 27], [134217706, 27], [134217707, 27], [268435454, 28], [134217708, 27], [134217709, 27], [134217710, 27], [134217711, 27], [134217712, 27], [67108846, 26], [1073741823, 30]];
+
+/// A Huffman tree as an array of nodes `#[zero, one, symbol]`: the nodes a
+/// 0 or a 1 leads to, or a symbol (-1 for a node with children). Node 0 is
+/// the root.
+priv let tree : :array;
+priv let tree = comp build_tree huffman_codes;
+
+priv let build_tree : [[:integer]] -> :array;
+priv let build_tree codes = {
+    // Built in a map, a node per index, then frozen into an array.
+    let insert = fn [nodes, count] [sym, code, bits] -> {
+        let rec walk node k nodes2 count2 =
+            if k < 0 { [nodes2.[node => [-1, -1, sym]], count2] }
+            else {
+                let bit = code / pow2 k % 2;
+                let here = nodes2.[node];
+                match here.[bit] {
+                    -1 => walk count2 (k - 1) (nodes2.[node => here.[bit => count2]].[count2 => [-1, -1, -1]]) (count2 + 1),
+                    child => walk child (k - 1) nodes2 count2,
+                }
+            };
+        walk 0 (bits - 1) nodes count
+    };
+    let numbered = list.map (fn [i, [code, bits]] -> [i, code, bits]) (list.enumerate codes);
+    let [nodes, count] = list.fold insert [%{ 0 => [-1, -1, -1] }, 1] numbered;
+    array.of_list (list.map (fn i -> array.of_list (nodes.[i])) (list.range 0 count))
+};
+
+priv let pow2 : :integer -> :integer;
+priv let rec pow2 k = if k <= 0 { 1 } else { 2 * pow2 (k - 1) };
+
+/// "name\0value" to the static index, and name to the first index with it.
+priv let static_pairs : :map;
+priv let static_pairs = comp map.from_pairs (list.reverse (list.map (fn i -> [static_entries.[i].[0] + "\u{0}" + static_entries.[i].[1], i + 1]) (list.range 0 61)));
+priv let static_names : :map;
+priv let static_names = comp map.from_pairs (list.reverse (list.map (fn i -> [static_entries.[i].[0], i + 1]) (list.range 0 61)));
+
+// --- integers and strings ----------------------------------------------------------------
+
+/// An integer with an `n`-bit prefix starting at byte `at`, the byte's high
+/// bits being something else: `[value, next]`, or `()` if the block ends.
+let read_int : :string -> :integer -> :integer -> :any;
+let read_int s at n = {
+    let b = str.byte at s;
+    let limit = pow2 n - 1;
+    if b < 0 { () }
+    else {
+        let v = b % pow2 n;
+        if v < limit { [v, at + 1] }
+        else {
+            let rec more i !acc !shift =
+                if shift > 56 { () }
+                else {
+                    let c = str.byte i s;
+                    if c < 0 { () }
+                    else if c >= 128 { more (i + 1) (acc + (c - 128) * pow2 shift) (shift + 7) }
+                    else { [acc + c * pow2 shift, i + 1] }
+                };
+            more (at + 1) limit 0
+        }
+    }
+};
+
+/// An integer with an `n`-bit prefix, the prefix byte's other bits `high`.
+let write_int : :integer -> :integer -> :integer -> :string;
+let write_int high n v = {
+    let limit = pow2 n - 1;
+    if v < limit { str.of_bytes [high + v] }
+    else {
+        let rec rest x = if x >= 128 { (x % 128 + 128) :: rest (x / 128) } else { [x] };
+        str.of_bytes ((high + limit) :: rest (v - limit))
+    }
+};
+
+/// A string literal at `at`: `[text, next]`, or `()` when it is malformed.
+priv let read_string : :string -> :integer -> :any;
+priv let read_string s at = {
+    let huffman = str.byte at s >= 128;
+    match read_int s at 7 {
+        () => (),
+        [n, start] => if start + n > len s { () }
+                      else {
+                          let raw = str.slice start n s;
+                          if huffman { match huffman_decode raw { () => (), t => [t, start + n] } } else { [raw, start + n] }
+                      },
+    }
+};
+
+/// A Huffman-coded string decoded, or `()` when it is not one: a code that
+/// leads nowhere, the end-of-string symbol inside it, or padding that is
+/// not the high bits of EOS.
+let huffman_decode : :string -> (:string | :unit);
+let huffman_decode raw = {
+    let finish node acc pad = if pad <= 7 && all_ones_path node { str.of_bytes (list.reverse acc) } else { () };
+    // Bit `k` of byte `i`, high bit first; `pad` counts the bits since the
+    // last symbol, which at the end must be at most seven 1s.
+    let rec step i k node acc !pad =
+        if k < 0 { if i + 1 >= len raw { finish node acc pad } else { step (i + 1) 7 node acc pad } }
+        else {
+            let bit = str.byte i raw / pow2 k % 2;
+            let next = tree.[node].[bit];
+            if next < 0 { () }
+            else {
+                let sym = tree.[next].[2];
+                if sym == 256 { () }
+                else if sym >= 0 { step i (k - 1) 0 (sym :: acc) 0 }
+                else { step i (k - 1) next acc (pad + 1) }
+            }
+        };
+    if len raw == 0 { "" } else { step 0 7 0 [] 0 }
+};
+
+/// Whether the path from the root to `node` was all 1s, which is what
+/// padding must be: the high bits of EOS, whose code is all 1s.
+priv let all_ones_path : :integer -> :bool;
+priv let all_ones_path node = {
+    let rec down n = if n == node { true } else { let one = tree.[n].[1]; if one < 0 || tree.[one].[2] >= 0 { false } else { down one } };
+    node == 0 || down 0
+};
+
+/// A string literal: a length and the bytes, not Huffman-coded.
+priv let literal : :string -> :string;
+priv let literal t = write_int 0 7 (len t) + t;
+
+// --- decoding ------------------------------------------------------------------------------
+
+/// A decoder: its dynamic table (newest first), the table's size by RFC
+/// 7541's measure (each entry its name and value plus 32), and the largest
+/// it may be, which is what this end said in its SETTINGS.
+struct Decoder {
+    !table : [[:string]]
+    !size : :integer
+    !limit : :integer
+    !max : :integer
+}
+
+let decoder : :integer -> Decoder;
+let decoder max = Decoder.make [] 0 max max;
+
+/// A header block decoded: `[:ok, [headers, decoder]]`, each header a
+/// `[name, value]` pair in order, or `[:error, why]` -- which in HTTP/2 is a
+/// connection error, since the two tables no longer agree.
+let decode : Decoder -> :string -> result.Of :any :string;
+let decode d block = decode_from d block 0 [];
+
+priv let decode_from : Decoder -> :string -> :integer -> [[:string]] -> result.Of :any :string;
+priv let rec decode_from d s at acc =
+    if at >= len s { result.ok [list.reverse acc, d] }
+    else {
+        let b = str.byte at s;
+        if b >= 128 {
+            match read_int s at 7 {
+                () => result.error "a header block cut short",
+                [0, _] => result.error "index 0 is not a header",
+                [i, next] => match entry d i { () => result.error ("no header at index " + to_string i), h => decode_from d s next (h :: acc) },
+            }
+        } else if b >= 64 {
+            match literal_field d s at 6 {
+                () => result.error "a malformed literal",
+                [[name, value], next] => decode_from (add d name value) s next ([name, value] :: acc),
+            }
+        } else if b >= 32 {
+            match read_int s at 5 {
+                () => result.error "a header block cut short",
+                [n, next] => if n > Decoder.max d { result.error "a table size larger than this end allowed" }
+                             else { decode_from (resize d n) s next acc },
+            }
+        } else {
+            match literal_field d s at 4 {
+                () => result.error "a malformed literal",
+                [h, next] => decode_from d s next (h :: acc),
+            }
+        }
+    };
+
+/// A literal field with an `n`-bit index prefix: the name by index (non-zero)
+/// or as a literal, then the value: `[[name, value], next]`.
+priv let literal_field : Decoder -> :string -> :integer -> :integer -> :any;
+priv let literal_field d s at n = match read_int s at n {
+    () => (),
+    [0, next] => match read_string s next {
+        () => (),
+        [name, n2] => match read_string s n2 { () => (), [value, n3] => [[name, value], n3] },
+    },
+    [i, next] => match entry d i {
+        () => (),
+        [name, _] => match read_string s next { () => (), [value, n2] => [[name, value], n2] },
+    },
+};
+
+/// The header at an index: the static table's from 1 to 61, the dynamic
+/// table's after, newest first.
+priv let entry : Decoder -> :integer -> :any;
+priv let entry d i =
+    if i <= 61 { static_entries.[i - 1] }
+    else { (Decoder.table d).[i - 62 else ()] };
+
+priv let add : Decoder -> :string -> :string -> Decoder;
+priv let add d name value = {
+    let cost = len name + len value + 32;
+    if cost > Decoder.limit d { Decoder.make [] 0 (Decoder.limit d) (Decoder.max d) }
+    else { evict (Decoder.make ([name, value] :: Decoder.table d) (Decoder.size d + cost) (Decoder.limit d) (Decoder.max d)) }
+};
+
+priv let resize : Decoder -> :integer -> Decoder;
+priv let resize d n = evict (Decoder.make (Decoder.table d) (Decoder.size d) n (Decoder.max d));
+
+/// Oldest entries dropped until the table fits its limit.
+priv let evict : Decoder -> Decoder;
+priv let evict d =
+    if Decoder.size d <= Decoder.limit d { d }
+    else {
+        let rev = list.reverse (Decoder.table d);
+        match rev {
+            [] => d,
+            [[name, value], ..rest] => evict (Decoder.make (list.reverse rest) (Decoder.size d - len name - len value - 32) (Decoder.limit d) (Decoder.max d)),
+        }
+    };
+
+// --- encoding ------------------------------------------------------------------------------
+
+/// Headers as a block. Names must already be lower case, as HTTP/2 requires.
+let encode : [[:string]] -> :string;
+let encode headers = str.concat_all (list.map encode_one headers);
+
+priv let encode_one : [:string] -> :string;
+priv let encode_one [name, value] = match static_pairs.[name + "\u{0}" + value else ()] {
+    () => match static_names.[name else ()] {
+        // Literal without indexing: 0000 and a four-bit index or zero.
+        () => str.of_bytes [0] + literal name + literal value,
+        i => write_int 0 4 i + literal value,
+    },
+    i => write_int 128 7 i,
+};
+
+when test {
+    import std.crypto;
+    import std.test;
+
+    let vectors = [
+        ["828684418cf1e3c2e5f23a6ba0ab90f4ff", [[":method", "GET"], [":scheme", "http"], [":path", "/"], [":authority", "www.example.com"]]],
+        ["828684be5886a8eb10649cbf", [[":method", "GET"], [":scheme", "http"], [":path", "/"], [":authority", "www.example.com"], ["cache-control", "no-cache"]]],
+        ["828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf", [[":method", "GET"], [":scheme", "https"], [":path", "/index.html"], [":authority", "www.example.com"], ["custom-key", "custom-value"]]],
+        ["4087f2b5b5188790bf8820e5fffe3fffeeff6196d07abe941054d444a8200595040b8166e082a62d1bff77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007", [["x-unicode", "caf\u{e9}"], ["date", "Mon, 21 Oct 2013 20:13:21 GMT"], ["set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"]]]
+    ];
+
+    let decode_all d blocks = match blocks {
+        [] => [],
+        [[hex, want], ..rest] => match decode d (match crypto.unhex hex { () => "", b => b }) {
+            [:ok, [got, d2]] => (got == want) :: decode_all d2 rest,
+            [:error, why] => [why],
+        },
+    };
+
+    let tests = [
+        test.case "integers, as the RFC's examples have them" $( test.eq! [[10, 1], [1337, 3], [42, 1]]
+            [read_int (str.of_bytes [10]) 0 5, read_int (str.of_bytes [31, 154, 10]) 0 5, read_int (str.of_bytes [42]) 0 8] ),
+        test.case "and back" $( test.eq! [str.of_bytes [10], str.of_bytes [31, 154, 10]] [write_int 0 5 10, write_int 0 5 1337] ),
+        test.case "the Huffman tree has every symbol" $( test.eq! 513 (array.length tree) ),
+        test.case "a Huffman string, from the RFC" $( test.eq! "www.example.com"
+            (huffman_decode (match crypto.unhex "f1e3c2e5f23a6ba0ab90f4ff" { () => "", b => b })) ),
+        test.case "bad padding is refused" $( test.eq! () (huffman_decode (str.of_bytes [0])) ),
+        test.case "blocks a real encoder made, in order, through the dynamic table" $( test.eq! [true, true, true, true]
+            (decode_all (decoder 4096) vectors) ),
+        test.case "what this encodes decodes" $( {
+            let hs = [[":status", "200"], ["content-type", "text/html"], ["x-thing", "caf\u{e9}"], [":path", "/"]];
+            test.eq! [:ok, hs] (result.map (fn [got, _] -> got) (decode (decoder 4096) (encode hs)))
+        } ),
+        test.case "static hits are one byte" $( test.eq! [1, 1] [len (encode [[":method", "GET"]]), len (encode [[":status", "404"]])] ),
+        test.case "the table evicts its oldest" $( {
+            let d = decoder 100;
+            let block = str.of_bytes [64] + literal "aaaa" + literal (str.repeat 30 "x") + str.of_bytes [64] + literal "bbbb" + literal (str.repeat 30 "y");
+            match decode d block {
+                [:ok, [_, d2]] => test.eq! [["bbbb", str.repeat 30 "y"]] (Decoder.table d2),
+                [:error, why] => test.fail! why,
+            }
+        } ),
+        test.case "an index past the tables" $( test.true! (result.is_error (decode (decoder 4096) (write_int 128 7 70))) ),
+    ];
+}

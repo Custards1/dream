@@ -18,7 +18,9 @@ Dont forget about strict parameters, use them when needed
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
 | `mind/std/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/sql/pg/README.md](mind/std/sql/pg/README.md). | Dream |
+| `ship/` | `ship`, the packager: .deb, .rpm, Arch packages, tarballs, Homebrew formulas, PKGBUILDs and install scripts, every byte written in Dream. [ship/README.md](ship/README.md). | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
+| `editors/nvim/` | The Neovim plugin: starts `lucid`, plus syntax, indent and a filetype. | Lua, Vim |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
 | `docs/` | `language-spec.md`, `builtins.md`, `ffi.md`, `gc.md`, `bytecode-format.md`. | — |
 | `docs/notes/` | The design and performance log: what was measured, kept and thrown away. | — |
@@ -106,6 +108,8 @@ just dreams       # build/dreams.dream, the compiler
 just mind         # build/mind, the build tool
 just lucid        # build/lucid.dream, the language server
 just vm-pgo       # build-pgo/bin/dream, the VM trained on a self-compile
+just ship         # build/ship, the packager
+just package      # Dream itself as every package ship makes, into dist/
 just mind-build vm  # the VM again, by the repository's own build.dr
 ```
 
@@ -178,7 +182,8 @@ The groups, and what each one is actually asking:
 | `test-examples` | Every example, output compared against what is recorded beside it |
 | `test-std` | The standard library's `when test` blocks |
 | `test-build` | `std.build.cc` against GCC, Clang and CMake, and the runner rebuilding only what changed |
-| `test-ffi` | `std.ffi`/`std.foreign` against a C library built from `dream/tests/ffi` |
+| `test-ffi` | `std.ffi`/`std.foreign` against a C library built from `dream/tests/ffi`, carried and found as a system library |
+| `test-image` | `std.image`: one image calling another, found by path, installed and carried |
 | `test-tls` | `std.tls`: a server and clients in one VM, and against OpenSSL's `s_server`/`s_client` |
 | `test-mind` | `mind`'s path handling, manifests, dependency specs |
 | `test-dreams` | Every `when test` block `dreams/main.dr` reaches |
@@ -188,11 +193,13 @@ The groups, and what each one is actually asking:
 | `test-lucid` | The language server's units: positions, framing, URIs, completion context |
 | `test-lucid-session` | One whole LSP conversation, against a running server |
 | `test-pg` | The PostgreSQL client's units, the SQL the compiler must refuse, and a live throwaway cluster (skipped without PostgreSQL) |
+| `test-ship` | `ship`'s units, then each package it makes installed, verified and removed by dpkg, rpm and pacman (each skipped without its tool) |
 
 The `dreams/tests/*.sh` scripts run directly with no environment set; there is
 one left, `compile.sh`, and it needs only the VM and the seed.
 
-`just test-vscode` checks the TextMate grammar by tokenizing Dream with it. It
+`just test-nvim` runs the Neovim plugin headless against `build/lucid.dream`,
+and is likewise outside `just test`. `just test-vscode` checks the TextMate grammar by tokenizing Dream with it. It
 is **not** in `just test`, because it needs `npm install` in `editors/vscode`
 first and the rest of the suite needs nothing from outside the repository.
 
@@ -214,6 +221,7 @@ times in a row afterwards, which is the shape of a race and not of a bug.
 just repl              # an interactive session
 just run FILE [args]   # compile and run
 just check FILE        # scope- and purity-check, no image
+just fmt FILE..        # lay files out in the house style (dreams/fmt.dr)
 just dump FILE         # the execution trees it compiles to
 just modules FILE      # what it pulls in
 ```
@@ -232,12 +240,18 @@ terminal over with `os.replace!` (`execvp`) rather than running a child, because
 it still starts, with just the standard library.
 
 The VM resolves an image four ways, nearest first: the name as written, that
-name with `.dream` added, and both of those under `$MINDV2_PATH`. So `dream
+name with `.dream` added, and both of those in the installation. So `dream
 mind` runs `./mind.dream` if there is one and the installed `mind.dream`
 otherwise, and an arbitrary path still means that path. `dream -x NAME` is the
 other half — the installation and nothing else, so a file in the working
 directory cannot shadow an installed program. `just install` is what puts
 `dreams.dream` and `lucid.dream` there.
+
+The installation is `$MINDV2_PATH` when it is set; otherwise `lib/dream`
+beside the directory the VM's binary is in (`/usr/bin/dream` has
+`/usr/lib/dream`), which is how a package made by `just package` finds its
+standard library and compiler with nothing set; otherwise `~/.mindv2`
+(`install_path` in dream/src/os.cpp).
 
 ## Making it faster
 
@@ -394,7 +408,21 @@ The lessons that keep coming back:
   a handle owned by the calling process and destroyed when it is released or
   the process ends; `foreign.run! server (fn () -> ..)` does work in a library
   server that owns what is made through it. `foreign` is contextual -- still
-  the name of `std.foreign`. [docs/ffi.md](docs/ffi.md).
+  the name of `std.foreign`. [docs/ffi.md](docs/ffi.md). `from system "sqlite3"
+  "0"` names a library installed on the system rather than a file: the VM
+  searches `$DREAM_LIB_SQLITE3`, `$DREAM_LIBRARY_PATH`, the installation's
+  `lib`, the loader, then the package managers' directories, and says all of
+  that when nothing is found ("Finding a library" in dream/src/ffi.cpp).
+- `image fmt from installed "formatter" { pretty : :string -> :string }` is
+  the same for another compiled Dream image: a module of `std.image` bindings,
+  typed as written, the image opened in a runtime of its own on first use
+  (`from "x.dream"`, `installed`, `embedded`, or `(expr)`). Only data crosses,
+  and a call runs to completion holding that image. It is built on
+  `vm.open_image!`'s sessions, not on docs/dynamic-linking.md, which is still
+  a plan. Where an installation is -- `$MINDV2_PATH` or `~/.mindv2` -- is
+  answered once, by the VM (`os.install_dirs!`), and `std.install` is that
+  answer in Dream; do not split `$MINDV2_PATH` again.
+  [docs/images.md](docs/images.md).
 - `import std.tls` gives **TLS** on a socket, upgraded in place:
   `tls.connect! sock %{ :host => h }` answers the same handle, and `io.read!`
   and `io.write!` on it then carry plaintext. The VM drives a TLS library
@@ -404,6 +432,29 @@ The lessons that keep coming back:
   and roots are PEM because those are what every backend imports.
   [dream/src/tls.hpp](dream/src/tls.hpp) is the design, and
   `dream/tests/tls` the fixtures, which portable.py runs on all three OSes.
+- The application libraries, each with its design at the head of the file:
+  `std.time` (instants and durations are integer nanoseconds; zones read
+  from the system's TZif files and POSIX rules), `std.random` (pure,
+  splittable MRG32k3a; `!` functions use the OS's secure bytes),
+  `std.property` (property tests that shrink by replaying a smaller tape),
+  `std.parse` (parser combinators), `std.regex` (a linear-time Pike VM; a
+  bad literal pattern is a compile error through `Pattern`'s `where`),
+  `std.log` (structured events, `DREAM_LOG=warn,db=debug`), and `std.http`
+  with `std.http.server`, `.url`, `.websocket`, `.h2` and `.hpack`: client
+  and server over HTTP/1.1 and HTTP/2, streaming bodies, a pooled client,
+  WebSockets. `std.regex` matches natively (`vm.regex_run`,
+  dream/src/regex.cpp: a lazy DFA and a Pike VM).
+  Examples 18-21 tour them.
+- `import std.ml` is **machine learning** on `std.tensor`: autodiff
+  (`std.ml.ad`, graph nodes found again by identity map keys), layers
+  (`std.ml.nn`: dense, conv2d, attention, transformer, LSTM, ..), losses,
+  optimizers, datasets and `ml.fit!`, which trains on the GPU when one is
+  there and the model is large enough. What it needed underneath went into
+  `std.tensor` (`repeat`, `max_axis`, `take`, `im2col`, batched `@`,
+  `permute`, ..), not into Dream. Its hot walks are shaped for the JIT;
+  `DREAM_JIT_WHY=1` names what refuses a function (a `match` on anything
+  but a parameter is the usual one). [docs/notes/ml.md](docs/notes/ml.md),
+  and example 22.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

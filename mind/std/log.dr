@@ -1,0 +1,451 @@
+// Logging: structured events, filtered by level and by name, written as text
+// for people or as JSON or logfmt for machines.
+//
+//     import std.log;
+//
+//     log.info! "listening" %{ :port => 8080 }
+//     log.warn! "slow query" %{ :took => time.milliseconds 340, :sql => q }
+//     log.error! "request failed" %{ :error => e }        // an error is described
+//
+//     let db = log.named "db" |> log.with %{ :pool => 4 };
+//     log.at! db :debug "connected" %{ :host => host }
+//     let rows = log.timed! db :info "loaded" %{} (load! path);   // logs how long it took
+//
+// prints, by default to standard error:
+//
+//     2026-10-04T18:21:07.512Z INFO  listening port=8080
+//     2026-10-04T18:21:07.513Z DEBUG db: connected host=localhost pool=4
+//
+// **An event is a message and fields.** The message says what happened, in
+// words that do not change from one occurrence to the next; the fields say
+// the particulars, as data. That split is what makes a log searchable --
+// every "slow query" is the same message, and `took` is a number a machine
+// can sort by -- and it is the whole of the interface: every level takes a
+// message and a map.
+//
+// **A logger is a value**, a `mapping` built by `log.new` and the functions
+// that change it -- `named`, `with`, `level`, `format`, `to` -- so a library
+// can be handed the one its caller configured, and a component can add its
+// name and context without disturbing anyone else's. There is no global
+// logger to set: the functions that take none (`log.info!` and the rest) use
+// `log.default! ()`, built from the environment on every call, so it is
+// configured the way an operator expects to configure one:
+//
+//     DREAM_LOG=debug                       # everything at debug and above
+//     DREAM_LOG=warn,db=debug,http=trace    # by name: `db` and `db.pool` both
+//     DREAM_LOG_FORMAT=json                 # text (the default), json or logfmt
+//
+// **Nothing about an event is computed unless it is written.** A map's values
+// are lazy, so the fields of a suppressed `debug` event are never evaluated;
+// `log.debug! "state" %{ :dump => render huge }` costs nothing at `info`.
+//
+// **Each event is one write**, assembled first and handed to the sink whole.
+// Lines from different processes therefore do not interleave mid-line on a
+// terminal, a pipe or a file opened for appending. For tests, `log.capture!`
+// collects events as values instead of writing them.
+
+import std.agent;
+import std.console;
+import std.error;
+import std.io;
+import std.json;
+import std.list;
+import std.map;
+import std.os;
+import std.str;
+import std.streams;
+import std.time;
+
+// --- levels -------------------------------------------------------------------------
+
+type Level = :trace | :debug | :info | :warn | :error | :off;
+type Format = :text | :json | :logfmt;
+
+let rank : Level -> :integer;
+let rank level = match level { :trace => 0, :debug => 1, :info => 2, :warn => 3, :error => 4, :off => 5 };
+
+let level_name : Level -> :string;
+let level_name level = match level { :trace => "TRACE", :debug => "DEBUG", :info => "INFO", :warn => "WARN",
+                                     :error => "ERROR", :off => "OFF" };
+
+/// The level a name spells, in any case, or `()`.
+let parse_level : :string -> (Level | :unit);
+let parse_level text = match str.lower (str.trim text) {
+    "trace" => :trace, "debug" => :debug, "info" => :info, "warn" => :warn, "warning" => :warn,
+    "error" => :error, "off" => :off, "none" => :off, _ => (),
+};
+
+// --- the logger ---------------------------------------------------------------------
+
+/// How to log: the component's name, context fields every event carries, the
+/// level below which events are dropped, the levels for names below this
+/// one (`%{ "db" => :debug }`), the format, where the lines go (`:stderr`,
+/// `:stdout`, `[:handle, h]`, `[:agent, pid]` or `[:call, f!]`), whether to
+/// colour the level (`:auto` does on a terminal), and the zone timestamps are
+/// written in.
+mapping Logger {
+    name : :string = ""
+    fields : :map = %{}
+    minimum : :trace | :debug | :info | :warn | :error | :off = :info
+    filters : :map = %{}
+    format : :any = :text
+    sink : :any = :stderr
+    color : :auto | :always | :off = :auto
+    zone : :any = ()
+}
+
+/// A logger at `info`, writing text to standard error.
+let new : Logger;
+let new = Logger.new ();
+
+/// The logger the environment describes: `DREAM_LOG` for the levels and
+/// `DREAM_LOG_FORMAT` for the format. What the functions without a logger
+/// argument use.
+let default! : :unit -> Logger;
+let default! () = {
+    let spec = match os.env! "DREAM_LOG" { () => "", s => s };
+    let format_name = match os.env! "DREAM_LOG_FORMAT" { () => "", s => str.lower (str.trim s) };
+    let [minimum, filters] = parse_spec spec;
+    new |> Logger.set_minimum minimum |> Logger.set_filters filters
+        |> Logger.set_format (match format_name { "json" => :json, "logfmt" => :logfmt, _ => :text })
+};
+
+/// `"warn,db=debug,http.client=trace"` as `[minimum, filters]`. A part that is
+/// not a level or `name=level` is ignored, rather than failing a program
+/// over a typo in its environment.
+let parse_spec : :string -> [Level, :map];
+let parse_spec spec = list.fold (fn [minimum, filters] part -> match str.split "=" (str.trim part) {
+    [name, lv] => match parse_level lv { () => [minimum, filters], l => [minimum, filters.[str.trim name => l]] },
+    [lv] => match parse_level lv { () => [minimum, filters], l => [l, filters] },
+    _ => [minimum, filters],
+}) [:info, %{}] (str.split "," spec);
+
+/// A logger for a component, named below the one it came from: `named "pool"`
+/// of a logger named `db` is `db.pool`.
+let named : :string -> Logger -> Logger;
+let named name lg = Logger.set_name (match Logger.name lg { "" => name, parent => parent + "." + name }) lg;
+
+/// The same logger with more context; later fields win.
+let with : :map -> Logger -> Logger;
+let with fields lg = Logger.set_fields (map.merge (Logger.fields lg) fields) lg;
+
+/// The same logger with a different minimum level.
+let level : Level -> Logger -> Logger;
+let level l lg = Logger.set_minimum l lg;
+
+/// The same logger with a level for one name and the names below it.
+let level_for : :string -> Level -> Logger -> Logger;
+let level_for name l lg = Logger.set_filters ((Logger.filters lg).[name => l]) lg;
+
+/// The same logger writing `:text`, `:json`, `:logfmt`, or what a function of
+/// an `Event` makes.
+let format : :any -> Logger -> Logger;
+let format f lg = Logger.set_format f lg;
+
+/// The same logger writing somewhere else: `:stderr`, `:stdout`, an open
+/// handle, or a function that is handed each line.
+let to : :any -> Logger -> Logger;
+let to sink lg = Logger.set_sink (match sink {
+    :stderr => :stderr,
+    :stdout => :stdout,
+    s if type_of s == :impure_fn || type_of s == :pure_fn => [:call, s],
+    [tag, _] if tag == :handle || tag == :call || tag == :agent => sink,
+    handle => [:handle, handle],
+}) lg;
+
+/// The same logger appending to a file, which is opened now and stays open.
+let to_file! : :string -> Logger -> Logger;
+let to_file! path lg = Logger.set_sink [:handle, io.open! path :append] lg;
+
+/// The same logger with timestamps in `zone` (a `time.Zone`) rather than UTC.
+let in_zone : :any -> Logger -> Logger;
+let in_zone zone lg = Logger.set_zone zone lg;
+
+/// The same logger colouring levels `:always`, `:auto` or `:off`.
+let colors : console.ColorMode -> Logger -> Logger;
+let colors mode lg = Logger.set_color mode lg;
+
+/// The level that applies to this logger's name: the most specific filter
+/// that names it or a name above it, otherwise its minimum.
+let threshold : Logger -> Level;
+let threshold lg = {
+    let name = Logger.name lg;
+    let filters = Logger.filters lg;
+    let rec walk n = match filters.[n else ()] {
+        () => {
+            let dot = last_dot n;
+            if dot < 0 { Logger.minimum lg } else { walk (str.slice 0 dot n) }
+        },
+        l => l,
+    };
+    if name == "" || map.is_empty filters { Logger.minimum lg } else { walk name }
+};
+
+priv let last_dot : :string -> :integer;
+priv let last_dot s = {
+    let rec go from best = { let at = str.find_from from "." s; if at < 0 { best } else { go (at + 1) at } };
+    go 0 (0 - 1)
+};
+
+/// Whether an event at `level` would be written, for work worth skipping
+/// that fields cannot put off.
+let enabled : Logger -> Level -> :bool;
+let enabled lg l = l != :off && rank l >= rank (threshold lg);
+
+// --- events ---------------------------------------------------------------------------
+
+/// One event, as formats and captures see it.
+mapping Event {
+    time : :integer
+    level : :trace | :debug | :info | :warn | :error | :off
+    name : :string
+    message : :string
+    fields : :map
+}
+
+/// Log at a level through a logger.
+let at! : Logger -> Level -> :string -> :map -> :unit;
+let at! lg l message fields =
+    if enabled lg l {
+        let event = Event.make (time.now! ()) l (Logger.name lg) message (map.merge (Logger.fields lg) fields);
+        emit! lg event
+    };
+
+let trace! : :string -> :map -> :unit;
+let trace! message fields = at! (default! ()) :trace message fields;
+let debug! : :string -> :map -> :unit;
+let debug! message fields = at! (default! ()) :debug message fields;
+let info! : :string -> :map -> :unit;
+let info! message fields = at! (default! ()) :info message fields;
+let warn! : :string -> :map -> :unit;
+let warn! message fields = at! (default! ()) :warn message fields;
+let error! : :string -> :map -> :unit;
+let error! message fields = at! (default! ()) :error message fields;
+
+/// Compute `value`, log how long it took as the field `took`, and answer the
+/// value. The argument is lazy, so it is timed rather than computed before
+/// the call; if it raises, that is logged at `:error` with the error, and
+/// raised again.
+let timed! : Logger -> Level -> :string -> :map -> a -> a;
+let timed! lg l message fields value = {
+    let start = time.monotonic! ();
+    let outcome = try! { strict! value; [:ok, value] } catch e { [:error, e] };
+    let took = time.monotonic! () - start;
+    match outcome {
+        [:ok, v] => { at! lg l message fields.[:took => time.format_duration took]; v },
+        [:error, e] => {
+            at! lg :error message fields.[:took => time.format_duration took].[:error => e]
+            raise! e
+        },
+    }
+};
+
+priv let emit! : Logger -> :map -> :unit;
+priv let emit! lg event = match Logger.sink lg {
+    [:agent, pid] => { agent.update! pid (fn events -> event :: events); () },
+    sink => {
+        let line = render lg event (wants_color! lg sink) + "\n";
+        match sink {
+            :stderr => write! (io.stderr! ()) line,
+            :stdout => write! (io.stdout! ()) line,
+            [:handle, h] => write! h line,
+            [:call, f] => { f line; () },
+            _ => write! (io.stderr! ()) line,
+        }
+    },
+};
+
+priv let write! : :any -> :string -> :unit;
+priv let write! handle line = { streams.write_all! handle line; () };
+
+priv let wants_color! : Logger -> :any -> :bool;
+priv let wants_color! lg sink = Logger.format lg == :text && match sink {
+    :stderr => console.color_enabled! (Logger.color lg) (io.stderr! ()),
+    :stdout => console.color_enabled! (Logger.color lg) (io.stdout! ()),
+    _ => Logger.color lg == :always,
+};
+
+// --- formats ----------------------------------------------------------------------------
+
+/// An event as a line, without the line break, in the logger's format.
+let render : Logger -> :map -> :bool -> :string;
+let render lg event color = {
+    let stamp = match Logger.zone lg {
+        () => time.rfc3339 (Event.time event),
+        zone => time.datetime_text (time.in_zone zone (Event.time event)),
+    };
+    match Logger.format lg {
+        :json => json_line stamp event,
+        :logfmt => logfmt_line stamp event,
+        :text => text_line stamp event color,
+        custom => custom event,
+    }
+};
+
+/// `2026-10-04T18:21:07.512Z WARN  db: slow query took=340ms`
+priv let text_line : :string -> :map -> :bool -> :string;
+priv let text_line stamp event color = {
+    let l = Event.level event;
+    let label = level_name l + str.repeat (5 - len (level_name l)) " ";
+    let painted = if color { console.style (level_style l) label } else { label };
+    let name = match Event.name event { "" => "", n => n + ": " };
+    let fields = Event.fields event;
+    let pairs = list.map (fn k -> key_text k + "=" + value_text (fields.[k])) (map.sorted_keys fields);
+    str.join_str " " ([stamp, painted, name + Event.message event] + pairs)
+};
+
+priv let level_style : Level -> [console.Style];
+priv let level_style l = match l { :trace => [:dim], :debug => [:dim], :info => [:cyan], :warn => [:yellow],
+                                   :error => [:red, :bold], :off => [] };
+
+/// `time=.. level=warn logger=db msg="slow query" took=340ms`
+priv let logfmt_line : :string -> :map -> :string;
+priv let logfmt_line stamp event = {
+    let fields = Event.fields event;
+    let head = ["time=" + stamp, "level=" + str.lower (level_name (Event.level event))]
+               + (match Event.name event { "" => [], n => ["logger=" + value_text n] })
+               + ["msg=" + quote_always (Event.message event)];
+    str.join_str " " (head + list.map (fn k -> key_text k + "=" + value_text (fields.[k])) (map.sorted_keys fields))
+};
+
+/// One JSON object per line, the fields beside `time`, `level`, `logger` and
+/// `msg`, which win if a field has the same name.
+priv let json_line : :string -> :map -> :string;
+priv let json_line stamp event = {
+    let fields = map.from_pairs (list.map (fn [k, v] -> [key_text k, jsonable v]) (map.pairs (Event.fields event)));
+    let base = %{ "time" => stamp, "level" => str.lower (level_name (Event.level event)), "msg" => Event.message event };
+    let named = match Event.name event { "" => base, n => base.["logger" => n] };
+    json.write (map.merge fields named)
+};
+
+/// A value JSON can carry: atoms as their names, errors described, anything
+/// else that is not data as it prints.
+let jsonable : :any -> :any;
+let jsonable v = match type_of v {
+    :integer => v, :float => v, :bool => v, :string => v, :unit => v,
+    :atom => atom_name v,
+    :list => list.map jsonable v,
+    :array => list.map jsonable (_array_to_list v),
+    :map => map.from_pairs (list.map (fn [k, x] -> [key_text k, jsonable x]) (map.pairs v)),
+    :error => error.describe v,
+    _ => to_string v,
+};
+
+priv let atom_name : :atom -> :string;
+priv let atom_name a = { let t = to_string a; if str.starts_with ":" t { str.slice 1 (len t) t } else { t } };
+
+priv let key_text : :any -> :string;
+priv let key_text k = match type_of k { :atom => atom_name k, :string => k, _ => to_string k };
+
+/// A field's value in text and logfmt: bare when it is one word, quoted when
+/// it has space, quotes or `=` in it. An error is described, an atom named.
+priv let value_text : :any -> :string;
+priv let value_text v = {
+    let t = match type_of v {
+        :string => v,
+        :atom => atom_name v,
+        :error => error.describe v,
+        _ => to_string v,
+    };
+    if t != "" && str.upto " \"=\n\t" 0 t >= len t { t } else { quote_always t }
+};
+
+priv let quote_always : :string -> :string;
+priv let quote_always t = "\"" + str.concat_all (list.map (fn c -> match c { '"' => "\\\"", '\\' => "\\\\", '\n' => "\\n", '\t' => "\\t",
+                                                                             other => str.of_chars [other] }) (str.chars t)) + "\"";
+
+// --- capturing, for tests -------------------------------------------------------------------
+
+/// A logger that keeps its events instead of writing them, at `:trace`, and
+/// a function that answers what it has kept, oldest first.
+///
+///     let [lg, events!] = log.capture! ();
+///     do_work! lg
+///     test.eq! ["started", "done"] (list.map log.Event.message (events! ()))
+///     log.release! lg
+let capture! : :unit -> [Logger, (:unit -> [:map])];
+let capture! () = {
+    let pid = agent.start! [];
+    let lg = new |> Logger.set_minimum :trace |> Logger.set_sink [:agent, pid];
+    [lg, fn () -> list.reverse (agent.value! pid)]
+};
+
+/// Stop the process a capturing logger keeps its events in. Anything else is
+/// left alone, so this is safe to call on any logger.
+let release! : Logger -> :unit;
+let release! lg = match Logger.sink lg { [:agent, pid] => { agent.stop! pid; () }, _ => () };
+
+when test {
+    import std.test;
+    import std.result;
+
+    let at_noon = time.to_instant (time.datetime 2026 10 4 12 0 0);
+    let event l name msg fields = Event.make at_noon l name msg fields;
+
+    let tests = [
+        test.case "a text line" $( test.eq! "2026-10-04T12:00:00Z WARN  db: slow query sql=\"SELECT 1\" took=340ms"
+            (render new (event :warn "db" "slow query" %{ :took => "340ms", :sql => "SELECT 1" }) false) ),
+        test.case "colour paints the level" $( test.true!
+            (str.contains_str "\u{1b}[33mWARN \u{1b}[0m" (render new (event :warn "" "x" %{}) true)) ),
+        test.case "logfmt" $( test.eq! "time=2026-10-04T12:00:00Z level=info logger=http msg=\"GET /\" status=200"
+            (render (format :logfmt new) (event :info "http" "GET /" %{ :status => 200 }) false) ),
+        test.case "JSON" $( test.eq! [:ok, %{ "time" => "2026-10-04T12:00:00Z", "level" => "error", "logger" => "app",
+                                             "msg" => "failed", "kind" => "timeout", "tries" => [1, 2] }]
+            (json.decode (render (format :json new) (event :error "app" "failed" %{ :kind => :timeout, :tries => [1, 2] }) false)) ),
+        test.case "an error field is described" $( test.true!
+            (str.contains_str "error=" (render new (event :error "" "x" %{ :error => _error_new :not_found "f.txt" }) false)) ),
+        test.case "a custom format" $( test.eq! "warn:x" (render (format (fn e -> str.lower (level_name (Event.level e)) + ":" + Event.message e) new)
+                                                               (event :warn "" "x" %{}) false) ),
+        test.case "timestamps in a zone" $( test.eq! "2026-10-04T14:00:00+02:00 INFO  x"
+            (render (in_zone (time.fixed_zone 7200) new) (event :info "" "x" %{}) false) ),
+        test.case "the spec" $( test.eq! [:warn, %{ "db" => :debug, "http.client" => :trace }]
+                                         (parse_spec "warn, db=debug,http.client=trace,nonsense") ),
+        test.case "filters by name" $( {
+            let lg = new |> level :warn |> level_for "db" :debug;
+            test.eq! [:warn, :debug, :debug, :warn]
+                     [threshold lg, threshold (named "db" lg), threshold (named "pool" (named "db" lg)), threshold (named "dbx" lg)]
+        } ),
+        test.case "names nest" $( test.eq! "db.pool" (Logger.name (named "pool" (named "db" new))) ),
+        test.case "below the level is dropped" $( {
+            let [lg, events!] = capture! ();
+            let quiet = level :info lg;
+            at! quiet :debug "hidden" %{}
+            at! quiet :info "shown" %{}
+            test.eq! ["shown"] (list.map Event.message (events! ()))
+            release! lg
+        } ),
+        test.case "context and event fields merge" $( {
+            let [lg, events!] = capture! ();
+            at! (with %{ :a => 1, :b => 2 } lg) :info "x" %{ :b => 3 }
+            test.eq! [%{ :a => 1, :b => 3 }] (list.map Event.fields (events! ()))
+            release! lg
+        } ),
+        test.case "suppressed fields are never computed" $( {
+            let [lg, events!] = capture! ();
+            at! (level :warn lg) :debug "x" %{ :boom => 1 / 0 }
+            test.eq! [] (events! ())
+            release! lg
+        } ),
+        test.case "timed logs the duration and answers the value" $( {
+            let [lg, events!] = capture! ();
+            let v = timed! lg :info "summed" %{} (list.sum (list.range 0 100));
+            test.eq! [4950, true] [v, map.has :took (Event.fields (list.head (events! ())))]
+            release! lg
+        } ),
+        test.case "timed logs a failure and raises it" $( {
+            let [lg, events!] = capture! ();
+            let raised = try! { timed! lg :info "divided" %{} (1 / 0); false } catch e { true };
+            test.eq! [true, :error] [raised, Event.level (list.head (events! ()))]
+            release! lg
+        } ),
+        test.case "a function sink gets the line" $( {
+            let got = agent.start! [];
+            let lg = new |> to (fn line -> agent.update! got (fn xs -> line :: xs));
+            at! lg :info "hello" %{}
+            test.true! (str.ends_with "INFO  hello\n" (list.head (agent.value! got)))
+            agent.stop! got
+        } ),
+        test.case "levels" $( test.eq! [:warn, (), true, false] [parse_level "WARNING", parse_level "loud",
+                                                                enabled new :error, enabled new :debug] ),
+    ];
+}

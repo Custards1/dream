@@ -1,0 +1,306 @@
+// What is being shipped: the `[ship]` part of a manifest, read and checked.
+//
+// A package is described once, in the `mind.toml` beside the code (or any
+// TOML file named with `--manifest`), and every format is made from that one
+// description:
+//
+//     [ship]
+//     summary = "a lazily evaluated functional language"
+//     maintainer = "Ada <ada@example.org>"
+//     license = "MIT"
+//     url = "https://example.org/releases/v{version}/{file}"
+//
+//     [ship.files]                         # where it goes = what it is
+//     "bin/dream" = "build/stage/bin/dream"
+//     "lib/dream/std" = { src = "mind/std", exclude = ["target"] }
+//
+//     [ship.deb]                           # what only one format needs
+//     depends = ["libffi8", "libssl3"]
+//
+// The name and version come from `[package]` when `[ship]` does not say, so
+// a Dream project describes itself once. Anything a format reads for itself
+// is looked up in `[ship.FORMAT]` first and `[ship]` second (`setting`):
+// `depends` may be written once for every format, and then said again,
+// differently, for the one whose packages are named differently.
+//
+// Reading is pure but for the file itself and the scripts it names, and
+// checking is pure: `problems` answers every mistake in the manifest at once,
+// each one naming the key at fault, rather than the first and then the next
+// on the following run.
+
+import std.file;
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+import std.toml;
+
+import platform;
+
+mapping Spec {
+    // The directory the manifest is in: every source is relative to it.
+    root : :string
+    doc : :map
+    name : :string
+    version : :string
+    arch : :x86_64 | :aarch64 | :all
+    os : :linux | :macos | :windows
+    release : :integer = 1
+    summary : :string = ""
+    description : :string = ""
+    license : :string = ""
+    homepage : :string = ""
+    maintainer : :string = ""
+    // Where a relative destination goes on a system that installs to one
+    // place for everyone; a tarball and a formula are laid out relative to it.
+    prefix : :string = "/usr"
+    // Where a release tarball will be published, with `{file}` for its name.
+    url : :string = ""
+    // The maintainer scripts, by hook (`postinst`), as their text.
+    scripts : %{:string => :string} = %{}
+}
+
+/// The hooks a package may run, by the names Debian gives them. Each format
+/// runs them at its own equivalent point (`rpm.dr`, `arch.dr`).
+let hooks : [:string] = ["preinst", "postinst", "prerm", "postrm"];
+
+// --- reading ------------------------------------------------------------------------
+
+/// A string-valued key of a section, whatever TOML type it was written as:
+/// `release = 2` and `release = "2"` mean the same.
+let text_of : :any -> :string;
+let text_of v = match type_of v { :string => v, :unit => "", _ => to_string v };
+
+/// `[ship] key`, falling back to `[package] key` and then to `default`.
+let own : :map -> :string -> :string -> :string;
+let own doc key default = match text_of (toml.get () doc "ship" key) {
+    "" => match text_of (toml.get () doc "package" key) { "" => default, v => v },
+    v => v,
+};
+
+/// A list-valued key, tolerating one item written bare: `depends = "libc6"`.
+let as_list : :any -> [:any];
+let as_list v = match type_of v { :list => v, :unit => [], _ => [v] };
+
+/// `[ship.FORMAT] key`, then `[ship] key`, then `default`.
+let setting : Spec -> :string -> :string -> :any -> :any;
+let setting sp format key default = match toml.get () (Spec.doc sp) ("ship." + format) key {
+    () => toml.get default (Spec.doc sp) "ship" key,
+    v => v,
+};
+
+/// The same, as a list of strings.
+let strings : Spec -> :string -> :string -> [:string];
+let strings sp format key = list.map text_of (as_list (setting sp format key ()));
+
+/// `[ship.FORMAT] key` as text, or `default`.
+let text : Spec -> :string -> :string -> :string -> :string;
+let text sp format key default = match text_of (setting sp format key ()) { "" => default, v => v };
+
+/// The `[key, value]` entries of a section of the manifest, sorted by key so
+/// that what is made from them does not depend on how a map is laid out.
+let entries : Spec -> :string -> [[:string, :any]];
+let entries sp section = list.sort_on (fn e -> list.head e) (toml.entries (Spec.doc sp) section);
+
+/// What the command line says instead of the manifest: `version`, `release`,
+/// `arch` and `os`, each as it was typed.
+type Overrides = %{:string => :string};
+
+/// A whole spec from a parsed manifest found in `root`. Everything about it
+/// that can be wrong is answered by `problems`, so this only fails where it
+/// cannot go on: a machine it does not know.
+let of_doc : :string -> :map -> Overrides -> %{:string => :string} -> [:ok, Spec] | [:error, :string];
+let of_doc root doc overrides scripts = {
+    let pick = fn key default -> match overrides.[key else ""] { "" => own doc key default, v => v };
+    let? arch = platform.parse_arch (pick "arch" "native");
+    let? os = platform.parse_os (pick "os" "native");
+    let release = match num.parse_int (pick "release" "1") { () => 0, n => n };
+    let summary = match text_of (toml.get () doc "ship" "summary") {
+        "" => text_of (toml.get () doc "package" "description"),
+        s => s,
+    };
+    [:ok, Spec.new root doc (own doc "name" "") (pick "version" "") arch os
+          |> Spec.set_release release
+          |> Spec.set_summary summary
+          |> Spec.set_description (own doc "description" summary)
+          |> Spec.set_license (own doc "license" "")
+          |> Spec.set_homepage (own doc "homepage" "")
+          |> Spec.set_maintainer (own doc "maintainer" "")
+          |> Spec.set_prefix (own doc "prefix" "/usr")
+          |> Spec.set_url (own doc "url" "")
+          |> Spec.set_scripts scripts]
+};
+
+/// The scripts a manifest names, read; `[:error, why]` for one that is not
+/// there, since a package that silently lost its `postinst` installs and
+/// then does not work.
+let read_scripts! : :string -> :map -> [:ok, %{:string => :string}] | [:error, :string];
+let read_scripts! root doc = {
+    let rec go! names acc = match names {
+        [] => [:ok, acc],
+        [hook, ..rest] => match text_of (toml.get () doc "ship.scripts" hook) {
+            "" => go! rest acc,
+            path => match file.read! (join root path) {
+                () => [:error, "[ship.scripts] " + hook + ": cannot read " + path],
+                body => go! rest acc.[hook => body],
+            },
+        },
+    };
+    go! hooks (%{})
+};
+
+/// The manifest at `path`, read and made a spec.
+let load! : :string -> Overrides -> [:ok, Spec] | [:error, :string];
+let load! path overrides = match file.read! path {
+    () => [:error, "cannot read " + path],
+    source => match toml.parse source {
+        [:error, why] => [:error, path + ": " + why],
+        [:ok, doc] => {
+            let root = match file.parent path { "" => ".", d => d };
+            let? scripts = read_scripts! root doc;
+            of_doc root doc overrides scripts
+        },
+    },
+};
+
+/// `path` relative to the manifest, unless it is absolute already.
+let join : :string -> :string -> :string;
+let join root path =
+    if str.starts_with "/" path || root == "." { path } else { root + "/" + path };
+
+// --- naming --------------------------------------------------------------------------
+
+/// The version a format with revisions writes: `0.1.0-1`.
+let full_version : Spec -> :string;
+let full_version sp = Spec.version sp + "-" + to_string (Spec.release sp);
+
+/// `template` with each `{key}` replaced by its value in `vars`; a key that
+/// is not there is left as written, so a mistake shows in the output.
+let fill : :string -> %{:string => :string} -> :string;
+let fill template vars = list.fold (fn acc [k, v] -> str.join_str v (str.split ("{" + k + "}") acc))
+                                   template (map.pairs vars);
+
+/// What a template may name.
+let vars : Spec -> %{:string => :string};
+let vars sp = %{
+    "name" => Spec.name sp,
+    "version" => Spec.version sp,
+    "release" => to_string (Spec.release sp),
+    "arch" => platform.uname (Spec.arch sp),
+    "os" => platform.os_name (Spec.os sp),
+};
+
+/// The prefix as a path inside an archive: `/usr` is `usr`, `/` is ``.
+let prefix_path : Spec -> :string;
+let prefix_path sp = str.join_str "/" (list.filter (fn n -> n != "") (str.split "/" (Spec.prefix sp)));
+
+// --- checking ------------------------------------------------------------------------
+
+let is_lower_alnum : :char -> :bool;
+let is_lower_alnum c = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+
+/// A name every format accepts: Debian's rule, which is the narrowest -- lower
+/// case, digits and `+-.`, beginning with a letter or digit, two or more long.
+let name_ok : :string -> :bool;
+let name_ok name = match str.chars name {
+    [first, second, ..rest] =>
+        is_lower_alnum first && list.all (fn c -> is_lower_alnum c || c == '+' || c == '-' || c == '.')
+                                         (second :: rest),
+    _ => false,
+};
+
+/// A version every format accepts: it begins with a digit, and has no `-`,
+/// which Debian, RPM and Arch all read as the start of the release. `~` sorts
+/// before anything, so `1.0~rc1` is the way to write a pre-release.
+let version_ok : :string -> :bool;
+let version_ok v = match str.chars v {
+    [first, ..rest] =>
+        first >= '0' && first <= '9'
+        && list.all (fn c -> is_lower_alnum c || (c >= 'A' && c <= 'Z') || c == '.' || c == '+' || c == '~' || c == '_')
+                    rest,
+    _ => false,
+};
+
+/// Every mistake in the manifest that would make every format wrong. A
+/// format checks what only it needs, such as Debian's maintainer, for itself.
+let problems : Spec -> [:string];
+let problems sp = list.concat [
+    if name_ok (Spec.name sp) { [] }
+    else { ["name `" + Spec.name sp + "`: use lower-case letters, digits and + - . (set it in [ship] or [package])"] },
+    if version_ok (Spec.version sp) { [] }
+    else { ["version `" + Spec.version sp + "`: begin with a digit, and write a pre-release as 1.0~rc1, not 1.0-rc1"] },
+    if Spec.release sp >= 1 { [] } else { ["release: a whole number, 1 or more"] },
+    if str.is_empty (Spec.summary sp) { ["summary: say in one line what the package is"] } else { [] },
+    if str.contains_str "\n" (Spec.summary sp) { ["summary: one line, with the rest in `description`"] } else { [] },
+    if str.starts_with "/" (Spec.prefix sp) { [] } else { ["prefix `" + Spec.prefix sp + "`: an absolute path, such as /usr"] },
+    if list.is_empty (toml.entries (Spec.doc sp) "ship.files")
+       && list.is_empty (toml.entries (Spec.doc sp) ("ship.files." + platform.os_name (Spec.os sp))) {
+        ["[ship.files]: name at least one file to install"]
+    }
+    else { [] },
+];
+
+/// What the manifest leaves out that a format will fill in with something
+/// worse: printed, not refused.
+let warnings : Spec -> [:string];
+let warnings sp = list.concat [
+    if str.is_empty (Spec.license sp) { ["license: not given; packages will say `unknown`"] } else { [] },
+    if str.is_empty (Spec.homepage sp) { ["homepage: not given"] } else { [] },
+    if str.is_empty (Spec.maintainer sp) { ["maintainer: not given; a Debian package needs one, as `Name <email>`"] }
+    else if not (str.contains_str "<" (Spec.maintainer sp)) { ["maintainer: write it as `Name <email>`"] }
+    else { [] },
+];
+
+when test {
+    import std.test;
+
+    let manifest = "[package]\nname = \"demo\"\nversion = \"1.2.0\"\ndescription = \"a demo\"\n\n"
+                   + "[ship]\nrelease = 3\narch = \"amd64\"\nlicense = \"MIT\"\n\n"
+                   + "[ship.files]\n\"bin/demo\" = \"demo\"\n\n[ship.deb]\ndepends = [\"libc6\"]\n";
+
+    let demo! () = match toml.parse manifest {
+        [:ok, doc] => match of_doc "." doc (%{}) (%{}) { [:ok, sp] => sp, other => raise! other },
+        other => raise! other,
+    };
+
+    let tests = [
+        test.case "the name and version come from [package]"
+            $( {
+                let sp = demo! ();
+                test.eq! ["demo", "1.2.0", 3, :x86_64, "a demo", "1.2.0-3"]
+                         [Spec.name sp, Spec.version sp, Spec.release sp, Spec.arch sp, Spec.summary sp, full_version sp]
+            } ),
+        test.case "the command line wins"
+            $( match toml.parse manifest {
+                [:ok, doc] => test.eq! [:ok, "2.0", :aarch64]
+                    (match of_doc "." doc (%{ "version" => "2.0", "arch" => "arm64" }) (%{}) {
+                        [:ok, sp] => [:ok, Spec.version sp, Spec.arch sp],
+                        other => other,
+                    }),
+                other => raise! other,
+            } ),
+        test.case "a format's own setting comes first"
+            $( {
+                let sp = demo! ();
+                test.eq! [["libc6"], []] [strings sp "deb" "depends", strings sp "rpm" "depends"]
+            } ),
+        test.case "a good manifest has no problems"
+            $( test.eq! [] (problems (demo! ())) ),
+        test.case "every problem at once"
+            $( {
+                let sp = demo! () |> Spec.set_name "Demo" |> Spec.set_version "1.0-rc1" |> Spec.set_summary "";
+                test.eq! 3 (list.length (problems sp))
+            } ),
+        test.case "names and versions every format accepts"
+            $( test.eq! [true, false, false, true, true, false, false]
+                        [name_ok "lib-x.y+z", name_ok "x", name_ok "Caps", version_ok "1.0~rc1", version_ok "2.3.4+git5",
+                         version_ok "1.0-1", version_ok "v1"] ),
+        test.case "templates"
+            $( test.eq! "https://x/v1.2.0/demo-1.2.0-linux-x86_64.tar.gz {nope}"
+                        (fill "https://x/v{version}/{file} {nope}"
+                              (vars (demo! ())).["file" => "demo-1.2.0-linux-x86_64.tar.gz"]) ),
+        test.case "the prefix inside an archive"
+            $( test.eq! ["usr", "", "opt/demo"]
+                        (list.map (fn p -> prefix_path (Spec.set_prefix p (demo! ()))) ["/usr", "/", "/opt/demo/"]) ),
+    ];
+}

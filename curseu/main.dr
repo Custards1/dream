@@ -14,12 +14,11 @@ let doSomething! handle = {
 };
 let unsafe_string! data = {
     let ptr = ffi.calloc(1 100);
-    
+
     ffi.memcpy(ptr "Hello from unsafe_string, you said: "  24)
-    
+
     ptr
 }
-
 
 let main! = console.print! unsafe_string! "Hello from curseu"
 let main2! = {

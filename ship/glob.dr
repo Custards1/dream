@@ -1,0 +1,83 @@
+// Which files of a directory to leave out.
+//
+// A directory named in `[ship.files]` is shipped whole, less what its
+// `exclude` patterns name. The patterns are read the way `.gitignore` reads
+// them, because that is the reading anyone writing one already has:
+//
+// - a pattern with no `/` matches a name at any depth -- `*.o` is every
+//   object file, and `target` every directory called that and all under it;
+// - a pattern with a `/` is anchored at the directory being shipped --
+//   `tests/fixtures` is that one directory, not one of the same name deeper;
+// - `*` and `?` match within one name, and `**` matches any number of whole
+//   names, none included.
+//
+// A pattern that matches a directory leaves out everything under it, so
+// `target` and `target/**` mean the same.
+
+import std.list;
+import std.str;
+
+/// Whether one name matches one pattern name, `*` and `?` included.
+let name_matches : [:char] -> [:char] -> :bool;
+let rec name_matches p s = match [p, s] {
+    [[], []] => true,
+    [['*', ..rest], _] => name_matches rest s || (not (list.is_empty s) && name_matches p (list.tail s)),
+    [['?', ..rest], [_, ..more]] => name_matches rest more,
+    [[c, ..rest], [d, ..more]] => c == d && name_matches rest more,
+    _ => false,
+};
+
+/// Whether a path, as its names, matches a pattern, as its names, with `**`.
+let names_match : [:string] -> [:string] -> :bool;
+let rec names_match ps ss = match [ps, ss] {
+    [[], []] => true,
+    [["**", ..rest], _] => names_match rest ss || (not (list.is_empty ss) && names_match ps (list.tail ss)),
+    [[p, ..rest], [s, ..more]] => name_matches (str.chars p) (str.chars s) && names_match rest more,
+    _ => false,
+};
+
+/// Every leading part of a path: `a/b/c` is `a`, `a/b` and `a/b/c`. A pattern
+/// that matches any of them matches the path, since leaving a directory out
+/// leaves out what is in it.
+let prefixes : [:string] -> [[:string]];
+let prefixes names = list.map (fn n -> list.take n names) (list.range 1 (list.length names + 1));
+
+/// Whether `path`, relative to the directory being shipped, is left out by
+/// `pattern`.
+let matches : :string -> :string -> :bool;
+let matches pattern path = {
+    let names = str.split "/" path;
+    let anchored = str.contains_str "/" pattern;
+    let wanted = list.filter (fn n -> n != "") (str.split "/" pattern);
+    if anchored { list.any (fn pre -> names_match wanted pre) (prefixes names) }
+    else { list.any (fn n -> name_matches (str.chars pattern) (str.chars n)) names }
+};
+
+/// Whether any of `patterns` leaves `path` out.
+let excluded : [:string] -> :string -> :bool;
+let excluded patterns path = list.any (fn p -> matches p path) patterns;
+
+/// What version control keeps beside the files, which is never meant to ship.
+let always : [:string] = [".git", ".hg", ".svn", ".DS_Store"];
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a bare pattern matches a name at any depth"
+            $( test.eq! [true, true, false] [matches "*.o" "a.o", matches "*.o" "x/y/a.o", matches "*.o" "a.c"] ),
+        test.case "a bare name leaves out a directory and its contents"
+            $( test.eq! [true, true, false] [matches "target" "target/x", matches "target" "a/target/b/c",
+                                             matches "target" "targets/x"] ),
+        test.case "a pattern with a slash is anchored"
+            $( test.eq! [true, false] [matches "tests/fixtures" "tests/fixtures/a", matches "tests/fixtures" "x/tests/fixtures/a"] ),
+        test.case "double star crosses directories, none included"
+            $( test.eq! [true, true, true, false]
+                        [matches "a/**/z.txt" "a/z.txt", matches "a/**/z.txt" "a/b/c/z.txt", matches "a/**" "a/q",
+                         matches "a/**/z.txt" "b/z.txt"] ),
+        test.case "question marks and stars stay within a name"
+            $( test.eq! [true, false, false] [matches "f?o" "foo", matches "a/*.txt" "a/b/c.txt", matches "f?o" "fo"] ),
+        test.case "version control is always left out"
+            $( test.eq! [true, true, false] [excluded always ".git/HEAD", excluded always "x/.DS_Store", excluded always "src/a.dr"] ),
+    ];
+}

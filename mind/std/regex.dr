@@ -1,0 +1,874 @@
+// Regular expressions, matched in time linear in the text.
+//
+//     import std.regex;
+//
+//     let date = regex.compile "(?<y>\\d{4})-(?<m>\\d\\d)-(?<d>\\d\\d)";
+//
+//     regex.is_match date "due 2026-10-04"                  // true
+//     regex.find date "due 2026-10-04" |> regex.named "y"   // "2026"
+//     regex.replace_all date "${d}/${m}/${y}" text          // reorder every date
+//     regex.split (regex.compile ",\\s*") "a, b,c"          // ["a", "b", "c"]
+//
+//     regex.compile "(unclosed"     // a compile error: `Pattern`'s `where` fails
+//
+// **Bad patterns are compile errors.** `compile` takes a `Pattern`, a string
+// for which `problem` finds nothing wrong, and the compiler runs that check on
+// every literal it is handed ("Compile-time contracts" in the language spec),
+// so a typo in a pattern is reported where it is written, not when the line
+// runs. Text that arrives at run time goes through `parse`, which answers a
+// result with the reason, and `problem` says what is wrong without compiling.
+// `comp regex.compile ".."` does the compiling itself while building, so the
+// program carries the finished matcher; it is plain data.
+//
+// **The engine is the VM's** (`vm.regex_run`, dream/src/regex.cpp). Parsing
+// and compiling happen here, in Dream; the program is then encoded as bytes
+// (`Regex.code`) and run natively by a lazy DFA -- a table lookup per
+// character, which finds where a match ends, and over the pattern reversed
+// where it starts -- and by a Pike VM for what a DFA cannot do: the spans of
+// groups, and the assertions `^`, `$` and `\b`. Both are linear in the text
+// and neither backtracks, so there is no catastrophic case -- `(a*)*b`
+// against a long run of `a`s is as quick as anything else -- and text no
+// match can start in is skipped with `memchr`. Counting the matches in a few
+// megabytes takes milliseconds. What linear time rules out is what RE2 rules
+// out: backreferences and lookaround, which this refuses with a message
+// rather than silently misreading.
+//
+// Matching is **leftmost-first**, as in Perl and every regex a programmer has
+// used: of the matches starting earliest, the one the pattern prefers --
+// greedy repetition as long as it can be, `a|ab` taking `a` -- is the one
+// found. One corner differs from Perl, as it does in RE2 and Go: a loop
+// whose body prefers to match nothing (`(?:a??)*`) still takes the
+// characters it can, where Perl would stop at the empty iteration.
+//
+// **Offsets are bytes and matching is by character.** `.` and a class
+// consume a whole UTF-8 character, and `start`, `stop` and every group's span
+// are byte offsets, ready for `str.slice`. `\w`, `\d`, `\s`, `\b` and case
+// folding (`(?i)`) are ASCII's, as in RE2's default; a class may name any
+// character, written as itself or as `\u{1F600}`.
+//
+// | | |
+// |---|---|
+// | `.` `[abc]` `[^a-z]` `\d \w \s \D \W \S` | characters |
+// | `*` `+` `?` `{n}` `{n,}` `{n,m}`, and each with `?` after it | greedy and lazy repetition |
+// | `(..)` `(?<name>..)` `(?:..)` `a|b` | groups and alternation |
+// | `^` `$` `\A` `\z` `\b` `\B` | anchors (`^`/`$` are lines' with `(?m)`) |
+// | `(?i)` `(?m)` `(?s)`, `(?i:..)` | ignore case, multi-line, `.` matches `\n` |
+// | `\n \t \r \f \v \0 \xHH \u{H..}` `\.` .. | escapes |
+
+import std.array;
+import std.char;
+import std.list;
+import std.map;
+import std.num;
+import std.parse as p;
+import std.result;
+import std.str;
+import std.vm;
+
+// --- the compiled form ---------------------------------------------------------------
+
+/// A compiled pattern: its source, how many groups it has (the whole match
+/// is group 0), the names of the named ones, the literal text every match
+/// starts with, the bytes a match can start with (`()` when that is not a
+/// short list of ASCII), and the program encoded for the VM's matcher --
+/// once as written, and once anchored at both ends for `matches`. All of it
+/// is data, so `comp regex.compile ".."` can build it while compiling.
+struct Regex {
+    !source : :string
+    !groups : :integer
+    !names : :map
+    !prefix : :string
+    !starts : :any
+    !code : :string
+    !full : :string
+}
+
+/// One match: the text matched, its byte span, and each group's span
+/// (`#[start, stop]`, or `()` for a group that took no part).
+struct Match {
+    !text : :string
+    !start : :integer
+    !stop : :integer
+    !spans : :array
+    !names : :map
+    !subject : :string
+}
+
+/// A pattern this module accepts. Written as a literal where `compile` is
+/// called, it is checked while compiling.
+type Pattern = :string where fn s -> problem s == ();
+
+/// The flags `compile_with` takes.
+type Flag = :ignore_case | :multiline | :dot_all;
+
+/// What is wrong with a pattern, or `()` when nothing is.
+let problem : :string -> (:string | :unit);
+let problem source = match parse source { [:ok, _] => (), [:error, why] => why };
+
+/// The pattern compiled. A literal is checked while the program is built; a
+/// string made at run time that is not a pattern raises a `:type_error`
+/// carrying the reason, which is why such text should go through `parse`.
+let compile : Pattern -> Regex;
+let compile source = compile_with [] source;
+
+let compile_with : [Flag] -> Pattern -> Regex;
+let compile_with flags source = match parse_with flags source {
+    [:ok, re] => re,
+    [:error, why] => type_assert false ("not a regular expression: " + why) (Regex.make source 0 %{} "" () "" ""),
+};
+
+/// The pattern compiled, or `[:error, why]`: for patterns that arrive at run
+/// time.
+let parse : :string -> result.Of Regex :string;
+let parse source = parse_with [] source;
+
+let parse_with : [Flag] -> :string -> result.Of Regex :string;
+let parse_with flags source = match p.run regex_syntax source {
+    [:error, e] => result.error ("column " + to_string (p.Error.column e) + ": " + p.Error.message e),
+    [:ok, tree] => {
+        let numbered = number_groups tree 1;
+        let ast = numbered.[0];
+        let groups = numbered.[1];
+        let initial = %{ :i => list.contains :ignore_case flags, :m => list.contains :multiline flags,
+                         :s => list.contains :dot_all flags };
+        match check_sizes ast {
+            () => {
+                let body = emit ast 1 initial;
+                let prefix = if initial.[:i] { "" } else { literal_prefix ast };
+                let starts = start_bytes ast initial;
+                let program = [#[:save, 0]] + body + [#[:save, 1], #[:match]];
+                let whole = [#[:save, 0]] + body + [#[:assert, :text_end], #[:save, 1], #[:match]];
+                // The pattern backwards, for the machine's reverse DFA, which
+                // finds where a match starts from where it ends; its groups
+                // are of no interest there.
+                let backwards = encode (emit (reversed ast) 0 initial + [#[:match]]) 1 "" () "";
+                result.ok (Regex.make source groups (group_names ast %{}) prefix starts
+                                      (encode program groups prefix starts backwards) (encode whole groups "" () ""))
+            },
+            why => result.error why,
+        }
+    },
+};
+
+/// `text` with every character that means something in a pattern escaped,
+/// so `compile (escape s)` matches `s` exactly.
+let escape : :string -> :string;
+let escape text = str.concat_all (list.map (fn c -> if str.contains c "\\.+*?()|[]{}^$#&-~" { "\\" + str.of_chars [c] }
+                                                    else { str.of_chars [c] }) (str.chars text));
+
+// --- syntax --------------------------------------------------------------------------
+//
+// The tree the parser builds:
+//
+//     [:char, code]  [:any]  [:class, negated, items]  [:assert, kind]
+//     [:seq, nodes]  [:alt, nodes]  [:repeat, node, min, max | (), greedy]
+//     [:group, name | (), node, capturing]  [:flags, settings, node]
+//
+// Groups are numbered afterwards, in the order their `(` appears, by
+// `number_groups`, which turns a capturing group into `[:cap, n, name, node]`.
+
+priv let regex_syntax : p.Parser :any;
+priv let regex_syntax s at = alternation s at;
+
+priv let alternation : p.Parser :any;
+priv let alternation s at = p.map (fn alts -> match alts { [one] => one, _ => [:alt, alts] })
+                                  (p.sep_by1 (p.text "|") (p.quiet sequence)) s at;
+
+priv let sequence : p.Parser :any;
+priv let sequence s at = p.map (fn items -> apply_flags items) (p.many quantified) s at;
+
+/// `(?i)` in the middle of a sequence applies to the rest of it.
+priv let apply_flags : [:any] -> :any;
+priv let apply_flags items = match items {
+    [] => [:seq, []],
+    _ => {
+        let rec wrap xs = match xs {
+            [] => [],
+            [[:set_flags, f], ..rest] => [[:flags, f, [:seq, wrap rest]]],
+            [x, ..rest] => x :: wrap rest,
+        };
+        match wrap items { [one] => one, many => [:seq, many] }
+    },
+};
+
+priv let quantified : p.Parser :any;
+priv let quantified s at = p.map2 (fn node q -> match q { () => node, [lo, hi, greedy] => [:repeat, node, lo, hi, greedy] })
+                                  atom (p.optional quantifier) s at;
+
+priv let quantifier : p.Parser :any;
+priv let quantifier s at = p.map2 (fn [lo, hi] lazy -> [lo, hi, lazy == ()])
+    (p.choice [p.to [0, ()] (p.text "*"), p.to [1, ()] (p.text "+"), p.to [0, 1] (p.text "?"), counted])
+    (p.optional (p.text "?")) s at;
+
+priv let counted : p.Parser :any;
+priv let counted s at = p.choice [
+    p.succeed (fn lo hi -> [lo, hi]) |> p.skip (p.text "{") |> p.keep p.natural |> p.skip (p.text ",")
+        |> p.keep p.natural |> p.skip (p.text "}"),
+    p.succeed (fn lo -> [lo, ()]) |> p.skip (p.text "{") |> p.keep p.natural |> p.skip (p.text ",}"),
+    p.succeed (fn n -> [n, n]) |> p.skip (p.text "{") |> p.keep p.natural |> p.skip (p.text "}"),
+] s at;
+
+priv let atom : p.Parser :any;
+priv let atom s at = p.choice [
+    group_syntax,
+    class,
+    p.to [:any] (p.text "."),
+    p.to [:assert, :bol] (p.text "^"),
+    p.to [:assert, :eol] (p.text "$"),
+    escape_atom,
+    p.map (fn c -> [:char, char.code c]) (p.char_not_in "()[]|*+?.^$\\"),
+] s at;
+
+priv let group_syntax : p.Parser :any;
+priv let group_syntax s at = p.choice [
+    p.choice [p.text "(?=", p.text "(?!", p.text "(?<=", p.text "(?<!"]
+        |> p.then (p.fail "lookaround is not supported (the engine is linear-time, as RE2's is)"),
+    p.succeed (fn n -> [:group, (), n, false]) |> p.skip (p.text "(?:") |> p.keep (p.lazy (fn () -> alternation)) |> p.skip (p.text ")"),
+    p.succeed (fn name n -> [:group, name, n, true]) |> p.skip (p.text "(?") |> p.skip (p.optional (p.text "P"))
+        |> p.skip (p.text "<") |> p.keep p.identifier |> p.skip (p.text ">")
+        |> p.keep (p.lazy (fn () -> alternation)) |> p.skip (p.text ")"),
+    p.succeed (fn f n -> [:flags, f, n]) |> p.skip (p.text "(?") |> p.keep flag_letters |> p.skip (p.text ":")
+        |> p.keep (p.lazy (fn () -> alternation)) |> p.skip (p.text ")"),
+    p.succeed (fn f -> [:set_flags, f]) |> p.skip (p.text "(?") |> p.keep flag_letters |> p.skip (p.text ")"),
+    p.succeed (fn n -> [:group, (), n, true]) |> p.skip (p.text "(") |> p.skip (p.not_followed_by (p.text "?"))
+        |> p.keep (p.lazy (fn () -> alternation)) |> p.skip (p.label "\")\"" (p.text ")")),
+] s at;
+
+priv let flag_letters : p.Parser :map;
+priv let flag_letters s at = p.map (fn letters -> list.fold (fn m c -> m.[flag_key c => true]) %{} (str.chars letters))
+                                   (p.span1 "a flag (i, m or s)" "ims") s at;
+
+priv let flag_key : :char -> :atom;
+priv let flag_key c = match c { 'i' => :i, 'm' => :m, _ => :s };
+
+priv let class : p.Parser :any;
+priv let class s at = p.choice [
+    p.succeed (fn neg first items -> [:class, neg != (), first :: items])
+        |> p.skip (p.text "[") |> p.keep (p.optional (p.text "^"))
+        |> p.keep (p.or class_item (p.map (fn _ -> [:range, 93, 93]) (p.text "]")))
+        |> p.keep (p.many class_item) |> p.skip (p.label "\"]\"" (p.text "]")),
+] s at;
+
+priv let class_item : p.Parser :any;
+priv let class_item s at = p.choice [
+    p.and_then (fn e -> match e {
+        [:char, c] => range_from c,
+        [:class, neg, items] => p.succeed (if neg { [:not, items] } else { [:any_of, items] }),
+        _ => p.fail "an anchor cannot be in a class",
+    }) escape_atom,
+    p.and_then range_from (p.map char.code (p.char_not_in "]\\")),
+] s at;
+
+/// After the first character of a class item: `-` and a second one makes a
+/// range, unless the `-` is the last thing in the class. Once a `-` that
+/// starts a range is seen the range must be good: falling back to reading
+/// `z`, `-` and `a` as three characters would accept `[z-a]` as something
+/// it is not.
+priv let range_from : :integer -> p.Parser :any;
+priv let range_from lo s at = p.and_then (fn dash -> if dash == () { p.succeed [:range, lo, lo] } else { range_end lo })
+    (p.optional (p.lookahead (p.skip (p.not_followed_by (p.text "]")) (p.text "-")))) s at;
+
+priv let range_end : :integer -> p.Parser :any;
+priv let range_end lo s at = (p.succeed (fn hi -> [:range, lo, hi])
+    |> p.skip (p.text "-")
+    |> p.keep (p.or (p.and_then (fn e -> match e { [:char, c] => p.succeed c, _ => p.fail "a range must end in a character" }) escape_atom)
+                    (p.map char.code (p.char_not_in "]\\")))
+    |> p.where_ok (fn r -> r.[2] >= lo) "a range that does not run backwards") s at;
+
+priv let escape_atom : p.Parser :any;
+priv let escape_atom s at = p.then escaped (p.text "\\") s at;
+
+priv let escaped : p.Parser :any;
+priv let escaped s at = match p.char_at s at {
+    () => p.fail "an escape after the backslash" s at,
+    [c, w] => match c {
+        'd' => p.succeed [:class, false, digit_items] s (at + 1),
+        'D' => p.succeed [:class, true, digit_items] s (at + 1),
+        'w' => p.succeed [:class, false, word_items] s (at + 1),
+        'W' => p.succeed [:class, true, word_items] s (at + 1),
+        's' => p.succeed [:class, false, space_items] s (at + 1),
+        'S' => p.succeed [:class, true, space_items] s (at + 1),
+        'b' => p.succeed [:assert, :word] s (at + 1),
+        'B' => p.succeed [:assert, :not_word] s (at + 1),
+        'A' => p.succeed [:assert, :text_start] s (at + 1),
+        'z' => p.succeed [:assert, :text_end] s (at + 1),
+        'n' => p.succeed [:char, 10] s (at + 1),
+        't' => p.succeed [:char, 9] s (at + 1),
+        'r' => p.succeed [:char, 13] s (at + 1),
+        'f' => p.succeed [:char, 12] s (at + 1),
+        'v' => p.succeed [:char, 11] s (at + 1),
+        '0' => p.succeed [:char, 0] s (at + 1),
+        'x' => p.map (fn h -> [:char, hex h]) (p.label "two hex digits" (p.capture (p.count 2 (p.char_in "0123456789abcdefABCDEF")))) s (at + 1),
+        'u' => p.map (fn h -> [:char, hex h])
+                     (p.or (p.label "four hex digits" (p.capture (p.count 4 (p.char_in "0123456789abcdefABCDEF"))))
+                           (p.between (p.text "{") (p.text "}") (p.span1 "hex digits" "0123456789abcdefABCDEF"))
+                      |> p.where_ok (fn h -> { let v = hex h; v <= 1114111 && (v < 55296 || v > 57343) }) "a Unicode scalar value")
+                     s (at + 1),
+        _ if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '1' && c <= '9') =>
+            p.fail ("\\" + str.of_chars [c] + " is not an escape this engine knows"
+                    + (if c >= '1' && c <= '9' { " (backreferences are not supported)" } else { "" })) s at,
+        _ => p.succeed [:char, char.code c] s (at + w),
+    },
+};
+
+priv let hex : :string -> :integer;
+priv let hex h = list.fold (fn acc c -> acc * 16 + (if c >= '0' && c <= '9' { char.code c - 48 }
+                                                    else if c >= 'a' && c <= 'f' { char.code c - 87 }
+                                                    else { char.code c - 55 })) 0 (str.chars h);
+
+priv let digit_items : [:any];
+priv let digit_items = [[:range, 48, 57]];
+priv let word_items : [:any];
+priv let word_items = [[:range, 48, 57], [:range, 65, 90], [:range, 97, 122], [:range, 95, 95]];
+priv let space_items : [:any];
+priv let space_items = [[:range, 9, 13], [:range, 32, 32]];
+
+/// Number the capturing groups by their `(`, depth first, left to right:
+/// `[tree, next number]`.
+priv let number_groups : :any -> :integer -> [:any, :integer];
+priv let rec number_groups node n = match node {
+    [:group, name, inner, true] => { let [t, n2] = number_groups inner (n + 1); [[:cap, n, name, t], n2] },
+    [:group, _, inner, false] => number_groups inner n,
+    [:seq, nodes] => { let [ts, n2] = number_all nodes n; [[:seq, ts], n2] },
+    [:alt, nodes] => { let [ts, n2] = number_all nodes n; [[:alt, ts], n2] },
+    [:repeat, inner, lo, hi, greedy] => { let [t, n2] = number_groups inner n; [[:repeat, t, lo, hi, greedy], n2] },
+    [:flags, f, inner] => { let [t, n2] = number_groups inner n; [[:flags, f, t], n2] },
+    other => [other, n],
+};
+
+priv let number_all : [:any] -> :integer -> [[:any], :integer];
+priv let rec number_all nodes n = match nodes {
+    [] => [[], n],
+    [x, ..rest] => { let [t, n2] = number_groups x n; let [ts, n3] = number_all rest n2; [t :: ts, n3] },
+};
+
+priv let group_names : :any -> :map -> :map;
+priv let rec group_names node m = match node {
+    [:cap, n, name, inner] => group_names inner (if name == () { m } else { m.[name => n] }),
+    [:seq, nodes] => list.fold (fn acc x -> group_names x acc) m nodes,
+    [:alt, nodes] => list.fold (fn acc x -> group_names x acc) m nodes,
+    [:repeat, inner, _, _, _] => group_names inner m,
+    [:flags, _, inner] => group_names inner m,
+    _ => m,
+};
+
+/// A counted repetition is compiled by copying, so `(x{1000}){1000}` would be
+/// a million instructions. Refused past a thousand copies, as RE2 does.
+priv let check_sizes : :any -> (:string | :unit);
+priv let rec check_sizes node = match node {
+    [:repeat, inner, lo, hi, _] =>
+        if lo > 1000 || (hi != () && hi > 1000) { "a repetition count over 1000" }
+        else if hi != () && hi < lo { "a repetition whose maximum is below its minimum" }
+        else { check_sizes inner },
+    [:seq, nodes] => first_problem nodes,
+    [:alt, nodes] => first_problem nodes,
+    [:cap, _, _, inner] => check_sizes inner,
+    [:flags, _, inner] => check_sizes inner,
+    _ => (),
+};
+
+priv let first_problem : [:any] -> (:string | :unit);
+priv let rec first_problem nodes = match nodes {
+    [] => (),
+    [x, ..rest] => match check_sizes x { () => first_problem rest, why => why },
+};
+
+/// The literal characters every match must begin with, when there are any.
+priv let literal_prefix : :any -> :string;
+priv let literal_prefix node = str.of_chars (list.map char.of_code (prefix_codes node));
+
+priv let prefix_codes : :any -> [:integer];
+priv let rec prefix_codes node = match node {
+    [:char, c] => [c],
+    [:seq, nodes] => seq_prefix nodes,
+    [:cap, _, _, inner] => prefix_codes inner,
+    [:repeat, inner, lo, _, _] if lo >= 1 => prefix_codes inner,
+    _ => [],
+};
+
+priv let seq_prefix : [:any] -> [:integer];
+priv let rec seq_prefix nodes = match nodes {
+    [] => [],
+    [[:char, c], ..rest] => c :: seq_prefix rest,
+    [[:cap, _, _, inner], .._] => prefix_codes inner,
+    _ => [],
+};
+
+/// The bytes a match can begin with, as a string for `str.upto`, or `()`
+/// when it could begin with anything, with a character past ASCII, or with
+/// nothing at all (a pattern that matches the empty string matches
+/// everywhere, and there is nothing to skip).
+priv let start_bytes : :any -> :map -> :any;
+priv let start_bytes node flags = match firsts node flags {
+    [:any, _] => (),
+    [_, true] => (),
+    [codes, false] => if list.is_empty codes || list.any (fn c -> c >= 128) codes { () }
+                      else { str.of_bytes (list.unique codes) },
+};
+
+/// `[codes or :any, nullable]`: what can come first, and whether the node can
+/// match nothing.
+priv let firsts : :any -> :map -> [:any, :bool];
+priv let rec firsts node flags = match node {
+    [:char, c] => [if flags.[:i] && is_letter_code c { [fold c, fold c - 32] } else { [c] }, false],
+    [:any] => [:any, false],
+    [:class, false, items] => match item_codes items {
+        :any => [:any, false],
+        codes => [if flags.[:i] { list.flat_map (fn c -> if is_letter_code c { [fold c, fold c - 32] } else { [c] }) codes } else { codes }, false],
+    },
+    [:class, true, _] => [:any, false],
+    [:assert, _] => [[], true],
+    [:seq, nodes] => seq_firsts nodes flags,
+    [:alt, nodes] => list.fold (fn acc n -> union_firsts acc (firsts n flags)) [[], false] nodes,
+    [:repeat, inner, lo, _, _] => { let [f, nullable] = firsts inner flags; [f, nullable || lo == 0] },
+    [:cap, _, _, inner] => firsts inner flags,
+    [:flags, f, inner] => firsts inner (map.merge flags f),
+};
+
+priv let seq_firsts : [:any] -> :map -> [:any, :bool];
+priv let rec seq_firsts nodes flags = match nodes {
+    [] => [[], true],
+    [x, ..rest] => {
+        let [f, nullable] = firsts x flags;
+        if nullable { union_firsts [f, false] (seq_firsts rest flags) } else { [f, false] }
+    },
+};
+
+priv let union_firsts : [:any, :bool] -> [:any, :bool] -> [:any, :bool];
+priv let union_firsts [a, na] [b, nb] = [if a == :any || b == :any { :any } else { a + b }, na || nb];
+
+/// The codes of a class's ranges, when they are few and all ASCII.
+priv let item_codes : [:any] -> :any;
+priv let item_codes items = {
+    let ranges = list.map (fn item -> match item { [:range, lo, hi] => [lo, hi], _ => () }) items;
+    if list.any (fn r -> r == () || r.[1] >= 128) ranges { :any }
+    else { list.flat_map (fn [lo, hi] -> list.range lo (hi + 1)) ranges }
+};
+
+// --- compiling to a program ------------------------------------------------------------
+//
+// `emit node pc flags` answers the instructions for `node`, placed at address
+// `pc`, so that jumps can be absolute. The instructions:
+//
+//     #[:char, code]  #[:char_ci, folded]  #[:any]  #[:any_nl]
+//     #[:class, negated, items, ignore_case]  #[:assert, kind]
+//     #[:split, preferred, other]  #[:jmp, to]  #[:save, slot]  #[:match]
+
+priv let emit : :any -> :integer -> :map -> [:any];
+priv let rec emit node pc flags = match node {
+    [:char, c] => if flags.[:i] && is_letter_code c { [#[:char_ci, fold c]] } else { [#[:char, c]] },
+    [:any] => if flags.[:s] { [#[:any_nl]] } else { [#[:any]] },
+    [:class, neg, items] => [#[:class, neg, items, flags.[:i]]],
+    [:assert, :bol] => [#[:assert, if flags.[:m] { :line_start } else { :text_start }]],
+    [:assert, :eol] => [#[:assert, if flags.[:m] { :line_end } else { :text_end }]],
+    [:assert, kind] => [#[:assert, kind]],
+    [:seq, nodes] => emit_seq nodes pc flags,
+    [:cap, n, _, inner] => {
+        let body = emit inner (pc + 1) flags;
+        [#[:save, 2 * n]] + body + [#[:save, 2 * n + 1]]
+    },
+    [:flags, f, inner] => emit inner pc (map.merge flags f),
+    [:alt, nodes] => emit_alt nodes pc flags,
+    [:repeat, inner, lo, hi, greedy] => emit_repeat inner lo hi greedy pc flags,
+};
+
+priv let emit_seq : [:any] -> :integer -> :map -> [:any];
+priv let rec emit_seq nodes pc flags = match nodes {
+    [] => [],
+    [x, ..rest] => { let code = emit x pc flags; code + emit_seq rest (pc + list.length code) flags },
+};
+
+/// `a|b|c` as `split L1, L2; L1: a; jmp end; L2: split ..`.
+priv let emit_alt : [:any] -> :integer -> :map -> [:any];
+priv let rec emit_alt nodes pc flags = match nodes {
+    [only] => emit only pc flags,
+    [first, ..rest] => {
+        let a = emit first (pc + 1) flags;
+        let after_a = pc + 1 + list.length a + 1;
+        let b = emit_alt rest after_a flags;
+        [#[:split, pc + 1, after_a]] + a + [#[:jmp, after_a + list.length b]] + b
+    },
+};
+
+priv let emit_repeat : :any -> :integer -> :any -> :bool -> :integer -> :map -> [:any];
+priv let rec emit_repeat inner lo hi greedy pc flags =
+    if lo > 0 {
+        let first = emit inner pc flags;
+        first + emit_repeat inner (lo - 1) (if hi == () { () } else { hi - 1 }) greedy (pc + list.length first) flags
+    } else if hi == () {
+        // L: split body, out; body; jmp L
+        let body = emit inner (pc + 1) flags;
+        let out = pc + 1 + list.length body + 1;
+        [fork greedy (pc + 1) out] + body + [#[:jmp, pc]]
+    } else if hi <= 0 { [] }
+    else {
+        // split body, out; body; (the rest, optional too)
+        let body = emit inner (pc + 1) flags;
+        let rest = emit_repeat inner 0 (hi - 1) greedy (pc + 1 + list.length body) flags;
+        let out = pc + 1 + list.length body + list.length rest;
+        [fork greedy (pc + 1) out] + body + rest
+    };
+
+priv let fork : :bool -> :integer -> :integer -> :array;
+priv let fork greedy body out = if greedy { #[:split, body, out] } else { #[:split, out, body] };
+
+priv let is_letter_code : :integer -> :bool;
+priv let is_letter_code c = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+
+/// ASCII case folded to lower.
+priv let fold : :integer -> :integer;
+priv let fold c = if c >= 65 && c <= 90 { c + 32 } else { c };
+
+// --- encoding for the machine ------------------------------------------------------------
+//
+// The program as the bytes `vm.regex_run` reads; dream/src/regex.cpp has the
+// layout. Two things change on the way. A case-insensitive character becomes
+// a class of its two cases, so the machine has one fewer instruction. And a
+// class's items -- ranges, `\d` inside `[..]`, `\D` inside `[..]` -- become one
+// sorted list of disjoint ranges, with case folding already applied, so the
+// machine tests a character with a bitmap or by halving.
+
+priv let encode : [:any] -> :integer -> :string -> :any -> :string -> :string;
+priv let encode program groups prefix starts backwards = {
+    let step = fn [pieces, classes, n] instr -> match instr {
+        #[:char, c] => [inst 0 c 0 :: pieces, classes, n],
+        #[:char_ci, c] => [inst 3 n 0 :: pieces, [false, normalize [[c, c], [c - 32, c - 32]]] :: classes, n + 1],
+        #[:any] => [inst 1 0 0 :: pieces, classes, n],
+        #[:any_nl] => [inst 2 0 0 :: pieces, classes, n],
+        #[:class, neg, items, ci] => {
+            let ranges = item_ranges items;
+            [inst 3 n 0 :: pieces, [neg, if ci { normalize (ranges + fold_ranges ranges) } else { ranges }] :: classes, n + 1]
+        },
+        #[:split, x, y] => [inst 4 x y :: pieces, classes, n],
+        #[:jmp, x] => [inst 5 x 0 :: pieces, classes, n],
+        #[:save, k] => [inst 6 k 0 :: pieces, classes, n],
+        #[:assert, kind] => [inst 7 (assert_code kind) 0 :: pieces, classes, n],
+        #[:match] => [inst 8 0 0 :: pieces, classes, n],
+    };
+    let [pieces, classes, n] = list.fold step [[], [], 0] program;
+    let class_bytes = list.map (fn [neg, ranges] -> str.concat_all ([str.of_bytes [if neg { 1 } else { 0 }], u32 (list.length ranges)]
+                                                                    + list.flat_map (fn [lo, hi] -> [u32 lo, u32 hi]) ranges))
+                               (list.reverse classes);
+    str.concat_all (["DRX1", u32 groups, u32 (list.length program)] + list.reverse pieces
+                    + [u32 n] + class_bytes + [u32 (len prefix), prefix]
+                    + (match starts { () => [str.of_bytes [0]], set => [str.of_bytes [1], bitmap set] })
+                    + [u32 (len backwards), backwards])
+};
+
+/// The pattern that matches the reverse of what `node` matches: sequences
+/// read the other way, and groups dropped, since only where the reversed
+/// pattern matches is wanted of it.
+priv let reversed : :any -> :any;
+priv let rec reversed node = match node {
+    [:seq, nodes] => [:seq, list.reverse (list.map reversed nodes)],
+    [:alt, nodes] => [:alt, list.map reversed nodes],
+    [:cap, _, _, inner] => reversed inner,
+    [:repeat, inner, lo, hi, greedy] => [:repeat, reversed inner, lo, hi, greedy],
+    [:flags, f, inner] => [:flags, f, reversed inner],
+    other => other,
+};
+
+priv let inst : :integer -> :integer -> :integer -> :string;
+priv let inst op a b = str.of_bytes [op] + str.of_int_le 4 a + str.of_int_le 4 b;
+
+priv let u32 : :integer -> :string;
+priv let u32 n = str.of_int_le 4 n;
+
+priv let assert_code : :atom -> :integer;
+priv let assert_code kind = match kind {
+    :text_start => 0, :text_end => 1, :line_start => 2, :line_end => 3, :word => 4, :not_word => 5,
+};
+
+/// A set of bytes as 32 bytes of bits, bit `b % 8` of byte `b / 8`.
+priv let bitmap : :string -> :string;
+priv let bitmap set = {
+    let bytes = list.unique (list.map (fn i -> str.byte i set) (list.range 0 (len set)));
+    str.of_bytes (list.map (fn k -> list.fold_strict (fn acc b -> acc + pow2 (b % 8)) 0 (list.filter (fn b -> b / 8 == k) bytes))
+                           (list.range 0 32))
+};
+
+priv let pow2 : :integer -> :integer;
+priv let rec pow2 n = if n <= 0 { 1 } else { 2 * pow2 (n - 1) };
+
+/// A class's items as sorted, disjoint ranges of code points.
+priv let item_ranges : [:any] -> [[:integer]];
+priv let item_ranges items = normalize (list.flat_map (fn item -> match item {
+    [:range, lo, hi] => [[lo, hi]],
+    [:any_of, inner] => item_ranges inner,
+    [:not, inner] => complement (item_ranges inner),
+}) items);
+
+/// Sorted by their low ends, with overlapping and touching ranges merged.
+priv let normalize : [[:integer]] -> [[:integer]];
+priv let normalize ranges = {
+    let rec merge rs acc = match [rs, acc] {
+        [[], _] => list.reverse acc,
+        [[r, ..rest], []] => merge rest [r],
+        [[[lo, hi], ..rest], [[plo, phi], ..done]] =>
+            if lo <= phi + 1 { merge rest ([plo, list.maximum [hi, phi]] :: done) }
+            else { merge rest ([lo, hi] :: acc) },
+    };
+    merge (list.sort ranges) []
+};
+
+/// Every code point the ranges do not cover.
+priv let complement : [[:integer]] -> [[:integer]];
+priv let complement ranges = {
+    let rec gaps from rs = match rs {
+        [] => if from <= 1114111 { [[from, 1114111]] } else { [] },
+        [[lo, hi], ..rest] => if lo > from { [from, lo - 1] :: gaps (hi + 1) rest } else { gaps (hi + 1) rest },
+    };
+    gaps 0 ranges
+};
+
+/// The other ASCII case of whatever letters the ranges cover.
+priv let fold_ranges : [[:integer]] -> [[:integer]];
+priv let fold_ranges ranges = list.flat_map (fn [lo, hi] -> {
+    let upper = [list.maximum [lo, 65], list.minimum [hi, 90]];
+    let lower = [list.maximum [lo, 97], list.minimum [hi, 122]];
+    (if upper.[0] <= upper.[1] { [[upper.[0] + 32, upper.[1] + 32]] } else { [] })
+        + (if lower.[0] <= lower.[1] { [[lower.[0] - 32, lower.[1] - 32]] } else { [] })
+}) ranges;
+
+/// The machine's modes; see dream/src/regex.cpp.
+priv let run : :string -> :string -> :integer -> :integer -> :any;
+priv let run code s from mode = vm.regex_run code s from mode;
+
+priv let match_of : Regex -> :string -> :array -> Match;
+priv let match_of re s caps = {
+    let spans = array.of_list (list.map (fn g -> { let a = caps.[2 * g]; let b = caps.[2 * g + 1];
+                                                   if a < 0 || b < 0 { () } else { #[a, b] } })
+                                         (list.range 0 (Regex.groups re)));
+    let start = caps.[0];
+    let stop = caps.[1];
+    Match.make (str.slice start (stop - start) s) start stop spans (Regex.names re) s
+};
+
+// --- asking ------------------------------------------------------------------------------------
+
+/// Whether the pattern matches anywhere in `s`.
+let is_match : Regex -> :string -> :bool;
+let is_match re s = run (Regex.code re) s 0 0;
+
+/// Whether it matches the whole of `s`, as if written `\A(?:..)\z`.
+let matches : Regex -> :string -> :bool;
+let matches re s = run (Regex.full re) s 0 4 != ();
+
+/// The first match, or `()`.
+let find : Regex -> :string -> (Match | :unit);
+let find re s = find_from 0 re s;
+
+/// The first match starting at or after byte `from`.
+let find_from : :integer -> Regex -> :string -> (Match | :unit);
+let find_from from re s = match run (Regex.code re) s from 1 { () => (), caps => match_of re s caps };
+
+/// Every match, left to right, not overlapping. An empty match is followed by
+/// a search one character further on, so `a*` over "baa" finds "", "aa" and
+/// "". The machine finds them all in one call; each becomes a `Match` only
+/// when the list is read that far.
+let find_all : Regex -> :string -> [Match];
+let find_all re s = list.map (fn caps -> match_of re s caps) (run (Regex.code re) s 0 2);
+
+/// The text of every match.
+let find_all_text : Regex -> :string -> [:string];
+let find_all_text re s = list.map Match.text (find_all re s);
+
+/// How many matches there are, counted by the machine without building any.
+let count : Regex -> :string -> :integer;
+let count re s = run (Regex.code re) s 0 3;
+
+// --- reading a match -------------------------------------------------------------------------------
+
+/// The text of group `n` (0 being the whole match), or `()` when it took no
+/// part. A match of `()` answers `()`, so `find re s |> group 1` needs no check.
+let group : :integer -> (Match | :unit) -> (:string | :unit);
+let group n m = match m {
+    () => (),
+    _ => match (Match.spans m).[n else ()] {
+        () => (),
+        #[a, b] => str.slice a (b - a) (Match.subject m),
+    },
+};
+
+/// The text of the group called `name`, or `()`.
+let named : :string -> (Match | :unit) -> (:string | :unit);
+let named name m = match m {
+    () => (),
+    _ => match (Match.names m).[name else ()] { () => (), n => group n m },
+};
+
+/// Every group's text, from group 1; `()` for one that took no part, and
+/// `()` for no match at all.
+let groups : (Match | :unit) -> ([(:string | :unit)] | :unit);
+let groups m = match m {
+    () => (),
+    _ => list.map (fn n -> group n m) (list.range 1 (array.length (Match.spans m))),
+};
+
+/// Every named group's text, by name.
+let named_groups : Match -> :map;
+let named_groups m = map.from_pairs (list.map (fn [k, n] -> [k, group n m]) (map.pairs (Match.names m)));
+
+/// The groups of the first match, from group 1, or `()` when there is none:
+/// the one-call way to take text apart.
+///
+///     regex.captures (regex.compile "(\\w+)@(\\w+)") "ada@example" // ["ada", "example"]
+let captures : Regex -> :string -> ([(:string | :unit)] | :unit);
+let captures re s = groups (find re s);
+
+/// The byte span of group `n`: `[start, stop]`, or `()`.
+let span : :integer -> (Match | :unit) -> ([:integer, :integer] | :unit);
+let span n m = match m {
+    () => (),
+    _ => match (Match.spans m).[n else ()] { () => (), #[a, b] => [a, b] },
+};
+
+// --- changing text ---------------------------------------------------------------------------------
+
+/// `s` with the first match replaced by `template`, in which `$1` or `${1}`
+/// is a group's text, `${name}` a named group's, `$0` the whole match and `$$`
+/// a dollar sign.
+let replace : Regex -> :string -> :string -> :string;
+let replace re template s = replace_first_with re (fill template) s;
+
+/// Every match replaced.
+let replace_all : Regex -> :string -> :string -> :string;
+let replace_all re template s = replace_all_with re (fill template) s;
+
+/// The first match replaced by what `f` makes of it.
+let replace_first_with : Regex -> (Match -> :string) -> :string -> :string;
+let replace_first_with re f s = match find re s {
+    () => s,
+    m => str.slice 0 (Match.start m) s + f m + str.slice (Match.stop m) (len s) s,
+};
+
+/// Every match replaced by what `f` makes of it.
+let replace_all_with : Regex -> (Match -> :string) -> :string -> :string;
+let replace_all_with re f s = {
+    let rec pieces from ms = match ms {
+        [] => [str.slice from (len s - from) s],
+        [m, ..rest] => str.slice from (Match.start m - from) s :: f m :: pieces (Match.stop m) rest,
+    };
+    str.concat_all (pieces 0 (find_all re s))
+};
+
+/// A template's text for one match.
+priv let fill : :string -> Match -> :string;
+priv let fill template m = str.concat_all (template_pieces template 0 m);
+
+priv let template_pieces : :string -> :integer -> Match -> [:string];
+priv let rec template_pieces t i m =
+    if i >= len t { [] }
+    else {
+        let at = str.upto "$" i t;
+        let literal = str.slice i (at - i) t;
+        if at >= len t { [literal] }
+        else {
+            let after = at + 1;
+            let b = str.byte after t;
+            if b == 36 { literal :: "$" :: template_pieces t (after + 1) m }
+            else if b == 123 {
+                let close = str.find_from after "}" t;
+                if close < 0 { [literal, str.slice at (len t - at) t] }
+                else {
+                    let key = str.slice (after + 1) (close - after - 1) t;
+                    literal :: or_empty (match num.parse_int key { () => named key m, n => group n m }) :: template_pieces t (close + 1) m
+                }
+            } else {
+                let stop = str.span "0123456789" after t;
+                if stop == after { literal :: "$" :: template_pieces t after m }
+                else { literal :: or_empty (group (num_value (str.slice after (stop - after) t)) m) :: template_pieces t stop m }
+            }
+        }
+    };
+
+priv let or_empty : (:string | :unit) -> :string;
+priv let or_empty v = match v { () => "", text => text };
+
+priv let num_value : :string -> :integer;
+priv let num_value digits = match num.parse_int digits { () => 0, n => n };
+
+/// The text between the matches.
+let split : Regex -> :string -> [:string];
+let split re s = {
+    let rec pieces from ms = match ms {
+        [] => [str.slice from (len s - from) s],
+        [m, ..rest] => if Match.stop m == 0 && Match.start m == 0 { pieces from rest }
+                       else { str.slice from (Match.start m - from) s :: pieces (Match.stop m) rest },
+    };
+    pieces 0 (find_all re s)
+};
+
+// --- with std.parse ---------------------------------------------------------------------------------
+
+/// A parser that matches the pattern at the current offset, answering the
+/// match: a regex as a token inside a larger grammar.
+let parser : Regex -> p.Parser Match;
+let parser re s at = match run (Regex.code re) s at 4 {
+    () => #[:fail, #[at, ["text matching /" + Regex.source re + "/"]]],
+    caps => #[:ok, match_of re s caps, caps.[1], ()],
+};
+
+/// The same, answering just the matched text.
+let token : Regex -> p.Parser :string;
+let token re s at = p.map Match.text (parser re) s at;
+
+when test {
+    import std.test;
+
+    let r src = compile src;
+    let first src s = match find (r src) s { () => (), m => Match.text m };
+    let date = compile "(?<y>\\d{4})-(?<m>\\d\\d)-(?<d>\\d\\d)";
+    let compiled_at_build = comp compile "[a-c]+";
+
+    let tests = [
+        test.case "literals"                 $( test.eq! ["abc", ()] [first "abc" "xxabcxx", first "abd" "xxabcxx"] ),
+        test.case "dot and classes"          $( test.eq! ["a1", "b-2", "Q"] [first "[a-z]\\d" "--a1--", first "b.\\d" "b-2", first "[^a-z]" "abQc"] ),
+        test.case "greedy and lazy"          $( test.eq! ["<a><b>", "<a>"] [first "<.+>" "<a><b>", first "<.+?>" "<a><b>"] ),
+        test.case "leftmost-first alternation" $( test.eq! ["a", "ab"] [first "a|ab" "ab", first "ab|a" "ab"] ),
+        test.case "counted repetition"       $( test.eq! ["aaa", "aaaa", "aa"] [first "a{3}" "aaaaa", first "a{2,4}" "aaaaa", first "a{2,}?" "aaaaa"] ),
+        test.case "anchors"                  $( test.eq! [true, false, true, true]
+                                                   [is_match (r "^ab") "abc", is_match (r "^b") "abc",
+                                                    is_match (r "c$") "abc", is_match (r "(?m)^b$") "a\nb\nc"] ),
+        test.case "word boundaries"          $( test.eq! ["cat", ()] [first "\\bcat\\b" "a cat sat", first "\\bcat\\b" "concatenate"] ),
+        test.case "ignore case"              $( test.eq! ["HeLLo", "X"] [first "(?i)hello" "say HeLLo", first "(?i)[x-z]" "aXb"] ),
+        test.case "scoped flags"             $( test.eq! ["aB", ()] [first "a(?i:b)" "aB", first "a(?i:b)" "AB"] ),
+        test.case "dot and newlines"         $( test.eq! [(), "a\nb"] [first "a.b" "a\nb", first "(?s)a.b" "a\nb"] ),
+        test.case "groups"                   $( test.eq! ["2026", "10", "04"] (groups (find date "on 2026-10-04!")) ),
+        test.case "named groups"             $( test.eq! ["10", ()] [named "m" (find date "2026-10-04"), named "nope" (find date "2026-10-04")] ),
+        test.case "a group that took no part" $( test.eq! [["a", ()]] [captures (r "(a)|(b)") "a"] ),
+        test.case "nothing to find"          $( test.eq! [(), ()] [find date "no dates", group 1 (find date "no dates")] ),
+        test.case "spans are bytes"          $( test.eq! [[4, 8]] [span 1 (find date "on: 2026-10-04")] ),
+        test.case "unicode is characters"    $( test.eq! ["é", "日本", "😀"] [first "." "é", first "\\u{65e5}." "x日本", first "[\\u{1F600}-\\u{1F64F}]" "a😀b"] ),
+        test.case "whole-string matches"     $( test.eq! [true, false] [matches (r "\\d+") "123", matches (r "\\d+") "123a"] ),
+        test.case "find all"                 $( test.eq! ["1", "22", "333"] (find_all_text (r "\\d+") "a1b22c333") ),
+        test.case "empty matches advance"    $( test.eq! ["", "aa", ""] (find_all_text (r "a*") "baa") ),
+        test.case "count"                    $( test.eq! 3 (count (r "o") "foo boo" - 1) ),
+        test.case "replace with groups"      $( test.eq! "04/10/2026 and 05/11/2027"
+                                                   (replace_all date "${d}/${m}/${y}" "2026-10-04 and 2027-11-05") ),
+        test.case "replace the first only"   $( test.eq! "X-b-c" (replace (r "[a-z]") "X" "a-b-c") ),
+        test.case "templates"                $( test.eq! "[$a] [b]" (replace_all (r "(\\w)") "[$$$1]" "a" + " " + replace_all (r "(\\w)") "[$0]" "b") ),
+        test.case "replace with a function"  $( test.eq! "A-B" (replace_all_with (r "[a-z]") (fn m -> str.upper (Match.text m)) "a-b") ),
+        test.case "split"                    $( test.eq! ["a", "b", "c", ""] (split (r ",\\s*") "a, b,c,") ),
+        test.case "escape"                   $( test.eq! [true, false] [matches (compile (escape "a.b*")) "a.b*", matches (compile (escape "a.b*")) "axbb"] ),
+        test.case "no catastrophic case"     $( test.false! (is_match (r "(a*)*b") (str.repeat 3000 "a")) ),
+        test.case "an empty loop terminates" $( test.eq! "" (first "(a*)*" "bbb") ),
+        test.case "problems are explained"   $( test.eq! ["column 10: expected \"|\" or \")\", found the end of the text", ()]
+                                                   [problem "(unclosed", problem "(closed)"] ),
+        test.case "lookaround is refused"    $( test.true! (str.contains_str "lookaround is not supported" (or_empty (problem "a(?=b)"))) ),
+        test.case "backreferences are refused" $( test.true! (str.contains_str "backreferences" (or_empty (problem "(a)\\1"))) ),
+        test.case "a backwards range is refused" $( test.true! (problem "[z-a]" != ()) ),
+        test.case "parse is a result"        $( test.eq! [true, true] [result.is_ok (parse "a+"), result.is_error (parse "a{2,1}")] ),
+        test.case "compile-time compiling"   $( test.eq! "abc" (group 0 (find compiled_at_build "xxabcxx")) ),
+        test.case "inside a parser"          $( test.eq! [:ok, ["key", "42"]]
+                                                   (p.run (p.seq [token (r "[a-z]+"), p.then (token (r "\\d+")) (p.text "=")]) "key=42") ),
+        test.case "the literal prefix"       $( test.eq! ["abc", "ab"] [Regex.prefix (r "abc(d|e)"), Regex.prefix (r "(ab)+")] ),
+        test.case "the bytes a match starts with" $( test.eq! ["0123456789", "xXyY", (), (), ()]
+                                                       [Regex.starts (r "\\d+x"), Regex.starts (r "(?i)[xy]"), Regex.starts (r "a*"),
+                                                        Regex.starts (r "."), Regex.starts (r "[^a]")] ),
+        test.case "skipping still finds matches" $( test.eq! ["42", "7", ()] [first "\\d+" "abc42", first "^\\d|7" "a7", first "\\d" "none"] ),
+        test.case "classes with escapes"     $( test.eq! ["a-1", "x y"] [first "[\\w-]+" "a-1", first "[^\\d]+" "x y"] ),
+        test.case "a dash at the end of a class" $( test.eq! "-" (first "[a-]" "x-") ),
+        test.case "a bracket first in a class" $( test.eq! "]" (first "[]a]" "x]") ),
+    ];
+}

@@ -1,0 +1,10 @@
+[1, 2, 4, 6, 1, 3, 5, 3, 3, 1]
+[4, 7, 3, 8, 9, 6, 5, 2, 1]
+[%{"age" => 35, "name" => "Ada"}, %{"age" => 89, "name" => "Alan"}]
+6d4784b5-2f79-4415-95aa-ea99cd940f0a
+AAGTACGCCACC
+[[:common, 903], [:rare, 86], [:legendary, 11]]
+[2, 57]
+holds
+falsified by [42] after 3 cases (shrunk 6 times; DREAM_SEED=7): the property answered false
+falsified by [0, -1] after 1 case (shrunk 9 times; DREAM_SEED=7): the property answered false
