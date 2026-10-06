@@ -78,7 +78,7 @@ let family_of sel = match sel {
     _ => ["MSVC"],
 };
 
-let platform_id os = match os { :linux => "Linux", :macos => "Darwin", :windows => "Windows", _ => to_string os };
+let platform_id os = match os { :linux => "Linux", :macos => "Darwin", :windows => "Windows", :android => "Android", _ => to_string os };
 
 // --- which settings go where ---------------------------------------------------------
 

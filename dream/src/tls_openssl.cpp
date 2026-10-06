@@ -1,4 +1,4 @@
-// The TLS engine on OpenSSL 3, for Linux and macOS. See tls.hpp for the shape.
+// The TLS engine on OpenSSL 3, for Linux, macOS and Android. See tls.hpp for the shape.
 //
 // The SSL object reads its records from one memory BIO and writes them to
 // another, so it never sees a descriptor: `feed` is a `BIO_write` into the
@@ -14,6 +14,7 @@
 #include "tls.hpp"
 
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 
 #include <openssl/err.h>
@@ -163,6 +164,36 @@ int tolerant_verify(int ok, X509_STORE_CTX* store) {
 
 int ocsp_status(SSL* ssl, void*);
 
+// Android's CA filenames use legacy subject hashes. Read the PEM files rather
+// than asking OpenSSL 3's hashed-directory lookup to interpret those names.
+// Explicit :ca still replaces these roots in context() below.
+int default_roots(SSL_CTX* ctx) {
+#if defined(__ANDROID__) && !defined(DREAM_TERMUX)
+    std::error_code ec;
+    const char* path = "/apex/com.android.conscrypt/cacerts";
+    if (!std::filesystem::is_directory(path, ec))
+        path = "/system/etc/security/cacerts";
+    std::filesystem::directory_iterator it(path, ec), end;
+    if (ec) return 0;
+    unsigned loaded = 0;
+    for (; it != end; it.increment(ec)) {
+        if (ec) return 0;
+        BIO* bio = BIO_new_file(it->path().c_str(), "r");
+        if (!bio) { ERR_clear_error(); continue; }
+        X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+        BIO_free(bio);
+        if (cert) {
+            if (X509_STORE_add_cert(SSL_CTX_get_cert_store(ctx), cert) == 1) ++loaded;
+            X509_free(cert);
+        }
+        ERR_clear_error();
+    }
+    return !ec && loaded > 0;
+#else
+    return SSL_CTX_set_default_verify_paths(ctx);
+#endif
+}
+
 /// A context for `config`. The plainest client configuration is made once.
 CtxPtr context(const Config& config, std::string* alpn_holder, Failure* why) {
     bool plain = !config.server && config.ca_pem.empty() && config.identity_p12.empty() && config.crl_pem.empty();
@@ -175,7 +206,7 @@ CtxPtr context(const Config& config, std::string* alpn_holder, Failure* why) {
             if (!ctx) { shared_why = {"tls_error", last_error("SSL_CTX_new failed")}; return; }
             SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
             SSL_CTX_set_tlsext_status_cb(ctx, ocsp_status);
-            if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            if (default_roots(ctx) != 1) {
                 shared_why = {"tls_config", "cannot load the system's trusted certificates: "
                                             + last_error("no default paths")};
                 SSL_CTX_free(ctx);
@@ -196,7 +227,7 @@ CtxPtr context(const Config& config, std::string* alpn_holder, Failure* why) {
     SSL_CTX_set_min_proto_version(raw, TLS1_2_VERSION);
     if (!config.ca_pem.empty()) {
         if (!load_ca(raw, config.ca_pem, why)) return nullptr;
-    } else if (!config.server && SSL_CTX_set_default_verify_paths(raw) != 1) {
+    } else if (!config.server && default_roots(raw) != 1) {
         *why = {"tls_config", "cannot load the system's trusted certificates: " + last_error("no default paths")};
         return nullptr;
     }

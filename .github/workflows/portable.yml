@@ -50,3 +50,49 @@ jobs:
         run: python3 dream/tests/portable.py run --vm build/bin/dream --images portable-images
       - if: runner.os == 'Windows'
         run: python dream/tests/portable.py run --vm build/bin/Release/dream.exe --images portable-images
+  android:
+    needs: images
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n dream/android/build.sh dream/android/termux-install.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: portable-images
+          path: portable-images
+      - run: sdkmanager 'ndk;29.0.14206865'
+      - name: Fetch pinned dependency sources
+        run: |
+          curl -fL https://github.com/libffi/libffi/releases/download/v3.4.6/libffi-3.4.6.tar.gz -o libffi.tar.gz
+          curl -fL https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz -o openssl.tar.gz
+          echo 'b0dea9df23c863a7a50e825440f3ebffabd65df1497108e5d437747843895a4e  libffi.tar.gz' | sha256sum -c -
+          echo '603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  openssl.tar.gz' | sha256sum -c -
+          tar xf libffi.tar.gz
+          tar xf openssl.tar.gz
+      - name: Build Android interpreter
+        run: |
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/29.0.14206865"
+          bash dream/android/build.sh '${{ matrix.abi }}' android-build libffi-3.4.6 openssl-3.5.9
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dream-android-${{ matrix.abi }}
+          path: android-build/dist
+      - name: Enable KVM
+        if: matrix.abi == 'x86_64'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run identical images on Android
+        if: matrix.abi == 'x86_64'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: python3 dream/android/test.py --serial emulator-5554 --dist android-build/dist --images portable-images

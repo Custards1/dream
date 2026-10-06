@@ -547,10 +547,10 @@ std::vector<std::string> matching(const std::string& dir, const std::string& pat
     return out;
 }
 
-/// Where the loader actually found a library it was given by name. On Linux
+/// Where the loader actually found a library it was given by name. With glibc
 /// the link map says; elsewhere the name is the honest answer.
 std::string loaded_from(void* handle, const std::string& name) {
-#if defined(__linux__)
+#if defined(__GLIBC__)
     struct link_map* map = nullptr;
     if (::dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0 && map && map->l_name && *map->l_name) {
         return map->l_name;

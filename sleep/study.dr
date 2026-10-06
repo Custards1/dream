@@ -1,0 +1,73 @@
+// A study: synthetic subjects sleeping for weeks, as recordings with real
+// start times.
+//
+//     let rs = study.cohort! 42 8 14;     // 8 subjects, 14 nights each
+//
+// Every subject lives in a time zone (`physiology.zones`) and goes to bed by
+// their own clock, so a night's start is an instant worked out from the
+// local date and bedtime in that zone, through `std.time`'s zone files --
+// a night that crosses the change from summer time starts at the right
+// instant, and a report reads it back in the sleeper's local time. The study
+// starts on Monday 2026-09-07, so night 5 and 6 of every week are a Saturday
+// and a Sunday.
+
+import std.list;
+import std.math;
+import std.time;
+
+import physiology;
+import physiology.Subject;
+import recording;
+import recording.Recording;
+
+/// The study's first night, a Monday.
+let first_night : time.DateTime;
+let first_night = time.date 2026 9 7;
+
+/// The night `n` of subject `s`, as a recording that starts when they lay
+/// down, in their zone.
+let recording! : Subject -> :integer -> Recording;
+let recording! s n = {
+    let night = physiology.night s n;
+    let zone = time.zone_or_utc! (Subject.zone s);
+    let start = start_of zone n night.[:bedtime];
+    Recording.make (Subject.id s) start (time.zone_name zone) night.[:signals] night.[:stages]
+};
+
+/// The instant `hours` after the local midnight that began night `n`'s day
+/// (24.5 is half past midnight the morning after).
+let start_of : time.Zone -> :integer -> :float -> :integer;
+let start_of zone n hours = {
+    let day = time.add_days n first_night;
+    let midnight = time.to_instant (time.datetime_in zone (time.DateTime.year day) (time.DateTime.month day)
+                                                        (time.DateTime.day day) 0 0 0);
+    midnight + math.floor (hours * 3600.0 + 0.5) * 1000000000
+};
+
+/// The subjects of a study seeded by `seed`: `subject-1` to `subject-n`.
+let subjects : :integer -> :integer -> [Subject];
+let subjects seed n = list.map (fn i -> physiology.subject (seed * 1000 + i) ("subject-" + to_string i)) (list.range 1 (n + 1));
+
+/// Every night of every subject: `count` subjects, `nights` nights each.
+let cohort! : :integer -> :integer -> :integer -> [Recording];
+let cohort! seed count nights = list.flat_map (fn s -> list.map (recording! s) (list.range 0 nights)) (subjects seed count);
+
+when test {
+    import std.test;
+
+    let s = physiology.subject 3 "x";
+
+    let tests = [
+        test.case "a night starts at the bedtime, in the subject's zone"
+            $( test.true! ({
+                let r = recording! s 0;
+                let local = time.in_zone (time.zone_or_utc! (Recording.zone r)) (Recording.start r);
+                let hour = time.DateTime.hour local;
+                hour >= 21 || hour <= 2
+            }) ),
+        test.case "the same night every time" $( test.eq! (recording! s 2) (recording! s 2) ),
+        test.case "night five is a Saturday"
+            $( test.eq! :saturday (time.weekday (time.add_days 5 first_night)) ),
+        test.case "subjects are named in order" $( test.eq! ["subject-1", "subject-2"] (list.map Subject.id (subjects 1 2)) ),
+    ];
+}

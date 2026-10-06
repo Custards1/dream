@@ -32,7 +32,7 @@ priv let fill! r = {
     else { [Reader.make (Reader.socket r) (str.slice at (len buf - at) buf + chunk) 0, true] }
 };
 
-/// A line, without its `\r\n` (a bare `\n` is accepted too), or `()` at the
+/// A line, without its `\r\n`, or `()` at the
 /// end of the stream. Longer than `limit` raises `:too_large`.
 let read_line! : Reader -> :integer -> [:any, Reader];
 let read_line! r limit = {
@@ -40,7 +40,8 @@ let read_line! r limit = {
     let at = Reader.at r;
     let nl = str.find_from at "\n" buf;
     if nl >= 0 {
-        let stop = if nl > at && str.byte (nl - 1) buf == 13 { nl - 1 } else { nl };
+        if nl == at || str.byte (nl - 1) buf != 13 { raise! (error.new :bad_message "a line must end with CRLF") }
+        let stop = nl - 1;
         if stop - at > limit { raise! (error.new :too_large "a line longer than the limit") }
         [str.slice at (stop - at) buf, Reader.make (Reader.socket r) buf (nl + 1)]
     } else if len buf - at > limit {
@@ -56,6 +57,7 @@ let read_line! r limit = {
 /// Exactly `n` bytes; fewer raises `:bad_message`, as a body cut short is.
 let read_exact! : Reader -> :integer -> [:string, Reader];
 let read_exact! r n = {
+    if n < 0 { raise! (error.new :bad_message "negative read length") }
     let buf = Reader.buffer r;
     let at = Reader.at r;
     if len buf - at >= n { [str.slice at n buf, Reader.make (Reader.socket r) buf (at + n)] }
@@ -71,6 +73,7 @@ let read_exact! r n = {
 /// is. `""` only at the end of the stream.
 let available! : Reader -> :integer -> [:string, Reader];
 let available! r most = {
+    if most <= 0 { raise! (error.new :bad_message "nonpositive read length") }
     let buf = Reader.buffer r;
     let at = Reader.at r;
     if len buf > at {

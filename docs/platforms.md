@@ -1,6 +1,6 @@
 # Platform and image portability
 
-Dream targets native 64-bit Linux, Windows, and macOS. A compiled `.dream`
+Dream targets native 64-bit Linux, Windows, macOS, and Android. A compiled `.dream`
 image is portable bytecode: copy the **same file**, without recompiling or
 rewriting it, to a compatible Dream VM on any of these systems. This includes
 the compiler image, `dreams.dream`.
@@ -18,7 +18,7 @@ process, and network operations belong to the portable interface. Native OS
 calls live in the VM. Windows paths and arguments are converted between
 Dream's UTF-8 and Windows' UTF-16, and binary file I/O does not translate CRLF
 or treat byte 26 as end of file. Windows sockets are kept distinct from CRT
-file descriptors. Linux uses epoll; macOS and Windows use a readiness poller.
+file descriptors. Linux and Android use epoll; macOS and Windows use a readiness poller.
 The portable poller checks readiness every 5 ms and is a correctness baseline,
 not a claim of identical throughput or latency to epoll.
 
@@ -52,7 +52,7 @@ Platform-specific work remains platform-specific:
 
 Use a C++20 compiler and CMake 3.20 or newer. GCC, Clang, and MSVC are supported
 by the build configuration. libffi is required -- `std.ffi` is part of every
-VM -- and so is TLS for `std.tls`: OpenSSL 3 on Linux and macOS (`libssl-dev`,
+VM -- and so is TLS for `std.tls`: OpenSSL 3 on Linux, macOS and Android (`libssl-dev`,
 or Homebrew's `openssl@3`, which CMake finds by itself), and on Windows
 SChannel, which is part of the system and needs nothing installed. LLVM is
 optional. Start with the interpreter to avoid LLVM:
@@ -72,10 +72,76 @@ vcpkg's `libffi` through its toolchain file. Without OpenSSL the configure stops
 too; `-DOPENSSL_ROOT_DIR` points it at an unusual install. On Windows, use
 libraries built for the same compiler ABI.
 
+### Android
+
+To build and install directly on a phone, use the
+[Termux installer](../dream/android/README.md). It installs the VM, compiler,
+and standard library using Termux's own dependencies.
+
+Android is an interpreter target for **arm64-v8a and x86_64, API 34+**
+(Android 14). It uses the NDK, libffi, OpenSSL 3, and the existing epoll IO
+backend. API 34 is required by `posix_spawn_file_actions_addchdir_np`, used
+by `os.exec_in!` and `os.exec_with!`. JIT builds and 32-bit ABIs are rejected
+at configure time. Android libraries and executables use 16 KB ELF alignment.
+
+With NDK r28 or newer and unpacked libffi and OpenSSL 3 source releases:
+
+```sh
+export ANDROID_NDK_ROOT=/path/to/android-sdk/ndk/29.0.14206865
+bash dream/android/build.sh arm64-v8a build/android-arm64 /path/to/libffi /path/to/openssl
+```
+
+The helper builds PIC static dependencies, then builds the VM through the NDK
+CMake toolchain. `build/android-arm64/dist` contains `dream`, `dream_tests`,
+`libdream.so`, and `libc++_shared.so`. Use `x86_64` for the emulator. The build
+requires CMake, make, Perl, and a host C/C++ toolchain on Linux or macOS.
+Existing Android dependency builds can instead be passed directly to CMake
+using the NDK toolchain, `ANDROID_ABI`, `ANDROID_PLATFORM=android-34`,
+`DREAM_FFI_INCLUDE`, `DREAM_FFI_LIB`, and the OpenSSL cache variables.
+
+`os.platform ()` returns `:android`; its compile-time family is `"unix"`.
+Use `dreams --target os=android,arch=aarch64` for Android-specific images.
+Android and desktop Linux are separate image targets even though both use
+ELF: libraries linked against glibc cannot run against Android's Bionic libc.
+ELF payload sniffing defaults to Linux, so **explicitly select Android when
+embedding Android native libraries**. Portable bytecode without native
+payloads or OS-specific conditions needs no target flag.
+
+For a shell deployment, push the four files and your image to a directory
+under `/data/local/tmp`, set `LD_LIBRARY_PATH` and `TMPDIR` to that directory,
+and run `dream program.dream`. Android has no general `/tmp` directory.
+For application embedding, package `libdream.so` and `libc++_shared.so` in
+the APK's native library directory and call the C API through your JNI layer.
+The app must supply writable paths and any required Android permissions
+(including `INTERNET` for sockets). Android's app sandbox and executable
+loading restrictions still apply; the shell test harness does not establish
+APK/JNI integration or permission handling.
+
+Default TLS trust reads Android's system CA certificates from Conscrypt's
+APEX store, falling back to `/system/etc/security/cacerts`. It does not apply
+Java Network Security Configuration or user-installed roots. Supply `:ca`
+to select application-specific PEM roots. Dependencies are bundled; Dream
+does not link Android's private platform TLS libraries.
+Native Termux builds instead use their packaged OpenSSL's default CA paths.
+
+To verify a device or emulator using the same Linux-compiled bytecode bundle:
+
+```sh
+python3 dream/tests/portable.py compile --vm build/bin/dream --images build/images
+python3 dream/android/test.py --serial emulator-5554 \
+  --dist build/android-x86_64/dist --images build/images
+```
+
+The runner verifies hashes on both sides of `adb push`, runs VM unit tests,
+language and IO fixtures, loopback TLS, FFI, subprocess working directories,
+and the portable compiler on Android. CI cross-builds both ABIs and runs the
+x86_64 suite on an API 34 emulator. ARM64 device execution and APK integration
+require separate validation.
+
 ### TLS on each platform
 
 `std.tls` is one interface over two libraries, and a program cannot tell which
-it got: OpenSSL on Linux and macOS, SChannel on Windows. Each is driven from
+it got: OpenSSL on Linux, macOS and Android, SChannel on Windows. Each is driven from
 memory by the same socket code in the VM, so parking, non-blocking IO and
 closing behave identically; the options are the ones every backend honours
 (an identity is a PKCS#12 bundle, trusted roots are PEM); and a failure is one

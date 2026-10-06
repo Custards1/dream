@@ -32,7 +32,7 @@ import std.types;
 /// atom the program already has -- it never interns what it is sent. Naming
 /// every value a field can take is what makes each one decodable.
 mapping Target {
-    os : :linux | :macos | :windows | :unknown
+    os : :linux | :macos | :windows | :android | :unknown
     arch : :x86_64 | :aarch64 | :unknown
 }
 

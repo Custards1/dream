@@ -1,0 +1,245 @@
+// A recording: one night of readings from one sleeper, and, when someone
+// has scored it, its stages.
+//
+//     let bytes = recording.encode r;              // the .slp format
+//     recording.decode bytes                       // [:ok, r] or [:error, why]
+//     recording.to_csv r                           // a reading a second, as text
+//     recording.of_csv text                        // and back
+//
+// **The `.slp` format** is what `sleep import` reads and the server accepts:
+// a magic number and a version, who and when (the start as nanoseconds since
+// the epoch, and the time zone the night was slept in), the shape of the
+// readings, the readings themselves as little-endian doubles, and the stages
+// if there are any -- a byte an epoch. It is written with `std.binary`: one
+// layout, read and written by the same description, with every length
+// bounded before anything is allocated, so a corrupt or hostile file is
+// refused with the byte offset and field that are wrong, never read past.
+//
+// **CSV** is the format a person or a spreadsheet makes: a header, a row a
+// second, and the stage as its class number on each row of a scored night.
+// Who and when ride in `# key: value` lines at the top, which `std.regex`
+// picks out before `std.ml.data` reads the numbers.
+
+import std.binary;
+import std.list;
+import std.map;
+import std.ml.data;
+import std.num;
+import std.regex;
+import std.result;
+import std.str;
+import std.tensor;
+
+import stage;
+import stage.Stage;
+
+/// One night's readings. `signals` is `[epochs, 30, channels]`; `stages` is a
+/// stage per epoch, or `()` when the night has not been scored.
+mapping Recording {
+    subject : :string
+    start : :integer
+    zone : :string
+    signals : :tensor
+    stages : :any = ()
+}
+
+/// How many epochs the night has.
+let epochs : Recording -> :integer;
+let epochs r = (tensor.shape (Recording.signals r)).[0];
+
+/// How many channels each reading has.
+let channel_count : Recording -> :integer;
+let channel_count r = (tensor.shape (Recording.signals r)).[2];
+
+/// Whether the night has been scored.
+let is_scored : Recording -> :bool;
+let is_scored r = Recording.stages r != ();
+
+/// The night in hours.
+let hours : Recording -> :float;
+let hours r = epochs r * stage.epoch_seconds / 3600.0;
+
+// --- the .slp format ------------------------------------------------------------------
+
+/// The most a file may claim: a week of readings at a second each, eight
+/// channels, as doubles. A length past it is refused before it is read.
+priv let max_epochs : :integer;
+priv let max_epochs = 7 * 24 * 120;
+
+/// Text with a one-byte length in front.
+priv let short_text : :map;
+priv let short_text = binary.blob binary.u8 255;
+
+/// The stages, a byte each, when there are any.
+priv let stage_bytes : :map;
+priv let stage_bytes = binary.tagged binary.u8 %{
+    0 => binary.bytes 0,
+    1 => binary.blob binary.u32le max_epochs,
+};
+
+/// Version 1 of the format, field by field.
+let layout : :map;
+let layout = binary.record [
+    binary.magic "SLP",
+    [:version, binary.where (fn v -> v == 1) "this reads version 1 of the format" binary.u8],
+    [:subject, short_text],
+    [:start, binary.i64le],
+    [:zone, short_text],
+    [:epoch_seconds, binary.where (fn s -> s == stage.epoch_seconds) "epochs are thirty seconds" binary.u16le],
+    [:channels, binary.where (fn c -> c >= 1 && c <= 8) "between one and eight channels" binary.u8],
+    [:epochs, binary.where (fn e -> e >= 1 && e <= max_epochs) "a night has at most a week of epochs" binary.u32le],
+    [:signals, binary.blob binary.u32le (max_epochs * 30 * 8 * 8)],
+    [:stages, stage_bytes],
+];
+
+/// The bytes of a recording in the `.slp` format.
+let encode : Recording -> :string;
+let encode r = result.or_else "" (binary.encode layout (to_fields r));
+
+priv let to_fields : Recording -> %{:atom => :any};
+priv let to_fields r = %{
+    :version => 1,
+    :subject => Recording.subject r,
+    :start => Recording.start r,
+    :zone => Recording.zone r,
+    :epoch_seconds => stage.epoch_seconds,
+    :channels => channel_count r,
+    :epochs => epochs r,
+    :signals => tensor.to_bytes (Recording.signals r),
+    :stages => match Recording.stages r {
+        () => [0, ""],
+        stages => [1, str.of_bytes (list.map stage.index stages)],
+    },
+};
+
+/// A recording from `.slp` bytes: `[:ok, r]`, or `[:error, why]` naming the
+/// byte and the field that are wrong.
+let decode : :string -> result.Of Recording :string;
+let decode bytes = match binary.decode layout bytes {
+    [:error, e] => result.error (binary.describe e),
+    [:ok, fields] => of_fields fields,
+};
+
+priv let of_fields : %{:atom => :any} -> result.Of Recording :string;
+priv let of_fields f = {
+    let e = f.[:epochs];
+    let c = f.[:channels];
+    let want = e * stage.epoch_seconds * c * 8;
+    let [tag, stage_text] = f.[:stages];
+    match want {
+        _ if len f.[:signals] != want =>
+            result.error ("the readings are " + to_string (len f.[:signals]) + " bytes; "
+                          + to_string e + " epochs of " + to_string c + " channels need " + to_string want),
+        _ if tag == 1 && len stage_text != e =>
+            result.error ("there are " + to_string (len stage_text) + " stages for " + to_string e + " epochs"),
+        _ if tag == 1 && list.any (fn b -> b >= stage.count) (str_bytes stage_text) =>
+            result.error "a stage byte names no stage",
+        _ => result.ok (Recording.make f.[:subject] f.[:start] f.[:zone]
+                (tensor.of_bytes [e, stage.epoch_seconds, c] f.[:signals])
+                (if tag == 1 { list.map stage.of_index (str_bytes stage_text) } else { () })),
+    }
+};
+
+priv let str_bytes : :string -> [:integer];
+priv let str_bytes s = list.map (fn i -> str.byte i s) (list.range 0 (len s));
+
+// --- CSV --------------------------------------------------------------------------------
+
+/// The recording as CSV: `# subject:`, `# start:` and `# zone:` lines, a
+/// header, and a row a second -- the readings, then the stage's class number
+/// when the night is scored.
+let to_csv : Recording -> :string;
+let to_csv r = {
+    let e = epochs r;
+    let c = channel_count r;
+    let rows = tensor.to_list (tensor.reshape [e * stage.epoch_seconds, c] (Recording.signals r));
+    let labels = match Recording.stages r {
+        () => list.repeat (),
+        stages => list.flat_map (fn s -> list.replicate stage.epoch_seconds (stage.index s)) stages,
+    };
+    let header = "second," + str.join_str "," (list.take c columns) + (if is_scored r { ",stage" } else { "" });
+    let line [i, [row, label]] = str.join_str "," (to_string i :: list.map to_string row
+        + (if label == () { [] } else { [to_string label] }));
+    str.join_str "\n" (["# subject: " + Recording.subject r, "# start: " + to_string (Recording.start r),
+                        "# zone: " + Recording.zone r, header]
+                       + list.map line (list.enumerate (list.zip rows labels))) + "\n"
+};
+
+/// The channels' names, in order.
+let columns : [:string];
+let columns = ["movement", "heart_rate", "breathing", "temperature"];
+
+priv let meta : regex.Regex;
+priv let meta = regex.compile "^#\\s*(?<key>[a-z_]+)\\s*:\\s*(?<value>.*?)\\s*$";
+
+/// A recording from CSV as `to_csv` writes it, or as a spreadsheet saves
+/// one with the same columns: `[:ok, r]` or `[:error, why]`. Rows are
+/// grouped thirty to an epoch; a last, partial epoch is dropped.
+let of_csv : :string -> result.Of Recording :string;
+let of_csv text = {
+    let lines = str.split "\n" text;
+    let found = list.filter (fn m -> m != ()) (list.map (fn l -> regex.find meta l) lines);
+    let fields = map.from_pairs (list.map (fn m -> [regex.named "key" m, regex.named "value" m]) found);
+    let body = str.join_str "\n" (list.filter (fn l -> not (str.starts_with "#" l)) lines);
+    match data.parse_csv body {
+        [:error, why] => result.error why,
+        [:ok, table] => of_table fields table,
+    }
+};
+
+priv let of_table : :map -> [[:float]] -> result.Of Recording :string;
+priv let of_table fields table = {
+    let width = len (list.first_or [] table);
+    let scored = width == 6;
+    let e = len table / stage.epoch_seconds;
+    let kept = list.take (e * stage.epoch_seconds) table;
+    let readings = list.map (fn row -> list.take 4 (list.drop 1 row)) kept;
+    match e {
+        0 => result.error "a recording needs at least thirty seconds of readings",
+        _ if width != 5 && width != 6 =>
+            result.error ("expected second, four readings and perhaps a stage; a row has " + to_string width + " columns"),
+        _ => result.ok (Recording.make fields.["subject" else "unknown"]
+                (num.to_int (num.parse_int fields.["start" else "0"] |> or_zero))
+                fields.["zone" else "UTC"]
+                (tensor.reshape [e, stage.epoch_seconds, 4] (tensor.of_list readings))
+                (if scored { epoch_stages kept } else { () })),
+    }
+};
+
+priv let or_zero : (:integer | :unit) -> :integer;
+priv let or_zero n = match n { () => 0, _ => n };
+
+/// A stage per epoch from per-second labels: the first second's.
+priv let epoch_stages : [[:float]] -> [Stage];
+priv let epoch_stages rows = list.map (fn i -> stage.of_index (num.to_int (list.nth i rows).[5]))
+    (list.map (fn k -> k * stage.epoch_seconds) (list.range 0 (len rows / stage.epoch_seconds)));
+
+when test {
+    import std.property;
+    import std.random;
+    import std.test;
+
+    let signals = tensor.random 3 [4, 30, 4];
+    let r = Recording.make "ada" 1757300000000000000 "Europe/Berlin" signals [Stage.wake, Stage.n1, Stage.n2, Stage.rem];
+    let unscored = Recording.set_stages () r;
+
+    let tests = [
+        test.case "a recording reads back exactly" $( test.eq! [:ok, r] (decode (encode r)) ),
+        test.case "so does an unscored one" $( test.eq! [:ok, unscored] (decode (encode unscored)) ),
+        test.case "it starts with its magic and version" $( test.eq! [83, 76, 80, 1] (str_bytes (str.slice 0 4 (encode r))) ),
+        test.case "a truncated file is refused"
+            $( test.true! (result.is_error (decode (str.slice 0 (len (encode r) - 7) (encode r)))) ),
+        test.case "a lying length is refused, not read"
+            $( test.true! (result.is_error (decode (str.slice 0 30 (encode r) + str.of_bytes [255, 255, 255, 255]))) ),
+        test.case "another format is refused" $( test.true! (result.is_error (decode "PNG")) ),
+        test.case "CSV reads back"
+            $( test.eq! [:ok, [Recording.subject r, Recording.zone r, Recording.stages r, tensor.shape signals]]
+                        (result.map (fn x -> [Recording.subject x, Recording.zone x, Recording.stages x, tensor.shape (Recording.signals x)]) (of_csv (to_csv r))) ),
+        test.case "CSV keeps the readings"
+            $( test.true! (tensor.maximum (tensor.abs (Recording.signals (result.or_else unscored (of_csv (to_csv r))) - signals)) < 1.0e-9) ),
+        property.check "the encoding round-trips any scoring" (random.list_n 4 (random.int 0 4)) (fn ix -> {
+            let x = Recording.set_stages (list.map stage.of_index ix) r;
+            decode (encode x) == [:ok, x]
+        }),
+    ];
+}

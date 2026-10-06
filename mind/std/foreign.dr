@@ -201,6 +201,9 @@ let library_files platform name version = match [platform, version] {
 let library_dirs : :atom -> :atom -> [:string];
 let library_dirs platform arch = match platform {
     :windows => [],
+    // Android's linker namespaces decide which packaged/NDK libraries are
+    // public. Desktop Linux directories cannot extend that namespace.
+    :android => [],
     :macos => ["/opt/homebrew/lib", "/usr/local/lib", "/opt/local/lib"] + nix_dirs,
     _ => {
         let multiarch = match multiarch_triplet arch {

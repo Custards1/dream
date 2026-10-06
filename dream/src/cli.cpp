@@ -62,7 +62,9 @@ const char* USAGE =
 
 /// This VM's bit in each set, fixed by the format.
 constexpr uint8_t HOST_OS =
-#if defined(__linux__)
+#if defined(__ANDROID__)
+    0x08;
+#elif defined(__linux__)
     0x01;
 #elif defined(__APPLE__)
     0x02;
@@ -91,13 +93,13 @@ std::string target_names(uint8_t bits, const char* const names[], size_t n) {
     return out;
 }
 
-const char* const OS_NAMES[] = {"linux", "macos", "windows"};
+const char* const OS_NAMES[] = {"linux", "macos", "windows", "android"};
 const char* const ARCH_NAMES[] = {"x86_64", "aarch64"};
 
 /// `linux (x86_64)`: a set as a person reads it, with an empty side left out.
 std::string describe_target(uint8_t os, uint8_t arch) {
     if (!os) return arch ? target_names(arch, ARCH_NAMES, 2) : "any platform";
-    std::string out = target_names(os, OS_NAMES, 3);
+    std::string out = target_names(os, OS_NAMES, 4);
     if (arch) out += " (" + target_names(arch, ARCH_NAMES, 2) + ")";
     return out;
 }

@@ -1,0 +1,9 @@
+[package]
+name = "sleep"
+version = "0.1.0"
+
+# Each dependency's key is the name it is imported by:
+#   util = "../util"
+#   json = "https://github.com/u/dream-json#v1.0"
+# or run `mind add <directory or URL>`.
+[dependencies]

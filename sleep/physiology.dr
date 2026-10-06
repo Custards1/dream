@@ -1,0 +1,248 @@
+// Synthetic sleepers: nights whose true stages are known, for training a
+// model and checking it, with nothing borrowed from a real dataset.
+//
+//     let s = physiology.subject 7 "ada";
+//     let night = physiology.night s 3;        // the fourth night of ada's study
+//     night.[:stages]                          // [:wake, :wake, .., :n1, :n2, ..]
+//     night.[:signals]                         // [epochs, 30, 4]: one reading a second
+//
+// **The hypnogram is a Markov walk shaped by the clock of the night.** Sleep
+// comes in cycles of about ninety minutes: down through N1 and N2 into N3,
+// back up, and a stretch of REM at the end. Two things change across the
+// night, and the walk follows both: slow-wave sleep is heaviest in the first
+// cycles and nearly gone by morning, and the REM stretches lengthen. Each
+// epoch the walk mostly stays where it is (stages last minutes, not
+// seconds), sometimes steps toward the stage the cycle wants now, and
+// occasionally wakes briefly. It never jumps from wake into N3 or REM: deep
+// sleep and dreaming are reached through N2, as they are in a real night.
+//
+// **The signals are what a wrist wearable records**, once a second: how much
+// the arm moved, heart rate, breathing rate and skin temperature. Each stage
+// has its own signature -- wake moves and its heart is fast and variable, N3
+// is still with a slow steady heart, REM is still (the body is paralysed) but
+// its heart and breathing are irregular -- and the signatures overlap, as
+// real ones do, so the stages have to be told apart from context as well as
+// from the epoch itself. Each subject has their own resting heart rate,
+// depth of sleep and bedtime, and the signals are drawn as tensors, an epoch
+// table at a time, not a reading at a time.
+//
+// **Everything is a function of its seed**, through `std.random`'s
+// splittable generator and `tensor.random`: the same subject and night are
+// the same on every machine and every run.
+
+import std.list;
+import std.math;
+import std.random;
+import std.tensor;
+
+import stage;
+import stage.Stage;
+
+/// A sleeper's constitution: what makes one night theirs.
+mapping Subject {
+    id : :string
+    seed : :integer
+    resting_hr : :float
+    deep : :float
+    bedtime : :float
+    latency : :float
+    zone : :string
+}
+
+/// The readings each second carries: arm movement (in g), heart rate (beats a
+/// minute), breathing rate (breaths a minute), skin temperature (degrees C).
+let channels : [:string];
+let channels = ["movement", "heart_rate", "breathing", "temperature"];
+
+/// A sleeper drawn from `seed`: a resting heart rate between 48 and 72, an
+/// appetite for deep sleep, a usual bedtime between 22:00 and 01:00, and how
+/// long they usually take to fall asleep.
+let subject : :integer -> :string -> Subject;
+let subject seed id = {
+    let rng = random.seed ["subject", seed];
+    let gen = random.all [random.float_in 48.0 72.0, random.float_in 0.5 1.2, random.float_in 22.0 25.0,
+                          random.float_in 4.0 25.0, random.pick zones];
+    let [[hr, deep, bed, lat, zone], _] = gen rng;
+    Subject.make id seed hr deep bed lat zone
+};
+
+/// Where the synthetic subjects live, so that their nights fall in real
+/// time zones (and cross daylight saving's changes).
+let zones : [:string];
+let zones = ["America/Denver", "America/New_York", "Europe/London", "Europe/Berlin", "Asia/Tokyo",
+             "Australia/Sydney"];
+
+/// One night: its stages, its signals, and when the subject lay down, as
+/// hours after midnight of the night's evening (23.5 is 23:30; 24.25 is
+/// 00:15 the next morning). Night `n` of a subject is the same every time.
+let night : Subject -> :integer -> %{:atom => :any};
+let night s n = {
+    let rng0 = random.seed ["night", Subject.seed s, n];
+    // Weekends -- every sixth and seventh night -- start later and run
+    // longer: social jetlag, which `sleep report` measures.
+    let weekend = n % 7 == 5 || n % 7 == 6;
+    let [jitter, rng1] = random.normal 0.0 0.4 rng0;
+    let bed = Subject.bedtime s + jitter + (if weekend { 1.1 } else { 0.0 });
+    let [hours, rng2] = random.float_in 6.4 8.6 rng1;
+    let in_bed = math.floor ((hours + (if weekend { 0.7 } else { 0.0 })) * 120.0);
+    let [lat, rng3] = random.exponential (1.0 / Subject.latency s) rng2;
+    let onset = math.floor (lat * 2.0) + 1;
+    let [stages, _] = hypnogram s in_bed onset rng3;
+    %{
+        :subject => Subject.id s,
+        :night => n,
+        :bedtime => bed,
+        :stages => stages,
+        :signals => signals s stages (Subject.seed s * 7919 + n),
+    }
+};
+
+// --- the hypnogram ------------------------------------------------------------------
+
+/// The stages of a night of `epochs` in bed, asleep after `onset` epochs.
+let hypnogram : Subject -> :integer -> :integer -> random.Rng -> [[Stage], random.Rng];
+let hypnogram s epochs onset rng = {
+    // A last few minutes awake before getting up.
+    let [tail, rng2] = random.int 2 20 rng;
+    let asleep_until = epochs - tail;
+    walk s epochs onset asleep_until 0 Stage.wake [] rng2
+};
+
+/// One step of the walk at epoch `e`, from stage `now`. Written as a loop
+/// the JIT can take: everything it needs is a parameter, and the list is
+/// built backwards and turned round once.
+priv let walk : Subject -> :integer -> :integer -> :integer -> :integer -> Stage -> [Stage] -> random.Rng -> [[Stage], random.Rng];
+priv let walk s epochs onset until !e now !acc rng = match e {
+    _ if e == epochs => [list.reverse acc, rng],
+    _ if e < onset || e >= until => walk s epochs onset until (e + 1) Stage.wake (Stage.wake :: acc) rng,
+    _ => {
+        let [u, rng2] = random.float rng;
+        let [v, rng3] = random.float rng2;
+        let wanted = target s (e - onset) (until - onset) v;
+        let next = step now wanted u (e == onset);
+        walk s epochs onset until (e + 1) next (next :: acc) rng3
+    },
+};
+
+/// The stage the cycle wants `e` epochs after sleep began, in a sleep of
+/// `span` epochs. `v` is a uniform draw, which decides between N2 and N3
+/// in the descent -- N3's share shrinking as the night goes on.
+priv let target : Subject -> :integer -> :integer -> :float -> Stage;
+priv let target s e span v = {
+    let minutes = e / 2;
+    let phase = 1.0 * (minutes % 92) / 92.0;
+    let f = 1.0 * e / span;
+    let deep = Subject.deep s * (1.0 - f) * (1.0 - f) * 1.4;
+    // REM's stretch at the end of the cycle grows from about a tenth of it
+    // to more than a third.
+    let rem_from = 0.88 - 0.32 * f;
+    phase_target phase rem_from (v < deep)
+};
+
+priv let phase_target : :float -> :float -> :bool -> Stage;
+priv let phase_target phase rem_from deep = match phase {
+    p if p < 0.07 => Stage.n1,
+    p if p < 0.55 => if deep { Stage.n3 } else { Stage.n2 },
+    p if p < rem_from => Stage.n2,
+    _ => Stage.rem,
+};
+
+/// Where the walk goes from `now`, wanting `wanted`, on a uniform draw `u`.
+/// Stages are sticky; a brief awakening is possible from any sleep; N3 and
+/// REM are entered only from N2.
+priv let step : Stage -> Stage -> :float -> :bool -> Stage;
+priv let step now wanted u first = match u {
+    _ if first => Stage.n1,
+    x if x < 0.006 => Stage.wake,
+    x if x < stay now => now,
+    _ => approach now wanted,
+};
+
+/// How likely a stage is to last another epoch.
+priv let stay : Stage -> :float;
+priv let stay now = match now { :wake => 0.55, :n1 => 0.80, :n2 => 0.90, :n3 => 0.93, :rem => 0.94 };
+
+/// One step from `now` toward `wanted`.
+priv let approach : Stage -> Stage -> Stage;
+priv let approach now wanted = match [now, wanted] {
+    [:wake, _] => Stage.n1,
+    [:n1, :n3] => Stage.n2,
+    [:n1, :rem] => Stage.n2,
+    [:n3, :rem] => Stage.n2,
+    [:rem, :n3] => Stage.n2,
+    _ => wanted,
+};
+
+// --- the signals ---------------------------------------------------------------------
+
+/// Per stage, in class order: movement's mean and spread, heart rate's offset
+/// from resting and spread, breathing's mean and spread, and temperature's
+/// offset from the evening's.
+let signature : :tensor;
+let signature = tensor.of_list [
+    [0.90, 0.60, 9.0, 4.5, 15.5, 2.6, 0.00],     // wake
+    [0.22, 0.20, 3.5, 2.8, 14.2, 1.6, -0.10],    // N1
+    [0.07, 0.07, 0.0, 2.0, 13.6, 1.1, -0.20],    // N2
+    [0.02, 0.03, -4.0, 1.1, 12.6, 0.6, -0.30],   // N3
+    [0.05, 0.14, 4.5, 4.0, 15.2, 2.8, -0.25],    // REM
+];
+
+/// Readings once a second for every epoch of `stages`: `[epochs, 30, 4]`.
+let signals : Subject -> [Stage] -> :integer -> :tensor;
+let signals s stages seed = {
+    let e = len stages;
+    // Each epoch's row of the signature, by its stage.
+    let rows = tensor.take (list.map stage.index stages) signature;
+    let column k = tensor.reshape [e] (tensor.slice k 1 (tensor.transpose rows));
+    let per_second t = tensor.repeat stage.epoch_seconds t;
+    let noise k = tensor.normal (seed * 31 + k) [e, stage.epoch_seconds];
+    // A slow drift across the night: the body cools toward morning.
+    let f = tensor.range e / e;
+    let cooling = tensor.sin (f * 3.14159) * (-0.6);
+    let movement = tensor.abs (per_second (column 0) + per_second (column 1) * noise 0);
+    let heart = per_second (column 2 + Subject.resting_hr s) + per_second (column 3) * noise 1;
+    let breathing = per_second (column 4) + per_second (column 5) * noise 2;
+    let temperature = per_second (column 6 + cooling + 34.2) + noise 3 * 0.05;
+    // Four `[e, 30]` channels, stacked into `[e, 30, 4]`.
+    tensor.permute [1, 2, 0] (tensor.reshape [4, e, stage.epoch_seconds] (tensor.concat [movement, heart, breathing, temperature]))
+};
+
+when test {
+    import std.test;
+
+    let ada = subject 7 "ada";
+    let n = night ada 0;
+    let stages = n.[:stages];
+
+    let tests = [
+        test.case "a subject is the same for the same seed" $( test.eq! ada (subject 7 "ada") ),
+        test.case "a night is the same every time" $( test.eq! stages ((night ada 0).[:stages]) ),
+        test.case "a night lasts six to ten hours"
+            $( test.true! (len stages >= 6 * 120 && len stages <= 10 * 120) ),
+        test.case "it starts and ends awake"
+            $( test.eq! [Stage.wake, Stage.wake] [list.head stages, list.last stages] ),
+        test.case "every stage appears"
+            $( test.true! (list.all (fn s -> list.contains s stages) stage.all) ),
+        test.case "never from wake straight into deep sleep or REM"
+            $( test.false! (list.any (fn [a, b] -> a == Stage.wake && (b == Stage.n3 || b == Stage.rem)) (list.zip stages (list.tail stages))) ),
+        test.case "deep sleep is early, REM is late"
+            $( test.true! ({
+                let half = len stages / 2;
+                let first = list.take half stages;
+                let second = list.drop half stages;
+                let share s xs = list.count (fn x -> x == s) xs;
+                share Stage.n3 first > share Stage.n3 second && share Stage.rem second > share Stage.rem first
+            }) ),
+        test.case "signals are [epochs, 30, 4]"
+            $( test.eq! [len stages, 30, 4] (tensor.shape n.[:signals]) ),
+        test.case "the deep-sleep heart is slower than the waking one"
+            $( test.true! ({
+                let hr = tensor.reshape [len stages, 30] (tensor.slice 1 1 (tensor.permute [2, 0, 1] n.[:signals]));
+                let mean_of s = {
+                    let ix = list.map (fn [i, _] -> i) (list.filter (fn [_, x] -> x == s) (list.enumerate stages));
+                    tensor.mean (tensor.take ix hr)
+                };
+                mean_of Stage.n3 + 5.0 < mean_of Stage.wake
+            }) ),
+    ];
+}
