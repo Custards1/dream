@@ -58,6 +58,11 @@ DREAM
 
 uri="file://$tmp/ws/app.dr"
 
+# Cached editor loads must not launch speculative parsers on every request:
+# completed VM processes retain their heaps for later joins.
+"$dream" "$dreams" lucid/tests/cache.dr -L mind -L . -o "$tmp/cache.dream" >/dev/null 2>&1 || exit 1
+MIND_STDLIB=${MIND_STDLIB:-mind} "$dream" "$tmp/cache.dream" "$tmp/ws/app.dr" || exit 1
+
 # `Content-Length` counts bytes, and everything here is ASCII.
 msg() { printf 'Content-Length: %d\r\n\r\n%s' "$(printf '%s' "$1" | wc -c)" "$1"; }
 

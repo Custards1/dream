@@ -66,7 +66,9 @@ section that does it says which parts of `dreams/scope.dr` it transcribes.
 
 Parses are kept between requests, since a file either changed or it did not;
 everything derived from them is recomputed, since an analysis that is kept is
-one that can be stale. [docs/notes/lucid.md](../docs/notes/lucid.md) is the
+one that can be stale. Editor loads parse on demand: speculative parser workers
+would repeat cached work and leave completed process heaps in the VM after each
+request. [docs/notes/lucid.md](../docs/notes/lucid.md) is the
 design: which tree answers which question, and why a record is a declaration
 before it is a module.
 
@@ -82,3 +84,5 @@ mind test lucid             # both
 program: that an unsaved buffer is what the compiler sees, that a definition in
 another file is found, and that a diagnostic is withdrawn once its cause is
 fixed.
+It also runs `tests/cache.dr`, which checks that repeated cached loads do not
+accumulate parser processes.

@@ -1,0 +1,34 @@
+// Repeated editor loads must not leave parser processes behind. Unlike RSS,
+// the process-table count is deterministic and works on every VM platform.
+import dreams.config;
+import dreams.modules;
+import std.console;
+import std.list;
+import std.os;
+import std.vm;
+
+let rec reload! path n parsed = {
+    if n == 0 { () }
+    else {
+        let loaded = modules.load_overlaid_cached! path ["mind"] (config.defaults! ()) false (%{}) parsed;
+        strict! loaded
+        if modules.failed loaded || list.length (modules.names loaded) < 2 {
+            console.error! "cache regression fixture did not load its imports"
+            os.exit! 1
+        }
+        reload! path (n - 1) (modules.parsed loaded)
+    }
+};
+
+let main! = {
+    let path = list.head (os.args! ());
+    let before = list.length (vm.processes_info! ());
+    strict! before
+    reload! path 20 (%{})
+    let after = list.length (vm.processes_info! ());
+    if after != before {
+        console.error! ("cached editor loads retained " + to_string (after - before) + " parser processes")
+        os.exit! 1
+    }
+    console.print! "cached editor loads do not accumulate parser processes"
+};

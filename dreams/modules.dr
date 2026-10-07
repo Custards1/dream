@@ -937,10 +937,11 @@ let parse_of! l file text = match ((fetched l)).[file else ()] {
 };
 
 let rec load_text! l0 text display name file = {
-    // Every file this one leads to is set parsing before this one is parsed.
+    // For batch loads, every file this one leads to starts parsing first.
     // For the root that is the whole program; for any other file it is almost
     // always nothing, because the root's scan already reached it.
-    let l = prefetch! l0 (scanned_imports text);
+    let l = if l0.[:prefetch_enabled else true] { prefetch! l0 (scanned_imports text) }
+            else { l0 };
     let source = file_count l;
     let read = add_file (diag.source display text) l;
     // A same-text parse already in hand is reused rather than done again: an
@@ -1187,9 +1188,13 @@ let load_overlaid! file roots cfg test_mode ov =
 /// The map travels back out in the loader it produces -- `parsed` -- so the
 /// caller keeps passing what it got last time, and what it costs is one string
 /// compare per module per request.
+/// Parse on demand here. Speculative workers ignore this cache and the VM
+/// retains completed processes for later joins; launching them on every editor
+/// request accumulates whole parser heaps even when no text has changed.
 let load_overlaid_cached! file roots cfg test_mode ov parsed =
-    load_root! (with_parsed parsed (with_overlay ov (loader (package.discover! file roots) cfg
-                                                           (default_search_paths! file roots) [])))
+    load_root! (put :prefetch_enabled false
+                   (with_parsed parsed (with_overlay ov (loader (package.discover! file roots) cfg
+                                                                (default_search_paths! file roots) []))))
                file test_mode;
 
 let failed l = diag.error_count (diags l) > 0;
