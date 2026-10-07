@@ -95,6 +95,7 @@ let names = [
     "_deadline_in!",
     "_match_fail",     // what a failed `match` raises with; see `lower.match_failure`
     "_error_trace!",   // where an error was raised; see `error.trace!`
+    "_tensor_of_bytes",
 
 ];
 
@@ -175,6 +176,7 @@ let signatures = %{
     "_data_at" => "integer -> bigstr",
     "compare" => "a -> b -> integer",
     "_sort_keyed" => "keys:list -> array -> list",
+    "_tensor_of_bytes" => "list|array -> string -> tensor",
     "_tensor_matmul" => "tensor|list|array -> tensor|list|array -> tensor|float",
     "_str_interp" => "list of any -> string, each rendered as `to_string` renders it",
     "_mailbox_peek!" => "integer -> [:ok, message] | :none, the message at that position, left there",

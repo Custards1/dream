@@ -1737,6 +1737,8 @@ bool import_across(Process& dest, Runtime& src_rt, Value v, Value* out, int dept
             *out = dest.heap().make_bigint(b->limbs(), b->len, b->neg != 0);
             return true;
         }
+        case ObjType::Tensor:
+            return tensor_host_copy(dest, v, out);
         case ObjType::Str: {
             auto* s = static_cast<StrObj*>(as_obj(v));
             *out = dest.heap().make_string(s->data(), s->len);
@@ -3239,7 +3241,7 @@ NativeResult core_sort_keyed(Process& p, Value, Value* args, uint32_t) {
 enum : uint8_t {
     WIRE_UNIT = 0, WIRE_FALSE = 1, WIRE_TRUE = 2, WIRE_INT = 3, WIRE_FLOAT = 4,
     WIRE_STRING = 5, WIRE_ATOM = 6, WIRE_CHAR = 7, WIRE_LIST = 8, WIRE_ARRAY = 9,
-    WIRE_MAP = 10, WIRE_BIGINT = 11,
+    WIRE_MAP = 10, WIRE_BIGINT = 11, WIRE_TENSOR = 12,
 };
 
 void wire_le(std::string* out, uint64_t v, int width) {
@@ -3300,6 +3302,20 @@ bool wire_write(Process& p, Value v, std::string* out, int depth) {
                 std::memcpy(b, &d, 8);
                 out->push_back(char(WIRE_FLOAT));
                 out->append(b, 8);
+                return true;
+            }
+            case ObjType::Tensor: {
+                Value host;
+                if (!tensor_host_copy(p, v, &host)) return false;
+                auto* t = static_cast<TensorObj*>(as_obj(host));
+                out->push_back(char(WIRE_TENSOR));
+                out->push_back(char(t->rank));
+                for (uint32_t axis = 0; axis < t->rank; ++axis) wire_le(out, t->dims[axis], 4);
+                for (uint64_t i = 0; i < t->count; ++i) {
+                    uint64_t bits;
+                    std::memcpy(&bits, t->data() + i, sizeof bits);
+                    wire_le(out, bits, 8);
+                }
                 return true;
             }
             case ObjType::Str: {
@@ -3418,6 +3434,28 @@ struct WireReader {
                 std::memcpy(&d, data + at, 8);
                 at += 8;
                 *out = p.heap().make_float(d);
+                return true;
+            }
+            case WIRE_TENSOR: {
+                if (!has(1)) return false;
+                const uint32_t rank = data[at++];
+                if (rank == 0 || rank > TENSOR_MAX_RANK || !has(rank * 4)) return false;
+                uint32_t dims[TENSOR_MAX_RANK];
+                uint64_t count = 1;
+                const uint64_t limit = (uint64_t(UINT32_MAX) - sizeof(TensorObj) - 64) / 8;
+                for (uint32_t axis = 0; axis < rank; ++axis) {
+                    dims[axis] = uint32_t(le(4));
+                    if (!dims[axis] || count > limit / dims[axis]) return false;
+                    count *= dims[axis];
+                }
+                if (!has(count * 8)) return false;
+                Value v = p.heap().make_tensor(rank, dims, count);
+                auto* t = static_cast<TensorObj*>(as_obj(v));
+                for (uint64_t i = 0; i < count; ++i) {
+                    const uint64_t bits = le(8);
+                    std::memcpy(t->data() + i, &bits, sizeof bits);
+                }
+                *out = v;
                 return true;
             }
             case WIRE_STRING: {
@@ -4002,6 +4040,7 @@ const BuiltinDef BUILTINS[] = {
     {"_deadline_in!", 1, 0b1, vm_deadline_in},
     {"_match_fail", 4, 0b1110, core_match_fail},
     {"_error_trace!", 1, 0b1, core_error_trace},
+    {"_tensor_of_bytes", 2, 0b11, tensor_of_bytes_builtin},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

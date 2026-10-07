@@ -83,6 +83,8 @@ bool download(Buffer* src, int dtype, double* dst, size_t n, std::string* err);
 /// `dst_offset`.
 bool copy(Buffer* src, int dtype, size_t offset, Buffer* dst, size_t n, std::string* err,
           size_t dst_offset = 0);
+/// Seeded uniforms generated on the device, with no host staging buffer.
+bool random_uniform(int dtype, Buffer* out, size_t n, uint64_t seed, std::string* err);
 /// Rows of `src`, each `width` elements, gathered into `dst` in the order
 /// `rows` names them: row `r` of `dst` is row `rows[r]` of `src`.
 bool gather(int dtype, Buffer* src, const uint32_t* rows, size_t nrows, size_t width, Buffer* dst,

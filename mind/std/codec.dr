@@ -111,6 +111,11 @@ virtual let write_array parts = write_list parts;
 let write_opaque : :any -> :string;
 virtual let write_opaque v = write_string (to_string v);
 
+/// A numeric tensor. Formats without a tensor representation retain their
+/// opaque-value behavior; binary formats can preserve shape and numbers.
+let write_tensor : :tensor -> :string;
+virtual let write_tensor v = write_opaque v;
+
 /// What this format is called, for a diagnostic that has to name one.
 let format_name : :any -> :string;
 virtual let format_name u = "codec";
@@ -158,6 +163,7 @@ let rec encode_value v = match type_of v {
     :list    => write_list (list.map encode_value v),
     :array   => write_array (list.map encode_value (_array_to_list v)),
     :map     => write_map (map_entries v),
+    :tensor  => write_tensor v,
     _        => write_opaque v,
 };
 

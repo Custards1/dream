@@ -53,6 +53,11 @@ inline int64_t tensor_len(Value t) {
 /// the dot product of two vectors.
 NativeResult tensor_matmul_builtin(Process& p, Value callee, Value* args, uint32_t argc);
 
+/// Materialize and copy numbers to a host tensor in the caller's heap.
+/// Also used when data crosses an image or wire boundary.
+bool tensor_host_copy(Process& p, Value t, Value* out);
+NativeResult tensor_of_bytes_builtin(Process& p, Value callee, Value* args, uint32_t argc);
+
 ModuleDef make_tensor_module();
 
 }  // namespace dream

@@ -74,7 +74,8 @@ Below that a step is a few small kernels, and launching them costs more than
 the arithmetic. On the GPU the parameters, the optimizer state and the
 dataset (when it is under a gigabyte) move there once; shuffling is a
 `take` on the device and batching a `slice`, so a step uploads nothing and
-reads back one number, the loss.
+keeps named built-in losses as one-element tensors until the epoch ends.
+Metrics and custom loss functions can still read back each step.
 
 Every model trains to the same answers on both devices within float32.
 Measured per training step, the best epoch after the first (which compiles
@@ -149,10 +150,30 @@ the topological walk, the gradient flow, the tree maps, `node`,
 helping nothing to **2.32 s with the JIT against 2.87 s without** (median of
 five, interleaved).
 
-Teaching the tier to take a strict binding of a computed value -- evaluate
-it where it is bound and keep it in its register -- would compile the same
-shapes everywhere in the language without anyone rewriting anything. It was
-not done here.
+The tier now also accepts strict bindings of computed values: it evaluates
+them at the binding point and retains them in its per-invocation memo storage.
+Computed match subjects can therefore compile without these rewrites.
+`jit_strict_computed.dr` checks both the answers and that the functions compile.
+
+## State and device-local training
+
+`nn.batch_norm` normalizes over every axis except the last, channels axis.
+Its trainable scale and bias belong to the parameter tree; its running mean
+and population variance belong to a separate state tree. `nn.init_state`
+creates that tree and `nn.forward_state` returns the output and updated state.
+Sequential and residual layers carry their children's state through them.
+Prediction uses the stored statistics without updating them.
+
+`ml.fit!` retains this state, including alongside the best parameters when
+early stopping restores them. Save `[ml.params fitted, ml.state fitted]` with
+`ml.save!` and supply both `:params` and `:state` to resume. For a manual loop,
+`ml.step_state` returns the new layer state beside the optimizer state.
+
+Named built-in losses use `tensor.sum_tensor` on the GPU, keeping the loss
+and its gradient on the device. The epoch's accumulated loss is read once.
+Dropout uses `tensor.random_like`, whose counter-based GPU kernel generates
+the mask on the device with the input's shape and dtype. Both random paths
+use the same splitmix64 stream, subject to the device's floating-point precision.
 
 ## Measured: a training run
 
@@ -163,16 +184,8 @@ takes 0.48 s in all, compiling included.
 
 ## What is not done
 
-- **Batch normalization**, which needs state that changes as it trains and
-  is not a parameter; the functional shape for it (apply answering new state
-  beside its output) is not built. `layer_norm` is there.
 - **Convolutions on the host** are slow beside the GPU (179 ms a step for
   the CNN above): `im2col` and a product per layer, with no host kernel of
   their own.
-- **The loss is read back every step**, a sync on the GPU. Keeping it a
-  one-element tensor until the epoch ends would let the queue run ahead.
-- **A dropout mask is drawn on the host** and uploaded each step on the GPU;
-  a random kernel would make it free.
 - **Float32 on the host**, mixed precision, and a faster GPU product -- see
   "What is not done yet" in tensors.md.
-- **The JIT's strict bindings**, above.

@@ -404,6 +404,19 @@ let sum x = {
     if type_of v == :tensor { node (tensor.sum v) [[x, fn g -> tensor.fill_like v g]] } else { x }
 };
 
+/// A sum kept as a one-element tensor on the input's device, so a GPU
+/// loss can participate in backpropagation without a host readback.
+let sum_tensor : :any -> :any;
+let sum_tensor x = {
+    let v = value x;
+    if type_of v == :tensor {
+        node (tensor.sum_tensor v) [[x, fn g ->
+            if type_of g == :tensor {
+                tensor.reshape (tensor.shape v) (tensor.repeat (tensor.size v) g)
+            } else { tensor.fill_like v g }]]
+    } else { x }
+};
+
 /// The mean of every number, as a float.
 let mean : :any -> :any;
 let mean x = {
@@ -683,6 +696,11 @@ when test {
     let tests = [
         test.case "a constant is not a variable" $( test.false! (is_var (add x x)) ),
         test.case "value_and_grad of a sum" $( test.eq! (tensor.fill_like x 1.0) (grad sum x) ),
+        test.case "tensor sum accepts a scalar backward seed"
+            $( {
+                let p = param x;
+                test.eq! (tensor.fill_like x 2.0) (backward (sum_tensor p) 2.0).[p]
+            } ),
         test.case "the gradient of x * x is 2x"
             $( test.eq! (2.0 * x) (grad (fn v -> sum (mul v v)) x) ),
         test.case "a node used twice gets both gradients"

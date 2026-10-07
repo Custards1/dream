@@ -200,6 +200,19 @@ __kernel void gather(__global const T* in, __global const uint* rows, __global T
     if (g < n) out[g] = in[(ulong)rows[g / width] * width + g % width];
 }
 
+// Counter form of the host's splitmix64 stream: each work-item can draw
+// its own element without a shared generator or a host upload.
+__kernel void random_uniform(__global T* out, ulong n, ulong seed) {
+    ulong i = get_global_id(0);
+    if (i >= n) return;
+    ulong z = seed + (i + 1) * (ulong)0x9E3779B97F4A7C15UL;
+    z = (z ^ (z >> 30)) * (ulong)0xBF58476D1CE4E5B9UL;
+    z = (z ^ (z >> 27)) * (ulong)0x94D049BB133111EBUL;
+    z ^= z >> 31;
+    out[i] = min((T)(z >> 11) * (T)(1.0 / 9007199254740992.0),
+                 nextafter((T)1, (T)0));
+}
+
 )CL";
 
 // What every generated elementwise kernel starts with: the operations a
@@ -346,7 +359,7 @@ struct Program {
     cl_kernel matmul[3] = {nullptr, nullptr, nullptr};  // by `wpt_index`
     cl_kernel matvec = nullptr, transpose = nullptr, gather = nullptr,
               matmul_part = nullptr, sum_parts = nullptr,
-              im2col = nullptr, col2im = nullptr, bmm = nullptr, permute = nullptr;
+              im2col = nullptr, col2im = nullptr, bmm = nullptr, permute = nullptr, random_uniform = nullptr;
 };
 
 /// The two kernels generated for one fused program: the elementwise one, and
@@ -536,6 +549,7 @@ bool build(Device& d, Program& prog, int dtype, std::string* why) {
            kernel(d, prog.program, "sum_parts", &prog.sum_parts, why) &&
            kernel(d, prog.program, "transpose", &prog.transpose, why) &&
            kernel(d, prog.program, "gather", &prog.gather, why) &&
+           kernel(d, prog.program, "random_uniform", &prog.random_uniform, why) &&
            kernel(d, prog.program, "im2col", &prog.im2col, why) &&
            kernel(d, prog.program, "col2im", &prog.col2im, why) &&
            kernel(d, prog.program, "bmm", &prog.bmm, why) &&
@@ -919,6 +933,18 @@ bool transpose(int dtype, Buffer* in, Buffer* out, size_t rows, size_t cols, std
     return Launch{*d, p->transpose}
         .arg(in->mem).arg(out->mem).arg(cl_int(rows)).arg(cl_int(cols))
         .run(2, global, nullptr, err);
+}
+
+bool random_uniform(int dtype, Buffer* out, size_t n, uint64_t seed, std::string* err) {
+    Device* d = ready(err);
+    if (!d) return false;
+    Program* p = program_for(*d, dtype, err);
+    if (!p) return false;
+    std::lock_guard<std::mutex> g(d->lock);
+    const size_t global = round_up(n, 64);
+    return Launch{*d, p->random_uniform}
+        .arg(out->mem).arg(cl_ulong(n)).arg(cl_ulong(seed))
+        .run(1, &global, nullptr, err);
 }
 
 bool gather(int dtype, Buffer* src, const uint32_t* rows, size_t nrows, size_t width, Buffer* dst,

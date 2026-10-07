@@ -28,6 +28,7 @@
 // | 10   | map     | four bytes of count, then key, value, key, ... |
 // | 11   | integer | four bytes of length, then that many bytes of  |
 // |      |         | two's complement, little-endian                |
+// | 12   | tensor  | rank byte, u32 axes, then little-endian doubles |
 //
 // **An integer is one of two tags.** Eight bytes hold every integer most
 // programs meet, and every one this format carried before Dream had bignums,
@@ -58,6 +59,7 @@ import std.list;
 import std.result;
 import std.str;
 import std.vm;
+import std.tensor;
 
 // --- the tags ----------------------------------------------------------------
 //
@@ -180,6 +182,12 @@ let write_map pairs = {
     _str_concat (_list_cons (byte tag_map)
                                (_list_cons (count (list.length pairs)) (list.map entry pairs)))
 };
+
+/// Device values travel as host doubles: shape and numeric values survive,
+/// while device placement belongs to the receiving process.
+let write_tensor : :tensor -> :string;
+let write_tensor t = byte 12 + byte (tensor.rank t)
+    + str.concat_all (list.map count (tensor.shape t)) + tensor.to_bytes t;
 
 let format_name : :any -> :string;
 let format_name u = "wire";
@@ -335,7 +343,21 @@ priv let rec read buf at = match _str_byte buf at {
           },
     10 => read_map buf (at + 1),
     11 => read_bigint buf (at + 1),
+    12 => read_tensor buf (at + 1),
     _  => (),
+};
+
+priv let read_tensor : :string -> :integer -> :any;
+priv let read_tensor buf at = {
+    let rank = _str_byte buf at;
+    if rank < 1 || rank > 6 || not (has buf (at + 1) (rank * 4)) { () }
+    else {
+        let shape = list.map (fn i -> le buf (at + 1 + i * 4) 4) (list.range 0 rank);
+        let n = list.fold_strict (fn !n d -> n * d) 1 shape;
+        let start = at + 1 + rank * 4;
+        if list.any (fn d -> d == 0) shape || n > 536870897 || not (has buf start (n * 8)) { () }
+        else { [tensor.of_bytes shape (str.slice start (n * 8) buf), start + n * 8] }
+    }
 };
 
 /// The hole `std.codec` leaves: one message, decoded whole.
@@ -388,6 +410,22 @@ when test {
     let trip v = round_trips v;
 
     let tests = [
+        test.case "tensor wire bytes match the reference writer"
+            $( {
+                let t = tensor.random 19 [2, 3, 4] * 2.0;
+                test.eq! (write_tensor t) (encode t)
+                test.eq! [:ok, t] (decode (encode t))
+                test.eq! [:ok, t] (decode_by_hand (encode t))
+                test.true! (trip [%{"weights" => t}])
+            } ),
+        test.case "malformed tensor shapes and payloads are refused"
+            $( test.true! (list.all (fn bytes -> {
+                let native = decode bytes;
+                native.[0] == :error && (decode_by_hand bytes).[0] == :error
+            }) [byte 12, byte 12 + byte 0, byte 12 + byte 7,
+                byte 12 + byte 1 + count 0,
+                byte 12 + byte 2 + count 4294967295 + count 4294967295,
+                byte 12 + byte 1 + count 2 + tensor.to_bytes (tensor.ones [1])]) ),
         // every kind, exactly
         test.case "unit"        $( test.true! (trip ()) ),
         test.case "true"        $( test.true! (trip true) ),

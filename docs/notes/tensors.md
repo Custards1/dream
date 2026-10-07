@@ -707,9 +707,24 @@ handles never go through message copying.
 What mutation would actually buy is fewer allocations in a chain like
 `a * 2.0 + b`. Fusion (above) gives that, without exposing mutation.
 
+## Transport and compile-time values
+
+The wire format now carries tensors as a rank, dimensions and little-endian
+double values. Both the native codec and the Dream reference codec preserve
+their shape and numbers, including tensors nested in containers; device
+values arrive on the host. Malformed shapes and truncated payloads are rejected.
+
+`comp` can return tensors too. Values copied out of the compile-time runtime
+are materialized on the host, and the compiler emits shape and byte constants
+reconstructed with `_tensor_of_bytes`. `comp_tensor.dr` covers deferred and
+nested tensors.
+
+`sum_tensor` retains a total as a one-element tensor on the input's device;
+`random_like` generates uniforms with its shape, device and dtype. These
+support device-local loss accumulation and dropout in `std.ml`.
+
 ## What is not done yet
 
-- **Fusing into the product** -- see "What fusion does not do yet".
 - **Float32 on the host.** Twice the vector throughput, and the type a model
   is stored in. `dtype` is already in the header.
 - **A faster GPU product.** Register tiling is done ("On a real GPU"); at
@@ -718,5 +733,3 @@ What mutation would actually buy is fewer allocations in a chain like
   behind the same `gpu::` functions are what is left.
 - **Sending a host tensor without copying it.** A large one could be
   reference-counted the way BEAM shares large binaries.
-- **The wire format** (`std.remote`) and compile-time values (`comp`) do not
-  carry tensors yet.

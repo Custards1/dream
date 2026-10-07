@@ -30,6 +30,7 @@ import dreams.fuse;
 import dreams.ir;
 import dreams.opt;
 import dreams.modules;
+import std.tensor;
 import std.vm;
 import dreams.scope;
 import dreams.unit;
@@ -2545,6 +2546,11 @@ let rec emit_const v l =
     match type_of v {
         :integer => const_int v l,
         :float   => const_float v l,
+        :tensor  => {
+            let [l1, shape] = emit_const (tensor.shape v) l;
+            let [l2, bytes] = const_str (tensor.to_bytes v) l1;
+            call_builtin "_tensor_of_bytes" [shape, bytes] l2
+        },
         :string  => const_str v l,
         :char    => const_char v l,
         :bool    => const_bool v l,

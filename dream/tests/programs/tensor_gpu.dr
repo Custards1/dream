@@ -29,6 +29,9 @@ let near : :float -> :float -> :bool;
 let near a b = a - b <= 1.0e-4 * (a + 1.0) && b - a <= 1.0e-4 * (a + 1.0);
 
 let main! = {
+    console.print! (not have || close (tensor.random (-17) [37, 53]) (tensor.random_like (-17) (tensor.gpu (tensor.zeros [37, 53]))))
+    console.print! (not have || tensor.device (tensor.sum_tensor (tensor.gpu (tensor.ones [37, 53]))) == :gpu)
+    console.print! (not have || near 1961.0 (tensor.sum (tensor.sum_tensor (tensor.gpu (tensor.ones [37, 53])))))
     let a = tensor.random 1 [37, 53] - 0.5;
     let b = tensor.random 2 [53, 29] - 0.5;
     let c = tensor.random 3 [37, 53];

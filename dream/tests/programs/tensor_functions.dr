@@ -9,6 +9,8 @@ import std.list;
 import std.tensor;
 
 let main! = {
+    console.print! (tensor.random 17 [3, 4] == tensor.random_like 17 (tensor.zeros [3, 4]))
+    console.print! (tensor.sum_tensor (tensor.range 10) == tensor.of_list [45.0])
     let a = tensor.of_list [[1, -2, 3], [4, 5, -6]];
 
     // --- elementwise, as functions ---

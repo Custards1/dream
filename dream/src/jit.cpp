@@ -675,6 +675,7 @@ public:
         binds_.assign(f_.slots, NO_NODE);
         reads_.assign(f_.slots, 0);
         bind_state_.assign(f_.slots, 0);
+        strict_binds_.assign(f_.slots, 0);
         const SlotSet params = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
         // Checked as though every self-call argument were evaluated, which asks
         // the most of the body: whatever the fixpoint below decides, everything
@@ -740,7 +741,7 @@ public:
         bind_inline_.assign(f_.slots, 0);
         for (uint32_t slot = f_.arity; slot < f_.slots; ++slot) {
             if (binds_[slot] == NO_NODE) continue;
-            if (!cheap_lazy(img_, binds_, f_.arity, binds_[slot], 0)) continue;
+            if (strict_binds_[slot] || !cheap_lazy(img_, binds_, f_.arity, binds_[slot], 0)) continue;
             bool calls = false;
             if (expand_cost(binds_[slot], 0, &calls) <= kMaxBindDuplication && !calls) {
                 bind_inline_[slot] = 1;
@@ -752,7 +753,7 @@ public:
             if (binds_[slot] == NO_NODE) continue;
             bool calls = false;
             expand_cost(binds_[slot], 0, &calls);
-            memo[slot] = calls ? 1 : 0;
+            memo[slot] = calls || strict_binds_[slot] ? 1 : 0;
         }
 
         a.binds = binds_;
@@ -1094,20 +1095,9 @@ private:
 
     /// A `let` statement. Answers false to refuse the whole function.
     bool check_bind(const Node& n, int depth) {
-        // A strict binding must run where it stands. Only parameter aliases
-        // are substitutable without repeating its work; block() forces those
-        // at the binding point and load_slot caches the answer.
-        if (n.flags & F_STRICT) {
-            // The match lowerer binds its subject strictly. A parameter alias
-            // can still be substituted after forcing it at the binding point:
-            // load_slot remembers the forced value. Other strict bindings need
-            // real stored values and remain outside this tier.
-            const Node& value = img_.node(n.b);
-            if (Op(value.op) != Op::Local || value.a >= f_.arity) {
-                why(value, "a strict `let`, or a `match` on something other than a parameter");
-                return false;
-            }
-        }
+        // Strict values are computed at the binding point and kept in the
+        // same per-invocation storage used for memoized lazy bindings. This
+        // admits computed match subjects without duplicating their work.
         // Into a parameter's slot, or past the end of the frame: neither is
         // something the compiler emits, and neither has a meaning here.
         if (n.a < f_.arity || n.a >= f_.slots) return false;
@@ -1115,6 +1105,7 @@ private:
         // before it, and this has no way to say which that was.
         if (binds_[n.a] != NO_NODE) return false;
         binds_[n.a] = n.b;
+        strict_binds_[n.a] = (n.flags & F_STRICT) != 0;
         // A strict binding runs where it stands, so it is checked here. Any
         // other is checked at its first evaluated read (see `check`'s `Local`),
         // and one nobody evaluates is never checked at all.
@@ -1673,6 +1664,7 @@ private:
     SlotSet eager_ = 0;
     /// Per slot: 0 a binding not yet checked, 1 one being checked, 2 checked.
     std::vector<uint8_t> bind_state_;
+    std::vector<uint8_t> strict_binds_;
     std::vector<uint8_t> bind_inline_;
     /// How each call `check` reached is made. See `check_apply`.
     std::unordered_map<uint32_t, CallKind> kinds_;

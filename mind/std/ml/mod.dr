@@ -38,7 +38,8 @@
 // host's vectorized kernels win. On the GPU, the parameters, the optimizer's
 // state and the dataset (if it is under a gigabyte) are moved there once,
 // and every step -- forward, backward, update, shuffle -- runs there;
-// what comes back each step is the loss, one number. The trained parameters
+// built-in named losses stay there until the epoch ends. Metrics and custom
+// losses may still read back each step. The trained parameters
 // stay where they were trained, and `predict` moves its input to them.
 //
 // **Each step is forced** (`strict!`) once its parameters and state are
@@ -77,6 +78,7 @@ mapping Fitted {
     metrics : [:any] = []
     history : [:any] = []
     device : :atom = :host
+    state : :any = ()
 }
 
 /// The trained parameters, on the host.
@@ -103,6 +105,23 @@ let step model loss_fn opt params state x y ctx = {
     let [p2, s2] = optim.step opt grads state params;
     [l, out, p2, s2]
 };
+
+/// One training step with non-trainable layer state. The result is
+/// `[loss, output, params, optimizer_state, layer_state]`.
+let step_state : nn.Layer -> (:any -> :any -> :any) -> optim.Optimizer -> :any -> :any -> :any -> :any -> :any -> nn.Ctx -> [:any, :any, :any, :any, :any];
+let step_state model loss_fn opt params optimizer_state layer_state x y ctx = {
+    let [l, grads, aux] = ad.value_grad_aux (fn q -> {
+        let [out, next] = nn.forward_state model q layer_state x ctx;
+        [loss_fn out y, [ad.value out, next]]
+    }) params;
+    let [p2, s2] = optim.step opt grads optimizer_state params;
+    [l, aux.[0], p2, s2, aux.[1]]
+};
+
+/// Learned non-trainable state, on the host; save beside `params` and pass
+/// it as `:state` when resuming training.
+let state : Fitted -> :any;
+let state f = tree.host (Fitted.state f);
 
 /// The device `:auto` chooses for training `params` in batches of `batch`.
 let auto_device : :any -> :integer -> :atom;
@@ -144,6 +163,7 @@ priv let atom_text a = str.slice 1 (str.length (to_string a) - 1) (to_string a);
 /// | `:seed` | 0 | initial weights, shuffling and dropout |
 /// | `:shuffle` | `true` | a new order each epoch |
 /// | `:params` | fresh | parameters to start from, to resume or fine-tune |
+/// | `:state` | fresh | non-trainable state to restore alongside parameters |
 /// | `:device` | `:auto` | `:gpu`, `:host`, or `:auto` (see the head of this file) |
 /// | `:verbose` | `true` | print a line per epoch |
 let fit! : nn.Layer -> data.Dataset -> %{:atom => :any} -> Fitted;
@@ -189,7 +209,6 @@ priv let train! model ds opts = {
                 + to_string (ops.rows (data.y ds)) + " of y")
     }
     let loss_name = opts.[:loss else :mse];
-    let loss_fn = loss.of loss_name;
     let opt = opts.[:optimizer else optim.adam 0.001];
     let epochs = opts.[:epochs else 10];
     let batch = if opts.[:batch else 32] > n { n } else { opts.[:batch else 32] };
@@ -206,6 +225,7 @@ priv let train! model ds opts = {
         d => d,
     };
     let on_gpu = device == :gpu;
+    let loss_fn = if on_gpu { loss.on_device loss_name } else { loss.of loss_name };
     // The dataset goes to the GPU whole when it is small enough to; a larger
     // one is batched on the host and each batch moved.
     let whole = on_gpu && (tensor.size (data.x ds) + tensor.size (data.y ds)) * 4 < 1073741824;
@@ -213,63 +233,70 @@ priv let train! model ds opts = {
     let place t = if on_gpu && not whole { tensor.gpu t } else { t };
     let validation = match opts.[:validation else ()] { () => (), v => if on_gpu { data.to_gpu v } else { v } };
     let params0 = if on_gpu { tree.gpu start_params } else { start_params };
+    let layer_state = opts.[:state else nn.init_state model (data.example_shape ds)];
+    let model_state0 = if on_gpu { tree.gpu layer_state } else { tree.host layer_state };
     let state0 = optim.start opt params0;
+    strict! model_state0
     strict! params0
     strict! state0
 
     // One epoch: every batch once, in `order`. Answers the parameters, the
     // state, the step count after it, and the sums of the loss and of each
     // metric, weighted by batch size.
-    let run_epoch! e p s t0 = {
+    let run_epoch! e p s m t0 = {
         let order = if shuffle { ops.permutation (init.seed_for seed e) n } else { list.range 0 n };
-        let rec go! idx p s !t !loss_sum sums = match idx {
-            [] => [p, s, t, loss_sum, sums],
+        let rec go! idx p s m !t !loss_sum sums = match idx {
+            [] => [p, s, m, t, loss_sum, sums],
             _ => {
                 let chunk = list.take batch idx;
                 let k = len chunk;
                 let xb = place (if shuffle { tensor.take chunk (data.x train) } else { tensor.slice (list.head chunk) k (data.x train) });
                 let yb = place (if shuffle { tensor.take chunk (data.y train) } else { tensor.slice (list.head chunk) k (data.y train) });
-                let [l, out, p2, s2] = step model loss_fn opt p s xb yb (nn.training seed t);
+                let [l, out, p2, s2, m2] = step_state model loss_fn opt p s m xb yb (nn.training seed t);
                 strict! p2
                 strict! s2
+                strict! m2
                 let scored = list.map (fn [[_, f], acc] -> acc + k * f out yb) (list.zip measures sums);
                 strict! scored
-                go! (list.drop batch idx) p2 s2 (t + 1) (loss_sum + k * l) scored
+                go! (list.drop batch idx) p2 s2 m2 (t + 1) (loss_sum + k * l) scored
             },
         };
-        go! order p s t0 0.0 (list.map (fn _ -> 0.0) measures)
+        go! order p s m t0 0.0 (list.map (fn _ -> 0.0) measures)
     };
 
-    let rec epochs! e p s t best stale log = {
-        if e == epochs { [p, log, best] }
+    let rec epochs! e p s m t best stale log = {
+        if e == epochs { [p, m, log, best] }
         else {
             let began = time.monotonic! ();
-            let [p2, s2, t2, loss_sum, sums] = run_epoch! e p s t;
+            let [p2, s2, m2, t2, loss_sum, sums] = run_epoch! e p s m t;
+            let measured_loss = if type_of loss_sum == :tensor { tensor.sum loss_sum } else { loss_sum };
+            strict! measured_loss
             let seconds = (time.monotonic! () - began) / 1.0e9;
-            let row0 = %{"epoch" => e + 1, "loss" => loss_sum / n, "seconds" => seconds};
+            let row0 = %{"epoch" => e + 1, "loss" => measured_loss / n, "seconds" => seconds};
             let row1 = list.fold (fn r [[name, _], total] -> r.[name => total / n]) row0 (list.zip measures sums);
             let row = match validation {
                 () => row1,
                 v => {
-                    let scores = evaluate_with model p2 loss_fn measures batch v;
+                    let scores = evaluate_with model p2 m2 loss_fn measures batch v;
                     list.fold (fn r [k, x] -> r.["val_" + k => x]) row1 (map.pairs scores)
                 },
             };
             if verbose { console.print! (describe_epoch (e + 1) epochs row (list.map (fn [name, _] -> name) measures)) }
             let watched = row.["val_loss" else row.["loss"]];
             let improved = best == () || watched < best.[0];
-            let best2 = if improved { [watched, p2] } else { best };
+            let best2 = if improved { [watched, p2, m2] } else { best };
             let stale2 = if improved { 0 } else { stale + 1 };
             if patience != () && stale2 >= patience {
                 if verbose { console.print! ("stopping: no improvement in " + to_string patience + " epochs") }
-                [p2, row :: log, best2]
-            } else { epochs! (e + 1) p2 s2 t2 best2 stale2 (row :: log) }
+                [p2, m2, row :: log, best2]
+            } else { epochs! (e + 1) p2 s2 m2 t2 best2 stale2 (row :: log) }
         }
     };
 
-    let [last, log, best] = epochs! 0 params0 state0 0 () 0 [];
+    let [last, last_state, log, best] = epochs! 0 params0 state0 model_state0 0 () 0 [];
     let kept = if patience != () && best != () { best.[1] } else { last };
     Fitted.make model kept loss_name wanted (list.reverse log) device
+        (if patience != () && best != () { best.[2] } else { last_state })
 };
 
 /// The line `fit!` prints for an epoch.
@@ -307,15 +334,22 @@ let fixed digits x = {
 /// The model's output for inputs `x`, as a host tensor. `x` may be a tensor
 /// or nested lists; it is moved to where the parameters are.
 let predict : Fitted -> :any -> :tensor;
-let predict f x = predict_with (Fitted.model f) (Fitted.params f) x;
+let predict f x = predict_with_state (Fitted.model f) (Fitted.params f) (Fitted.state f) x;
 
 /// `predict` for a model and parameters given separately.
 let predict_with : nn.Layer -> :any -> :any -> :tensor;
 let predict_with model p x = {
     let t = if type_of x == :tensor { x } else { tensor.of_list x };
+    predict_with_state model p (nn.init_state model (list.drop 1 (tensor.shape t))) t
+};
+
+/// Prediction with parameters and learned layer state supplied separately.
+let predict_with_state : nn.Layer -> :any -> :any -> :any -> :tensor;
+let predict_with_state model p state x = {
+    let t = if type_of x == :tensor { x } else { tensor.of_list x };
     let first = list.head (tree.leaves p);
     let placed = if type_of first == :tensor { ops.like first t } else { t };
-    tensor.host (nn.apply model p placed)
+    tensor.host (nn.apply_state model p state placed)
 };
 
 /// The predicted class of each row of `x`: the column with the largest
@@ -346,22 +380,22 @@ let evaluate f ds = {
     let measures = list.map (fn m -> [metric_name m, metric_fn loss_name m]) (Fitted.metrics f);
     let first = list.head (tree.leaves (Fitted.params f));
     let placed = if type_of first == :tensor && tensor.device first == :gpu { data.to_gpu ds } else { ds };
-    evaluate_with (Fitted.model f) (Fitted.params f) (loss.of loss_name) measures 256 placed
+    evaluate_with (Fitted.model f) (Fitted.params f) (Fitted.state f) (loss.of loss_name) measures 256 placed
 };
 
 /// The loss and metrics of `model` with `p` over `ds`, a batch of `batch` at
 /// a time, each weighted by its size.
-priv let evaluate_with : nn.Layer -> :any -> :any -> [:any] -> :integer -> data.Dataset -> %{:string => :float};
-priv let evaluate_with model p loss_fn measures batch ds = {
+priv let evaluate_with : nn.Layer -> :any -> :any -> :any -> [:any] -> :integer -> data.Dataset -> %{:string => :float};
+priv let evaluate_with model p state loss_fn measures batch ds = {
     let n = data.size ds;
     let totals = list.fold (fn acc b -> {
         let k = data.size b;
-        let out = nn.apply model p (data.x b);
+        let out = nn.apply_state model p state (data.x b);
         let l = loss_fn out (data.y b);
         list.map (fn [a, v] -> a + k * v) (list.zip acc (l :: list.map (fn [_, f] -> f out (data.y b)) measures))
     }) (list.map (fn _ -> 0.0) (0 :: measures)) (data.batches batch ds);
     let names = "loss" :: list.map (fn [name, _] -> name) measures;
-    map.from_pairs (list.map (fn [k, v] -> [k, v / n]) (list.zip names totals))
+    map.from_pairs (list.map (fn [k, v] -> [k, (if type_of v == :tensor { tensor.sum v } else { v }) / n]) (list.zip names totals))
 };
 
 /// `model`'s parameters, as a table to print: each layer, what it outputs
@@ -474,6 +508,17 @@ when test {
                 }) (tree.paths t)));
                 back == [:ok, t]
             }) ),
+        test.case "fit retains batch norm state for prediction and resuming"
+            $( {
+                let model = nn.sequential [nn.batch_norm_with %{:momentum => 1.0}, nn.dense 1];
+                let ds = data.of_lists [[1, 2], [3, 6]] [[0], [1]];
+                let fitted = fit! model ds %{:epochs => 1, :batch => 2, :shuffle => false, :verbose => false, :device => :host};
+                test.eq! (tensor.of_list [2, 4]) (state fitted).[0].["mean"]
+                test.eq! (predict fitted (data.x ds)) (predict_with_state model (params fitted) (state fitted) (data.x ds))
+                let resumed = fit! model ds %{:epochs => 0, :params => params fitted, :state => state fitted, :verbose => false, :device => :host};
+                test.eq! (predict fitted (data.x ds)) (predict resumed (data.x ds))
+                test.true! ((evaluate fitted ds).["loss"] >= 0.0)
+            } ),
         test.case "auto picks the host for a small model" $( test.eq! :host (auto_device [tensor.zeros [10]] 32) ),
     ];
 }

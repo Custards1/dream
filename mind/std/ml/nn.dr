@@ -62,6 +62,8 @@ mapping Layer {
     init : :any
     apply : :any
     children : [:any] = []
+    init_state : :any = ()
+    apply_state : :any = ()
 }
 
 /// The context a prediction runs in: not training.
@@ -93,6 +95,28 @@ let forward model params x ctx = (Layer.apply model) params x ctx;
 /// tensor out.
 let apply : Layer -> :any -> :any -> :any;
 let apply model params x = ad.value (forward model params x predicting);
+
+/// Initial non-trainable state, kept separately from the parameter tree.
+let init_state : Layer -> [:integer] -> :any;
+let init_state model shape = match Layer.init_state model {
+    () => (),
+    f => f shape,
+};
+
+/// Apply a layer and return `[output, new_state]`. Stateless layers carry
+/// the state unchanged; only parameters participate in differentiation.
+let forward_state : Layer -> :any -> :any -> :any -> Ctx -> [:any, :any];
+let forward_state model params state x ctx = match Layer.apply_state model {
+    () => [forward model params x ctx, state],
+    f => f params state x ctx,
+};
+
+/// Prediction with learned state, without changing it.
+let apply_state : Layer -> :any -> :any -> :any -> :any;
+let apply_state model params state x = ad.value (forward_state model params state x predicting).[0];
+
+priv let stateful : Layer -> :any -> :any -> Layer;
+priv let stateful layer initialize run = Layer.set_apply_state run (Layer.set_init_state initialize layer);
 
 /// A layer with no parameters that answers `f x`, `f` written with `ad`'s
 /// operations; its output shape is found by running it on one example.
@@ -292,7 +316,7 @@ let dropout rate = Layer.new ("dropout " + to_string rate) (fn _ shape -> [%{}, 
     if not (Ctx.training ctx) || rate <= 0.0 { x }
     else {
         let v = ad.value x;
-        let keep = tensor.gt (tensor.random (Ctx.seed ctx) (tensor.shape v)) rate;
+        let keep = tensor.gt (tensor.random_like (Ctx.seed ctx) v) rate;
         ad.mul x (ops.like v keep * (1.0 / (1.0 - rate)))
     });
 
@@ -308,6 +332,44 @@ let layer_norm_with eps = Layer.new "layer_norm"
         [%{"gamma" => tensor.ones [d], "beta" => tensor.zeros [d]}, shape]
     })
     (fn p x _ -> ad.add (ad.mul (ad.normalize eps x) p.["gamma"]) p.["beta"]);
+
+/// Batch normalization across every axis except the last (channels).
+/// Running mean and population variance live in the layer state, never in
+/// the optimizer's parameter tree. Use `forward_state` to retain updates.
+let batch_norm : Layer;
+let batch_norm = batch_norm_with %{};
+
+/// Options: `:epsilon` (1e-5), `:momentum` (0.1, the new batch's weight).
+let batch_norm_with : %{:atom => :any} -> Layer;
+let batch_norm_with opts = {
+    let eps = opts.[:epsilon else 1.0e-5];
+    let momentum = opts.[:momentum else 0.1];
+    let initialize shape = {
+        let d = shape.[len shape - 1];
+        %{"mean" => tensor.zeros [d], "variance" => tensor.ones [d]}
+    };
+    let run p state x ctx = {
+        let v = ad.value x;
+        let shape = tensor.shape v;
+        let d = shape.[len shape - 1];
+        let flat = ad.reshape [tensor.size v / d, d] x;
+        let training = Ctx.training ctx;
+        let mean = if training { ad.mean_axis 0 flat } else { ops.like v state.["mean"] };
+        let centered = ad.sub flat mean;
+        let variance = if training { ad.mean_axis 0 (ad.square centered) } else { ops.like v state.["variance"] };
+        let normalized = ad.div centered (ad.sqrt (ad.add variance eps));
+        let out = ad.reshape shape (ad.add (ad.mul normalized p.["gamma"]) p.["beta"]);
+        let next = if training {
+            %{"mean" => (1.0 - momentum) * ops.like v state.["mean"] + momentum * ad.value mean,
+              "variance" => (1.0 - momentum) * ops.like v state.["variance"] + momentum * ad.value variance}
+        } else { state };
+        [out, next]
+    };
+    let layer = Layer.new "batch_norm"
+        (fn _ shape -> { let d = shape.[len shape - 1]; [%{"gamma" => tensor.ones [d], "beta" => tensor.zeros [d]}, shape] })
+        (fn p x ctx -> (run p (initialize (list.drop 1 (tensor.shape (ad.value x)))) x ctx).[0]);
+    stateful layer initialize run
+};
 
 // --- shape --------------------------------------------------------------------------------------
 
@@ -538,27 +600,48 @@ priv let columns start count m = ad.transpose (ad.slice start count (ad.transpos
 /// Layers one after another, each fed what the one before made. Its
 /// parameters are a list of the layers' own, in order.
 let sequential : [Layer] -> Layer;
-let sequential layers = Layer.make "sequential"
-    (fn seed shape -> {
-        let step [ps, s, i] layer = {
-            let [p, out] = init_layer layer (initial.seed_for seed i) s;
-            [p :: ps, out, i + 1]
-        };
-        let [ps, out, _] = list.fold step [[], shape, 0] layers;
-        [list.reverse ps, out]
-    })
-    (fn ps x ctx -> {
-        let run [h, i] [layer, p] = [forward layer p h (Ctx.set_seed (initial.seed_for (Ctx.seed ctx) i) ctx), i + 1];
-        (list.fold run [x, 0] (list.zip layers ps)).[0]
-    })
-    layers;
+let sequential layers = {
+    let layer = Layer.make "sequential"
+        (fn seed shape -> {
+            let step [ps, s, i] layer = {
+                let [p, out] = init_layer layer (initial.seed_for seed i) s;
+                [p :: ps, out, i + 1]
+            };
+            let [ps, out, _] = list.fold step [[], shape, 0] layers;
+            [list.reverse ps, out]
+        })
+        (fn ps x ctx -> {
+            let run [h, i] [layer, p] = [forward layer p h (Ctx.set_seed (initial.seed_for (Ctx.seed ctx) i) ctx), i + 1];
+            (list.fold run [x, 0] (list.zip layers ps)).[0]
+        })
+        layers () ();
+    stateful layer
+        (fn shape -> {
+            let [states, _] = list.fold (fn [states, shape] child ->
+                [init_state child shape :: states, out_shape child shape]) [[], shape] layers;
+            list.reverse states
+        })
+        (fn ps states x ctx -> {
+            let [out, next, _] = list.fold (fn [h, acc, i] [child, p] -> {
+                let [y, state] = forward_state child p states.[i] h (Ctx.set_seed (initial.seed_for (Ctx.seed ctx) i) ctx);
+                [y, state :: acc, i + 1]
+            }) [x, [], 0] (list.zip layers ps);
+            [out, list.reverse next]
+        })
+};
 
 /// `layer` with its input added to its output -- a skip connection, which
 /// lets a deep network's gradient reach its first layers undiminished.
 /// `layer` must keep the shape.
 let residual : Layer -> Layer;
-let residual layer = Layer.new ("residual " + Layer.name layer) (Layer.init layer)
-    (fn p x ctx -> ad.add x (forward layer p x ctx));
+let residual layer = stateful
+    (Layer.new ("residual " + Layer.name layer) (Layer.init layer)
+        (fn p x ctx -> ad.add x (forward layer p x ctx)))
+    (init_state layer)
+    (fn p state x ctx -> {
+        let [y, next] = forward_state layer p state x ctx;
+        [ad.add x y, next]
+    });
 
 /// The layers of a model, with what each outputs and how many numbers it
 /// learns, as a table to print.
@@ -607,6 +690,30 @@ when test {
             }) ),
         test.case "a dense layer over a sequence" $( test.eq! [2, 7, 4] (tensor.shape (apply (dense 4) (init (dense 4) 1 [7, 3]) (tensor.zeros [2, 7, 3]))) ),
         test.case "embedding" $( test.eq! [2, 3, 8] (tensor.shape (apply (embedding 10 8) (init (embedding 10 8) 1 [3]) (tensor.of_list [[1, 2, 3], [4, 5, 9]]))) ),
+        test.case "batch norm updates state and freezes it for inference"
+            $( {
+                let layer = batch_norm_with %{:momentum => 1.0};
+                let p = init layer 0 [2];
+                let x = tensor.of_list [[1, 2], [3, 6]];
+                let [out, state] = forward_state layer p (init_state layer [2]) x (training 0 0);
+                test.eq! (tensor.of_list [2, 4]) state.["mean"]
+                test.eq! (tensor.of_list [1, 4]) state.["variance"]
+                test.true! (tensor.maximum (tensor.abs (tensor.sum_axis 0 (ad.value out))) < 1.0e-10)
+                let [pred, unchanged] = forward_state layer p state (tensor.of_list [[2, 4]]) predicting;
+                test.eq! state unchanged
+                test.eq! (tensor.zeros [1, 2]) (ad.value pred)
+            } ),
+        test.case "batch norm gradients through nested stateful layers"
+            $( test.true! ({
+                let model = sequential [dense 2, residual (sequential [batch_norm, relu]), dense 1];
+                let p = init model 4 [2];
+                let state = init_state model [2];
+                let x = tensor.of_list [[1, 2], [3, -1], [0, 4]];
+                let f q = ad.mean (ad.square (forward_state model q state x (training 0 0)).[0]);
+                let g = ad.grad f p;
+                let want = ad.numeric_grad f p 1.0e-5;
+                list.all (fn [path, t] -> tensor.maximum (tensor.abs (t - tree.at path want)) < 1.0e-5) (tree.paths g)
+            }) ),
         test.case "layer norm" $( test.true! (tensor.maximum (tensor.abs (ops.mean_last (apply layer_norm (init layer_norm 0 [6]) (tensor.random 2 [3, 6])))) < 1.0e-9) ),
         test.case "residual keeps the shape" $( test.eq! [4, 3] (tensor.shape (apply (residual (dense 3)) (init (residual (dense 3)) 1 [3]) x)) ),
         test.case "a function layer" $( test.eq! [6] (out_shape (function "twice" (fn v -> ad.concat [v, v])) [6]) ),

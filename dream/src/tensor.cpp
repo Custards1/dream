@@ -1929,6 +1929,41 @@ NativeResult t_random(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(t);
 }
 
+/// Uniforms with the shape, device and dtype of a tensor. In particular a
+/// dropout mask never needs to cross from the host to the device.
+NativeResult t_random_like(Process& p, Value, Value* args, uint32_t) {
+    DREAM_SHAPE_ARG(like, 1);
+    Value seed = resolve(args[0]), out;
+    if (!is_fixnum(seed)) {
+        type_fail(p, &out, "`random_like` takes an integer seed");
+        return raised(out);
+    }
+    const Shape s = shape_of(like);
+    const uint64_t start = uint64_t(fixnum_value(seed));
+    if (on_gpu(like)) {
+        gpu::Buffer* b = gpu_alloc(p, s.count, like->dtype, &out);
+        if (!b) return raised(out);
+        std::string why;
+        if (!gpu::random_uniform(like->dtype, b, s.count, start, &why)) {
+            gpu::release(b);
+            gpu_fail(p, &out, why);
+            return raised(out);
+        }
+        return NativeResult::ok(wrap_gpu(p, s, like->dtype, b));
+    }
+    double* data;
+    if (!new_host(p, s, &out, &data)) return raised(out);
+    uint64_t x = start;
+    for (uint64_t i = 0; i < s.count; ++i) {
+        uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        data[i] = double(z >> 11) * (1.0 / 9007199254740992.0);
+    }
+    return NativeResult::ok(out);
+}
+
 NativeResult t_shape(Process& p, Value, Value* args, uint32_t) {
     DREAM_SHAPE_ARG(t, 0);
     Value list = NIL;
@@ -2081,6 +2116,16 @@ NativeResult t_reduce(Process& p, Value callee, Value* args, uint32_t) {
     Value err;
     if (!reduce(p, op, t, &r, &err)) return raised(err);
     return NativeResult::ok(p.heap().make_float(r));
+}
+
+/// Keep the reduction on its device as a one-element tensor. Reshaping to
+/// a column lets the existing parallel axis reduction do the whole fold.
+NativeResult t_sum_tensor(Process& p, Value, Value* args, uint32_t) {
+    DREAM_SHAPE_ARG(t, 0);
+    Value column, out;
+    if (!reshape(p, t, shape2(uint32_t(t->count), 1), &column)) return raised(column);
+    if (!reduce_axis(p, KRED_SUM, tensor_of(column), 0, &out)) return raised(out);
+    return NativeResult::ok(out);
 }
 
 NativeResult t_mean(Process& p, Value, Value* args, uint32_t) {
@@ -2964,6 +3009,21 @@ NativeResult tensor_matmul_builtin(Process& p, Value, Value* args, uint32_t) {
     return t_matmul(p, UNIT, args, 2);
 }
 
+bool tensor_host_copy(Process& p, Value v, Value* out) {
+    TensorObj* t = tensor_of(v);
+    std::vector<double> scratch;
+    const double* data;
+    if (!host_view(p, t, scratch, &data, out)) return false;
+    double* dest;
+    if (!new_host(p, shape_of(t), out, &dest)) return false;
+    std::memcpy(dest, data, size_t(t->count) * sizeof(double));
+    return true;
+}
+
+NativeResult tensor_of_bytes_builtin(Process& p, Value callee, Value* args, uint32_t argc) {
+    return t_of_bytes(p, callee, args, argc);
+}
+
 ModuleDef make_tensor_module() {
     // Arguments are forced to weak head normal form before each call (bit i of
     // the mask is argument i); a list argument's elements are forced as they
@@ -2979,6 +3039,7 @@ ModuleDef make_tensor_module() {
             {"identity", 1, 0b1, t_identity},
             {"range", 1, 0b1, t_range},
             {"random", 2, 0b11, t_random},
+            {"random_like", 2, 0b11, t_random_like},
             {"shape", 1, 0b1, t_shape},
             {"rank", 1, 0b1, t_rank},
             {"size", 1, 0b1, t_size},
@@ -2991,6 +3052,7 @@ ModuleDef make_tensor_module() {
             {"dot", 2, 0b11, t_dot},
             {"outer", 2, 0b11, t_outer},
             {"sum", 1, 0b1, t_reduce, KRED_SUM},
+            {"sum_tensor", 1, 0b1, t_sum_tensor},
             {"minimum", 1, 0b1, t_reduce, KRED_MIN},
             {"maximum", 1, 0b1, t_reduce, KRED_MAX},
             {"mean", 1, 0b1, t_mean},

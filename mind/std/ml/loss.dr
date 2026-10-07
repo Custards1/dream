@@ -53,20 +53,29 @@ let as_rows logits y = {
 
 /// The mean squared error.
 let mse : Loss;
-let mse pred y = { let d = ad.sub pred (target_like (ad.value pred) y); ad.mean (ad.mul d d) };
+let mse = mse_using ad.sum;
+
+priv let mse_using : (:any -> :any) -> Loss;
+priv let mse_using sum pred y = { let d = ad.sub pred (target_like (ad.value pred) y); mean_using sum (ad.mul d d) };
 
 /// The mean absolute error.
 let mae : Loss;
-let mae pred y = ad.mean (ad.abs (ad.sub pred (target_like (ad.value pred) y)));
+let mae = mae_using ad.sum;
+
+priv let mae_using : (:any -> :any) -> Loss;
+priv let mae_using sum pred y = mean_using sum (ad.abs (ad.sub pred (target_like (ad.value pred) y)));
 
 /// The Huber loss: squared within `delta` of the target and absolute beyond
 /// it, so that an outlier pulls with a bounded force.
 let huber : :float -> Loss;
-let huber delta pred y = {
+let huber = huber_using ad.sum;
+
+priv let huber_using : (:any -> :any) -> :float -> Loss;
+priv let huber_using sum delta pred y = {
     let d = ad.sub pred (target_like (ad.value pred) y);
     let a = ad.abs d;
     let small = tensor.le (ad.value a) delta;
-    ad.mean (ad.where small (ad.scale 0.5 (ad.square d)) (ad.scale delta (ad.sub a (0.5 * delta))))
+    mean_using sum (ad.where small (ad.scale 0.5 (ad.square d)) (ad.scale delta (ad.sub a (0.5 * delta))))
 };
 
 /// Softmax cross-entropy from logits `[n, k]` against classes or rows of
@@ -78,41 +87,53 @@ let cross_entropy logits y = cross_entropy_with 0.0 logits y;
 /// the way toward uniform, which stops a classifier growing its logits
 /// without bound to be ever more certain.
 let cross_entropy_with : :float -> Loss;
-let cross_entropy_with eps logits y = {
+let cross_entropy_with = cross_entropy_using tensor.sum;
+
+priv let cross_entropy_using : (:any -> :any) -> :float -> Loss;
+priv let cross_entropy_using sum eps logits y = {
     let z = ad.value logits;
     let k = (tensor.shape z).[tensor.rank z - 1];
     let rows = as_rows z y;
     let target = if eps > 0.0 { rows * (1.0 - eps) + eps / k } else { rows };
     let n = tensor.size z / k;
     let per = ops.logsumexp z - tensor.sum_axis (tensor.rank z - 1) (z * target);
-    let v = if type_of per == :tensor { tensor.sum per / n } else { per };
-    ad.node v [[logits, fn g -> (ops.softmax z - target) * (g / n)]]
+    let v = if type_of per == :tensor { sum per / n } else { per };
+    ad.node v [[logits, fn g -> (ops.softmax z - target) * (gradient_like z g / n)]]
 };
 
 /// Sigmoid cross-entropy from logits against targets in `[0, 1]`, each
 /// output its own yes-or-no question: `mean (softplus z - y * z)`.
 let binary_cross_entropy : Loss;
-let binary_cross_entropy logits y = {
+let binary_cross_entropy = binary_cross_entropy_using tensor.sum;
+
+priv let binary_cross_entropy_using : (:any -> :any) -> Loss;
+priv let binary_cross_entropy_using sum logits y = {
     let z = ad.value logits;
     let t = target_like z y;
     let t2 = if type_of t == :tensor && tensor.size t == tensor.size z { tensor.reshape (tensor.shape z) t } else { t };
     let n = tensor.size z;
     let sp = tensor.relu z + tensor.log (1.0 + tensor.exp (-(tensor.abs z)));
-    ad.node (tensor.sum (sp - t2 * z) / n) [[logits, fn g -> (tensor.sigmoid z - t2) * (g / n)]]
+    ad.node (sum (sp - t2 * z) / n) [[logits, fn g -> (tensor.sigmoid z - t2) * (gradient_like z g / n)]]
 };
 
 /// The negative log-likelihood of log-probabilities `[n, k]` (as
 /// `ad.log_softmax` makes them) against classes or rows.
 let nll : Loss;
-let nll logp y = {
+let nll = nll_using ad.sum;
+
+priv let nll_using : (:any -> :any) -> Loss;
+priv let nll_using sum logp y = {
     let rows = as_rows (ad.value logp) y;
-    ad.neg (ad.scale (1.0 / ops.rows rows) (ad.sum (ad.mul logp rows)))
+    ad.neg (ad.scale (1.0 / ops.rows rows) (sum (ad.mul logp rows)))
 };
 
 /// The hinge loss of scores against targets of -1 and 1: `mean (relu (1 -
 /// y * z))`.
 let hinge : Loss;
-let hinge pred y = ad.mean (ad.relu (ad.sub 1.0 (ad.mul pred (target_like (ad.value pred) y))));
+let hinge = hinge_using ad.sum;
+
+priv let hinge_using : (:any -> :any) -> Loss;
+priv let hinge_using sum pred y = mean_using sum (ad.relu (ad.sub 1.0 (ad.mul pred (target_like (ad.value pred) y))));
 
 /// A loss by name: `:mse`, `:mae`, `:huber` (delta 1), `:cross_entropy`,
 /// `:binary_cross_entropy`, `:nll` or `:hinge`. A function is its own loss.
@@ -128,6 +149,30 @@ let of name = match name {
     f => f,
 };
 
+/// Built-in losses with their scalar result kept on the device as a
+/// one-element tensor. A custom function controls its own reductions.
+let on_device : :any -> Loss;
+let on_device name = match name {
+    :mse => mse_using ad.sum_tensor,
+    :mae => mae_using ad.sum_tensor,
+    :huber => huber_using ad.sum_tensor 1.0,
+    :cross_entropy => cross_entropy_using tensor.sum_tensor 0.0,
+    :binary_cross_entropy => binary_cross_entropy_using tensor.sum_tensor,
+    :nll => nll_using ad.sum_tensor,
+    :hinge => hinge_using ad.sum_tensor,
+    f => f,
+};
+
+priv let gradient_like : :tensor -> :any -> :any;
+priv let gradient_like like g = if type_of g == :tensor {
+    tensor.reshape (tensor.shape like) (tensor.repeat (tensor.size like) g)
+} else { g };
+
+priv let mean_using : (:any -> :any) -> :any -> :any;
+priv let mean_using sum x = if type_of (ad.value x) == :tensor {
+    ad.scale (1.0 / tensor.size (ad.value x)) (sum x)
+} else { x };
+
 when test {
     import std.math;
     import std.test;
@@ -142,6 +187,21 @@ when test {
     };
 
     let tests = [
+        test.case "mse keeps scalar values and gradients"
+            $( {
+                test.near! 1.0e-12 4.0 (mse 3.0 1.0)
+                test.near! 1.0e-12 4.0 (ad.grad (fn x -> mse x 1.0) 3.0)
+            } ),
+        test.case "device losses agree in value and gradient"
+            $( test.true! (list.all (fn name -> {
+                let y = if name == :cross_entropy || name == :nll { classes } else { tensor.ones [2, 3] };
+                let scalar = of name;
+                let kept = on_device name;
+                let g = ad.grad (fn x -> kept x y) z;
+                let expected = ad.grad (fn x -> scalar x y) z;
+                math.abs (tensor.sum (kept z y) - scalar z y) < 1.0e-10
+                    && tensor.maximum (tensor.abs (g - expected)) < 1.0e-10
+            }) [:mse, :mae, :huber, :cross_entropy, :binary_cross_entropy, :nll, :hinge]) ),
         test.case "mse" $( test.near! 1.0e-12 2.5 (mse (tensor.of_list [1, 2]) (tensor.of_list [0, 4])) ),
         test.case "mae of a list target" $( test.near! 1.0e-12 1.5 (mae (tensor.of_list [1, 2]) [0, 4]) ),
         test.case "cross entropy of classes equals one-hot rows"

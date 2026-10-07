@@ -1378,6 +1378,7 @@ static void test_builtin_table_matches_compiler() {
                               "_deadline_in!",
                               "_match_fail",
                               "_error_trace!",
+                              "_tensor_of_bytes",
     };
     const uint32_t n = uint32_t(sizeof(expected) / sizeof(expected[0]));
     CHECK_EQ(builtin_count(), n);
