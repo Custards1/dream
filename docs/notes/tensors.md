@@ -146,15 +146,29 @@ is fast at: most consumer cards run doubles at a thirty-second of the rate.
 `tensor.gpu64` asks for float64 where the device has it. A GPU tensor prints
 as `gpu tensor[..]`, at float32's precision.
 
-**OpenCL, loaded at run time.** It is the one API every vendor's GPU answers
-(NVIDIA, AMD, Intel, Apple), and it has a CPU implementation (POCL), which is
+**OpenCL, loaded at run time.** It supports compatible NVIDIA, AMD, Intel,
+and Apple OpenCL runtimes, and has a CPU implementation (POCL), which is
 how the tests exercise this code on machines without a GPU. It is loaded with
 `dlopen`, and the twenty-odd types and constants used are declared in gpu.cpp
 rather than taken from `<CL/cl.h>`. Building the VM therefore needs nothing
 new, a machine with no OpenCL runs every program that does not ask for a GPU,
 and one that asks gets `:no_gpu` naming what is missing. `DREAM_OPENCL_LIB`
-points at a specific library. The device is the first GPU any platform
-offers, falling back to any device; it is found on first use and kept.
+points at a specific loader or vendor library and disables automatic library
+selection. Dream first tries the system loader (`OpenCL.dll` on Windows,
+Apple's OpenCL framework on macOS, `libOpenCL.so.1`/`libOpenCL.so` on Linux).
+On Linux, if no GPU is found, it also reads vendor `.icd` registrations in
+`/etc/OpenCL/vendors` and NixOS's `/run/opengl-driver/etc/OpenCL/vendors`.
+`OCL_ICD_VENDORS` overrides these directories. Vendor libraries are accessed
+through the standard `cl_khr_icd` dispatch table, so a separate loader package
+is not required for this fallback. No vendor SDK is needed to build Dream.
+
+The first GPU discovered wins, falling back to a CPU OpenCL device only after
+the candidates have been checked; it is found on first use and kept. The
+runtime must support OpenCL 1.2 and compile Dream's kernels. A graphics-only,
+CUDA-only, or Metal-only installation is not sufficient: these are different
+APIs and would require additional backends. Missing drivers and kernel build
+failures still make `gpu_available()` return false; attempting `tensor.gpu`
+reports the reason as `:no_gpu`.
 
 The kernels are one OpenCL source, built once per element type. They are:
 

@@ -4,10 +4,11 @@
 // It is reached through OpenCL, loaded with `dlopen` rather than linked: the VM
 // gains no build dependency, a machine with no OpenCL runs every program that
 // does not ask for a GPU, and one that asks gets an error naming what is
-// missing. OpenCL because it is the one API every vendor's GPU answers --
-// NVIDIA, AMD, Intel and Apple's -- and because a CPU implementation of it
+// missing. OpenCL supports compatible NVIDIA, AMD, Intel and Apple runtimes,
+// and a CPU implementation of it
 // (POCL) exists, which is how the tests run this code on a machine without a
-// GPU. A CUDA or Metal backend would sit behind the same functions.
+// GPU. Linux can also load registered vendor ICDs without a system loader.
+// A CUDA or Metal backend would sit behind the same functions.
 //
 // Everything is asynchronous except `download`. Operations are enqueued in
 // order on one queue and return at once, so a chain of products and sums runs

@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <unordered_map>
 #include <string>
@@ -377,6 +380,7 @@ struct Fused {
 
 struct Device {
     Api cl{};
+    cl_platform_id platform = nullptr;
     cl_device_id device = nullptr;
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
@@ -414,22 +418,54 @@ std::string cl_failure(const char* what, cl_int code) {
     return std::string("OpenCL failed in ") + what + " (error " + std::to_string(code) + ")";
 }
 
-void* open_library() {
-    const char* forced = std::getenv("DREAM_OPENCL_LIB");
+void* open_library(const char* name) {
 #if defined(_WIN32)
-    if (forced) return reinterpret_cast<void*>(LoadLibraryA(forced));
-    return reinterpret_cast<void*>(LoadLibraryA("OpenCL.dll"));
+    return reinterpret_cast<void*>(LoadLibraryA(name));
 #else
-    if (forced) return dlopen(forced, RTLD_NOW | RTLD_LOCAL);
-    const char* names[] = {
-#if defined(__APPLE__)
-        "/System/Library/Frameworks/OpenCL.framework/OpenCL",
+    return dlopen(name, RTLD_NOW | RTLD_LOCAL);
 #endif
-        "libOpenCL.so.1", "libOpenCL.so",
-    };
-    for (const char* n : names)
-        if (void* h = dlopen(n, RTLD_NOW | RTLD_LOCAL)) return h;
-    return nullptr;
+}
+
+void close_library(void* lib) {
+#if defined(_WIN32)
+    FreeLibrary(reinterpret_cast<HMODULE>(lib));
+#else
+    dlclose(lib);
+#endif
+}
+
+/// Prefer the system ICD loader. On Linux, also discover registered vendor
+/// libraries: some installations ship these without libOpenCL (notably NixOS).
+std::vector<std::string> library_names() {
+    if (const char* forced = std::getenv("DREAM_OPENCL_LIB")) return {forced};
+#if defined(_WIN32)
+    return {"OpenCL.dll"};
+#elif defined(__APPLE__)
+    return {"/System/Library/Frameworks/OpenCL.framework/OpenCL"};
+#else
+    std::vector<std::string> names = {"libOpenCL.so.1", "libOpenCL.so",
+                                    "/run/opengl-driver/lib/libOpenCL.so.1"};
+    std::vector<std::string> dirs = {"/etc/OpenCL/vendors", "/run/opengl-driver/etc/OpenCL/vendors"};
+    if (const char* override_dir = std::getenv("OCL_ICD_VENDORS")) dirs = {override_dir};
+    for (const auto& dir : dirs) {
+        std::error_code ec;
+        std::vector<std::filesystem::path> files;
+        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+            if (it->path().extension() == ".icd") files.push_back(it->path());
+        std::sort(files.begin(), files.end());
+        for (const auto& path : files) {
+            std::ifstream file(path);
+            std::string name;
+            std::getline(file, name);
+            const auto first = name.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos || name[first] == '#') continue;
+            name = name.substr(first, name.find_last_not_of(" \t\r\n") - first + 1);
+            if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+            if (name.find('/') == std::string::npos)
+                names.push_back(std::string("/run/opengl-driver/lib/") + name);
+        }
+    }
+    return names;
 #endif
 }
 
@@ -441,66 +477,119 @@ void* symbol(void* lib, const char* name) {
 #endif
 }
 
-bool load_api(Api& api, std::string* why) {
-    void* lib = open_library();
-    if (!lib) {
-        *why = "no OpenCL library was found (install your GPU's OpenCL driver, or set "
-               "DREAM_OPENCL_LIB to the library's path)";
-        return false;
-    }
-#define DREAM_CL_LOAD(field, name)                                         \
-    api.field = reinterpret_cast<decltype(api.field)>(symbol(lib, name));  \
+// cl_khr_icd's dispatch table is an append-only ABI. Use only the entries
+// through OpenCL 1.2, after checking the platform version. A vendor need not
+// export the core functions (NVIDIA does not); each platform carries its table.
+// Slots: https://github.com/KhronosGroup/OpenCL-Headers/blob/main/CL/cl_icd.h
+bool load_api(Api& api, void* lib, void* const* dispatch, std::string* why) {
+#define DREAM_CL_LOAD(field, name, slot)                                   \
+    api.field = reinterpret_cast<decltype(api.field)>(                     \
+        dispatch ? dispatch[slot] : symbol(lib, name));                    \
     if (!api.field) {                                                      \
         *why = std::string("the OpenCL library has no ") + name;           \
-        return false;                                                      \
+        return false;                                                     \
     }
-    DREAM_CL_LOAD(GetPlatformIDs, "clGetPlatformIDs")
-    DREAM_CL_LOAD(GetDeviceIDs, "clGetDeviceIDs")
-    DREAM_CL_LOAD(GetDeviceInfo, "clGetDeviceInfo")
-    DREAM_CL_LOAD(CreateContext, "clCreateContext")
-    DREAM_CL_LOAD(CreateCommandQueue, "clCreateCommandQueue")
-    DREAM_CL_LOAD(CreateBuffer, "clCreateBuffer")
-    DREAM_CL_LOAD(ReleaseMemObject, "clReleaseMemObject")
-    DREAM_CL_LOAD(EnqueueWriteBuffer, "clEnqueueWriteBuffer")
-    DREAM_CL_LOAD(EnqueueReadBuffer, "clEnqueueReadBuffer")
-    DREAM_CL_LOAD(EnqueueCopyBuffer, "clEnqueueCopyBuffer")
-    DREAM_CL_LOAD(CreateProgramWithSource, "clCreateProgramWithSource")
-    DREAM_CL_LOAD(BuildProgram, "clBuildProgram")
-    DREAM_CL_LOAD(GetProgramBuildInfo, "clGetProgramBuildInfo")
-    DREAM_CL_LOAD(CreateKernel, "clCreateKernel")
-    DREAM_CL_LOAD(SetKernelArg, "clSetKernelArg")
-    DREAM_CL_LOAD(EnqueueNDRangeKernel, "clEnqueueNDRangeKernel")
-    DREAM_CL_LOAD(Finish, "clFinish")
-    DREAM_CL_LOAD(Flush, "clFlush")
-    DREAM_CL_LOAD(EnqueueMarkerWithWaitList, "clEnqueueMarkerWithWaitList")
-    DREAM_CL_LOAD(WaitForEvents, "clWaitForEvents")
-    DREAM_CL_LOAD(ReleaseEvent, "clReleaseEvent")
+    DREAM_CL_LOAD(GetDeviceIDs, "clGetDeviceIDs", 2)
+    DREAM_CL_LOAD(GetDeviceInfo, "clGetDeviceInfo", 3)
+    DREAM_CL_LOAD(CreateContext, "clCreateContext", 4)
+    DREAM_CL_LOAD(CreateCommandQueue, "clCreateCommandQueue", 9)
+    DREAM_CL_LOAD(CreateBuffer, "clCreateBuffer", 14)
+    DREAM_CL_LOAD(ReleaseMemObject, "clReleaseMemObject", 18)
+    DREAM_CL_LOAD(EnqueueWriteBuffer, "clEnqueueWriteBuffer", 49)
+    DREAM_CL_LOAD(EnqueueReadBuffer, "clEnqueueReadBuffer", 48)
+    DREAM_CL_LOAD(EnqueueCopyBuffer, "clEnqueueCopyBuffer", 50)
+    DREAM_CL_LOAD(CreateProgramWithSource, "clCreateProgramWithSource", 26)
+    DREAM_CL_LOAD(BuildProgram, "clBuildProgram", 30)
+    DREAM_CL_LOAD(GetProgramBuildInfo, "clGetProgramBuildInfo", 33)
+    DREAM_CL_LOAD(CreateKernel, "clCreateKernel", 34)
+    DREAM_CL_LOAD(SetKernelArg, "clSetKernelArg", 38)
+    DREAM_CL_LOAD(EnqueueNDRangeKernel, "clEnqueueNDRangeKernel", 59)
+    DREAM_CL_LOAD(Finish, "clFinish", 47)
+    DREAM_CL_LOAD(Flush, "clFlush", 46)
+    DREAM_CL_LOAD(EnqueueMarkerWithWaitList, "clEnqueueMarkerWithWaitList", 105)
+    DREAM_CL_LOAD(WaitForEvents, "clWaitForEvents", 41)
+    DREAM_CL_LOAD(ReleaseEvent, "clReleaseEvent", 44)
 #undef DREAM_CL_LOAD
     return true;
 }
 
-/// A GPU if there is one, and otherwise whatever device OpenCL offers. The
-/// second half is what lets a CPU implementation stand in, which is how these
-/// paths are tested on machines with no GPU; a real one always wins.
+/// Keep each platform's functions together: direct vendor libraries can have
+/// different dispatch tables. GPUs across all candidates precede CPU devices.
 bool pick_device(Device& d, std::string* why) {
-    cl_uint nplat = 0;
-    if (d.cl.GetPlatformIDs(0, nullptr, &nplat) != CL_SUCCESS || nplat == 0) {
-        *why = "OpenCL is installed but reports no platforms";
-        return false;
-    }
-    std::vector<cl_platform_id> plats(nplat);
-    d.cl.GetPlatformIDs(nplat, plats.data(), nullptr);
-    for (cl_bitfield type : {CL_DEVICE_TYPE_GPU, CL_DEVICE_TYPE_ALL}) {
-        for (cl_platform_id p : plats) {
+    struct Candidate { Api api; cl_platform_id platform; };
+    std::vector<Candidate> candidates;
+    *why = "no usable OpenCL device was found (install your GPU's OpenCL runtime, "
+           "or set DREAM_OPENCL_LIB to its loader or vendor library)";
+    for (const auto& name : library_names()) {
+        void* lib = open_library(name.c_str());
+        if (!lib) continue;
+        auto platforms = reinterpret_cast<decltype(Api::GetPlatformIDs)>(symbol(lib, "clGetPlatformIDs"));
+        const bool vendor = !platforms;
+        if (vendor) {
+            using Extension = void*(DREAM_CL_API*)(const char*);
+            auto extension = reinterpret_cast<Extension>(symbol(lib, "clGetExtensionFunctionAddress"));
+            if (extension)
+                platforms = reinterpret_cast<decltype(platforms)>(extension("clIcdGetPlatformIDsKHR"));
+        }
+        cl_uint count = 0;
+        if (!platforms || platforms(0, nullptr, &count) != CL_SUCCESS || !count) {
+            *why = name + ": OpenCL reports no platforms";
+            close_library(lib);
+            continue;
+        }
+        std::vector<cl_platform_id> ids(count);
+        if (platforms(count, ids.data(), nullptr) != CL_SUCCESS) {
+            *why = name + ": OpenCL platform enumeration failed";
+            close_library(lib);
+            continue;
+        }
+        bool used = false;
+        for (auto id : ids) {
+            if (!id) continue;
+            void* const* dispatch = nullptr;
+            if (vendor) {
+                dispatch = *reinterpret_cast<void* const* const*>(id);
+                using Info = cl_int(DREAM_CL_API*)(cl_platform_id, cl_uint, size_t, void*, size_t*);
+                if (!dispatch) continue;
+                auto info = reinterpret_cast<Info>(dispatch[1]);
+                char version[128] = {};
+                unsigned major = 0, minor = 0;
+                if (!info || info(id, 0x0901 /* CL_PLATFORM_VERSION */, sizeof version, version, nullptr) != CL_SUCCESS ||
+                    std::sscanf(version, "OpenCL %u.%u", &major, &minor) != 2 ||
+                    major < 1 || (major == 1 && minor < 2)) {
+                    *why = name + ": OpenCL 1.2 or later is required";
+                    continue;
+                }
+            }
+            Api api{};
+            if (!load_api(api, lib, dispatch, why)) continue;
+            api.GetPlatformIDs = platforms;
+            candidates.push_back({api, id});
+            used = true;
+        }
+        // Keep usable libraries loaded for the runtime's lifetime.
+        if (!used) close_library(lib);
+        // The system loader already enumerates its registered vendors. Only
+        // consult direct vendors if it has no usable GPU.
+        for (const auto& candidate : candidates) {
             cl_device_id id = nullptr;
-            cl_uint n = 0;
-            if (d.cl.GetDeviceIDs(p, type, 1, &id, &n) == CL_SUCCESS && n > 0) {
+            if (candidate.api.GetDeviceIDs(candidate.platform, CL_DEVICE_TYPE_GPU, 1, &id, nullptr) == CL_SUCCESS && id) {
+                d.cl = candidate.api;
                 d.device = id;
+                d.platform = candidate.platform;
                 return true;
             }
         }
     }
-    *why = "OpenCL reports no devices";
+    for (const auto& candidate : candidates) {
+        cl_device_id id = nullptr;
+        if (candidate.api.GetDeviceIDs(candidate.platform, CL_DEVICE_TYPE_ALL, 1, &id, nullptr) == CL_SUCCESS && id) {
+            d.cl = candidate.api;
+            d.device = id;
+            d.platform = candidate.platform;
+            return true;
+        }
+    }
     return false;
 }
 
@@ -558,7 +647,7 @@ bool build(Device& d, Program& prog, int dtype, std::string* why) {
 
 void init(Device& d) {
     std::string why;
-    if (!load_api(d.cl, &why) || !pick_device(d, &why)) {
+    if (!pick_device(d, &why)) {
         d.why = why;
         return;
     }
@@ -582,7 +671,9 @@ void init(Device& d) {
     while (d.group > max_group && d.group > 1) d.group /= 2;
 
     cl_int err = 0;
-    d.context = d.cl.CreateContext(nullptr, 1, &d.device, nullptr, nullptr, &err);
+    const intptr_t properties[] = {0x1084 /* CL_CONTEXT_PLATFORM */,
+                                   reinterpret_cast<intptr_t>(d.platform), 0};
+    d.context = d.cl.CreateContext(properties, 1, &d.device, nullptr, nullptr, &err);
     if (err != CL_SUCCESS) {
         d.why = cl_failure("clCreateContext", err);
         return;
