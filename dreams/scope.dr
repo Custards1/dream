@@ -1549,6 +1549,10 @@ let suspended_forces_warned c body r =
             "force it as a statement first -- `strict! x;` -- and put `x` in the literal" acc)
         r (lint.suspended_forces body);
 
+let pitfalls_warned c body r =
+    list.fold (fn acc hit -> warn_note c (list.nth 0 hit) (list.nth 1 hit) (list.nth 2 hit) acc)
+        r (lint.pitfalls body);
+
 /// A module or a namespace written where a value belongs.
 let not_a_value c m shown span r =
     report_note c span ("`" + shown + "` is a module, not a value")
@@ -2053,9 +2057,10 @@ let check_body l p r = {
     let started = begin_func (decl_name d) (list.length (decl_params d)) impure impure
                              (decl_rec d) (list.is_empty (decl_params d)) (decl_span d) source r;
     let fi = list.nth 1 started;
-    let bound = suspended_forces_warned c (decl_body d)
-                    (lazy_accumulators_warned c (decl_name d) (decl_params d) (decl_body d)
-                        (bind_params c (decl_params d) (list.head started)));
+    let bound = pitfalls_warned c (decl_body d)
+                    (suspended_forces_warned c (decl_body d)
+                        (lazy_accumulators_warned c (decl_name d) (decl_params d) (decl_body d)
+                            (bind_params c (decl_params d) (list.head started))));
     let done = end_func fi (check_expr c (decl_body d) bound);
     done.[:bodies => (list.cons [mi, source, d, fi] (bodies_rev done))]
 };

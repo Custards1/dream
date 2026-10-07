@@ -127,7 +127,7 @@ its text does; a runtime value does not. [`repl.dr`](repl.dr) and
 | `lower.dr`, `ir.dr` | syntax trees into the execution-tree arena |
 | `fuse.dr` | deforestation: `std.list` pipelines as loops |
 | `typecheck.dr`, `contract.dr` | signatures, and compile-time contracts |
-| `lint.dr` | warnings about programs that are correct and will still go wrong |
+| `lint.dr` | warnings for lazy accumulator chains, suspended forces, duplicate literal map keys, unreachable match arms, and literal zero divisors |
 | `fmt.dr` | the formatter: reindents by the grammar's own line rules, and proves the tree did not change |
 | `opt.dr` | sharing the finished arena |
 | `emit.dr` | the image writer ([docs/bytecode-format.md](../docs/bytecode-format.md)) |

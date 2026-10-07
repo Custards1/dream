@@ -1,0 +1,177 @@
+// Ethereum/EVM JSON-RPC over std.http. All fallible operations return results.
+// See README.md for units, wire-value conventions, errors and examples.
+import std.error;
+import std.http;
+import std.json;
+import std.list;
+import std.map;
+import std.result;
+import std.time;
+import std.web3.hex;
+
+/// An immutable HTTP request template. Configure it with http.with_timeout,
+/// http.with_header or http.with_bearer. Each exchange has its own ID space.
+let provider url = http.request "POST" url |> http.with_timeout (time.seconds 30) |> http.with_redirects 0;
+
+priv let bad message = result.error (error.new :web3_argument message);
+priv let malformed message = result.error (error.new :web3_response message);
+
+/// Construct a JSON-RPC request. IDs are nonnegative integers or strings.
+let request id method params =
+    if not ((type_of id == :integer && id >= 0) || type_of id == :string) { bad "invalid RPC request id" }
+    else if type_of method != :string || len method == 0 { bad "expected a nonempty RPC method" }
+    else if type_of params != :list && type_of params != :map { bad "RPC params must be a list or map" }
+    else { result.ok %{ "jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params } };
+
+/// Decode an envelope, keeping JSON null as a successful (). A node's error
+/// payload is retained intact, including its code, message and optional data.
+let response id value =
+    if type_of value != :map { malformed "RPC response must be an object" }
+    else if value.["jsonrpc" else ()] != "2.0" { malformed "RPC response version must be 2.0" }
+    else if not (map.has "id" value) || type_of value.["id"] != type_of id || value.["id"] != id {
+        malformed "RPC response id does not match the request"
+    }
+    else if map.has "result" value == map.has "error" value { malformed "RPC response must contain exactly one of result or error" }
+    else if map.has "result" value { result.ok value.["result"] }
+    else {
+        let e = value.["error"];
+        if type_of e != :map { malformed "RPC error must be an object" }
+        else if type_of e.["code" else ()] != :integer || type_of e.["message" else ()] != :string {
+            malformed "RPC error requires an integer code and a string message"
+        } else { result.error (error.new :web3_rpc e) }
+    };
+
+priv let exchange! client payload = {
+    let? received = http.send! (client |> http.Request.set_method "POST" |> http.with_json payload);
+    let? good = http.expect_ok received;
+    result.map_error (fn why -> error.new :web3_response why) (http.body_json good)
+};
+
+/// Call any method with JSON-compatible wire parameters. No retries: a failed
+/// transport does not prove that the node did not process a transaction.
+let rpc! client method params = {
+    let? payload = request 1 method params;
+    let? decoded = exchange! client payload;
+    response 1 decoded
+};
+
+/// Build a batch from [[method, params], ...]. Empty batches are invalid.
+let batch_request calls =
+    if type_of calls != :list || list.is_empty calls { bad "expected a nonempty list of RPC calls" }
+    else { result.all (list.map (fn i -> match list.nth i calls {
+        [method, params] => request (i + 1) method params,
+        _ => bad "each RPC call must be [method, params]",
+    }) (list.range 0 (list.length calls))) };
+
+/// Match unordered batch replies by ID, rejecting missing, extra or repeated
+/// IDs. The outer result validates the batch; inner results keep RPC errors.
+let batch_response count values =
+    if type_of count != :integer || count <= 0 { bad "batch count must be positive" }
+    else if type_of values != :list || list.length values != count { malformed "RPC batch response has the wrong length" }
+    else {
+        let? indexed = index_responses values count %{};
+        let replies = list.map (fn id -> response id indexed.[id]) (list.range 1 (count + 1));
+        let invalid = list.filter (fn r -> result.is_error r && error.kind (result.reason () r) == :web3_response) replies;
+        if list.is_empty invalid { result.ok replies } else { list.head invalid }
+    };
+
+priv let rec index_responses values count found = match values {
+    [] => result.ok found,
+    [v, ..rest] =>
+        if type_of v != :map { malformed "RPC batch member must be an object" }
+        else {
+            let id = v.["id" else ()];
+            if type_of id != :integer || id < 1 || id > count || map.has id found {
+                malformed "RPC batch has an unknown or duplicate id"
+            } else { index_responses rest count (found.[id => v]) }
+        },
+};
+
+let batch! client calls = {
+    let? payload = batch_request calls;
+    let? decoded = exchange! client payload;
+    batch_response (list.length calls) decoded
+};
+
+priv let quantity_response value = result.map_error (fn e -> error.new :web3_response (error.payload e)) (hex.parse_quantity value);
+priv let data_response value = result.map_error (fn e -> error.new :web3_response (error.payload e)) (hex.data value);
+priv let quantity_rpc! client method params = {
+    let? value = rpc! client method params;
+    quantity_response value
+};
+
+let chain_id! client = quantity_rpc! client "eth_chainId" [];
+let block_number! client = quantity_rpc! client "eth_blockNumber" [];
+/// Wei per gas, as an integer.
+let gas_price! client = quantity_rpc! client "eth_gasPrice" [];
+
+/// Balance in wei, as an integer. Block is explicit, e.g. "latest".
+let balance! client address block = {
+    let? a = hex.address address;
+    let? b = hex.block block;
+    quantity_rpc! client "eth_getBalance" [a, b]
+};
+
+let transaction_count! client address block = {
+    let? a = hex.address address;
+    let? b = hex.block block;
+    quantity_rpc! client "eth_getTransactionCount" [a, b]
+};
+
+let code! client address block = {
+    let? a = hex.address address;
+    let? b = hex.block block;
+    let? value = rpc! client "eth_getCode" [a, b];
+    data_response value
+};
+
+/// Transaction objects use string keys and RPC wire values (hex quantities,
+/// hex data). This also leaves room for node-specific transaction extensions.
+let call! client transaction block = {
+    let? b = hex.block block;
+    if type_of transaction != :map { bad "expected a transaction object" }
+    else {
+        let? value = rpc! client "eth_call" [transaction, b];
+        data_response value
+    }
+};
+
+let estimate_gas! client transaction =
+    if type_of transaction != :map { bad "expected a transaction object" }
+    else { quantity_rpc! client "eth_estimateGas" [transaction] };
+
+/// Complex node objects are returned unchanged; unknown transactions are ().
+let transaction! client hash = {
+    let? h = hex.hash hash;
+    rpc! client "eth_getTransactionByHash" [h]
+};
+let receipt! client hash = {
+    let? h = hex.hash hash;
+    rpc! client "eth_getTransactionReceipt" [h]
+};
+let block! client block full_transactions = {
+    let? b = hex.block block;
+    if type_of full_transactions != :bool { bad "full_transactions must be a bool" }
+    else { rpc! client "eth_getBlockByNumber" [b, full_transactions] }
+};
+let logs! client filter =
+    if type_of filter != :map { bad "expected a log filter object" }
+    else { rpc! client "eth_getLogs" [filter] };
+
+/// Broadcast an already-signed transaction, supplied as hex DATA. Does not
+/// sign, hold keys, wait for confirmation or retry an ambiguous failure.
+let send_raw_transaction! client signed = {
+    let? bytes = hex.data signed;
+    if bytes == "0x" { bad "signed transaction must not be empty" }
+    else {
+        let? value = rpc! client "eth_sendRawTransaction" [bytes];
+        result.map_error (fn e -> error.new :web3_response (error.payload e)) (hex.hash value)
+    }
+};
+
+// The wire helpers are also available directly from std.web3.
+let quantity = hex.quantity;
+let parse_quantity = hex.parse_quantity;
+let encode_data = hex.encode_data;
+let decode_data = hex.decode_data;
+let address = hex.address;

@@ -1,7 +1,6 @@
 // Warnings about programs that are correct and will still go wrong.
 //
-// The one here is the trap the notes keep finding: an accumulator nobody
-// forces.
+// The first trap is an accumulator nobody forces.
 //
 //     let rec total i n acc = if i > n { acc } else { total (i + 1) n (acc + i) };
 //
@@ -166,6 +165,82 @@ let rec forces_in e acc =
             _ => acc,
         };
         list.fold (fn a x -> forces_in x a) here e
+    };
+
+// --- local, syntax-proven pitfalls -------------------------------------------
+
+/// Keep the literal kind: map keys need not share numeric equality semantics.
+/// Unknown expressions and floats are deliberately left to runtime.
+let literal_key e = match e {
+    [kind, value, _] if list.contains kind [:int, :str, :char, :atom, :bool] => [kind, value],
+    [:unit, _] => [:unit],
+    _ => (),
+};
+
+let rec catches_all p = match p {
+    [:wildcard, _] => true,
+    [:bind, _, _] => true,
+    [:as_p, inner, _, _, _] => catches_all inner,
+    _ => false,
+};
+
+let pattern_key p = match p {
+    [:literal, e, _] => literal_key e,
+    _ => (),
+};
+
+let rec duplicate_keys pairs seen acc = match pairs {
+    [] => acc,
+    [[k, _], ..rest] => {
+        let key = literal_key k;
+        let next = if key != () && list.contains key seen {
+            list.cons [ast.span k, "duplicate literal map key: the earlier value is overwritten",
+                       "remove the duplicate key or give this entry a different key"] acc
+        } else { acc };
+        duplicate_keys rest (if key == () { seen } else { list.cons key seen }) next
+    },
+    _ => acc,
+};
+
+let rec unreachable_arms arms covered seen acc = match arms {
+    [] => acc,
+    [[p, guard, _, span], ..rest] => {
+        let key = pattern_key p;
+        let unreachable = covered || (key != () && list.contains key seen);
+        let next = if unreachable {
+            list.cons [span, "unreachable match arm: an earlier unguarded arm already matches it",
+                       "remove this arm, move it before the earlier arm, or guard the earlier arm"] acc
+        } else { acc };
+        unreachable_arms rest (covered || (guard == () && catches_all p))
+            (if guard == () && key != () { list.cons key seen } else { seen }) next
+    },
+    _ => acc,
+};
+
+let rec literal_zero e = match e {
+    [:int, v, _] => v == 0,
+    [:float, v, _] => v == 0.0,
+    [:unary, :neg, inner, _] => literal_zero inner,
+    _ => false,
+};
+
+/// `[span, message, note]` in source traversal order. Walk each body once so
+/// nested functions and literals are checked without duplicate diagnostics.
+let pitfalls e = list.reverse (pitfalls_in e []);
+
+let rec pitfalls_in e acc =
+    if type_of e != :list { acc }
+    else {
+        let here = match e {
+            [:map, pairs, _] => duplicate_keys pairs [] acc,
+            [:match, _, arms, _] => unreachable_arms arms false [] acc,
+            [:binary, op, _, divisor, _] if (op == :div || op == :mod) && literal_zero divisor =>
+                list.cons [ast.span divisor,
+                           (if op == :div { "division" } else { "remainder" }) + " by a literal zero",
+                           "check the divisor: zero can raise an error or produce a non-finite result"] acc,
+            _ => acc,
+        };
+        list.fold (fn a x -> pitfalls_in x a) here e
     };
 
 when test {
