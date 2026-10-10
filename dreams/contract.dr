@@ -59,9 +59,25 @@ let rec emit_datum d l = match type_of d {
         [:list_d, xs] => datum_seq :make_list xs (list.length xs) l,
         [:array_d, xs] => datum_seq :make_array xs (list.length xs) l,
         [:map_d, ps] => datum_seq :make_map (list.concat ps) (list.length ps) l,
+        [:record_d, id, variant, xs] => {
+            let [program, index] = ir.intern_atom id (lower.prog l);
+            datum_record xs (if variant { index + ir.record_variant } else { index })
+                         (lower.set_prog program l)
+        },
         _ => lower.emit_leaf :unit l,
     },
     _ => lower.emit_leaf :unit l,
+};
+
+/// A record, as `datum_seq` makes a sequence: the fields, then the
+/// `record_make` naming them, its id the atom `c` says.
+let datum_record items c l = {
+    let done = list.fold (fn acc x -> {
+        let got = emit_datum x (list.head acc);
+        [list.head got, list.cons (list.nth 1 got) (list.nth 1 acc)]
+    }) [l, []] items;
+    let placed = lower.kids (list.reverse (list.nth 1 done)) (list.head done);
+    lower.emit (ir.node :record_make (list.nth 1 placed) (list.length items) c) (list.head placed)
 };
 
 /// The children first, then the run of kids naming them, then the node: a

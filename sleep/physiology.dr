@@ -160,16 +160,16 @@ priv let step now wanted u first = match u {
 
 /// How likely a stage is to last another epoch.
 priv let stay : Stage -> :float;
-priv let stay now = match now { :wake => 0.55, :n1 => 0.80, :n2 => 0.90, :n3 => 0.93, :rem => 0.94 };
+priv let stay now = match now { Stage.wake => 0.55, Stage.n1 => 0.80, Stage.n2 => 0.90, Stage.n3 => 0.93, Stage.rem => 0.94 };
 
 /// One step from `now` toward `wanted`.
 priv let approach : Stage -> Stage -> Stage;
 priv let approach now wanted = match [now, wanted] {
-    [:wake, _] => Stage.n1,
-    [:n1, :n3] => Stage.n2,
-    [:n1, :rem] => Stage.n2,
-    [:n3, :rem] => Stage.n2,
-    [:rem, :n3] => Stage.n2,
+    [Stage.wake, _] => Stage.n1,
+    [Stage.n1, Stage.n3] => Stage.n2,
+    [Stage.n1, Stage.rem] => Stage.n2,
+    [Stage.n3, Stage.rem] => Stage.n2,
+    [Stage.rem, Stage.n3] => Stage.n2,
     _ => wanted,
 };
 

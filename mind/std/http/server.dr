@@ -607,7 +607,7 @@ when test {
         |> get "/users/:id" (fn req -> http.json %{ "id" => http.param "id" req })
         |> post "/echo" (fn req -> http.respond 200 (http.body req) |> http.with_header "content-type" (or_empty (http.header "content-type" req)))
         |> get "/files/*rest" (fn req -> http.text (or_empty (http.param "rest" req)))
-        |> get "/boom" (fn req -> http.text (to_string (1 / 0)))
+        |> get "/boom" (fn req -> http.text (to_string test.boom))
         |> get "/string" (fn req -> "just a string")
         |> mount "/api" (router |> get "/ping" (fn req -> http.text "pong"));
 
@@ -810,7 +810,7 @@ when test {
         } ),
         // HTTP/2, in clear text by prior knowledge so that no certificate is needed.
         test.case "HTTP/2: a request and its answer" $( {
-            let s = serve! 0 (router |> get "/" (fn req -> http.text (http.Request.version req)) |> get "/boom" (fn req -> http.text (to_string (1 / 0))));
+            let s = serve! 0 (router |> get "/" (fn req -> http.text (http.Request.version req)) |> get "/boom" (fn req -> http.text (to_string test.boom)));
             let h2_get! path = http.send! (http.request "GET" (local_url s + path) |> http.Request.set_options %{ :http2 => :prior_knowledge });
             let ok = h2_get! "/";
             let boom = h2_get! "/boom";

@@ -1,10 +1,9 @@
 // Records on a wire: the named form of a declared value, and the way back.
 //
-// A record already crosses a wire without any help, because it is not a new
-// kind of value: `struct User { name, age }` is an array of two, and
-// `std.wire` sends an array of two and hands back an array of two, which *is*
-// a `User`. Nothing here is needed for that, and the tests at the foot of this
-// file say so.
+// A record already crosses a wire without any help: `struct User { name, age }`
+// is a value of its own that knows it is a `User`, and `std.wire` sends it as
+// that and hands back a `User` -- to a program that declares one. Nothing here
+// is needed for that, and the tests at the foot of this file say so.
 //
 // What is needed is the other three things, and they are what this module is:
 //
@@ -19,10 +18,10 @@
 //   *string* keys, and no longer is one. `of_map` takes either spelling and
 //   rebuilds the record's own backing, so a round trip through JSON ends where
 //   it started.
-// - **A shape to check.** A message arrives from somewhere else, so "is this a
-//   `User`?" is a real question and `fits` is the answer -- the only one
-//   available, since a record adds no tag and `type_of` cannot tell a `User`
-//   from any other array of two.
+// - **A question to ask.** A message arrives from somewhere else, so "is this
+//   a `User`?" is a real question and `fits` is the answer. For a `group` or a
+//   `struct` it is exact -- the value says what made it, `record_id` -- and
+//   for a `mapping`, which is a map, it is the shape.
 //
 // A record derives this:
 //
@@ -68,12 +67,14 @@ let fields : :any -> Fields;
 virtual let fields u;
 
 /// Which collection this record is built on: `:list` for a `group`, `:array`
-/// for a `struct`, `:map` for a `mapping`.
+/// for a `struct`, `:map` for a `mapping`. A `group` and a `struct` are both
+/// records of their own now, so the answer that matters is whether it is
+/// `:map`.
 ///
 /// Only building needs this. Reading does not, because a value in hand can be
-/// asked (`to_fields` uses `type_of`), and asking beats being told; but
-/// `of_fields` is handed the field values and nothing else, so something has to
-/// say what to put them in. The default is `:list`, so a `group` says nothing.
+/// asked, and asking beats being told; but `of_fields` is handed the field
+/// values and nothing else, so something has to say what to put them in. The
+/// default is `:list`, so a `group` says nothing.
 let backing : :any -> :atom;
 virtual let backing u = :list;
 
@@ -88,9 +89,10 @@ virtual let record_name u = "record";
 /// -- a wrong `backing` breaks construction and leaves reading alone.
 let to_fields : :any -> [:any];
 virtual let to_fields self = match type_of self {
-    :array => _array_to_list self,
     :map   => list.map (fn k -> self.[k else ()]) (fields ()),
-    _      => self,
+    :array => _array_to_list self,
+    :list  => self,
+    _      => types.record_fields self,
 };
 
 /// One of these, from its field values in `fields` order.
@@ -100,10 +102,15 @@ virtual let to_fields self = match type_of self {
 /// express -- validating, defaulting, or renaming a field that moved.
 let of_fields : [:any] -> :any;
 virtual let of_fields values = match backing () {
-    :array => _array_of_list values,
-    :map   => map.from_pairs (list.zip (fields ()) values),
-    _      => values,
+    :map => map.from_pairs (list.zip (fields ()) values),
+    _    => types.make_record (record_id ()) false values,
 };
+
+/// The atom naming this record, which every value of it carries: a `group`'s
+/// and a `struct`'s declaration fills it in for itself (`syntax.record`), and
+/// a `mapping` has none, being a map.
+let record_id : :any -> :any;
+virtual let record_id u = ();
 
 // --- the named form -------------------------------------------------------------
 
@@ -143,19 +150,17 @@ let of_map m = of_fields (list.map (fn k -> value_of m k) (fields ()));
 let arity : :any -> :integer;
 let arity u = list.length (fields ());
 
-/// Could this value be one of these?
+/// Is this value one of these?
 ///
-/// The only answer there is. A record adds no tag and no type -- `type_of` on a
-/// `User` says `:array`, the same as for any other array -- so "is this a
-/// `User`" can only ever mean "is this the right shape", and a message that
-/// fits is not thereby one that was meant. Check the shape and then check the
-/// values; this is the first half only.
+/// A value of a `group` or a `struct` is asked what made it, which is exact: a
+/// list or an array of the right length is not a `User`. A map -- a `mapping`,
+/// or any record's named form, which is what crosses a format -- can only be
+/// asked for the right shape, and a message that fits is not thereby one that
+/// was meant. Either way, check the values next; this is the first half only.
 let fits : :any -> :bool;
 let fits v = match type_of v {
-    :list  => list.length v == arity (),
-    :array => len v == arity (),
-    :map   => list.all (fn k -> _map_has v k || _map_has v (text_of k)) (fields ()),
-    _      => false,
+    :map => list.all (fn k -> _map_has v k || _map_has v (text_of k)) (fields ()),
+    _    => record_id () != () && types.record_id v == record_id (),
 };
 
 /// `User(name: ada, age: 36)`, for a person rather than a wire.

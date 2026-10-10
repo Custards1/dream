@@ -29,7 +29,7 @@ when test {
     let tests = [
         test.case "a fetch is keyed by its pin, not its URL"
             $( {
-                let shape a = build.Step.shape (list.nth 1 a);
+                let shape a = build.Step.shape a.[0];
                 test.eq! [true, false] [shape (url "a" "https://x/a" "00") == shape (url "a" "https://y/a" "00"),
                                         shape (url "a" "https://x/a" "00") == shape (url "a" "https://x/a" "11")]
             } ),

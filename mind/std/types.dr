@@ -155,6 +155,12 @@ let rec accepts description value = match description {
     // A function can only be asked whether it is one. `enforce` is what
     // checks an arrow's halves, and it can, because it has an application.
     [:fn, _, _] => type_of value == :pure_fn || type_of value == :impure_fn,
+    // A value of a declared `group`, `struct` or union variant: made by the
+    // constructor `id` names, with fields that fit. Nothing else is one --
+    // not a list or an array of the same fields -- which is what makes the
+    // declaration a type rather than a shape.
+    [:constructed, id, fields] => record_id value == id && type_of fields == :list
+                        && exactly fields (record_fields value),
     [:shape, kind, fields] => type_of value == kind && type_of fields == :list
                         && (kind == :map || len value <= list.length fields)
                         && list.all (fn field -> shape_field kind field value) fields,
@@ -279,6 +285,46 @@ let function input output f = fn value -> check output (f (check input value));
 
 /// What a description calls itself, for a diagnostic that wants to name the
 /// type rather than print the data it expanded to.
+// --- records ---------------------------------------------------------------------
+//
+// A value of a declared `group`, `struct` or `union` is a record: it carries
+// the atom naming its declaration -- `app.Point`, `app.Shape.circle` -- and its
+// fields by position. These read and make one where the declaration is not to
+// hand, as a decoder or a compile-time value is. See "Records are values of
+// their own" in docs/notes/static-types.md.
+
+/// The atom naming what made `value`, or `()` when no constructor did.
+let record_id : :any -> :any;
+let record_id value = _record_id value;
+
+/// A record's fields, in the order they were declared, unforced.
+let record_fields : :any -> [:any];
+let record_fields value = _array_to_list (_record_fields value);
+
+/// A record from its id and its fields; `variant` says the id names a union's
+/// variant. It is the value the declaration's own constructor makes.
+let make_record : :atom -> :bool -> [:any] -> :any;
+let make_record id variant fields = _record_of id variant (_array_of_list fields);
+
+/// Whether a record is a union's variant rather than a record of its own. A
+/// record's `type_of` is the last part of its id -- `app.Point` is a `Point`
+/// -- and a variant's is the part before that: `app.Shape.circle` is a
+/// `Shape`, not a `circle`, since a type is written capitalised and a variant
+/// is not. So nothing beyond `type_of` has to say it.
+let is_variant : :any -> :bool;
+let is_variant value = match record_id value {
+    () => false,
+    id => {
+        // `:app.Point` ends in `.Point`, or is `:Point`; `:app.Shape.circle`
+        // does not end in `.Shape`. Spelled with the primitives because
+        // `std.str` is above this module, not below it.
+        let name = to_string id;
+        let kind = to_string (type_of value);
+        let tail = "." + _str_slice kind 1 (len kind - 1);
+        not (name == kind || (len name >= len tail && _str_slice name (len name - len tail) (len tail) == tail))
+    },
+};
+
 let name_of : Description -> :string;
 let rec name_of description = match description {
     [:named, name, _] => name,

@@ -62,6 +62,10 @@ uint64_t key_hash(Value v) {
             // Compared by the process it names, so hashed by it too: two
             // boxes of one pid are one key.
             h = static_cast<PidObj*>(o)->id;
+        } else if (o->type == ObjType::Record && static_cast<RecordObj*>(o)->len == 0) {
+            // A variant with no fields -- `Shape.empty` -- is what an atom
+            // was before it was a record, and is a key the way an atom is.
+            h = static_cast<RecordObj*>(o)->id;
         } else {
             h = identity_hash(o);
         }
@@ -92,6 +96,11 @@ bool key_equal(Value a, Value b) {
     }
     if (x->type == ObjType::Pid) {
         return static_cast<PidObj*>(x)->id == static_cast<PidObj*>(y)->id;
+    }
+    if (x->type == ObjType::Record) {
+        auto* rx = static_cast<RecordObj*>(x);
+        auto* ry = static_cast<RecordObj*>(y);
+        return rx->len == 0 && ry->len == 0 && rx->id == ry->id;
     }
     if (x->type == ObjType::BigInt) {
         return bigint::equal(static_cast<BigIntObj*>(x), static_cast<BigIntObj*>(y));
@@ -494,6 +503,27 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
             out->push_back(']');
             return true;
         }
+        case ObjType::Record: {
+            // `Shape.circle(1.0)`, `Shape.empty`, `Point(3, 4)`: the
+            // declaration's name, then the fields in the order they were
+            // declared. A variant with no fields is the name alone.
+            out->append(record_shown_name(p, w));
+            uint32_t len = static_cast<RecordObj*>(as_obj(w))->len;
+            if (len == 0 && (static_cast<RecordObj*>(as_obj(w))->flags & RECORD_VARIANT)) return true;
+            out->push_back('(');
+            p.stack.push_back(w);
+            for (uint32_t i = 0; i < len; ++i) {
+                if (i) out->append(", ");
+                Value item = static_cast<RecordObj*>(as_obj(p.stack.back()))->items()[i];
+                if (!stringify_into(p, item, out, true, depth + 1)) {
+                    p.stack.pop_back();
+                    return false;
+                }
+            }
+            p.stack.pop_back();
+            out->push_back(')');
+            return true;
+        }
         case ObjType::Map: {
             out->append("%{");
             p.stack.push_back(w);
@@ -572,8 +602,38 @@ namespace {
 
 /// `text`, then where the error was raised, a line a place: the lines an
 /// uncaught error is reported with.
+///
+/// Shorter than what `error_trace` answers, in two ways, because this is read
+/// by a person looking for their own code. A function that was running and a
+/// value it made, side by side, are one place, and are said once. And a run
+/// of three or more places in the standard library is one line saying how
+/// many: a `console.print!` at the top of a program put six of `std.console`'s
+/// and `std.streams`'s functions under every uncaught error, below the line
+/// that mattered. The innermost place is always shown -- it is where the error
+/// was raised, and `list.head []` raises in `std`. `error.trace!` still
+/// answers every place.
 std::string with_trace(Process& p, Value err, std::string text) {
-    for (const TracePlace& at : error_trace(p, err)) {
+    std::vector<TracePlace> places = error_trace(p, err);
+    std::vector<const TracePlace*> kept;
+    for (const TracePlace& at : places) {
+        if (!kept.empty() && kept.back()->name == at.name && kept.back()->path == at.path &&
+            kept.back()->line == at.line) {
+            continue;
+        }
+        kept.push_back(&at);
+    }
+    auto in_std = [](const TracePlace* at) { return at->path.rfind("std/", 0) == 0; };
+    for (size_t i = 0; i < kept.size();) {
+        size_t run = 0;
+        if (i > 0) {
+            while (i + run < kept.size() && in_std(kept[i + run])) ++run;
+        }
+        if (run >= 3) {
+            text += "\n    ... " + std::to_string(run) + " more in std";
+            i += run;
+            continue;
+        }
+        const TracePlace& at = *kept[i++];
         text += at.made ? "\n    forcing a value made in `" : "\n    in `";
         text += at.name + "`";
         if (at.line != 0) {
@@ -750,7 +810,10 @@ NativeResult bi_type_of(Process& p, Value, Value* args, uint32_t) {
         }
         if (impure) t = DREAM_TYPE_IMPURE_FN;
     }
-    if (unsigned(t) > unsigned(DREAM_TYPE_TENSOR)) t = DREAM_TYPE_UNKNOWN;
+    if (t == DREAM_TYPE_RECORD) {
+        return NativeResult::ok(make_atom(p.runtime().intern_atom(record_type_name(p, args[0]))));
+    }
+    if (unsigned(t) > unsigned(DREAM_TYPE_RECORD)) t = DREAM_TYPE_UNKNOWN;
     return NativeResult::ok(make_atom(wk.types[t]));
 }
 
@@ -782,6 +845,8 @@ NativeResult bi_len(Process& p, Value, Value* args, uint32_t) {
         n = int64_t(static_cast<BigStrObj*>(as_obj(v))->len);
     } else if (is_obj(v, ObjType::Array)) {
         n = static_cast<ArrayObj*>(as_obj(v))->len;
+    } else if (is_obj(v, ObjType::Record)) {
+        n = static_cast<RecordObj*>(as_obj(v))->len;
     } else if (is_obj(v, ObjType::Map)) {
         n = static_cast<MapObj*>(as_obj(v))->count;
     } else if (is_obj(v, ObjType::Tensor)) {
@@ -882,6 +947,17 @@ NativeResult bi_match_tail(Process& p, Value, Value* args, uint32_t) {
 NativeResult bi_match_at(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     Value i = resolve(args[1]);
+    // A constructor pattern's fields are read by position, as an array
+    // pattern's elements are, once `_record_is` has said what it is.
+    if (is_obj(v, ObjType::Record) && is_fixnum(i)) {
+        auto* r = static_cast<RecordObj*>(as_obj(v));
+        int64_t k = fixnum_value(i);
+        if (k < 0 || k >= r->len) {
+            return NativeResult::raise(raise_error(p, p.runtime().intern_atom("out_of_bounds"),
+                                                   "match_at is outside the record"));
+        }
+        return NativeResult::enter(r->items()[k]);
+    }
     if (!is_obj(v, ObjType::Array) || !is_fixnum(i)) {
         return NativeResult::raise(
             raise_error(p, well_known(p.runtime()).type_error, "match_at needs an array"));
@@ -1775,6 +1851,25 @@ bool import_across(Process& dest, Runtime& src_rt, Value v, Value* out, int dept
             *out = arr;
             return true;
         }
+        case ObjType::Record: {
+            // The id is an atom of the runtime it came from, and is a name
+            // again in this one.
+            auto* src = static_cast<RecordObj*>(as_obj(v));
+            Value id = make_atom(dest.runtime().intern_atom(
+                src_rt.atom_name(uint32_t(imm_payload(src->id)))));
+            uint32_t n = src->len;
+            Value rec = dest.heap().make_record(id, src->flags, n);
+            for (uint32_t i = 0; i < n; ++i) {
+                Value item;
+                if (!import_across(dest, src_rt, static_cast<RecordObj*>(as_obj(v))->items()[i],
+                                   &item, depth + 1)) {
+                    return false;
+                }
+                static_cast<RecordObj*>(as_obj(rec))->items()[i] = item;
+            }
+            *out = rec;
+            return true;
+        }
         case ObjType::Map: {
             std::vector<std::pair<Value, Value>> entries;
             map_collect(v, entries);
@@ -2647,6 +2742,69 @@ NativeResult core_match_fail(Process& p, Value, Value* args, uint32_t) {
 /// the one that made a value being forced. `[]` for an error never raised.
 /// Impure because the answer is filled in by the raise, so asking before and
 /// after are different questions about the same value.
+// --- records ---------------------------------------------------------------
+//
+// What a constructor pattern compiles to, and what `std.record` reads and
+// builds a record with. A record is made by the `record_make` opcode, whose id
+// is a constant; `_record_of` is the same thing for an id in hand, which is
+// what a decoder has.
+
+/// `_record_is id x`: is `x` a record whose id is `id`? Never raises, so a
+/// pattern can ask it of anything.
+NativeResult core_record_is(Process&, Value, Value* args, uint32_t) {
+    Value id = resolve(args[0]);
+    Value v = resolve(args[1]);
+    return NativeResult::ok(make_bool(is_obj(v, ObjType::Record) &&
+                                      static_cast<RecordObj*>(as_obj(v))->id == id));
+}
+
+/// `_record_id x`: the atom naming what `x` is, or `()` when it is no record.
+NativeResult core_record_id(Process&, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_obj(v, ObjType::Record)) return NativeResult::ok(UNIT);
+    return NativeResult::ok(static_cast<RecordObj*>(as_obj(v))->id);
+}
+
+/// `_record_fields x`: the fields, in order, as an array -- unforced, as they
+/// are in the record.
+NativeResult core_record_fields(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_obj(v, ObjType::Record)) return type_fail(p, "_record_fields needs a record");
+    uint32_t n = static_cast<RecordObj*>(as_obj(v))->len;
+    p.stack.push_back(v);
+    Value arr = p.heap().make_array(n);
+    auto* src = static_cast<RecordObj*>(as_obj(p.stack.back()));
+    auto* dst = static_cast<ArrayObj*>(as_obj(arr));
+    for (uint32_t i = 0; i < n; ++i) {
+        dst->items()[i] = src->items()[i];
+        p.heap().remember_if_old(dst, src->items()[i]);
+    }
+    p.stack.pop_back();
+    return NativeResult::ok(arr);
+}
+
+/// `_record_of id variant fields`: a record with that id, a variant's when
+/// `variant` is true, whose fields are the array's items, unforced.
+NativeResult core_record_of(Process& p, Value, Value* args, uint32_t) {
+    Value id = resolve(args[0]);
+    Value variant = resolve(args[1]);
+    Value items = resolve(args[2]);
+    if (!is_atom(id)) return type_fail(p, "_record_of needs an atom for the id");
+    if (!is_bool(variant)) return type_fail(p, "_record_of needs a bool for whether it is a variant");
+    if (!is_obj(items, ObjType::Array)) return type_fail(p, "_record_of needs an array of fields");
+    uint32_t n = static_cast<ArrayObj*>(as_obj(items))->len;
+    p.stack.push_back(items);
+    Value rec = p.heap().make_record(id, truthy(variant) ? RECORD_VARIANT : 0, n);
+    auto* src = static_cast<ArrayObj*>(as_obj(p.stack.back()));
+    auto* dst = static_cast<RecordObj*>(as_obj(rec));
+    for (uint32_t i = 0; i < n; ++i) {
+        dst->items()[i] = src->items()[i];
+        p.heap().remember_if_old(dst, src->items()[i]);
+    }
+    p.stack.pop_back();
+    return NativeResult::ok(rec);
+}
+
 NativeResult core_error_trace(Process& p, Value, Value* args, uint32_t) {
     std::vector<TracePlace> places = error_trace(p, args[0]);
     Heap& h = p.heap();
@@ -3089,7 +3247,8 @@ int compare_rank(Value v) {
     if (v == NIL || is_obj(v, ObjType::Cons)) return 6;
     if (is_obj(v, ObjType::Array)) return 7;
     if (is_obj(v, ObjType::Tensor)) return 8;
-    return 9;
+    if (is_obj(v, ObjType::Record)) return 9;
+    return 10;
 }
 
 bool compare_values(Process& p, Value a, Value b, int depth, int* out) {
@@ -3172,6 +3331,28 @@ bool compare_values(Process& p, Value a, Value b, int depth, int* out) {
             return true;
         }
         case 8: return tensor_compare(p, a, b, out);
+        case 9: {
+            // By what they are, then field by field: records of one
+            // declaration sort as their fields do, which is what sorting a
+            // list of them by `compare` wants.
+            auto* x = static_cast<RecordObj*>(as_obj(a));
+            auto* y = static_cast<RecordObj*>(as_obj(b));
+            if (x->id != y->id) {
+                *out = order(p.runtime().atom_name(uint32_t(imm_payload(x->id))),
+                             p.runtime().atom_name(uint32_t(imm_payload(y->id))));
+                return true;
+            }
+            uint32_t n = std::min(x->len, y->len);
+            for (uint32_t i = 0; i < n; ++i) {
+                if (!compare_values(p, static_cast<RecordObj*>(as_obj(a))->items()[i],
+                                    static_cast<RecordObj*>(as_obj(b))->items()[i], depth + 1, out))
+                    return false;
+                if (*out != 0) return true;
+            }
+            *out = order(static_cast<RecordObj*>(as_obj(a))->len,
+                         static_cast<RecordObj*>(as_obj(b))->len);
+            return true;
+        }
         default: *out = 0; return true;
     }
 }
@@ -3242,6 +3423,10 @@ enum : uint8_t {
     WIRE_UNIT = 0, WIRE_FALSE = 1, WIRE_TRUE = 2, WIRE_INT = 3, WIRE_FLOAT = 4,
     WIRE_STRING = 5, WIRE_ATOM = 6, WIRE_CHAR = 7, WIRE_LIST = 8, WIRE_ARRAY = 9,
     WIRE_MAP = 10, WIRE_BIGINT = 11, WIRE_TENSOR = 12,
+    // The id as an atom is written, a byte of flags, a count, then the
+    // fields. Read back only where the atom already exists, as an atom is:
+    // a record crosses to a program that declares it.
+    WIRE_RECORD = 13,
 };
 
 void wire_le(std::string* out, uint64_t v, int width) {
@@ -3336,6 +3521,17 @@ bool wire_write(Process& p, Value v, std::string* out, int depth) {
                     ++n;
                 }
                 for (int i = 0; i < 4; ++i) (*out)[at + i] = char((n >> (8 * i)) & 0xff);
+                return true;
+            }
+            case ObjType::Record: {
+                auto* r = static_cast<RecordObj*>(as_obj(v));
+                const std::string& name = p.runtime().atom_name(uint32_t(imm_payload(r->id)));
+                wire_bytes(out, WIRE_RECORD, name.data(), name.size());
+                out->push_back(char(r->flags & 0xff));
+                wire_le(out, r->len, 4);
+                for (uint32_t i = 0; i < r->len; ++i) {
+                    if (!wire_write(p, static_cast<RecordObj*>(as_obj(v))->items()[i], out, depth + 1)) return false;
+                }
                 return true;
             }
             case ObjType::Array: {
@@ -3516,6 +3712,32 @@ struct WireReader {
                 *out = arr;
                 return true;
             }
+            case WIRE_RECORD: {
+                if (!has(4)) return false;
+                uint64_t name_len = le(4);
+                if (!has(name_len)) return false;
+                uint32_t id;
+                if (!p.runtime().find_atom(std::string_view(reinterpret_cast<const char*>(data + at), name_len), &id)) {
+                    return false;
+                }
+                at += name_len;
+                if (!has(5)) return false;
+                uint32_t flags = data[at] & RECORD_VARIANT;
+                at += 1;
+                uint64_t n = le(4);
+                if (n > len) return false;
+                std::vector<Value> items;
+                items.reserve(size_t(n));
+                for (uint64_t i = 0; i < n; ++i) {
+                    Value item;
+                    if (!read(&item, depth + 1)) return false;
+                    items.push_back(item);
+                }
+                Value rec = p.heap().make_record(make_atom(id), flags, uint32_t(n));
+                for (uint64_t i = 0; i < n; ++i) static_cast<RecordObj*>(as_obj(rec))->items()[i] = items[i];
+                *out = rec;
+                return true;
+            }
             case WIRE_MAP: {
                 if (!has(4)) return false;
                 uint64_t n = le(4);
@@ -3584,7 +3806,7 @@ struct ShareArenas {
     int64_t invented_from = 0;
     Value filled = NIL;
     Value none = 0, nop = 0, field = 0, unit = 0, global = 0, make_closure = 0, make_thunk = 0;
-    Value const_int = 0, const_float = 0, const_str = 0, const_atom = 0;
+    Value const_int = 0, const_float = 0, const_str = 0, const_atom = 0, record_make = 0;
     std::unordered_map<Value, std::vector<int>> edges;
     std::unordered_map<Value, std::array<int64_t, 3>> runs;
 
@@ -3731,6 +3953,12 @@ struct ShareArenas {
     Value rebuild_node(Node n) {
         const Part& part = parts[cur];
         if (n[0] == field && resolve(part.remap) != UNIT) n[3] = remapped(part.strs, n[3]);
+        // `record_make`'s atom, as `const_atom`'s, with its variant bit kept.
+        if (n[0] == record_make && resolve(part.remap) != UNIT) {
+            const int64_t c = num(n[4]);
+            const int64_t bit = c & int64_t(RECORD_MAKE_VARIANT);
+            n[4] = make_fixnum(num(remapped(part.atoms, make_fixnum(c & int64_t(RECORD_MAKE_ATOM)))) | bit);
+        }
         auto e = edges.find(n[0]);
         if (e != edges.end()) {
             for (int k : e->second) n[2 + k] = rebuild(n[2 + k]);
@@ -3777,6 +4005,7 @@ NativeResult vm_share_arenas(Process& p, Value, Value* args, uint32_t) {
     s.global = s.atom("global"); s.make_closure = s.atom("make_closure"); s.make_thunk = s.atom("make_thunk");
     s.const_int = s.atom("const_int"); s.const_float = s.atom("const_float");
     s.const_str = s.atom("const_str"); s.const_atom = s.atom("const_atom");
+    s.record_make = s.atom("record_make");
     std::vector<std::pair<Value, Value>> table;
     map_collect(resolve(in[4]), table);
     for (auto& [op, ks] : table) {
@@ -4041,6 +4270,10 @@ const BuiltinDef BUILTINS[] = {
     {"_match_fail", 4, 0b1110, core_match_fail},
     {"_error_trace!", 1, 0b1, core_error_trace},
     {"_tensor_of_bytes", 2, 0b11, tensor_of_bytes_builtin},
+    {"_record_is", 2, 0b11, core_record_is},
+    {"_record_id", 1, 0b1, core_record_id},
+    {"_record_fields", 1, 0b1, core_record_fields},
+    {"_record_of", 3, 0b111, core_record_of},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

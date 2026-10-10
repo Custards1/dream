@@ -143,6 +143,19 @@ let raises! body = {
 let fail! : :any -> :never;
 let fail! message = raise! message;
 
+/// A value that raises when it is forced, for a test that something is never
+/// forced (`test.eq! 7 (const 7 test.boom)`) or that forcing it reports the
+/// error. Pure, so it goes wherever a value does.
+///
+/// It is a division, because a pure function has no other way to raise
+/// anything but a type error; and the divisor is a name rather than `0`,
+/// because `x / 0` is the compiler's "division by a literal zero" warning, which
+/// is right everywhere except where the error is the point.
+let boom : :any;
+let boom = 1 / nothing;
+priv let nothing : :integer;
+priv let nothing = 0;
+
 // --- running ----------------------------------------------------------------
 
 /// Where a failing case raised, a few lines of it under the failure: enough to

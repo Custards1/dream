@@ -74,10 +74,10 @@ when test {
 
     let tests = [
         test.case "every spelling reads the same"
-            $( test.eq! [["libffi", ">=", "3.4"], ["libffi", ">=", "3.4"], ["libffi", ">=", "3.4"], ["libc6", "", ""]]
+            $( test.eq! [Dep.make "libffi" ">=" "3.4", Dep.make "libffi" ">=" "3.4", Dep.make "libffi" ">=" "3.4", Dep.new "libc6"]
                         (list.map (fn t -> result.or_else [] (parse t)) ["libffi >= 3.4", "libffi (>= 3.4)", "libffi>=3.4", " libc6 "]) ),
         test.case "Debian's strict operators"
-            $( test.eq! [["a", ">", "1"], ["a", "<", "2"]] [result.or_else [] (parse "a (>> 1)"), result.or_else [] (parse "a << 2")] ),
+            $( test.eq! [Dep.make "a" ">" "1", Dep.make "a" "<" "2"] [result.or_else [] (parse "a (>> 1)"), result.or_else [] (parse "a << 2")] ),
         test.case "mistakes"
             $( test.eq! [:error, :error, :error] (list.map (fn t -> list.head (parse t)) ["", "a >=", "a => 2"]) ),
         test.case "each format's spelling"

@@ -476,7 +476,7 @@ bool op_is_supported(Op op) {
         // Data. See "Lists, arrays and maps" and "Lazy positions" below.
         case Op::ConstStr: case Op::Global:
         case Op::ListIsEmpty: case Op::ListTail: case Op::Cons:
-        case Op::MakeList: case Op::MakeArray: case Op::Get: case Op::Set:
+        case Op::MakeList: case Op::MakeArray: case Op::RecordMake: case Op::Get: case Op::Set:
             return true;
         default:
             return false;
@@ -1195,6 +1195,7 @@ private:
                        expand_cost(n.b, depth + 1, calls) +
                        (n.c == NO_NODE ? 0 : expand_cost(n.c, depth + 1, calls));
             case Op::Set: case Op::Cons: case Op::MakeList: case Op::MakeArray:
+            case Op::RecordMake:
                 // Each builds something, and building it twice is two of it
                 // where the program had one -- sharing lost, not just time.
                 *calls = true;
@@ -2284,7 +2285,7 @@ private:
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
         rt_frame_slots_, rt_native_, rt_builtin_, rt_switch_head_,
-        rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_literal_str_,
+        rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_make_record_, rt_literal_str_,
         rt_global_, rt_snapshot_, rt_thunk_, rt_apply_, rt_peek_, rt_adopt_, rt_yield_frame_,
         rt_cons_after_, rt_set_tail_, rt_type_error_got_;
     /// The adopt arm of the `snapshot` being written, joined at its end.
@@ -2374,6 +2375,8 @@ void Emitter::declare_helpers() {
         "dream_rt_make_list", llvm::FunctionType::get(i64_, {ptr_, i32_, ptr_}, false));
     rt_make_array_ = mod_.getOrInsertFunction(
         "dream_rt_make_array", llvm::FunctionType::get(i64_, {ptr_, i32_, ptr_}, false));
+    rt_make_record_ = mod_.getOrInsertFunction(
+        "dream_rt_make_record", llvm::FunctionType::get(i64_, {ptr_, i32_, i32_, ptr_}, false));
     rt_literal_str_ = mod_.getOrInsertFunction(
         "dream_rt_literal_str", llvm::FunctionType::get(i64_, {ptr_, i32_}, false));
     rt_global_ = mod_.getOrInsertFunction(
@@ -3031,7 +3034,7 @@ void Emitter::mark_refs(uint32_t idx, int depth) {
             mark_refs(n.a, depth + 1);
             run(n.b, n.c);
             return;
-        case Op::Block: case Op::MakeList: case Op::MakeArray:
+        case Op::Block: case Op::MakeList: case Op::MakeArray: case Op::RecordMake:
             run(n.a, n.b);
             return;
         case Op::MakeMap:
@@ -3125,6 +3128,12 @@ Emitter::JV Emitter::lazy(uint32_t idx) {
             if (failed_) return none();
             return tag(b_.CreateCall(Op(n.op) == Op::MakeList ? rt_make_list_ : rt_make_array_,
                                      {proc_, i32c(int(n.b)), items}));
+        }
+        case Op::RecordMake: {
+            llvm::Value* items = lazy_array(n.a, n.b);
+            if (failed_) return none();
+            return tag(b_.CreateCall(rt_make_record_,
+                                     {proc_, i32c(int(n.c)), i32c(int(n.b)), items}));
         }
         case Op::Add: case Op::Sub: case Op::Mul: {
             // `thunk_for`'s arithmetic: two fixnums already in hand, and an
@@ -3309,20 +3318,38 @@ Emitter::JV Emitter::get(const Node& n) {
     b_.CreateCondBr(b_.CreateICmpEQ(k, i64(make_fixnum(0))), found, slow);
 
     // An array at a fixnum inside it. The index is signed, so one unsigned
-    // compare against the length rules out both ends.
+    // compare against the length rules out both ends. A record is read the
+    // same way: its length is where an array's is, and its fields start one
+    // word later, after the atom naming it (`RecordObj`) -- so a record's
+    // accessor is an inline load, as a `struct`'s was when it was an array.
+    auto* not_arr = bb("get.notarray");
+    auto* is_rec = bb("get.record");
     b_.SetInsertPoint(not_cell);
     b_.CreateCondBr(b_.CreateAnd(b_.CreateICmpEQ(type, llvm::ConstantInt::get(
                                                            i8_, uint8_t(ObjType::Array))),
                                  is_fixnum(k)),
-                    is_arr, slow);
+                    is_arr, not_arr);
+    b_.SetInsertPoint(not_arr);
+    b_.CreateCondBr(b_.CreateAnd(b_.CreateICmpEQ(type, llvm::ConstantInt::get(
+                                                           i8_, uint8_t(ObjType::Record))),
+                                 is_fixnum(k)),
+                    is_rec, slow);
     b_.SetInsertPoint(is_arr);
+    auto* checked = bb("get.checked");
+    b_.CreateBr(checked);
+    b_.SetInsertPoint(is_rec);
+    b_.CreateBr(checked);
+    b_.SetInsertPoint(checked);
+    auto* first = b_.CreatePHI(i64_, 2, "get.first");
+    first->addIncoming(i64(16), is_arr);
+    first->addIncoming(i64(24), is_rec);
     llvm::Value* len = b_.CreateZExt(
         b_.CreateLoad(i32_, b_.CreateIntToPtr(b_.CreateAdd(c, i64(8)), ptr_)), i64_);
     llvm::Value* at = b_.CreateAShr(k, 1);
     b_.CreateCondBr(b_.CreateICmpULT(at, len), in_arr, slow);
     b_.SetInsertPoint(in_arr);
     llvm::Value* item = b_.CreateLoad(
-        i64_, b_.CreateIntToPtr(b_.CreateAdd(b_.CreateAdd(c, i64(16)), b_.CreateShl(at, 3)), ptr_));
+        i64_, b_.CreateIntToPtr(b_.CreateAdd(b_.CreateAdd(c, first), b_.CreateShl(at, 3)), ptr_));
     auto* item_bb = b_.GetInsertBlock();
     b_.CreateBr(found);
 
@@ -3679,7 +3706,7 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
         case Op::ListTail: return list_tail(n);
         case Op::Get: return get(n);
         case Op::Set: return set(n);
-        case Op::Cons: case Op::MakeList: case Op::MakeArray:
+        case Op::Cons: case Op::MakeList: case Op::MakeArray: case Op::RecordMake:
             // Every part of these is in a lazy position, and so is the whole:
             // building one in place is the one way it is ever written.
             return lazy(idx);
@@ -3745,7 +3772,8 @@ Emitter::JV Emitter::type_test(const Node& n) {
                        n.b == DREAM_TYPE_STRING ? ObjType::Str :
                        n.b == DREAM_TYPE_LIST ? ObjType::Cons :
                        n.b == DREAM_TYPE_ARRAY ? ObjType::Array :
-                       n.b == DREAM_TYPE_TENSOR ? ObjType::Tensor : ObjType::Map;
+                       n.b == DREAM_TYPE_TENSOR ? ObjType::Tensor :
+                       n.b == DREAM_TYPE_RECORD ? ObjType::Record : ObjType::Map;
         llvm::Value* matches = b_.CreateICmpEQ(header, llvm::ConstantInt::get(i8_, uint8_t(kind)));
         if (n.b == DREAM_TYPE_MAP)
             matches = b_.CreateOr(matches, b_.CreateICmpEQ(
@@ -5201,6 +5229,7 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_set_tail", reinterpret_cast<void*>(&dream_rt_set_tail));
     add("dream_rt_make_list", reinterpret_cast<void*>(&dream_rt_make_list));
     add("dream_rt_make_array", reinterpret_cast<void*>(&dream_rt_make_array));
+    add("dream_rt_make_record", reinterpret_cast<void*>(&dream_rt_make_record));
     add("dream_rt_literal_str", reinterpret_cast<void*>(&dream_rt_literal_str));
     add("dream_rt_global", reinterpret_cast<void*>(&dream_rt_global));
     add("dream_rt_snapshot", reinterpret_cast<void*>(&dream_rt_snapshot));

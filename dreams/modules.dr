@@ -484,8 +484,9 @@ let unresolved_note! l dotted = {
 /// as the file is read, so the rest of the compiler never sees a conditional
 /// item at all -- and an `import` inside a `when` that is off is never
 /// followed, so a module only test builds need is never even opened.
-let expand_items cfg items = {
-    let flat = flatten_items cfg items;
+let expand_items owner cfg items = {
+    let flat = (if config.is_defined "strict_everything" cfg { strict_everything } else { fn x -> x })
+                   (flatten_items cfg items);
     let inherited = list.filter whole_import flat;
     list.concat (list.map (fn item ->
         match item {
@@ -498,11 +499,11 @@ let expand_items cfg items = {
             // selected member could be the name of a field, and a `let` and an
             // import of one name is an error (`report_clashes` in scope.dr).
             [:record, kind, name, fields, members, bases, span] =>
-                [syntax.record_derived kind name fields members (inherited + bases) span],
+                [syntax.record_derived owner kind name fields members (inherited + bases) span],
             // A union is a module and, in the parent, a global of the same
             // name holding its description -- see `syntax.union_decl`.
             [:union_decl, name, params, variants, members, kind, span] =>
-                syntax.union_decl name params variants members kind span,
+                syntax.union_decl owner name params variants members kind span,
             // A C library is a module of bindings -- see `syntax.foreign_decl`.
             [:foreign_decl, name, library, entries, span] =>
                 syntax.foreign_decl name library entries span,
@@ -512,6 +513,38 @@ let expand_items cfg items = {
             other => [other],
         }) flat)
 };
+
+/// `-D strict_everything`: every named parameter of every `let` and `fn`
+/// written as though it were `!x`, so the program runs call-by-value in its
+/// arguments while everything else -- a list's cells, a map's values, a
+/// block's `let` -- stays as lazy as it was. It is an experiment and not a
+/// mode: it answers what a strict-by-default Dream would break and what it
+/// would cost or save, by compiling a real program that way and running it.
+/// "Strict by default: the experiment" in docs/notes/vm-performance.md is what
+/// it found. A pattern parameter and a record's member are left alone, and so
+/// is a `let` whose body is one call or one `.[ ]`: that is the shape `scope.wrapper_of`
+/// turns into the call it stands for, which it will not do for a function
+/// with a strict parameter -- and a strict-by-default compiler would still
+/// inline it, since the primitive under it evaluates what it needs.
+let rec strict_everything node : :any =
+    match node {
+        [:lambda, ps, b, sp] => [:lambda, strict_params ps, strict_everything b, sp],
+        [:let, n, ps, b, r, sp] =>
+            [:let, n, (if wrapper_shaped b { ps } else { strict_params ps }), strict_everything b, r, sp],
+        _ => if type_of node == :list { list.map strict_everything node } else { node },
+    };
+
+priv let wrapper_shaped b =
+    type_of b == :list && not (list.is_empty b) && list.contains (list.head b) [:apply, :get, :set];
+
+priv let strict_params ps =
+    if type_of ps != :list { ps }
+    else {
+        list.map (fn p -> match p {
+            [name, span] => if type_of name == :string { ast.strict_param name span } else { p },
+            _ => p,
+        }) ps
+    };
 
 /// `when` resolved and `priv` unwrapped, with every other item as written.
 let rec flatten_items cfg items =
@@ -781,7 +814,7 @@ let rec hoist_mod! l parent source m =
             else {
                 // Its own `when`s and nested `mod`s, resolved the way a file's
                 // are: by the time this is recorded it is an ordinary module.
-                let kept = expand_items (config_in l full) items;
+                let kept = expand_items full (config_in l full) items;
                 // Consed and reversed once, as `load_items!` does its own.
                 let nested = list.fold (fn acc item ->
                     match item {
@@ -972,7 +1005,7 @@ let load_items! l source parsed display name file text = {
         [:error, message, span] => complain span message source l,
         [:ok, items, sites] => {
             // Resolve `when` before anything else looks at the module.
-            let kept = expand_items (config_in l name) items;
+            let kept = expand_items name (config_in l name) items;
             let noted = note_reads name items
                             (note_foreigns name items (note_records name items (note_expanding source sites l)));
 
@@ -1229,9 +1262,9 @@ when test {
 
         // --- `when`, resolved as the file is read ---
         test.case "a when that holds contributes its items"
-            $( test.eq! 1 (list.length (expand_items on (items_of "when test { let a = 1; }"))) ),
+            $( test.eq! 1 (list.length (expand_items "" on (items_of "when test { let a = 1; }"))) ),
         test.case "a when that does not hold contributes nothing"
-            $( test.eq! [] (expand_items config.empty (items_of "when test { let a = 1; }")) ),
+            $( test.eq! [] (expand_items "" config.empty (items_of "when test { let a = 1; }")) ),
 
         // What `expand_items` is about to destroy, kept for a tool. Nothing in
         // the compiler reads it -- see `note_records`.
@@ -1262,7 +1295,7 @@ when test {
                                   (foreign_items on (items_of
                                       "foreign m {\n    resource R = r_free\n    f! : :void -> R\n}"))) ),
         test.case "a nested when is resolved too"
-            $( test.eq! 1 (list.length (expand_items on
+            $( test.eq! 1 (list.length (expand_items "" on
                    (items_of "when test { when test { let a = 1; } }"))) ),
         test.case "an import inside a when that is off is never followed"
             $( test.eq! [] (natives (from_text! config.empty "when test { import std.io; }")) ),

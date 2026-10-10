@@ -136,6 +136,11 @@ when test {
     import std.test;
     import std.list;
 
+    /// The divisor of the runtime's own error, which several cases read. A name
+    /// rather than `0`: a division by a literal zero is a compiler warning,
+    /// right everywhere but here, where the error is the point.
+    let zero = 0;
+
     /// Run a thunk in its own process and answer whatever it raised. In a
     /// process, because a case that raises should not take the runner with it,
     /// and `join!` is what turns the failure back into a value here.
@@ -143,24 +148,24 @@ when test {
 
     let tests = [
         test.case "the runtime's own kind is readable"
-            $( test.eq! :divide_by_zero (kind (caught! $( 1 / 0 ))) ),
+            $( test.eq! :divide_by_zero (kind (caught! $( 1 / zero ))) ),
         test.case "a raised value is wrapped in the catch-all kind"
             $( test.eq! :error (kind (caught! $( raise! "boom" ))) ),
         test.case "the payload comes back"
             $( test.eq! "boom" (payload (caught! $( raise! "boom" ))) ),
         test.case "a kind can be matched on"
             $( test.eq! "divided"
-                        (match kind (caught! $( 1 / 0 )) {
+                        (match kind (caught! $( 1 / zero )) {
                              :divide_by_zero => "divided",
                              _ => "something else",
                          }) ),
 
-        test.case "is_kind"      $( test.true! (is_kind :divide_by_zero (caught! $( 1 / 0 ))) ),
+        test.case "is_kind"      $( test.true! (is_kind :divide_by_zero (caught! $( 1 / zero ))) ),
         test.case "is_kind of something that is not an error"
             $( test.false! (is_kind :divide_by_zero 42) ),
         test.case "is_any"
-            $( test.true! (is_any [:type_error, :divide_by_zero] (caught! $( 1 / 0 ))) ),
-        test.case "is_error"     $( test.true! (is_error (caught! $( 1 / 0 ))) ),
+            $( test.true! (is_any [:type_error, :divide_by_zero] (caught! $( 1 / zero ))) ),
+        test.case "is_error"     $( test.true! (is_error (caught! $( 1 / zero ))) ),
         test.case "a value is not an error"  $( test.false! (is_error 42) ),
 
         test.case "kind of a non-error is unit"  $( test.eq! () (kind 42) ),

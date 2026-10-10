@@ -35,6 +35,7 @@ import bytes;
 import compress;
 import deb;
 import installer;
+import item;
 import layout;
 import layout.Layout;
 import release;
@@ -189,8 +190,8 @@ let cmd_files! c = {
     let sp = spec! c;
     let lay = layout! sp;
     each! (fn i -> console.print! (match i {
-        [:file, path, mode, source, size] => bytes.octal 4 mode + " " + bytes.pad_left 10 " " (to_string size) + "  /" + path + "  <- " + source,
-        [:link, path, target] => "link " + bytes.pad_left 10 " " "" + "  /" + path + "  -> " + target,
+        item.Item.file(path, mode, source, size) => bytes.octal 4 mode + " " + bytes.pad_left 10 " " (to_string size) + "  /" + path + "  <- " + source,
+        item.Item.link(path, target) => "link " + bytes.pad_left 10 " " "" + "  /" + path + "  -> " + target,
         _ => "",
     })) (Layout.items lay)
 };

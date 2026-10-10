@@ -72,7 +72,7 @@ let main! = {
     let v = h.Vector.make 3 4;
     console.print! [type_of v, h.Vector.set_y 8 v, v]
 };
-''', '12\n[3, 2, 1]\n14\n[[1, 2], [9, 2], 2]\n[:array, #[3, 8], #[3, 4]]\n')
+''', '12\n[3, 2, 1]\n14\n[Point(1, 2), Point(9, 2), 2]\n[:Vector, Vector(3, 8), Vector(3, 4)]\n')
 
     success('''
 import std.console;
@@ -173,7 +173,7 @@ let main! = {
     console.print! [Empty.make (), EmptyArray.make ()]
     console.print! (Lazy.first (Lazy.make 7 (1 / 0)))
 };
-''', '[[], #[]]\n7\n')
+''', '[Empty(), EmptyArray()]\n7\n')
 
     # Map records use field-name atoms, preserve constructor order and remain
     # ordinary persistent maps. Both constructors and updates keep values lazy.
@@ -231,7 +231,7 @@ let main! = {
     console.print! (Lazy.kept (Lazy.new 7))
     console.print! (Person.greeting %{})
 };
-''', '["Hi Ada", "Yo Bob!"]\ntrue\n[25, 9]\n[6, 5]\n[2, 12]\n7\nHi\n')
+''', '["Hi Ada", "Yo Bob!"]\ntrue\n[25, 9]\nPoint(6, 5)\n[2, 12]\n7\nHi\n')
 
     failure('macro id x = x; let main! = expand id;', 'expects 1 syntax arguments')
     failure('let id x = x; let main! = expand id 1;', 'declared macro')
@@ -318,7 +318,7 @@ macro wrap e = helper e;
               'Named.x (Named.set_x 73 (Named.make 1))\n:quit\n',
         env={**os.environ, 'DREAM': vm}, capture_output=True, text=True, timeout=30)
     assert session.returncode == 0, session.stderr
-    assert '42' in session.stdout and '[9, 2]' in session.stdout, session.stdout
+    assert '42' in session.stdout and 'Point(9, 2)' in session.stdout, session.stdout
     assert '73' in session.stdout, session.stdout
     assert 'error:' not in session.stderr, session.stderr
     count += 1

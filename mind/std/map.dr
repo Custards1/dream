@@ -162,11 +162,11 @@ when test {
         test.case "update a missing key starts from the default"
             $( test.eq! 1 (get 0 :zz (update 0 (fn n -> n + 1) :zz m)) ),
         test.case "put_strict forces the value"
-            $( test.raises! $( size (put_strict :a (1 / 0) m) ) ),
+            $( test.raises! $( size (put_strict :a test.boom m) ) ),
         test.case "put leaves the value suspended"
-            $( test.eq! 3 (size (put :c (1 / 0) m)) ),
+            $( test.eq! 3 (size (put :c test.boom m)) ),
         test.case "update_strict forces what f answers"
-            $( test.raises! $( size (update_strict 0 (fn n -> n / 0) :a m) ) ),
+            $( test.raises! $( size (update_strict 0 (fn _ -> test.boom) :a m) ) ),
         test.case "update_strict"          $( test.eq! 2 (get 0 :a (update_strict 0 (fn n -> n + 1) :a m)) ),
         test.case "put_new keeps the first" $( test.eq! 1 (get 0 :a (put_new :a 9 m)) ),
         test.case "map_values"             $( test.eq! [10, 20]

@@ -711,9 +711,14 @@ let dispatching mi module v = {
     let kind_is k = ast.binary_e :eq (ast.name_e "<kind>" at) (ast.atom_e k at) at;
     let lookup =
         ast.match_e (ast.apply_e (ast.name_e "type_of" at) [receiver] at)
+            // A `group` or a `struct` is a record, which `type_of` names by
+            // its declaration; the table is its slot 0 all the same.
             [ast.arm (ast.bind_p "<kind>" at)
-                     (ast.binary_e :or (ast.binary_e :or (kind_is "list") (kind_is "array") at)
-                                   (kind_is "map") at)
+                     (ast.binary_e :or
+                          (ast.binary_e :or (ast.binary_e :or (kind_is "list") (kind_is "array") at)
+                                        (kind_is "map") at)
+                          (ast.binary_e :ne (ast.apply_e (ast.name_e "_record_id" at) [receiver] at)
+                                        (ast.unit_e at) at) at)
                      (ast.match_e (ast.get_e receiver (ast.int_e 0 at) (ast.unit_e at) at)
                           [ast.arm (ast.bind_p "<table>" at)
                                    (ast.binary_e :eq (ast.apply_e (ast.name_e "type_of" at)
@@ -1549,9 +1554,18 @@ let suspended_forces_warned c body r =
             "force it as a statement first -- `strict! x;` -- and put `x` in the literal" acc)
         r (lint.suspended_forces body);
 
+/// A warning for each pitfall dreams/lint.dr can prove from the syntax alone:
+/// a repeated literal map key, an arm an earlier one hides, a literal zero
+/// divisor.
 let pitfalls_warned c body r =
-    list.fold (fn acc hit -> warn_note c (list.nth 0 hit) (list.nth 1 hit) (list.nth 2 hit) acc)
+    list.fold (fn acc hit -> warn_note c (lint.Hit.span hit) (lint.Hit.message hit) (lint.Hit.note hit) acc)
         r (lint.pitfalls body);
+
+/// Every lint a top-level declaration's body is read by, in the order their
+/// warnings are reported. A new pass is one more entry here.
+let body_lints_warned c n ps body r =
+    list.fold (fn acc pass -> pass acc) r
+        [lazy_accumulators_warned c n ps body, suspended_forces_warned c body, pitfalls_warned c body];
 
 /// A module or a namespace written where a value belongs.
 let not_a_value c m shown span r =
@@ -1634,6 +1648,7 @@ let rec pattern_bindings p =
             list.append (list.concat (list.map (fn i -> pattern_bindings i) items))
                         (rest_bindings rest),
         [:map_p, pairs, _] => list.concat (list.map (fn kv -> pattern_bindings (list.nth 1 kv)) pairs),
+        [:record_p, _, fields, _] => list.concat (list.map (fn f -> pattern_bindings f) fields),
         _ => [],
     };
 
@@ -1926,6 +1941,9 @@ let rec check_pattern c p r =
         [:map_p, pairs, _] =>
             list.fold (fn acc kv -> check_pattern c (list.nth 1 kv) (check_expr c (list.nth 0 kv) acc))
                       r pairs,
+        // The constructor is an expression, resolved where the `match` is.
+        [:record_p, ctor, fields, _] =>
+            list.fold (fn acc f -> check_pattern c f acc) (check_expr c ctor r) fields,
         _ => r,
     };
 
@@ -1953,6 +1971,7 @@ let takes_apart p =
         [:list_p, _, _, _]  => true,
         [:array_p, _, _, _] => true,
         [:map_p, _, _]      => true,
+        [:record_p, _, _, _] => true,
         _ => false,
     };
 
@@ -1974,6 +1993,9 @@ let rec refutable_part p =
         [:list_p, items, _, _]  => first_refutable items,
         [:array_p, items, _, _] => first_refutable items,
         [:map_p, pairs, _]      => first_refutable (list.map (fn kv -> list.nth 1 kv) pairs),
+        // A shape, as an array pattern is: a value of another constructor
+        // does not fit and raises, as an array of another length does.
+        [:record_p, _, fields, _] => first_refutable fields,
         _ => (),
     };
 
@@ -2057,10 +2079,8 @@ let check_body l p r = {
     let started = begin_func (decl_name d) (list.length (decl_params d)) impure impure
                              (decl_rec d) (list.is_empty (decl_params d)) (decl_span d) source r;
     let fi = list.nth 1 started;
-    let bound = pitfalls_warned c (decl_body d)
-                    (suspended_forces_warned c (decl_body d)
-                        (lazy_accumulators_warned c (decl_name d) (decl_params d) (decl_body d)
-                            (bind_params c (decl_params d) (list.head started))));
+    let bound = body_lints_warned c (decl_name d) (decl_params d) (decl_body d)
+                    (bind_params c (decl_params d) (list.head started));
     let done = end_func fi (check_expr c (decl_body d) bound);
     done.[:bodies => (list.cons [mi, source, d, fi] (bodies_rev done))]
 };
@@ -2726,7 +2746,41 @@ let target_global t =
     };
 
 /// The call this declaration stands for: `[target, plan, arity]`, or `()`.
-let wrapper_of r mi source d = {
+///
+/// A record's or a union's constructor is filed here too, whatever it looks
+/// like, because the table is where lowering finds what a constructor makes:
+/// a constructor pattern asks it for the id to test (`lower.record_test`).
+let wrapper_of r mi source d =
+    match constructor_of d {
+        () => plain_wrapper_of r mi source d,
+        made => made,
+    };
+
+/// A constructor, as `syntax.record` and `syntax.union_decl` write one --
+/// `_record_of :id variant #[fields..]` -- as `[[:record, id, variant,
+/// rewritable, fields], plan, arity]`.
+///
+/// `rewritable` says a call may become the `record_make` itself, the way a
+/// wrapper's call becomes the call it stands for: only when its fields are
+/// its parameters, in order, and none of them is strict -- a strict field is
+/// forced by the constructor's frame, which the rewrite would remove. `make`
+/// of a record with no fields takes a `()` it does not keep, and is called.
+/// `fields` is how many the record has, which a pattern must take apart.
+let constructor_of d =
+    match decl_body d {
+        [:apply, [:name, "_record_of", _], [[:atom, id, _], [:bool, variant, _], [:array, fields, _]], _] => {
+            let params = decl_params d;
+            let passed = list.map (fn f -> match f { [:name, n, _] => n, _ => () }) fields;
+            let rewritable = not (list.any ast.param_strict params)
+                             && passed == list.map ast.param_name params;
+            [[:record, id, variant, rewritable, list.length fields],
+             list.map (fn k -> [:param, k]) (list.range 0 (list.length params)),
+             list.length params]
+        },
+        _ => (),
+    };
+
+let plain_wrapper_of r mi source d = {
     let params = decl_params d;
     // A wrapper with no parameters is a constant, and a constant is evaluated
     // once and shared. Rewriting its uses into the call it came from would do

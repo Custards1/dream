@@ -258,6 +258,15 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
             if (x->len != y->len) return false;
             return equal_children(p, x->items(), y->items(), x->len, raised, depth);
         }
+        case ObjType::Record: {
+            // The same declaration, then the same fields. The id is the whole
+            // of "the same declaration": it is qualified by module, and a
+            // variant's names its union as well as itself.
+            auto* x = static_cast<RecordObj*>(oa);
+            auto* y = static_cast<RecordObj*>(ob);
+            if (x->id != y->id || x->len != y->len) return false;
+            return equal_children(p, x->items(), y->items(), x->len, raised, depth);
+        }
         case ObjType::Pid:
             return static_cast<PidObj*>(oa)->id == static_cast<PidObj*>(ob)->id;
         case ObjType::Tensor:
@@ -710,6 +719,48 @@ void fill_native_args(Process& p, uint32_t call_node, Value callee, uint32_t bas
         return;
     }
     resume_native(p, callee, base, n.c, 0);
+}
+
+/// A saturated call to a closure whose function forces some of its parameters
+/// before anything else (`Image::strict_args`): those arguments are evaluated
+/// here, in the caller, rather than suspended and forced one step into the
+/// callee. The rest are suspended as ever.
+///
+/// It is the closure half of `fill_native_args`, and it is safe for the same
+/// reason: nothing of the callee's has run before its strict parameters are
+/// forced, and they are forced in parameter order on both paths, so the same
+/// argument raises first with the same error. What is saved is a thunk and its
+/// update per strict argument per call -- every `!acc` loop paid both.
+/// The arguments gather on the value stack, where the collector sees them,
+/// and the frame is built once the last is in.
+void fill_closure_args(Process& p, uint32_t call_node, uint32_t mask, uint32_t base,
+                       uint32_t from, Value frame) {
+    const Image& img = img_of(p);
+    const Node& n = img.node(call_node);
+    const uint32_t* kids = img.kids_at(n.b);
+    for (uint32_t i = from; i < n.c; ++i) {
+        const bool strict = i < 32 && (mask & (1u << i));
+        if (!strict || thunk_for_may_answer(Op(img.node(kids[i]).op))) {
+            p.stack.push_back(thunk_for(p, kids[i], frame));
+            continue;
+        }
+        push_cont(p, ContKind::ClosureArgs, call_node, base, i, frame);
+        eval_node(p, kids[i], frame);
+        return;
+    }
+    Value callee;
+    if (!callee_operand(p, img, n.a, frame, &callee)) {
+        p.unreachable("the callee of a closure call stopped being a name");
+    }
+    Value fn = resolve(callee);
+    auto* cl = static_cast<ClosureObj*>(as_obj(fn));
+    const FuncRec& f = img.func(cl->func);
+    Value fr = p.heap().make_frame_filling(fn, f.slots, f.arity);
+    auto* fo = static_cast<FrameObj*>(as_obj(fr));
+    const Value* args = &p.stack[base];
+    for (uint32_t i = 0; i < n.c; ++i) fo->slots()[i] = args[i];
+    p.stack.resize(base);
+    enter_function(p, cl->func, f, fr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,6 +1534,24 @@ void container_get(Process& p, uint32_t at, Value container, Value key, Value fr
                                     std::to_string(tensor_len(container))));
         return;
     }
+    if (is_obj(container, ObjType::Record)) {
+        if (!is_fixnum(key)) {
+            do_raise(p, type_error(p, "a field of a record is read by position, not " +
+                                          describe(p, key)));
+            return;
+        }
+        auto* r = static_cast<RecordObj*>(as_obj(container));
+        const int64_t k = fixnum_value(key);
+        if (k >= 0 && k < int64_t(r->len)) {
+            enter(p, r->items()[k]);
+            return;
+        }
+        if (get_fallback(p, at, frame)) return;
+        do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                "field " + std::to_string(k) + " is outside " +
+                                    describe(p, container)));
+        return;
+    }
     if (!is_sequence(container)) {
         do_raise(p, type_error(p, "`.[ ]` reads a map, an array or a list, not " +
                                       describe(p, container)));
@@ -1523,6 +1592,35 @@ void container_set(Process& p, uint32_t at, Value container, Value key, Value fr
     if (is_obj(container, ObjType::Map)) {
         Value value = thunk_for(p, value_node, frame);
         ret(p, map_insert(p, container, key, value));
+        return;
+    }
+    if (is_obj(container, ObjType::Record)) {
+        if (!is_fixnum(key)) {
+            do_raise(p, type_error(p, "a field of a record is changed by position, not " +
+                                          describe(p, key)));
+            return;
+        }
+        auto* src = static_cast<RecordObj*>(as_obj(container));
+        const uint32_t n = src->len;
+        const int64_t k = fixnum_value(key);
+        if (k < 0 || k >= int64_t(n)) {
+            do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                    "field " + std::to_string(k) + " is outside " +
+                                        describe(p, container)));
+            return;
+        }
+        // A copy, with the id it had: changing a field of a `Point` answers
+        // a `Point`.
+        Value value = thunk_for(p, value_node, frame);
+        Value out = p.heap().make_record(src->id, src->flags, n);
+        src = static_cast<RecordObj*>(as_obj(container));
+        auto* dst = static_cast<RecordObj*>(as_obj(out));
+        for (uint32_t i = 0; i < n; ++i) {
+            Value item = uint32_t(k) == i ? value : src->items()[i];
+            dst->items()[i] = item;
+            p.heap().remember_if_old(dst, item);
+        }
+        ret(p, out);
         return;
     }
     if (!is_sequence(container)) {
@@ -1939,18 +2037,32 @@ void step_eval(Process& p) {
                             } else {
                                 have_key = operand_value(p, img, kids[accessor.key_slot], frame, &key);
                             }
-                            if (have_key && is_fixnum(key) && is_obj(container, ObjType::Array)) {
-                                auto* array = static_cast<ArrayObj*>(as_obj(container));
+                            // A record's accessor is the same `.[i]` an
+                            // array's was, and earns the same shortcut.
+                            const bool positional = is_obj(container, ObjType::Array) ||
+                                                    is_obj(container, ObjType::Record);
+                            if (have_key && is_fixnum(key) && positional) {
+                                const bool rec = is_obj(container, ObjType::Record);
+                                const uint32_t len =
+                                    rec ? static_cast<RecordObj*>(as_obj(container))->len
+                                        : static_cast<ArrayObj*>(as_obj(container))->len;
+                                Value* items =
+                                    rec ? static_cast<RecordObj*>(as_obj(container))->items()
+                                        : static_cast<ArrayObj*>(as_obj(container))->items();
                                 const int64_t index = fixnum_value(key);
-                                if (index >= 0 && uint64_t(index) < array->len &&
-                                    array->items()[index] != NIL_SLOT) {
+                                if (index >= 0 && uint64_t(index) < len &&
+                                    items[index] != NIL_SLOT) {
                                     --p.reductions;
                                     ++p.total_reductions;
-                                    enter(p, array->items()[index]);
+                                    enter(p, items[index]);
                                     return;
                                 }
                             }
                         }
+                    }
+                    if (const uint32_t mask = img.strict_args(cl->func)) {
+                        fill_closure_args(p, p.node, mask, uint32_t(p.stack.size()), 0, frame);
+                        return;
                     }
                     Value fr = p.heap().make_frame_filling(fn, f.slots, f.arity);
                     auto* fo = static_cast<FrameObj*>(as_obj(fr));
@@ -2103,6 +2215,18 @@ void step_eval(Process& p) {
             Value m = p.heap().make_map(0);
             p.stack.push_back(m);
             advance_map(p, n.a, n.b, 0, frame);
+            return;
+        }
+        case Op::RecordMake: {
+            const uint32_t* kids = img.kids_at(n.a);
+            Value id = make_atom(p.runtime().image_atom(n.c & RECORD_MAKE_ATOM));
+            Value rec = p.heap().make_record(
+                id, (n.c & RECORD_MAKE_VARIANT) ? RECORD_VARIANT : 0, n.b);
+            for (uint32_t i = 0; i < n.b; ++i) {
+                Value item = thunk_for(p, kids[i], frame);
+                static_cast<RecordObj*>(as_obj(rec))->items()[i] = item;
+            }
+            ret(p, rec);
             return;
         }
 
@@ -2281,6 +2405,18 @@ void step_return(Process& p, size_t floor) {
             return;
         }
 
+        case ContKind::ClosureArgs: {
+            p.stack.push_back(p.result);
+            const Image& img = img_of(p);
+            Value callee;
+            if (!callee_operand(p, img, img.node(c.a).a, c.v1, &callee)) {
+                p.unreachable("the callee of a closure call stopped being a name");
+            }
+            auto* cl = static_cast<ClosureObj*>(as_obj(resolve(callee)));
+            fill_closure_args(p, c.a, img.strict_args(cl->func), c.b, c.c + 1, c.v1);
+            return;
+        }
+
         case ContKind::NativeRetry:
             resume_native(p, c.v1, c.a, c.b, 0);
             return;
@@ -2394,6 +2530,7 @@ void locate_error(Process& p) {
             }
             case ContKind::IfBranch: case ContKind::BinRight: case ContKind::LogicRight:
             case ContKind::BlockNext: case ContKind::Catch: case ContKind::NativeArgs:
+            case ContKind::ClosureArgs:
             case ContKind::IndexKey: case ContKind::IndexApply: case ContKind::GetWalk:
             case ContKind::SetWalk: case ContKind::SwitchOn: case ContKind::SwitchKey:
             case ContKind::EnterRetry: {
@@ -2609,6 +2746,14 @@ Value thunk_for(Process& p, uint32_t node, Value frame) {
                 }
                 break;
             }
+            if (is_obj(c, ObjType::Record)) {
+                auto* r = static_cast<RecordObj*>(as_obj(c));
+                if (i < int64_t(r->len)) {
+                    Value v = r->items()[i];
+                    if (v != NIL_SLOT) return v;
+                }
+                break;
+            }
             // A list, walked only as far as it has already been built.
             //
             // Indexing a list is a walk, and a walk normally *forces* -- which
@@ -2770,8 +2915,18 @@ static inline bool check_limits(Process& p, const WellKnownAtoms& wk,
     // Once raised, it is not raised again until a collection has measured
     // the live data afresh: what the last one found is stale the moment the
     // error unwinds the frames that held it, and a `catch` must be able to run.
-    if (p.heap().bytes_allocated() > max_heap && p.heap().bytes_live() > max_heap / 2 &&
-        p.heap_limit_raised_at != p.heap().collections()) {
+    //
+    // A force nobody vouched for (`force_pins`) is the exception: nothing can
+    // be collected under it, so the live figure is never measured afresh and
+    // everything allocated since is held whether or not it is reachable. A
+    // native walking an endless list -- `list.length (list.from 1)` -- grew
+    // that way past the cap until the allocator failed and took the whole VM
+    // down with `bad_alloc`. Under a pin, what has been allocated is the
+    // measure.
+    const bool over = p.force_pins > 0 ? p.heap().bytes_allocated() > max_heap
+                                       : p.heap().bytes_allocated() > max_heap &&
+                                             p.heap().bytes_live() > max_heap / 2;
+    if (over && p.heap_limit_raised_at != p.heap().collections()) {
         p.heap_limit_raised_at = p.heap().collections();
         raise_heap_limit(p, wk, max_heap);
         return true;
@@ -3199,6 +3354,22 @@ bool force_deep(Process& p, Value v, Value* out) {
             p.stack.pop_back();
             return true;
         }
+        case ObjType::Record: {
+            // As an array, and for the same reason re-read across each force.
+            p.stack.push_back(head);
+            auto rec = [&] { return static_cast<RecordObj*>(as_obj(p.stack.back())); };
+            const uint32_t len = rec()->len;
+            for (uint32_t i = 0; i < len; ++i) {
+                Value tmp;
+                if (!force_deep(p, rec()->items()[i], &tmp)) return unwind(out);
+                value_slot_store(&rec()->items()[i], tmp);
+                p.heap().remember_if_old(rec(), tmp);
+            }
+            as_obj(p.stack.back())->aux |= AUX_DEEP_FORCED;
+            *out = p.stack.back();
+            p.stack.pop_back();
+            return true;
+        }
         case ObjType::Map: {
             p.stack.push_back(head);
             // The leaves are collected once and then forced in place. A leaf
@@ -3256,6 +3427,31 @@ bool jit_arith(Process& p, Op op, Value a, Value b, Value* out) {
 }
 bool jit_compare(Process& p, Op op, Value a, Value b, Value* out) {
     return compare(p, op, a, b, out);
+}
+
+/// What a record is, as `type_of` says it: the declaration's own name,
+/// without the module it was declared in. `ship.item.Item.file` is an `Item`,
+/// and `ship.item.Point` a `Point`.
+std::string record_type_name(Process& p, Value v) {
+    auto* r = static_cast<RecordObj*>(as_obj(resolve(v)));
+    const std::string& id = p.runtime().atom_name(uint32_t(imm_payload(r->id)));
+    size_t end = id.size();
+    if (r->flags & RECORD_VARIANT) {
+        size_t dot = id.rfind('.');
+        if (dot != std::string::npos) end = dot;
+    }
+    size_t start = id.rfind('.', end == 0 ? 0 : end - 1);
+    start = start == std::string::npos || start >= end ? 0 : start + 1;
+    return id.substr(start, end - start);
+}
+
+/// How a record is written: `Item.file` for a variant, `Point` for a record.
+std::string record_shown_name(Process& p, Value v) {
+    auto* r = static_cast<RecordObj*>(as_obj(resolve(v)));
+    std::string type = record_type_name(p, v);
+    if (!(r->flags & RECORD_VARIANT)) return type;
+    const std::string& id = p.runtime().atom_name(uint32_t(imm_payload(r->id)));
+    return type + id.substr(id.rfind('.'));
 }
 
 std::string describe(Process& p, Value v) {

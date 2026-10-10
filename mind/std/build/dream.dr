@@ -42,8 +42,8 @@ let no_warnings p = Program.set_no_warnings true p;
 /// Is this input an image the VM has to run, rather than a program of its own?
 let is_image : :any -> :bool;
 let is_image i = match i {
-    [:file, p] => str.ends_with ".dream" p,
-    [:artifact, _, n] => str.ends_with ".dream" n,
+    build.Input.file(p) => str.ends_with ".dream" p,
+    build.Input.artifact(_, n) => str.ends_with ".dream" n,
     _ => false,
 };
 
@@ -103,8 +103,8 @@ when test {
         test.case "an image is told from a program by its name"
             $( test.eq! [true, true, false] [is_image seed, is_image (artifact stage2), is_image vm] ),
         test.case "the compile runs in the package and names what it read"
-            $( test.eq! [[:run_to, "/p", %{}, "/p/vm", ["/p/seed.dream", "-L", "mind", "-L", ".", "dreams/main.dr",
-                                                        "-o", "/d/dreams.dream", "--depfile", "/d/deps.d"], "log"]]
+            $( test.eq! [build.Op.run_to "/p" %{} "/p/vm" ["/p/seed.dream", "-L", "mind", "-L", ".", "dreams/main.dr",
+                                                          "-o", "/d/dreams.dream", "--depfile", "/d/deps.d"] "log"]
                         (build.Step.action (image stage2) job) ),
     ];
 }

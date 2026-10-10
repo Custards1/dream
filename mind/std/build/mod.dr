@@ -181,9 +181,9 @@ mapping Job { dir, ctx, paths = %{} }
 /// The shape of an input, as a step's shape includes it.
 priv let input_shape : :any -> :any;
 priv let input_shape i = match i {
-    [:file, p] => [:file, p],
-    [:tree, d, suffix] => [:tree, d, suffix],
-    [:artifact, s, n] => [:artifact, Step.shape s, n],
+    Input.file(p) => [:file, p],
+    Input.tree(d, suffix) => [:tree, d, suffix],
+    Input.artifact(s, n) => [:artifact, Step.shape s, n],
 };
 
 /// A step. The constructor every tool ends in, because it is the one that
@@ -500,11 +500,14 @@ let write name text =
 /// the step that could change what it makes.
 let keyed : :any -> :any;
 let rec keyed v = match v {
-    [:artifact, s, n] if type_of s == :map && _map_has s :shape => [:artifact, Step.shape s, n],
+    Input.artifact(s, n) if type_of s == :map && _map_has s :shape => [:artifact, Step.shape s, n],
     _ => match type_of v {
         :list => list.map keyed v,
         :map => map.map_values keyed v,
-        _ => v,
+        // A record, keyed as what it is and its fields: a key is read, never
+        // used, so it need not be the record again.
+        _ => if _record_id v == () { v }
+             else { %{ "<record>" => _record_id v, "<fields>" => list.map keyed (_array_to_list (_record_fields v)) } },
     },
 };
 
@@ -521,7 +524,7 @@ let rec is_data v = match type_of v {
     :list => list.all is_data v,
     :array => list.all is_data (_array_to_list v),
     :map => list.all (fn pair -> is_data (list.head pair) && is_data (list.nth 1 pair)) (_map_pairs v),
-    _ => true,
+    _ => _record_id v == () || list.all is_data (_array_to_list (_record_fields v)),
 };
 
 /// A canonical spelling of a piece of data: two values encode alike exactly
@@ -542,7 +545,9 @@ let rec encode v = match type_of v {
     :array => "#[" + str.join_str "" (list.map encode (_array_to_list v)) + "]",
     :map => "{" + str.join_str "" (list.map (fn pair -> encode (list.head pair) + encode (list.nth 1 pair))
                                             (list.sort_on list.head (_map_pairs v))) + "}",
-    other => "?" + to_string other + ";",
+    // A record says which one it is, then its fields, as an array does.
+    other => if _record_id v == () { "?" + to_string other + ";" }
+             else { "r" + encode (_record_id v) + encode (_record_fields v) },
 };
 
 when test {
@@ -557,7 +562,7 @@ when test {
             $( test.eq! ["libz.so", "libz.dylib", "z.dll"]
                         (list.map (fn os -> shared_name (ctx os) "z") [:linux, :macos, :windows]) ),
         test.case "a bare string is a file"
-            $( test.eq! [[:file, "a.c"], [:artifact, leaf, "a.o"]]
+            $( test.eq! [Input.file "a.c", Input.artifact leaf "a.o"]
                         [input "a.c", input (artifact leaf "a.o")] ),
         test.case "encoding does not depend on the order a map was built in"
             $( test.eq! (encode (%{ :a => 1, "b" => [2, 3] })) (encode ((%{ "b" => [2, 3] }).[:a => 1])) ),
@@ -588,6 +593,6 @@ when test {
                         [Plan.target (all [empty |> target [:linux, :macos], empty |> target [:linux]]),
                          Plan.target empty] ),
         test.case "writing is keyed on the text"
-            $( test.ne! (Step.shape (list.nth 1 (write "v.dr" "a"))) (Step.shape (list.nth 1 (write "v.dr" "b"))) ),
+            $( test.ne! (Step.shape (write "v.dr" "a").[0]) (Step.shape (write "v.dr" "b").[0]) ),
     ];
 }

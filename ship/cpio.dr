@@ -20,8 +20,8 @@ import out;
 /// The type bits `stat` puts above the permissions.
 let type_bits : Item -> :integer;
 let type_bits i = match i {
-    [:dir, _, _] => 0o040000,
-    [:link, _, _] => 0o120000,
+    item.Item.dir(_, _) => 0o040000,
+    item.Item.link(_, _) => 0o120000,
     _ => 0o100000,
 };
 
@@ -37,13 +37,13 @@ let header ino mode nlink epoch size name = {
 /// One member, numbered `ino`, onto `h`.
 let member! : :any -> :integer -> [:integer, Item] -> :unit;
 let member! h epoch [ino, i] = {
-    let size = match i { [:dir, _, _] => 0, _ => item.size i };
+    let size = match i { item.Item.dir(_, _) => 0, _ => item.size i };
     let nlink = if item.is_dir i { 2 } else { 1 };
     out.write! h (header ino (type_bits i + item.mode i % 4096) nlink epoch size (item.path i))
     match i {
-        [:file, _, _, source, n] => out.copy_exactly! h source n,
-        [:text, _, _, data] => out.write! h data,
-        [:link, _, target] => out.write! h target,
+        item.Item.file(_, _, source, n) => out.copy_exactly! h source n,
+        item.Item.text(_, _, data) => out.write! h data,
+        item.Item.link(_, target) => out.write! h target,
         _ => (),
     }
     out.write! h (bytes.zeros (bytes.padding 4 size))
@@ -67,7 +67,7 @@ let write! h epoch members = {
 let size_of : [[:integer, Item]] -> :integer;
 let size_of members = {
     let one = fn [ino, i] -> {
-        let size = match i { [:dir, _, _] => 0, _ => item.size i };
+        let size = match i { item.Item.dir(_, _) => 0, _ => item.size i };
         str.byte_length (header ino 0 1 0 size (item.path i)) + size + bytes.padding 4 size
     };
     list.fold_strict (fn !acc m -> acc + one m) 0 members + str.byte_length (header 0 0 1 0 0 "TRAILER!!!")

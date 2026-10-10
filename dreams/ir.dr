@@ -129,7 +129,15 @@ let ops = [
     [:band, 75, "band"], [:bor, 76, "bor"], [:bxor, 77, "bxor"],
     [:bnot, 78, "bnot"], [:shl, 79, "shl"], [:shr, 80, "shr"],
 
+    /// A value of a declared record or union: `a` = kids offset, `b` = field
+    /// count, `c` = the atom naming it, plus `record_variant` when that is a
+    /// union's variant. See `lower.lower_record`.
+    [:record_make, 81, "record"],
+
 ];
+
+/// `record_make`'s `c`: the top bit says the id names a variant.
+let record_variant = 2147483648;
 
 priv let nth = list.nth;
 
@@ -225,18 +233,20 @@ type Image = :map;
 /// `[op, flags, a, b, c]`. The VM's record also carries a 16-bit `aux` field
 /// that nothing generates yet; it is written as zero and left out here rather
 /// than threaded through every constructor unused.
-group Node { op, flags, a, b, c }
-
-let node op a b c = Node.make op 0 a b c;
-let node_op = Node.op;
-let node_flags = Node.flags;
-let node_a = Node.a;
-let node_b = Node.b;
-let node_c = Node.c;
+///
+/// A list and not a record, because it is read by position on the other side
+/// of a native: `vm.share_arenas` walks the arena in C++ and reads each node
+/// as the five things it is.
+let node op a b c = [op, 0, a, b, c];
+let node_op n = n.[0];
+let node_flags n = n.[1];
+let node_a n = n.[2];
+let node_b n = n.[3];
+let node_c n = n.[4];
 
 let leaf op = node op no_node no_node no_node;
 
-let with_flags flags n = Node.set_flags flags n;
+let with_flags flags n = n.[1 => flags];
 
 let node_is_impure n = has_flag (node_flags n) f_impure;
 
@@ -537,6 +547,8 @@ let show_node img i n = {
             :make_list   => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
             :make_array  => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
             :make_map    => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
+            :record_make => "kids@" + to_string (node_a n) + "x" + to_string (node_b n)
+                            + " " + const_at :atoms (node_c n % record_variant),
             :switch_head => to_string (node_a n) + " kids@" + to_string (node_b n)
                             + "x" + to_string (node_c n),
             :switch_atom => to_string (node_a n) + " kids@" + to_string (node_b n)

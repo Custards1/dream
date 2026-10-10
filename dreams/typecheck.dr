@@ -59,6 +59,7 @@ import dreams.modules;
 import dreams.scope;
 import std.array;
 import std.map;
+import std.types;
 
 // --- types as the checker holds them ---------------------------------------------
 //
@@ -68,6 +69,8 @@ import std.map;
 //     [:fn, a, b]                curried, as the grammar writes it
 //     [:list_of, t]  [:tuple, [t, ..]]      [:array_of, t]  [:array_t, [t, ..]]
 //     [:map_of, k, v]  [:record, [[key, t], ..]]
+//     [:nominal, id, [t, ..]]    a value one constructor made: `app.Point`,
+//                                `app.Shape.circle`, and its fields' types
 //     [:var, name]               a type variable of the signature being checked
 //     [:flex, name]              one of a *callee's*, to be solved at the call
 //     [:named, shown, gi, args]  a declared type, unfolded only when asked
@@ -133,6 +136,7 @@ let rec flexible t = match t {
     [:tuple, ts] => [:tuple, list.map (fn x -> flexible x) ts],
     [:array_of, e] => [:array_of, flexible e],
     [:array_t, ts] => [:array_t, list.map (fn x -> flexible x) ts],
+    [:nominal, id, ts] => [:nominal, id, list.map (fn x -> flexible x) ts],
     [:map_of, kt, vt] => [:map_of, flexible kt, flexible vt],
     [:record, ps] => [:record, list.map (fn p -> list.take 1 p + [flexible (list.nth 1 p)] + list.drop 2 p) ps],
     [:named, n, gi, args] => [:named, n, gi, list.map (fn x -> flexible x) args],
@@ -154,6 +158,8 @@ let rec show t = match t {
     [:tuple, ts] => "[" + str.join_str ", " (list.map (fn x -> show x) ts) + "]",
     [:array_of, e] => "#[" + show e + "]",
     [:array_t, ts] => "#[" + str.join_str ", " (list.map (fn x -> show x) ts) + "]",
+    [:nominal, id, ts] => shown_id id + (if list.is_empty ts { "" }
+                                         else { "(" + str.join_str ", " (list.map (fn x -> show x) ts) + ")" }),
     [:map_of, kt, vt] => "%{" + show kt + " => " + show vt + "}",
     [:record, ps] => "%{" + str.join_str ", " (list.map (fn p ->
                         show (list.nth 0 p) + " => " + show (list.nth 1 p)
@@ -293,6 +299,7 @@ let tagged k ev tag parts = {
         ["literal", [[:atom, n, _]]] => lit :atom n,
         ["literal", [v]] => ev1 v,
         ["shape", [[:atom, kind, _], [:list, fields, _]]] => shape_type k ev kind fields,
+        ["constructed", [[:atom, id, _], [:list, ts, _]]] => [:nominal, id, list.map ev1 ts],
         _ => :any,
     }
 };
@@ -565,6 +572,13 @@ let rec sub k s t n =
                 :map => true,
                 _ => false,
             },
+            // Made by one constructor: the same one, with fields that fit.
+            // Nothing else is -- not a list or an array of those fields --
+            // which is the whole of what makes a declaration a type.
+            [_, [:nominal, id, ts]] => match s {
+                [:nominal, id2, ss] => id == id2 && list.length ss == list.length ts && pointwise k ss ts n,
+                _ => false,
+            },
             [_, [:record, tps]] => match s {
                 [:record, sps] => list.all (fn tp -> match field_in sps (list.nth 0 tp) {
                     () => list.length tp > 2,
@@ -578,6 +592,16 @@ let rec sub k s t n =
             _ => true,
         }
     };
+
+/// A constructor's id as a reader knows it: `Shape.circle` for a variant,
+/// `Point` for a record, without the module in front.
+let shown_id id = {
+    let parts = str.split "." id;
+    let last = list.last parts;
+    let b = str.byte 0 last;
+    if (b >= 65 && b <= 90) || list.length parts < 2 { last }
+    else { list.nth (list.length parts - 2) parts + "." + last }
+};
 
 let rec pointwise k ss ts n = match [ss, ts] {
     [[s, ..sr], [t, ..tr]] => sub k s t n && pointwise k sr tr n,
@@ -668,6 +692,11 @@ let rec solve k p a subst = {
                                        subst ps,
             _ => subst,
         },
+        [:nominal, id, ps] => match a2 {
+            [:nominal, id2, ts] if id == id2 && list.length ps == list.length ts =>
+                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip ps ts),
+            _ => subst,
+        },
         [:named, _, g, pargs] => match a {
             [:named, _, g2, aargs] if g == g2 && list.length pargs == list.length aargs =>
                 list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip pargs aargs),
@@ -695,6 +724,7 @@ let rec solved subst t settle = match t {
     [:tuple, ts] => [:tuple, list.map (fn x -> solved subst x settle) ts],
     [:array_of, e] => [:array_of, solved subst e settle],
     [:array_t, ts] => [:array_t, list.map (fn x -> solved subst x settle) ts],
+    [:nominal, id, ts] => [:nominal, id, list.map (fn x -> solved subst x settle) ts],
     [:map_of, kt, vt] => [:map_of, solved subst kt settle, solved subst vt settle],
     [:record, ps] => [:record, list.map (fn p -> list.take 1 p + [solved subst (list.nth 1 p) settle] + list.drop 2 p) ps],
     [:named, n, gi, args] => [:named, n, gi, list.map (fn x -> solved subst x settle) args],
@@ -850,6 +880,7 @@ let element k ct kt = match [peel k ct 8, kt] {
     [[:record, ps], [:lit, _, _]] => match field_in ps kt { () => :any, t => t },
     [[:tuple, ts], [:lit, :integer, i]] => if i >= 0 && i < list.length ts { list.nth i ts } else { :any },
     [[:array_t, ts], [:lit, :integer, i]] => if i >= 0 && i < list.length ts { list.nth i ts } else { :any },
+    [[:nominal, _, ts], [:lit, :integer, i]] => if i >= 0 && i < list.length ts { list.nth i ts } else { :any },
     [[:list_of, e], _] => e,
     [[:array_of, e], _] => e,
     [[:map_of, _, v], _] => v,
@@ -1114,7 +1145,7 @@ let rec arrows k t n acc =
 let not_a_function t = match t {
     [:lit, _, _] => true,
     [:tuple, _] => true, [:list_of, _] => true,
-    [:array_t, _] => true, [:array_of, _] => true,
+    [:array_t, _] => true, [:array_of, _] => true, [:nominal, _, _] => true,
     [:record, _] => true, [:map_of, _, _] => true,
     :integer => true, :float => true, :string => true, :bool => true,
     :char => true, :atom => true, :unit => true, :list => true, :array => true,
@@ -1262,6 +1293,7 @@ let rec has_flex t = match t {
     [:tuple, ts] => list.any (fn x -> has_flex x) ts,
     [:array_of, e] => has_flex e,
     [:array_t, ts] => list.any (fn x -> has_flex x) ts,
+    [:nominal, _, ts] => list.any (fn x -> has_flex x) ts,
     [:map_of, a, b] => has_flex a || has_flex b,
     [:record, ps] => list.any (fn p -> has_flex (list.nth 1 p)) ps,
     [:named, _, _, args] => list.any (fn x -> has_flex x) args,
@@ -1354,6 +1386,16 @@ let statement k h st ds = match st {
 
 let rec bind_pattern k h p t = match p {
     [:bind, n, _] => with_local n t h,
+    [:record_p, _, _, _] => bind_pattern k h (resolved_pattern k h p) t,
+    // Each field is what that constructor's values hold there: the members of
+    // `t` it made, read at the field's position.
+    [:ctor_p, id, fields, _] => {
+        let made = list.filter (fn m -> match m { [:nominal, i, ts] => i == id && list.length ts == list.length fields, _ => false })
+                               (flat_members k t);
+        let at i = if list.is_empty made { :any }
+                   else { union_of (list.map (fn m -> list.nth i (list.nth 2 m)) made) };
+        list.fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (list.enumerate fields)
+    },
     [:as_p, inner, n, _, _] => with_local n t (bind_pattern k h inner t),
     [:cons_p, head, tail, _, _] => {
         let found = sequence_members k t :list [head] [()];
@@ -1366,6 +1408,62 @@ let rec bind_pattern k h p t = match p {
     [:map_p, kvs, _] => list.fold (fn acc kv ->
         bind_pattern k acc (list.nth 1 kv) (element k t (literal_type (list.nth 0 kv)))) h kvs,
     _ => h,
+};
+
+/// A pattern with every constructor in it said as the id it makes:
+/// `[:ctor_p, id, fields, span]`, the id `()` for a name that is no
+/// constructor -- which lowering reports. The functions that decide what an
+/// arm covers have the pattern and a type and nothing to resolve a name
+/// with, so a `match` asks once, here, for all of them.
+let rec resolved_pattern k h p = match p {
+    [:record_p, ctor, fields, sp] => {
+        let at = match ctor { [:name, _, s] => s, [:field, _, _, s] => s, _ => () };
+        let id = match scope.resolution (res k) (Here.mi h) (Here.source h) at {
+            [:global, _, _, g] => constructor_id k g,
+            [:member, [:dream, _], _, g] => constructor_id k g,
+            _ => (),
+        };
+        [:ctor_p, id, list.map (fn f -> resolved_pattern k h f) fields, sp]
+    },
+    [:as_p, inner, n, ns, sp] => [:as_p, resolved_pattern k h inner, n, ns, sp],
+    [:cons_p, hd, tl, os, sp] => [:cons_p, resolved_pattern k h hd, resolved_pattern k h tl, os, sp],
+    [:list_p, items, rest, sp] => [:list_p, list.map (fn i -> resolved_pattern k h i) items, rest, sp],
+    [:array_p, items, rest, sp] => [:array_p, list.map (fn i -> resolved_pattern k h i) items, rest, sp],
+    [:map_p, kvs, sp] => [:map_p, list.map (fn kv -> [list.nth 0 kv, resolved_pattern k h (list.nth 1 kv)]) kvs, sp],
+    _ => p,
+};
+
+/// An arm whose pattern no value of the scrutinee's declared type could fit:
+/// `[:circle, r]` against a `Shape`, which is a record now and never a list.
+/// It is never taken, and the code under it is never run, which is what a
+/// `match` written before `Shape` was a type looks like. Only a declared type
+/// is held to it -- a name, as exhaustiveness asks -- and only a pattern that
+/// fails every member, so an arm left over after the others covered
+/// everything, `_ =>`, is not one: a wildcard fits anything.
+let dead_arm k h st p ds = match st {
+    [:named, shown, _, _] => {
+        let ms = flat_members k st;
+        if list.is_empty ms || list.any (fn m -> may_match k p m) ms { ds }
+        else { bad h (ast.span p) ("this arm can never match: a `" + shown + "` is not " + pattern_kind p) ds }
+    },
+    _ => ds,
+};
+
+let pattern_kind p = match p {
+    [:list_p, _, _, _] => "a list",
+    [:cons_p, _, _, _, _] => "a list",
+    [:array_p, _, _, _] => "an array",
+    [:map_p, _, _] => "a map",
+    [:literal, e, _] => "`" + show (literal_type e) + "`",
+    [:as_p, inner, _, _, _] => pattern_kind inner,
+    _ => "what this pattern takes apart",
+};
+
+/// The id the constructor global `g` stamps on what it makes, from the
+/// resolver's wrappers (`scope.constructor_of`), or `()`.
+let constructor_id k g = match (scope.wrappers (res k)).[g else ()] {
+    [[:record, id, _, _, _], _, _] => id,
+    _ => (),
 };
 
 /// The members of `t` a sequence pattern could match: `[:seq, [elements]]`
@@ -1448,11 +1546,16 @@ let bind_items k h items rest found kind = {
 /// says the probe answered, in that arm and, for an unguarded one, the other
 /// way in the arms below it. Exhaustiveness is asked of the scrutinee as
 /// written, not as narrowed.
-let infer_match k h s arms sp expected ds = {
+let infer_match k h s written sp expected ds = {
     let [st, ds1] = infer k h s ds;
+    // Each constructor pattern said once what it names, for everything below
+    // that has no resolution to ask (`resolved_pattern`).
+    let arms = list.map (fn a -> ast.arm (resolved_pattern k h (ast.arm_pattern a)) (ast.arm_guard a)
+                                         (ast.arm_body a) (list.nth 3 a)) written;
     let [t, _, _, ds2] = list.fold (fn acc arm -> {
-        let [t, left, hs, d] = acc;
+        let [t, left, hs, d0] = acc;
         let pattern = ast.arm_pattern arm;
+        let d = dead_arm k h st pattern d0;
         let here_t = within k left pattern;
         let h1 = probe_arm k (if here_t == st { hs } else { narrow_scrutinee k hs s here_t }) s pattern true;
         let h2 = bind_pattern k h1 pattern here_t;
@@ -1606,6 +1709,11 @@ let rec covers p m = match p {
         },
         _ => false,
     },
+    [:ctor_p, id, fields, _] => match m {
+        [:nominal, i, ts] => id != () && i == id && list.length ts == list.length fields
+                             && list.all (fn pt -> covers (list.nth 0 pt) (list.nth 1 pt)) (list.zip fields ts),
+        _ => false,
+    },
     _ => false,
 };
 
@@ -1628,6 +1736,16 @@ let rec may_match k p m = match p {
     [:map_p, _, _] => match kinds_of k m {
         () => true,
         ks => list.contains :map ks,
+    },
+    // Only what that constructor made. Anything whose shape the checker knows
+    // and is not a record -- a list, an array, a map, a literal -- it cannot be.
+    [:ctor_p, id, fields, _] => match peel k m 8 {
+        [:nominal, i, ts] => id == () || (i == id && list.length ts == list.length fields
+                                          && list.all (fn pt -> may_match k (list.nth 0 pt) (list.nth 1 pt))
+                                                      (list.zip fields ts)),
+        [:tuple, _] => false, [:list_of, _] => false, [:array_t, _] => false, [:array_of, _] => false,
+        [:map_of, _, _] => false, [:record, _] => false, [:lit, _, _] => false,
+        _ => true,
     },
     _ => true,
 };
@@ -1797,6 +1915,7 @@ let narrow_elem k h x key raises l yes = narrow_name k h x (fn t -> keeping k t 
 let element_at k m key = match [peel k m 8, key] {
     [[:tuple, ts], [:lit, :integer, i]] => positional ts i,
     [[:array_t, ts], [:lit, :integer, i]] => positional ts i,
+    [[:nominal, _, ts], [:lit, :integer, i]] => positional ts i,
     [[:list_of, e], _] => [e, false],
     [[:array_of, e], _] => [e, false],
     [[:record, ps], _] => match list.filter (fn p -> list.nth 0 p == key) ps {
@@ -1830,6 +1949,9 @@ let kinds_of k m = match peel k m 8 {
     [:array_t, _] => [:array],
     [:map_of, _, _] => [:map],
     [:record, _] => [:map],
+    // A record answers `type_of` with its own name; what matters here is that
+    // it is none of the kinds a list, an array or a map pattern asks for.
+    [:nominal, _, _] => [:record],
     :number => [:integer, :float],
     :any => (),
     p if type_of p == :atom => [p],
@@ -1910,6 +2032,8 @@ let tagged_variant v = match v {
     :unit => true,
     [:tuple, [tag, .._]] => is_tag tag,
     [:array_t, [tag, .._]] => is_tag tag,
+    // A variant of a declared union is told apart by what made it.
+    [:nominal, _, _] => true,
     _ => false,
 };
 
@@ -1929,6 +2053,8 @@ let show_variant v = match v {
         "[:" + tag_name tag + str.join_str "" (list.map (fn f -> ", _") fields) + "]",
     [:array_t, [tag, ..fields]] =>
         "#[:" + tag_name tag + str.join_str "" (list.map (fn f -> ", _") fields) + "]",
+    [:nominal, id, ts] => shown_id id + (if list.is_empty ts { "" }
+                                         else { "(" + str.join_str ", " (list.map (fn _ -> "_") ts) + ")" }),
     _ => show v,
 };
 
@@ -1962,10 +2088,21 @@ let rec arm_misses p v = match p {
         _ => true,
     },
     [:map_p, _, _] => true,
+    // Another constructor's value, or none: the id is the whole question,
+    // and then the fields, as a list pattern's elements are.
+    [:ctor_p, id, fields, _] => match v {
+        [:nominal, i, ts] => id == () || i != id || list.length ts != list.length fields
+                             || list.any (fn pt -> element_misses (list.nth 0 pt) (list.nth 1 pt)) (list.zip fields ts),
+        _ => true,
+    },
     _ => false,
 };
 
 let element_misses p t = match p {
+    [:ctor_p, id, _, _] => match t {
+        [:nominal, i, _] => id != () && i != id,
+        _ => false,
+    },
     [:literal, e, _] => match [literal_type e, t] {
         [[:lit, :atom, n], [:lit, :atom, m]] => n != m,
         [[:lit, :atom, n], q] if is_tag q => ":" + n != to_string q,
@@ -2030,6 +2167,7 @@ let element_misses p t = match p {
 /// that happens to begin with one cannot be confused:
 ///
 ///     [:atom_d, name]   [:list_d, [d, ..]]   [:array_d, [d, ..]]   [:map_d, [[k, v], ..]]
+///     [:record_d, id, variant, [d, ..]]   a value of a `group`, `struct` or union
 ///
 /// A value read from syntax is spelled this way directly, and one a `comp`
 /// produced is converted, so the two meet on equal terms.
@@ -2040,7 +2178,10 @@ let rec datum_of v = match type_of v {
     :list => [:list_d, list.map (fn x -> datum_of x) v],
     :array => [:array_d, list.map (fn x -> datum_of x) (array.to_list v)],
     :map => [:map_d, list.map (fn kv -> [datum_of (list.nth 0 kv), datum_of (list.nth 1 kv)]) (map.pairs v)],
-    _ => v,
+    _ => match types.record_id v {
+        () => v,
+        id => [:record_d, atom_name id, types.is_variant v, list.map (fn x -> datum_of x) (types.record_fields v)],
+    },
 };
 
 /// The type of exactly this value.
@@ -2056,6 +2197,7 @@ let rec datum_type d = match type_of d {
         [:list_d, xs] => [:tuple, list.map (fn x -> datum_type x) xs],
         [:array_d, xs] => [:array_t, list.map (fn x -> datum_type x) xs],
         [:map_d, ps] => [:record, list.map (fn p -> [datum_type (list.nth 0 p), datum_type (list.nth 1 p)]) ps],
+        [:record_d, id, _, xs] => [:nominal, id, list.map (fn x -> datum_type x) xs],
         _ => :any,
     },
     kind => kind,
@@ -2070,6 +2212,7 @@ let rec show_datum d = match type_of d {
         [:array_d, xs] => "#[" + str.join_str ", " (list.map (fn x -> show_datum x) xs) + "]",
         [:map_d, ps] => "%{" + str.join_str ", " (list.map (fn p ->
                             show_datum (list.nth 0 p) + " => " + show_datum (list.nth 1 p)) ps) + "}",
+        [:record_d, id, _, xs] => shown_id id + "(" + str.join_str ", " (list.map (fn x -> show_datum x) xs) + ")",
         _ => to_string d,
     },
     _ => to_string d,
@@ -2366,6 +2509,7 @@ let rec refines k t n =
             [:array_of, e] => refines k e (n - 1),
             [:tuple, ts] => list.any (fn x -> refines k x (n - 1)) ts,
             [:array_t, ts] => list.any (fn x -> refines k x (n - 1)) ts,
+            [:nominal, _, ts] => list.any (fn x -> refines k x (n - 1)) ts,
             [:map_of, a, b] => refines k a (n - 1) || refines k b (n - 1),
             [:record, ps] => list.any (fn p -> refines k (list.nth 1 p) (n - 1)) ps,
             _ => false,
@@ -2706,6 +2850,7 @@ let rec loosen t = match t {
     [:tuple, []] => [:list_of, :never],
     [:tuple, ts] => [:tuple, list.map (fn x -> loosen x) ts],
     [:array_t, ts] => [:array_t, list.map (fn x -> loosen x) ts],
+    [:nominal, id, ts] => [:nominal, id, list.map (fn x -> loosen x) ts],
     [:list_of, e] => [:list_of, loosen e],
     [:array_of, e] => [:array_of, loosen e],
     [:map_of, kt, vt] => [:map_of, loosen kt, loosen vt],
@@ -2725,6 +2870,7 @@ let rec has_unknowns t = match t {
     [:tuple, ts] => list.any (fn x -> has_unknowns x) ts,
     [:array_of, e] => has_unknowns e,
     [:array_t, ts] => list.any (fn x -> has_unknowns x) ts,
+    [:nominal, _, ts] => list.any (fn x -> has_unknowns x) ts,
     [:map_of, a, b] => has_unknowns a || has_unknowns b,
     [:record, ps] => list.any (fn p -> has_unknowns (list.nth 1 p)) ps,
     [:named, _, _, args] => list.any (fn x -> has_unknowns x) args,
@@ -2845,8 +2991,10 @@ let tables k = [Checker.named k, Checker.sigs k, Checker.uses k, Checker.comps k
 /// the names of the bodies it walked and no others (see "resolving in parts" in
 /// `scope`), so a part's bodies are checked with the part's resolution and
 /// everything else the checker holds -- the signatures, the named types, what
-/// the `comp`s came to -- is the whole program's.
-let with_resolution k r = Checker.set_r r k;
+/// the `comp`s came to -- is the whole program's. So are the wrappers, which is
+/// where a constructor pattern finds the id of a constructor some other part
+/// walked (`constructor_id`), as lowering's parts are given them.
+let with_resolution k r = Checker.set_r (r.[:wrappers => scope.wrappers (Checker.r k)]) k;
 
 /// The analysis, given what each body said on its own -- `check_decl k b []`,
 /// in the order the resolver queued the bodies -- and what each said in the

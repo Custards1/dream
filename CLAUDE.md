@@ -348,13 +348,16 @@ The lessons that keep coming back:
   resolution; [dreams/expand.dr](dreams/expand.dr) and [docs/notes/macro-expansion.md](docs/notes/macro-expansion.md) says what
   that costs.
 - `group P { x, y }`, `struct P { x, y }` and `mapping P { x, y }` declare a
-  record: a module of generated functions — `P.make`, `P.new`, `P.x`, `P.set_x`
-  — over a list, an array and a map respectively. The *loader* rewrites them
-  (`syntax.record`), so nothing downstream knows a record from a `mod`; "A
-  record is a declaration before it is a module" is what that costs a tool.
-  A field may be given a default (`x = 0`), which is the `else` of the read its
-  accessor compiles to; `new` is the constructor that takes only the fields
-  without one. An entry *with parameters* is a **member** — `say_hi self = ..`
+  record: a module of generated functions — `P.make`, `P.new`, `P.x`, `P.set_x`.
+  A `group` or `struct` value is a **record of its own** (`RecordObj`): it
+  carries the atom naming its declaration (`app.P`), prints as `P(1, 2)`,
+  `type_of` answers `:P`, it equals no list or array, and `P(x, y)` takes it
+  apart; a `mapping` is a map. The *loader* rewrites them (`syntax.record`),
+  so nothing downstream knows a record from a `mod`; "A record is a
+  declaration before it is a module" is what that costs a tool, and "Records
+  are values of their own" in docs/notes/static-types.md is the design.
+  A field may be given a default (`x = 0`); `new` is the constructor that
+  takes only the fields without one. An entry *with parameters* is a **member** — `say_hi self = ..`
   — an ordinary function compiled inside the generated module, where the
   accessors are globals. Having parameters is the whole of what tells the two
   apart, and entries are separated by `,` or by a line break, as a block's
@@ -379,12 +382,13 @@ The lessons that keep coming back:
   never rejected. [docs/notes/static-types.md](docs/notes/static-types.md)
   is the design.
 - `union Shape { circle(radius : :float), empty }` declares a **discriminated
-  union**: a module of constructors whose values are `[:circle, r]` and
-  `:empty` -- the tagged lists Dream already writes by hand -- plus a global
-  `Shape` holding its description. A `match` on one must handle every
-  variant. Lists back it; `union struct Shape { .. }` makes the variants
-  with fields arrays (`#[:circle, r]`) instead, as `struct` is to `group`,
-  and `switch_head` dispatches on either.
+  union**: a module of constructors whose values are records --
+  `Shape.circle 1.0`, `Shape.empty`, each carrying `app.Shape.circle` -- plus
+  a global `Shape` holding its description. They are matched with
+  constructor patterns, `Shape.circle(r)` and `Shape.empty`, and are equal
+  to no tagged list or atom: `[:circle, r]` against a `Shape` never matches,
+  and the checker says so. A `match` on one must handle every variant.
+  `union struct` still parses and means the same thing.
 - `import std.tensor` gives **tensors**: packed numbers with a shape
   (`TensorObj`), on which `+ - * / %` are elementwise and `a @ b` is the
   matrix product (the parser writes it as the builtin `_tensor_matmul`).

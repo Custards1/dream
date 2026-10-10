@@ -85,13 +85,40 @@ let rec literal value span = match type_of value {
 /// would throw away the only spans a diagnostic inside it could point at.
 /// Generated spans live above 2^31 and written ones below, so the two cannot
 /// collide.
-let record kind name fields members span = record_derived kind name fields members [] span;
+let record kind name fields members span = record_derived "" kind name fields members [] span;
+
+/// A member's body, with `Shape.circle` read as the `circle` it means.
+///
+/// A member is compiled inside the module the declaration becomes, where the
+/// constructors and accessors are its own globals and the declaration's name
+/// is nobody's -- so `Shape.circle(r)` in a member of `Shape` named nothing,
+/// and a bare `empty` in a pattern would have bound anything, which is the
+/// mistake this keeps anyone from having to write. A dotted name through the
+/// declaration's own name becomes the name it reaches, keeping the dotted
+/// span, which starts where the `Shape` did and so names nothing else.
+let rec own_names owner e =
+    match e {
+        [:field, [:name, n, _], member, sp] if n == owner => [:name, member, sp],
+        _ => if type_of e == :list { list.map (fn x -> own_names owner x) e } else { e },
+    };
+
+/// `_record_of :id variant #[fields..]`: what a constructor's body is, and the
+/// one shape lowering turns into a `record_make` (`lower.lower_apply`) and
+/// the resolver files as a constructor (`scope.constructor_of`).
+let constructed id variant items span =
+    ast.apply_e (ast.name_e "_record_of" span)
+                [ast.atom_e id span, ast.bool_e variant span, ast.array_e items span] span;
+
+/// The id a declaration's values carry: the module it was declared in, then
+/// its own name. `owner` is empty only for a declaration read with no module
+/// around it, which is a test's.
+let qualified owner name = if owner == "" { name } else { owner + "." + name };
 
 /// The global a `derive dyn` record's values carry in slot 0. Angle brackets
 /// cannot be written, so it can name nothing else.
 let dispatch_table_name = "<dispatch>";
 
-let record_derived kind name fields members bases span = {
+let record_derived owner kind name fields members bases span = {
     let named f = ast.name_e (ast.field_name f) (ast.field_span f);
     // `derive dyn`: every value carries its record's dispatch table in slot 0
     // -- the first position of a list or an array, the key `0` of a map, so
@@ -101,12 +128,15 @@ let record_derived kind name fields members bases span = {
     let dispatched = list.any (fn b -> b.[0] == :dispatch) bases;
     let table = ast.name_e dispatch_table_name span;
     let offset = if dispatched && kind != :map { 1 } else { 0 };
+    // A `group` and a `struct` are records of their own: a value that says
+    // what it is, made by the constructor and matched by `Name(..)`. They
+    // differed in what backed them, a list or an array, and no longer do.
+    let id = qualified owner name;
     let build of_field = match kind {
-        :list => ast.list_e ((if dispatched { [table] } else { [] }) + list.map of_field fields) span,
-        :array => ast.array_e ((if dispatched { [table] } else { [] }) + list.map of_field fields) span,
         :map => ast.map_e ((if dispatched { [[ast.int_e 0 span, table]] } else { [] })
                            + list.map (fn f -> [ast.atom_e (ast.field_name f) (ast.field_span f), of_field f])
                                       fields) span,
+        _ => constructed id false ((if dispatched { [table] } else { [] }) + list.map of_field fields) span,
     };
     let constructor = ast.let_d "make"
         (if list.is_empty fields { [ast.param () span] }
@@ -150,14 +180,30 @@ let record_derived kind name fields members bases span = {
     let table_field = if dispatched {
         [ast.list_e [ast.int_e 0 span, ast.atom_e "map" span, ast.list_e [] span] span]
     } else { [] };
+    // A `mapping` is described by its shape, as a map is. A `group` or a
+    // `struct` is described by what made it: `[:constructed, id, [field ..]]`
+    // accepts exactly the values its constructor made.
     let description = ast.let_d "type" []
         (ast.list_e [ast.atom_e "named" span, ast.str_e name span,
-            ast.list_e [ast.atom_e "shape" span, literal kind span,
-                        ast.list_e (table_field + type_fields) span] span] span) false span;
-    let generated = list.head (fresh ([constructor, from_default] + helpers)
+            (if kind == :map {
+                ast.list_e [ast.atom_e "shape" span, literal kind span,
+                            ast.list_e (table_field + type_fields) span] span
+             } else {
+                ast.list_e [ast.atom_e "constructed" span, ast.atom_e id span,
+                            ast.list_e ((if dispatched { [ast.atom_e "map" span] } else { [] })
+                                        + list.map (fn f -> match ast.field_type f { () => ast.atom_e "any" span, t => t }) fields)
+                                       span] span
+             })] span) false span;
+    // What every value of it carries, as a function: how `std.record`'s
+    // `record_id` hole is filled without the declaration saying anything.
+    let identity = match kind {
+        :map => [],
+        _ => [ast.let_d "record_id" [ast.param () span] (ast.atom_e id span) false span],
+    };
+    let generated = list.head (fresh ([constructor, from_default] + helpers + identity)
                                      (2147483648 + ast.span_start span * 128));
     let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
-                                              (ast.member_body m) true (ast.member_span m))
+                                              (own_names name (ast.member_body m)) true (ast.member_span m))
                            members;
     // Each field type occurs once, so retain its written spans for diagnostics.
     ast.mod_d name (bases + generated + [description] + record_sigs kind name fields span + written) span
@@ -175,16 +221,19 @@ let record_derived kind name fields members bases span = {
 /// in the generated module -- so the checker resolves it the way it resolves
 /// any name in a signature, and nothing here has to know how.
 ///
-/// Only a record with at least one annotated field gets them. One that
-/// annotates nothing has promised nothing, and code that uses it -- reading a
-/// defaulted field of an empty map, say, which is legitimate -- must check
-/// exactly as it compiled before any of this existed.
+/// A `mapping` gets them only when it annotates a field. One that annotates
+/// nothing has promised nothing, and code that uses it -- reading a defaulted
+/// field of an empty map, say, which is legitimate -- must check exactly as it
+/// compiled before any of this existed. A `group` or a `struct` always gets
+/// them, because its values are its own: nothing but its constructor makes
+/// one, so a list handed to its accessor is a mistake whether or not a field
+/// was annotated.
 ///
 /// A `mapping`'s accessor asks only for the field it reads, and for any map
 /// at all when that field has a default: `Config.retries %{}` is `3`. A
 /// `group`'s or a `struct`'s reads by position, so it takes the record.
 let record_sigs kind name fields span =
-    if list.all (fn f -> ast.field_type f == ()) fields { [] }
+    if kind == :map && list.all (fn f -> ast.field_type f == ()) fields { [] }
     else {
         let self = shown_as name (ast.name_e "type" span) span;
         let field_t f = match ast.field_type f { () => ast.atom_e "any" span, t => t };
@@ -322,33 +371,27 @@ let receive_e arms after span = {
 /// The description is then a function of them, as a parameterised `type` is,
 /// and the constructors' signatures say `a -> Option a` -- `a` being free in a
 /// signature is what makes it a type variable.
-let union_decl name params variants members kind span = {
+let union_decl owner name params variants members kind span = {
     let at_ = span;
-    let lit_tag v = ast.list_e [ast.atom_e "literal" at_, ast.atom_e (ast.variant_name v) at_] at_;
     let field_t f = match list.nth 2 f { () => ast.atom_e "any" at_, t => t };
-    // `union struct` makes a variant with fields an array, `#[:tag, ..]`, and
-    // says so in its description; one with none is the atom either way.
-    let shape = if kind == :array { "array" } else { "tuple" };
-    let built items = if kind == :array { ast.array_e items at_ } else { ast.list_e items at_ };
-    let described v = match ast.variant_fields v {
-        [] => lit_tag v,
-        fs => ast.list_e [ast.atom_e shape at_,
-                          ast.list_e (list.cons (lit_tag v) (list.map field_t fs)) at_] at_,
-    };
+    // Every variant is a record of its own, fields or none: `Shape.circle 1.0`
+    // and `Shape.empty` are values that say they are a `Shape` and which one,
+    // and are equal to no list, array or atom. `union struct` once chose an
+    // array to back them, and no longer has anything to choose.
+    let variant_id v = qualified (qualified owner name) (ast.variant_name v);
+    let described v = ast.list_e [ast.atom_e "constructed" at_, ast.atom_e (variant_id v) at_,
+                                  ast.list_e (list.map field_t (ast.variant_fields v)) at_] at_;
     let description = ast.let_d "type" params
         (ast.list_e [ast.atom_e "named" at_, ast.str_e name at_,
                      ast.list_e [ast.atom_e "union" at_,
                                  ast.list_e (list.map described variants) at_] at_] at_) false at_;
     let constructors = list.map (fn v -> {
         let fs = ast.variant_fields v;
-        let tag = ast.atom_e (ast.variant_name v) at_;
-        match fs {
-            [] => ast.let_d (ast.variant_name v) [] tag false at_,
-            _ => ast.let_d (ast.variant_name v)
-                    (list.map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
-                    (built (list.cons tag (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs)))
-                    false at_,
-        }
+        ast.let_d (ast.variant_name v)
+                  (list.map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
+                  (constructed (variant_id v) true
+                               (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs) at_)
+                  false at_
     }) variants;
     // The union's own type, applied to its parameters: `type a b`, read in
     // the generated module where `type` is the description's global.
@@ -374,7 +417,7 @@ let union_decl name params variants members kind span = {
     // description does.
     let [generated, _] = fresh (constructors + [alias]) (2147483648 + ast.span_start span * 128);
     let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
-                                              (ast.member_body m) true (ast.member_span m))
+                                              (own_names name (ast.member_body m)) true (ast.member_span m))
                            members;
     let made = list.take (list.length constructors) generated;
     [ast.mod_d name (made + [description] + sigs + written) span, list.last generated]
@@ -692,6 +735,7 @@ let rec pattern p = match p {
     [:array_p, xs, rest, sp] => sequence pattern xs && rest_pattern rest && is_span sp,
     [:map_p, xs, sp] => sequence (pair expression pattern) xs && is_span sp,
     [:as_p, p, n, ns, sp] => pattern p && string n && is_span ns && is_span sp,
+    [:record_p, ctor, fs, sp] => expression ctor && sequence pattern fs && is_span sp,
     _ => false,
 };
 let rest_pattern p = match p {

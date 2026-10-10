@@ -65,18 +65,18 @@ let param x = Var.ad_node x [];
 
 /// Whether `x` is a variable rather than a plain tensor or number.
 let is_var : :any -> :bool;
-let is_var x = type_of x == :array && len x == 3 && x.[0] == :ad_node;
+let is_var x = match x { Var.ad_node(_, _) => true, _ => false };
 
 /// What `x` holds: a variable's value, or `x` itself.
 let value : :any -> :any;
-let value x = if is_var x { x.[1] } else { x };
+let value x = match x { Var.ad_node(v, _) => v, _ => x };
 
 /// `x` as a constant: its value, with nothing flowing back through it.
 let stop : :any -> :any;
 let stop x = value x;
 
 priv let parents_of : :any -> [:any];
-priv let parents_of n = n.[2];
+priv let parents_of n = match n { Var.ad_node(_, ps) => ps, _ => [] };
 
 /// The result of an operation: `v`, remembering the operands among `links`
 /// (`[operand, back]` pairs) that are variables. With none, `v` itself.

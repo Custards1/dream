@@ -23,6 +23,14 @@ let parse_int s = _parse_int s;
 let parse_float : :string -> (:float | :unit);
 let parse_float s = _parse_float s;
 
+/// The float that is not a number, and the infinities: what `0.0 / 0.0` and
+/// `1.0 / 0.0` make. Named, rather than left to be written as divisions,
+/// because a division by a literal zero is a compiler warning (dreams/lint.dr).
+let nan : :float;
+let nan = _parse_float "nan";
+let infinity : :float;
+let infinity = _parse_float "inf";
+
 /// A float's eight IEEE 754 bytes, little-endian -- what an image and the wire
 /// format store one as. An integer is converted first.
 let float_bytes : (:integer | :float) -> :string;

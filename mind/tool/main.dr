@@ -306,7 +306,7 @@ let picked : [:string] -> :string -> :bool;
 let picked asked name = list.is_empty asked || list.any (fn a -> a == name || str.starts_with (a + ".") name) asked;
 
 /// One package's units.
-let units! : :map -> :map -> [:list];
+let units! : :map -> :map -> [Result];
 let units! pm o = {
     let started = os.monotonic! ();
     let to = build.with_option :output (util.join (build.target_dir pm) ("test/" + manifest.name pm + ".dream"))
@@ -323,7 +323,7 @@ let units! pm o = {
 };
 
 /// One package's checks, narrowed to the ones asked for by name.
-let checks! : :map -> :map -> [:string] -> [:list];
+let checks! : :map -> :map -> [:string] -> [Result];
 let checks! pm o asked = {
     let prefix = manifest.name pm + ".";
     let named = list.flat_map (fn a -> if str.starts_with prefix a { [str.slice (str.byte_length prefix) (str.byte_length a - str.byte_length prefix) a] } else { [] })
@@ -337,7 +337,7 @@ let checks! pm o asked = {
 
 /// A task, run in a process of its own: `[:units, manifest, options]` or
 /// `[:checks, manifest, options, asked]`.
-let test_task! : :list -> [:list];
+let test_task! : :list -> [Result];
 let test_task! t = match t {
     [:units, pm, o] => units! pm o,
     [:checks, pm, o, asked] => checks! pm o asked,

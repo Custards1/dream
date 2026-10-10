@@ -3,7 +3,7 @@
 import std.console;
 import std.list;
 
-let boom n = 1 / 0;
+let boom n = list.head [];
 
 // An infinite list. Only ever as long as somebody looks.
 let rec naturals from = list.cons from (naturals (from + 1));

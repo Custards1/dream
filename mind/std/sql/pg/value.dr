@@ -339,7 +339,7 @@ when test {
                         (list.map encode [(), 7, 1.5, true, "x", 'c', :active, [1, "a,b", ()], %{ "k" => 1 }]) ),
         test.case "a float that is not a number is spelled as PostgreSQL spells it"
             $( test.eq! ["NaN", "Infinity", "-Infinity"]
-                        (list.map encode [0.0 / 0.0, 1.0 / 0.0, -1.0 / 0.0]) ),
+                        (list.map encode [num.nan, num.infinity, -num.infinity]) ),
         test.case "nested arrays, and the quoting an element needs"
             $( test.eq! "{{1,2},{\"say \\\"hi\\\"\",\"back\\\\slash\"}}"
                         (encode [[1, 2], ["say \"hi\"", "back\\slash"]]) ),

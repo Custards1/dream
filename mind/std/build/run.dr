@@ -121,7 +121,7 @@ let fail! why = {
 /// The steps an input reaches, into `acc` by shape.
 let reach : :map -> :any -> :map;
 let rec reach acc i = match build.input i {
-    [:artifact, s, _] => reach_step acc s,
+    build.Input.artifact(s, _) => reach_step acc s,
     _ => acc,
 };
 
@@ -159,7 +159,7 @@ let steps_of plan mods = {
 
 /// The shapes of the steps `s` reads from.
 let upstream : :map -> [:string];
-let upstream s = list.unique (list.flat_map (fn i -> match i { [:artifact, t, _] => [build.Step.shape t], _ => [] })
+let upstream s = list.unique (list.flat_map (fn i -> match i { build.Input.artifact(t, _) => [build.Step.shape t], _ => [] })
                                             (build.Step.inputs s));
 
 // --- the state -------------------------------------------------------------------------
@@ -235,12 +235,12 @@ let result_of key reads = match reads { [] => key, _ => io.digest (build.encode 
 /// step did not finish.
 let where : :map -> :map -> :any -> :any;
 let where ctx st i = match i {
-    [:artifact, s, n] => match (State.done st).[build.Step.shape s else ()] {
+    build.Input.artifact(s, n) => match (State.done st).[build.Step.shape s else ()] {
         () => (),
         [_, dir] => if n == "" { dir } else { dir + "/" + n },
     },
-    [:file, p] => absolute ctx p,
-    [:tree, d, _] => absolute ctx d,
+    build.Input.file(p) => absolute ctx p,
+    build.Input.tree(d, _) => absolute ctx d,
 };
 
 /// A step whose inputs are all made: `[state, key, paths]`, where `paths` is
@@ -251,13 +251,13 @@ let keyed! ctx st s = {
         fail! ("the step `" + build.Step.name s + "` has a function in its config, which no key can say")
     }
     let [after, parts] = fold! (fn [acc, ps] i -> match i {
-        [:file, p] => { let [st2, d] = digest! ctx acc p; [st2, list.cons [:file, p, d] ps] },
-        [:tree, dir, suffix] => {
+        build.Input.file(p) => { let [st2, d] = digest! ctx acc p; [st2, list.cons [:file, p, d] ps] },
+        build.Input.tree(dir, suffix) => {
             let [st2, ds] = fold! (fn [stx, found] f -> { let [sty, d] = digest! ctx stx f; [sty, list.cons [f, d] found] })
                                   [acc, []] (tree_files! ctx dir suffix);
             [st2, list.cons [:tree, dir, suffix, list.reverse ds] ps]
         },
-        [:artifact, t, n] => [acc, list.cons [:artifact, list.head ((State.done acc).[build.Step.shape t]), n] ps],
+        build.Input.artifact(t, n) => [acc, list.cons [:artifact, list.head ((State.done acc).[build.Step.shape t]), n] ps],
     }) [st, []] (build.Step.inputs s);
     let key = io.digest (build.encode [build.Step.shape s, list.reverse parts]);
     let paths = map.from_pairs (list.map (fn i -> [build.input_id i, where ctx after i]) (build.Step.inputs s));
@@ -336,53 +336,53 @@ let op! dir ms o = try! {
     let target! name = { let t = dir + "/" + name; file.mkdir_all! (file.parent t); t };
     let env_list env = list.map (fn [k, v] -> k + "=" + v) (_map_pairs env);
     match o {
-        [:write, name, text] => { file.write! (target! name) text; [:ok, ()] },
-        [:copy, from, name] => { file.copy! from (target! name); [:ok, ()] },
-        [:link, from, name] => { io.link! from (target! name); [:ok, ()] },
-        [:exec, program, args] => {
+        build.Op.write(name, text) => { file.write! (target! name) text; [:ok, ()] },
+        build.Op.copy(from, name) => { file.copy! from (target! name); [:ok, ()] },
+        build.Op.link(from, name) => { io.link! from (target! name); [:ok, ()] },
+        build.Op.exec(program, args) => {
             let r = os.exec_in! dir program args ms;
             if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
         },
-        [:run, where, env, program, args] => {
+        build.Op.run(where, env, program, args) => {
             let r = os.exec_with! where (env_list env) program args ms;
             if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
         },
-        [:run_to, where, env, program, args, name] => {
+        build.Op.run_to(where, env, program, args, name) => {
             let r = os.exec_joined! (if str.is_empty where { dir } else { where }) (env_list env) program args ms;
             file.write! (target! name) r.[:out]
             if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
         },
-        [:observe, where, env, program, args, name] => {
+        build.Op.observe(where, env, program, args, name) => {
             let r = os.exec_joined! (if str.is_empty where { dir } else { where }) (env_list env) program args ms;
             file.write! (target! name) r.[:out]
             if r.[:timed_out] { [:error, exited program r] } else { [:ok, ()] }
         },
-        [:find, program, name] => { file.write! (target! name) (on_path! program); [:ok, ()] },
-        [:capture, program, args, name] => {
+        build.Op.find(program, name) => { file.write! (target! name) (on_path! program); [:ok, ()] },
+        build.Op.capture(program, args, name) => {
             let r = asked! dir program args;
             file.write! (target! name) (if r.[:code] == 0 { r.[:out] } else { "" })
             [:ok, ()]
         },
-        [:attempt, program, args, name] => {
+        build.Op.attempt(program, args, name) => {
             let r = asked! dir program args;
             file.write! (target! name) (if r.[:code] == 0 { "yes" } else { "no" })
             [:ok, ()]
         },
-        [:list, from, suffix, name] => {
+        build.Op.list(from, suffix, name) => {
             file.write! (target! name) (str.join_str "\n" (list.filter (fn f -> str.ends_with suffix f) (file.walk! from)))
             [:ok, ()]
         },
-        [:verify, name, digest] => match io.digest! (dir + "/" + name) {
+        build.Op.verify(name, digest) => match io.digest! (dir + "/" + name) {
             d if d == digest => [:ok, ()],
             d => [:error, name + " has the SHA-256 " + d + ", and the build pins it to " + digest],
         },
-        [:transform, from, name, f] => {
+        build.Op.transform(from, name, f) => {
             let text = f (list.map (fn n -> match file.read! (dir + "/" + n) { () => "", t => t }) from);
             strict! text
             file.write! (target! name) text
             [:ok, ()]
         },
-        [:expect, name, path, bless] => {
+        build.Op.expect(name, path, bless) => {
             let got = str.trim_end (match file.read! (dir + "/" + name) { () => "", t => t });
             let wanted = str.trim_end (match file.read! path { () => "", t => t });
             match [got == wanted, bless] {
@@ -393,11 +393,11 @@ let op! dir ms o = try! {
                 _ => [:error, "what it printed is not " + path + ", from " + first_difference wanted got],
             }
         },
-        [:same, a, b] => match io.digest! a == io.digest! b {
+        build.Op.same(a, b) => match io.digest! a == io.digest! b {
             true => [:ok, ()],
             false => [:error, a + " and " + b + " differ"],
         },
-        [:empty, name, why] => match file.read! (dir + "/" + name) {
+        build.Op.empty(name, why) => match file.read! (dir + "/" + name) {
             () => [:ok, ()],
             "" => [:ok, ()],
             text => [:error, why + "\n" + tail text],
@@ -645,7 +645,7 @@ let rec settle! ctx st plan = {
     }
     let mods = overlay (build.Plan.modules plan);
     let steps = steps_of plan mods;
-    let files = fold! (fn acc i -> match i { [:file, p] => list.head (digest! ctx acc p), _ => acc })
+    let files = fold! (fn acc i -> match i { build.Input.file(p) => list.head (digest! ctx acc p), _ => acc })
                       st (list.concat [map.values (build.Plan.payloads plan),
                                        list.map (fn [i, _] -> i) (build.Plan.later plan)]);
     let done = build_all! ctx files steps false;
@@ -695,15 +695,15 @@ let run_checks! ctx st plan = {
 /// goal `()` for a name the plan does not have.
 let goals_named : :map -> :string -> [:any];
 let rec goals_named plan name = match (build.Plan.goals plan).[name else ()] {
-    [:each, names] => list.flat_map (fn n -> goals_named plan n) names,
+    build.Goal.each(names) => list.flat_map (fn n -> goals_named plan n) names,
     g => [[name, g]],
 };
 
 let goal_input : :any -> :any;
 let goal_input g = match g {
-    [:make, i] => i,
-    [:place, _, i] => i,
-    [:effect, s] => build.artifact s "",
+    build.Goal.make(i) => i,
+    build.Goal.place(_, i) => i,
+    build.Goal.effect(s) => build.artifact s "",
 };
 
 /// What there is to ask for, for the answer to a name the plan does not have.
@@ -740,11 +740,11 @@ let make_goals! ctx st plan = {
     let paths = fold! (fn m [name, g] -> {
         let made = where ctx after (goal_input g);
         match g {
-            [:place, dest, [:artifact, s, ""]] => {
+            build.Goal.place(dest, build.Input.artifact(s, "")) => {
                 fold! (fn _ o -> place_file! (made + "/" + o) (absolute ctx dest + "/" + o)) () (build.Step.outputs s)
                 m.[name => absolute ctx dest]
             },
-            [:place, dest, _] => { place_file! made (absolute ctx dest); m.[name => absolute ctx dest] },
+            build.Goal.place(dest, _) => { place_file! made (absolute ctx dest); m.[name => absolute ctx dest] },
             _ => m.[name => made],
         }
     }) (%{}) chosen;

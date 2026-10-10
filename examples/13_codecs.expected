@@ -3,5 +3,5 @@
 [1, :ok, 2.5]
 [1, "ok", 2.5]
 User(name: ada, age: 36)
-[[:ok, :hello], [:ok, #["ada", 36]]]
+[[:ok, :hello], [:ok, User("ada", 36)]]
 3 bytes left over

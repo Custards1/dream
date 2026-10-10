@@ -36,6 +36,7 @@ import dreams.scope;
 import dreams.unit;
 import std.array;
 import std.char;
+import std.types;
 
 // --- the lowering state -----------------------------------------------------
 //
@@ -213,9 +214,27 @@ let emit_apply callee args l = {
 /// but the arguments the inner call was going to get.
 let lower_apply callee args span l = {
     let found = callee_resolution callee l;
+    match [found, args] {
+        // A record, as its constructor writes it: one `record_make`, and no
+        // array of fields made only to be copied out of.
+        [[:builtin, "_record_of"], [[:atom, id, _], [:bool, variant, _], [:array, fields, _]]] =>
+            lower_record id variant fields l,
+        _ => lower_call found callee args span l,
+    }
+};
+
+let lower_call found callee args span l =
     match unwrap found args 8 l {
         // ..and a wrapper around a `get` or a `set` is that operation.
         [[:op, kind], actual] => lower_expr (op_expr kind actual span) l,
+        // A constructor whose fields are all lazy is the record it makes; one
+        // with a strict field is called, so its frame forces the field.
+        [[:record, id, variant, true, _], actual] => lower_record id variant actual l,
+        [[:record, _, _, false, _], _] => {
+            let f = lower_callee callee found l;
+            let done = lower_all args (list.head f);
+            emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
+        },
         [target, actual] => {
             let f = emit_target target l;
             let done = lower_all actual (list.head f);
@@ -226,8 +245,36 @@ let lower_apply callee args span l = {
             let done = lower_all args (list.head f);
             emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
         },
-    }
+    };
+
+/// `record_make`: the fields, each in a lazy position, and the id as an atom
+/// of the image, with the top bit of `c` saying whether it names a variant.
+/// See `RecordMake` in dream/src/image.hpp.
+let lower_record id variant fields l = {
+    let done = lower_all fields l;
+    let placed = kids (list.nth 1 done) (list.head done);
+    let [program, index] = ir.intern_atom id (prog (list.head placed));
+    let c = if variant { index + ir.record_variant } else { index };
+    let made = emit (ir.node :record_make (list.nth 1 placed) (list.length fields) c)
+                    (set_prog program (list.head placed));
+    [inherit (list.nth 1 made) (list.nth 1 done) (list.head made), list.nth 1 made]
 };
+
+/// What the constructor a pattern names makes: `[id, variant, arity]`, or
+/// `()` when it names no constructor. Read from the resolver's wrappers,
+/// where every constructor is filed with the id it stamps (`scope.wrapper_of`).
+let constructor_of ctor l =
+    match callee_resolution ctor l {
+        [:global, _, _, g]           => constructor_at g l,
+        [:member, [:dream, _], _, g] => constructor_at g l,
+        _ => (),
+    };
+
+let constructor_at g l =
+    match ((scope.wrappers (res l))).[g else ()] {
+        [[:record, id, variant, _, fields], _, _] => [id, variant, fields],
+        _ => (),
+    };
 
 let builtin_ref name l =
     match builtins.id name {
@@ -1037,7 +1084,41 @@ let rec pattern_test p subject binds l =
         [:list_p, items, rest, _]     => list_test items rest subject binds l,
         [:array_p, items, rest, span] => array_test items rest subject binds span l,
         [:map_p, pairs, span] => map_test pairs subject binds span l,
+        [:record_p, ctor, fields, span] => record_test ctor fields subject binds span l,
         _ => { let t = const_bool true l; [list.head t, list.nth 1 t, binds] },
+    };
+
+/// `Shape.circle(r)`: one question for what it is -- the constructor's id,
+/// which is also how many fields it has -- then the fields by position, as an
+/// array pattern's elements. A name that is no constructor, or the wrong
+/// number of fields, is an error here rather than an arm that never matches.
+let rec record_test ctor fields subject binds span l =
+    match constructor_of ctor l {
+        () => {
+            let t = const_bool false (complain span ("`" + written ctor + "` is not a constructor") l);
+            [list.head t, list.nth 1 t, binds]
+        },
+        [id, _, arity] =>
+            if arity != list.length fields {
+                let said = "`" + written ctor + "` makes " + to_string arity
+                           + (if arity == 1 { " field" } else { " fields" }) + ", and this pattern has "
+                           + to_string (list.length fields);
+                let t = const_bool false (complain span said l);
+                [list.head t, list.nth 1 t, binds]
+            }
+            else {
+                let k = const_atom id l;
+                let is = call_builtin "_record_is" [list.nth 1 k, subject] (list.head k);
+                list.fold (fn acc pair -> {
+                    let at = const_int (list.nth 1 pair) (list.nth 0 acc);
+                    let field = call_builtin "_match_at" [subject, list.nth 1 at] (list.head at);
+                    let inner = pattern_test (list.nth 0 pair) (list.nth 1 field) (list.nth 2 acc)
+                                            (list.head field);
+                    let both = bool_and (list.nth 1 acc) (list.nth 1 inner) (list.nth 0 inner);
+                    [list.head both, list.nth 1 both, list.nth 2 inner]
+                }) [list.head is, list.nth 1 is, binds]
+                   (list.zip fields (list.range 0 (list.length fields)))
+            },
     };
 
 /// The value must be a list at all. Without this `[]` would match anything that
@@ -1246,6 +1327,24 @@ let check_value pattern value l = {
 /// The binds a destructuring comes to, given a node that reads the value:
 /// `[lowering, binds]`. The first holds the checked value, and each of the rest
 /// binds a name to its part of the first.
+/// A constructor as it was written: `Shape.circle`, `geo.Shape.circle`.
+let rec written e = match e {
+    [:name, n, _] => n,
+    [:field, obj, n, _] => written obj + "." + n,
+    _ => ast.show e,
+};
+
+/// The parts at each position of an array or a record, by `_match_at`.
+let extract_at items subject want binds l =
+    list.fold (fn acc pair ->
+        if not (wants want (list.nth 0 pair)) { acc }
+        else {
+            let at = const_int (list.nth 1 pair) (list.nth 0 acc);
+            let element = call_builtin "_match_at" [subject, list.nth 1 at] (list.head at);
+            extract (list.nth 0 pair) (list.nth 1 element) want (list.nth 1 acc)
+                    (list.head element)
+        }) [l, binds] (list.zip items (list.range 0 (list.length items)));
+
 let destructure pattern value l = {
     let checked = check_value pattern value l;
     let slot = expand macros.coalesce (slot_at (scope.checked_span pattern) (list.head checked)) 0;
@@ -1285,15 +1384,8 @@ let rec extract p subject want binds l =
             } else { first }
         },
         [:list_p, items, rest, _] => extract_list items rest subject want binds l,
-        [:array_p, items, _, _] =>
-            list.fold (fn acc pair ->
-                if not (wants want (list.nth 0 pair)) { acc }
-                else {
-                    let at = const_int (list.nth 1 pair) (list.nth 0 acc);
-                    let element = call_builtin "_match_at" [subject, list.nth 1 at] (list.head at);
-                    extract (list.nth 0 pair) (list.nth 1 element) want (list.nth 1 acc)
-                            (list.head element)
-                }) [l, binds] (list.zip items (list.range 0 (list.length items))),
+        [:array_p, items, _, _] => extract_at items subject want binds l,
+        [:record_p, _, fields, _] => extract_at fields subject want binds l,
         [:map_p, pairs, _] =>
             list.fold (fn acc kv ->
                 if not (wants want (list.nth 1 kv)) { acc }
@@ -2563,8 +2655,28 @@ let rec emit_const v l =
         :map     => const_seq :make_map
                         (list.concat (list.map (fn kv -> [list.nth 0 kv, list.nth 1 kv])
                                                (map.pairs v))) l,
-        _ => emit_leaf :unit l,
+        _ => match types.record_id v {
+            () => emit_leaf :unit l,
+            id => const_record (atom_name id) (types.record_fields v) (types.is_variant v) l,
+        },
     };
+
+/// A record a compile-time expression made, as the constructor would have
+/// made it: one `record_make` of its fields.
+let rec const_record id fields variant l = {
+    let done = list.fold (fn acc x -> {
+        let got = emit_const x (list.head acc);
+        [list.head got, list.append (list.nth 1 acc) [list.nth 1 got]]
+    }) [l, []] fields;
+    let placed = kids (list.nth 1 done) (list.head done);
+    let [program, index] = ir.intern_atom id (prog (list.head placed));
+    emit (ir.node :record_make (list.nth 1 placed) (list.length fields)
+                  (if variant { index + ir.record_variant } else { index }))
+         (set_prog program (list.head placed))
+};
+
+/// The name of an atom, without the colon `to_string` writes in front of it.
+let atom_name a = { let t = to_string a; str.slice 1 (str.byte_length t - 1) t };
 
 let rec const_seq op items l = {
     let done = list.fold (fn acc x -> {

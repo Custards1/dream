@@ -151,6 +151,7 @@ dream::Value dream_rt_cons_after(dream::Process* p, dream::Value last, dream::Va
 void dream_rt_set_tail(dream::Process* p, dream::Value cell, dream::Value tail);
 dream::Value dream_rt_make_list(dream::Process* p, uint32_t n, const dream::Value* items);
 dream::Value dream_rt_make_array(dream::Process* p, uint32_t n, const dream::Value* items);
+dream::Value dream_rt_make_record(dream::Process* p, uint32_t id, uint32_t n, const dream::Value* items);
 
 /// The string, or the boxed float, for an image constant: the per-process
 /// shared copy the interpreter hands out, so a literal keeps one identity.

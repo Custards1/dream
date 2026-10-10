@@ -47,8 +47,8 @@ union Shape { circle(radius : :float), square(side : :float) }
 
 let area shape : :float =
     match shape {
-        [:circle, r] => 3.14159 * r * r,
-        [:square, s] => s * s,
+        Shape.circle(r) => 3.14159 * r * r,
+        Shape.square(s) => s * s,
     };
 
 let rec total !acc shapes =
@@ -235,6 +235,7 @@ answers it as an atom.
 | `:list` | a chain of cells, lazy in head and tail | `[1, 2]`, `x :: xs` |
 | `:array` | a flat sequence with constant-time indexing | `#[1, 2]` |
 | `:map` | a hash trie from keys to values | `%{ k => v }` |
+| `:Point`, `:Shape`, .. | a value of a declared `group`, `struct` or union, answering its declaration's name ([§10](#10-records-and-unions)) | `Point.make 1 2`, `Shape.circle 1.0` |
 | `:pure_fn` | a function, closure or thunk | `fn x -> x`, `$( e )` |
 | `:impure_fn` | a function whose name ends in `!` | `let f! x = ..` |
 | `:error` | an error value: a kind and a payload | caught by `try!` |
@@ -676,6 +677,7 @@ A `let` may carry a signature ([§9](#signatures)).
 | `[x, ..]` | a non-empty list, ignoring the tail |
 | `#[a, b]`, `#[a, ..rest]` | an array of exactly two elements, or at least one |
 | `%{ :k => p }` | a map with the key `:k` whose value matches `p`; other keys are ignored |
+| `Shape.circle(r)`, `Shape.empty`, `Point(x, y)` | a value that constructor made, its fields matching the patterns ([§10](#constructor-patterns)) |
 | `p as name` | `p`, also binding the whole value to `name` |
 | `(p)` | `p`: parentheses only group |
 
@@ -698,7 +700,7 @@ whose payload is `[value, path, line, col]`: what did not fit, and where the
 under. Uncaught, it is reported the way a compiler diagnostic is:
 
 ```
-dream: uncaught error: shapes.dr:12:5: no pattern fits [:hexagon, 2]
+dream: uncaught error: shapes.dr:12:5: no pattern fits Shape.hexagon(2)
 ```
 
 Make a `match` total with a final `_` arm, or, on a declared union, by
@@ -1004,9 +1006,12 @@ otherwise leaves the image exactly as it was.
 
 ### `group`, `struct` and `mapping`
 
-A record declaration makes a module of functions over an ordinary
-collection: `group` over a list, `struct` over an array, `mapping` over a map
-keyed by atoms named after the fields.
+A record declaration makes a module of functions for one kind of value.
+A `group` or a `struct` is a **value of its own**: it carries what made it,
+prints as what it is, and is taken apart with a constructor pattern. A
+`mapping` is a map keyed by atoms named after the fields, with names for
+them. (`group` and `struct` once meant a list and an array; they are now two
+spellings of one thing.)
 
 ```dream
 group Point { x, y = 0 }
@@ -1017,35 +1022,44 @@ mapping Person {
     say_hi self = greeting self + " " + name self
 }
 
-Point.make 1 2                    // [1, 2]
-Point.new 1                       // [1, 0]: the fields without defaults
-Point.y [1]                       // 0: the default, where the collection has nothing
-Point.set_x 9 (Point.make 1 2)    // [9, 2]
-Vec.make 1 2                      // #[1, 2]
+Point.make 1 2                    // Point(1, 2)
+Point.new 1                       // Point(1, 0): the fields without defaults
+Point.set_x 9 (Point.make 1 2)    // Point(9, 2)
+type_of (Point.make 1 2)          // :Point
+Point.make 1 2 == [1, 2]          // false: a Point is no list
+Vec.make 1 2                      // Vec(1, 2)
 Person.new "Ada"                  // %{:greeting => "Hi", :name => "Ada"}
 Person.say_hi (Person.new "Ada")  // "Hi Ada"
-Point.make 1 2 |> Point.set_x 5 |> Point.set_y 6      // [5, 6]
+Point.make 1 2 |> Point.set_x 5 |> Point.set_y 6      // Point(5, 6)
+
+let Point(x, y) = p;              // destructuring, as `let [a, b] = ..` is
+match p { Point(0, y) => y, Point(x, _) => x }
 ```
 
 For each field `f`, the module has `f record` and `set_f value record`. The
 record comes last, as `list.map f xs` takes its list last, so setters chain
 with `|>` and `Point.set_x 1` is a function from record to record. `make`
 takes every field in order. `new` takes only the fields without a default,
-and writes the defaults in.
+and writes the defaults in. A `group` or a `struct` also has `record_id ()`,
+the atom its values carry (below).
 
 - **Entries** are separated by `,` or by a line break, and an entry may run
   over as many lines as it is indented past.
-- **A default** (`y = 0`) is what reading the field answers when the
-  collection has nothing there. It is compiled inside the record's module,
-  so it may not name anything from the enclosing one.
+- **A default** (`y = 0`) is what `new` fills in, and, for a `mapping`, what
+  reading the field answers when the map has nothing there. It is compiled
+  inside the record's module, so it may not name anything from the enclosing
+  one.
 - **A member** is an entry with parameters (`say_hi self = ..`): an ordinary
   function compiled inside the record's module, where the accessors,
   setters and other members are in scope without an import. Having
   parameters is the whole of what tells a member from a field. `self` is
   just a name. A member may be impure; a field may not.
 - **A field annotation** (`x : :integer`) contributes to `Point.type`, a
-  description of the record, and gives the generated functions signatures
-  that the checker uses.
+  description of the record. Every `group` and `struct` gives its generated
+  functions signatures -- `Point.x : Point -> :any` -- so the checker knows a
+  `Point` from a list; a `mapping` gives them only when a field is annotated.
+  A field's type cannot yet name another record declared beside it: it is
+  resolved inside the record's module, where its siblings are not visible.
 - **A strict field** (`!x`, or `(strict x)`) is forced before it is stored:
   it is a [strict parameter](#strict-parameters) of `make`, `new` and
   `set_x`. A suspended field holds whatever its frame reached, and a record
@@ -1053,14 +1067,23 @@ and writes the defaults in.
   A default is not forced, since it names nothing and so holds nothing.
   Only a field can be strict: `!` before a member is an error.
 
-A record adds no tag or runtime type. Its values are the list, array or map,
-and indexing, equality, patterns and `type_of` see exactly that. A record
-can be declared wherever a module item can, including in `mod` and `when`.
+**What a record is at run time.** A value of a `group` or a `struct` holds its
+fields, lazily, by position, and an atom naming its declaration, qualified by
+the module it was declared in: `app.Point`. That atom is what makes it a type
+and not a shape. Two records are equal when they were made by the same
+declaration and their fields are equal; a record and a list or an array of
+the same fields never are. `type_of` answers the declaration's own name.
+`c.[i]` reads field `i` and `c.[i => v]` changes it, as on an array, which is
+what the generated accessors compile to. A record crosses `send!`, `std.wire`
+and `std.image` as itself. `std.types.record_id`, `record_fields` and
+`make_record` read and build one where the declaration is not to hand.
+
+A record can be declared wherever a module item can, including in `mod` and
+`when`.
 
 ### Unions
 
-A union is a value that is exactly one of its variants, with the variant
-written on the value:
+A union is a value that is exactly one of its variants:
 
 ```dream
 union Shape {
@@ -1069,58 +1092,68 @@ union Shape {
     empty
 
     area self = match self {
-        [:circle, r]  => 3.0 * r * r,
-        [:rect, w, h] => w * h,
-        :empty        => 0.0,
+        Shape.circle(r)  => 3.0 * r * r,
+        Shape.rect(w, h) => w * h,
+        Shape.empty      => 0.0,
     }
 }
 
 union Option a { some(value : a), none }
 
-Shape.circle 1.0                 // [:circle, 1.0]
-Shape.empty                      // :empty
+Shape.circle 1.0                 // Shape.circle(1)
+Shape.empty                      // Shape.empty
+type_of Shape.empty              // :Shape
 Shape.area (Shape.rect 2.0 3.0)  // 6.0
+Shape.circle 1.0 == [:circle, 1.0]   // false
 types.check Shape s              // the union's name is its description
 ```
 
-A variant with fields is the list `[:tag, field, ...]`, and one without is the
-atom `:tag`. That is the representation Dream code already uses by hand, so
-`union Outcome v { ok(value : v), error(reason : :string) }` is exactly the
-shape of every result in the standard library.
+Every variant is a record whose id names the union and the variant --
+`app.Shape.circle` -- with or without fields. It is equal to no list, array or
+atom, so a tag can never collide with data that merely looks like it: the
+`[:ok, value]` a function returns is not an `Outcome.ok`, and `:empty` is not
+`Shape.empty`. A variant with no fields is a key by value in a map, as an atom
+is.
 
 The declaration makes a module `Shape` (a constructor per variant, the
 members, `Shape.type`, and a signature for each constructor) and a global
 `Shape` holding the description, so `Shape` is a type wherever a type is
 written. A field's type is optional. Parameters after the name make the
-union generic.
+union generic. `union struct` is accepted and means the same: it once chose
+arrays to back the variants.
 
-`union struct Shape { .. }` is the same union with its variants that have
-fields made **arrays**, `#[:circle, 1.0]`, and matched with array patterns --
-what `struct` is to `group`. A field is then one step away instead of a walk
-down the list, and a variant of `n` fields is one object instead of `n + 1`
-cells. A variant with no fields is still the atom. `match` dispatches on the
-tag of either kind in one step.
+### Constructor patterns
 
-```dream
-union struct Op { push(n : :integer), add, clamp(lo : :integer, hi : :integer) }
+`Shape.circle(r)` matches a value made by that constructor, and takes its
+fields apart by position with the patterns inside the parentheses, which may
+be any patterns: `Shape.rect(0.0, h)`, `[:ok, Shape.circle(r)]`. A variant
+with no fields is written without parentheses, `Shape.empty`. A record is
+matched by its name, `Point(x, y)`, which means its `make`.
 
-match op {
-    #[:push, n] => n,
-    :add => acc + 1,
-    #[:clamp, lo, hi] => ..,
-}
-```
+The constructor is an expression -- a name or a dotted path, resolved as any
+name is: `Shape.circle`, `geo.Shape.circle`. In a declaration's own members,
+where its constructors are local, `Shape.circle` still means `circle` and
+`Point(..)` still means `make`, so a member is written the way any other code
+is. A pattern begins one when it is a name followed by a `.`, or
+a capitalised name followed directly by `(`; a capitalised name standing
+alone still binds. A name that is no constructor, or the wrong number of
+fields, is a compile error.
 
 **A `match` on a declared union must handle every variant**, wherever the
 checker knows the subject's type is that union:
 
 ```
-error: this `match` on `Shape` does not handle `:empty`; add an arm for it, or `_ =>` to handle everything else
+error: this `match` on `Shape` does not handle `Shape.empty`; add an arm for it, or `_ =>` to handle everything else
 ```
 
 A wildcard or a bare name handles everything. An arm with a guard, or one
 that takes a field apart with a nested pattern, counts as handling its
-variant.
+variant. And an arm whose pattern no value of the declared type could fit --
+a list pattern against a `Shape` -- is reported, since it can never be taken:
+
+```
+error: this arm can never match: a `Shape` is not a list
+```
 
 ---
 
@@ -1265,9 +1298,9 @@ list.map solid.report [Cube.make 3, Slab.make 2 3 4]    // ["solid: 27", "solid:
   that declares it*, dispatches on its **last** argument (by convention, a
   member's `self`). A deriving module still gets its own specialized copy.
 - **`derive dyn path`** in a record header makes the record's values carry a
-  table of their implementations in slot 0: the first element of a list or
-  array, or key `0` of a map. The generated functions account for it, and a
-  pattern over the raw collection sees it.
+  table of their implementations in slot 0: field 0 of a `group` or a
+  `struct`, or key `0` of a `mapping`. The generated functions account for
+  it, and a constructor pattern sees it as the first field.
 
 A value with no table gets the virtual's default, or an error for a hole. A
 dispatched call costs a few reductions more than a direct one, and code that

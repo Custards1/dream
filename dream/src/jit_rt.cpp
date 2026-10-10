@@ -377,6 +377,17 @@ int dream_rt_get(Process* p, Value c, Value k, int32_t has_default, Value* out) 
                                         std::to_string(tensor_len(c)));
         return 0;
     }
+    if (is_obj(c, ObjType::Record) && is_fixnum(k)) {
+        auto* r = static_cast<RecordObj*>(as_obj(c));
+        const int64_t i = fixnum_value(k);
+        if (i >= 0 && i < int64_t(r->len)) {
+            *out = r->items()[i];
+            return 1;
+        }
+        if (has_default) return 2;
+        *out = rt_out_of_bounds(*p, "field " + std::to_string(i) + " is outside " + describe(*p, c));
+        return 0;
+    }
     if (!is_sequence_value(c)) {
         *out = rt_type_error(*p, "`.[ ]` reads a map, an array or a list, not " +
                                      describe(*p, c));
@@ -437,6 +448,24 @@ int dream_rt_set(Process* p, Value c, Value k, Value v, Value* out) {
     k = resolve(k);
     if (is_obj(c, ObjType::Map)) {
         *out = map_insert(*p, c, k, v);
+        return 1;
+    }
+    if (is_obj(c, ObjType::Record) && is_fixnum(k)) {
+        const uint32_t n = static_cast<RecordObj*>(as_obj(c))->len;
+        const int64_t i = fixnum_value(k);
+        if (i < 0 || i >= int64_t(n)) {
+            *out = rt_out_of_bounds(*p, "field " + std::to_string(i) + " is outside " + describe(*p, c));
+            return 0;
+        }
+        auto* src = static_cast<RecordObj*>(as_obj(c));
+        Value copy = p->heap().make_record(src->id, src->flags, n);
+        auto* dst = static_cast<RecordObj*>(as_obj(copy));
+        for (uint32_t j = 0; j < n; ++j) {
+            Value item = uint32_t(i) == j ? v : src->items()[j];
+            dst->items()[j] = item;
+            p->heap().remember_if_old(dst, item);
+        }
+        *out = copy;
         return 1;
     }
     if (!is_sequence_value(c)) {
@@ -534,6 +563,15 @@ Value dream_rt_make_array(Process* p, uint32_t n, const Value* items) {
     auto* a = static_cast<ArrayObj*>(as_obj(arr));
     for (uint32_t i = 0; i < n; ++i) a->items()[i] = items[i];
     return arr;
+}
+
+Value dream_rt_make_record(Process* p, uint32_t id, uint32_t n, const Value* items) {
+    // `id` is the node's `c`: an image atom index, and the variant bit.
+    Value rec = p->heap().make_record(make_atom(p->runtime().image_atom(id & RECORD_MAKE_ATOM)),
+                                      (id & RECORD_MAKE_VARIANT) ? RECORD_VARIANT : 0, n);
+    auto* r = static_cast<RecordObj*>(as_obj(rec));
+    for (uint32_t i = 0; i < n; ++i) r->items()[i] = items[i];
+    return rec;
 }
 
 Value dream_rt_literal_str(Process* p, uint32_t index) { return literal_string_value(*p, index); }
@@ -673,6 +711,10 @@ extern "C" Value dream_rt_peek(Value c, Value k) {
     if (is_obj(c, ObjType::Array)) {
         auto* a = static_cast<ArrayObj*>(as_obj(c));
         return i < int64_t(a->len) ? a->items()[i] : NIL_SLOT;
+    }
+    if (is_obj(c, ObjType::Record)) {
+        auto* r = static_cast<RecordObj*>(as_obj(c));
+        return i < int64_t(r->len) ? r->items()[i] : NIL_SLOT;
     }
     if (!is_obj(c, ObjType::Cons) || i > 8) return NIL_SLOT;
     Value cur = c;

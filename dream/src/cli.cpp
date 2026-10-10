@@ -179,6 +179,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
         case Op::MakeList:
         case Op::MakeArray:
         case Op::MakeMap:
+        case Op::RecordMake:
             std::snprintf(buf, sizeof buf, "/%u", n.b);
             out += buf;
             break;
@@ -222,6 +223,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
         case Op::Block:
         case Op::MakeList:
         case Op::MakeArray:
+        case Op::RecordMake:
             dump_kids(img, n.a, n.b, depth + 1, out);
             break;
         case Op::MakeMap:

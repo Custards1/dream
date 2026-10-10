@@ -516,6 +516,15 @@ Value Heap::make_array(uint32_t len) {
     return from_obj(o);
 }
 
+Value Heap::make_record(Value id, uint32_t flags, uint32_t len) {
+    auto* o = static_cast<RecordObj*>(
+        alloc(ObjType::Record, 16 + size_t(len) * sizeof(Value)));
+    o->len = len;
+    o->flags = flags;
+    o->id = id;
+    return from_obj(o);
+}
+
 Value Heap::make_map(uint32_t) {
     return make_map_branch(0);
 }
@@ -1255,6 +1264,12 @@ inline void for_each_slot(Obj* o, ObjType type, F&& visit) {
         case ObjType::Array: {
             auto* a = static_cast<ArrayObj*>(o);
             for (uint32_t i = 0; i < a->len; ++i) visit(&a->items()[i]);
+            break;
+        }
+        case ObjType::Record: {
+            // The id is an atom, an immediate, so the fields are all of it.
+            auto* r = static_cast<RecordObj*>(o);
+            for (uint32_t i = 0; i < r->len; ++i) visit(&r->items()[i]);
             break;
         }
         case ObjType::Map: {
@@ -2696,6 +2711,21 @@ struct VerifyWalk {
                     for (uint32_t i = 0; i < a->len; ++i) push(a->items()[i], v);
                     break;
                 }
+                case ObjType::Record: {
+                    auto* r = static_cast<RecordObj*>(o);
+                    size_t need = sizeof(Obj) + 16 + size_t(r->len) * sizeof(Value);
+                    if (r->bytes < need) {
+                        problem("record at " + addr(o) + " says it holds " +
+                                std::to_string(r->len) + " fields but is too small");
+                        return;
+                    }
+                    if (!is_atom(r->id)) {
+                        problem("record at " + addr(o) + " has an id that is not an atom");
+                        return;
+                    }
+                    for (uint32_t i = 0; i < r->len; ++i) push(r->items()[i], v);
+                    break;
+                }
                 case ObjType::MapLeaf: {
                     auto* l = static_cast<MapLeafObj*>(o);
                     if (l->bytes < sizeof(Obj) + 8 + 3 * sizeof(Value)) {
@@ -3097,6 +3127,17 @@ Value copy_object(Dest& dest, Value v, CopySeen& seen) {
                 static_cast<ArrayObj*>(as_obj(arr))->items()[i] = item;
             }
             return arr;
+        }
+        case ObjType::Record: {
+            // The id is an atom of this runtime, as the copy is.
+            auto* src = static_cast<RecordObj*>(o);
+            Value rec = dest.make_record(src->id, src->flags, src->len);
+            seen.emplace(v, rec);
+            for (uint32_t i = 0; i < src->len; ++i) {
+                Value item = copy_value(dest, static_cast<RecordObj*>(o)->items()[i], seen);
+                static_cast<RecordObj*>(as_obj(rec))->items()[i] = item;
+            }
+            return rec;
         }
         case ObjType::Map: {
             // Copied branch for branch, so the shape -- and with it the
@@ -3538,6 +3579,15 @@ Value SharedArea::make_cons(Value head, Value tail) {
 Value SharedArea::make_array(uint32_t len) {
     auto* o = static_cast<ArrayObj*>(alloc(ObjType::Array, 8 + size_t(len) * sizeof(Value)));
     o->len = len;
+    return from_obj(o);
+}
+
+Value SharedArea::make_record(Value id, uint32_t flags, uint32_t len) {
+    auto* o = static_cast<RecordObj*>(
+        alloc(ObjType::Record, 16 + size_t(len) * sizeof(Value)));
+    o->len = len;
+    o->flags = flags;
+    o->id = id;
     return from_obj(o);
 }
 

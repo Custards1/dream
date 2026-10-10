@@ -19,16 +19,25 @@ import std.list;
 
 // --- spans ------------------------------------------------------------------
 
-group Span derive dreams.source_range { span_start, span_end }
+// A span is `[start, end]`: a pair, not a record. It is syntax, and syntax is
+// ordinary lists -- a macro builds and reads it as freely as the parser does,
+// and a `group` is a value of its own now, which a macro's `[0, 3]` is not
+// (see "Records are values of their own" in docs/notes/static-types.md).
+mod Span {
+    derive dreams.source_range;
 
-let span_of = Span.make;
-let span_start s = Span.span_start s;
-let span_end s = Span.span_end s;
+    let span_start self = self.[0];
+    let span_end self = self.[1];
+}
+
+let span_of a b = [a, b];
+let span_start s = s.[0];
+let span_end s = s.[1];
 
 /// The span covering both, for a node built out of two others.
 let span_to a b = [span_start a, span_end b];
 
-let no_span = Span.make 0 0;
+let no_span = [0, 0];
 
 // --- expressions ------------------------------------------------------------
 //
@@ -228,11 +237,12 @@ let macro_d name params body span = [:macro, name, params, body, span];
 /// so a field's default is spliced straight into the read. A default of `()`
 /// *written by the author* is `[:unit, span]` and not this, so the two do not
 /// collide.
-group RecordField { param, default }
-
-let record_field = RecordField.make;
-let field_param f = RecordField.param f;
-let field_default f = RecordField.default f;
+///
+/// `[param, default]`, or `[param, default, type]` once a type is written --
+/// a list, as every piece of syntax is, so that a macro can make one.
+let record_field param default = [param, default];
+let field_param f = f.[0];
+let field_default f = f.[1];
 // Older syntax and macros keep their two-element fields.
 let field_type f = f.[2 else ()];
 let field_name f    = param_name (list.nth 0 f);
@@ -254,13 +264,13 @@ let field_span f    = list.nth 1 (list.nth 0 f);
 /// Having parameters is also what tells a member from a field: `x = 0` is a
 /// field with a default and `f self = 0` is a member, and nothing else has to
 /// be written to say which was meant.
-group RecordMember { name, params, body, span }
-
-let record_member = RecordMember.make;
-let member_name m = RecordMember.name m;
-let member_params m = RecordMember.params m;
-let member_body m = RecordMember.body m;
-let member_span m = RecordMember.span m;
+///
+/// `[name, params, body, span]`, a list for the reason a field is.
+let record_member name params body span = [name, params, body, span];
+let member_name m = m.[0];
+let member_params m = m.[1];
+let member_body m = m.[2];
+let member_span m = m.[3];
 
 let record_d kind name fields members span = [:record, kind, name, fields, members, [], span];
 
@@ -357,6 +367,16 @@ let list_p items rest span  = [:list_p, items, rest, span];
 let array_p items rest span = [:array_p, items, rest, span];
 let map_p pairs span        = [:map_p, pairs, span];
 let as_p inner name name_span span = [:as_p, inner, name, name_span, span];
+/// `Shape.circle(r)`, `Shape.empty`, `Point(x, y)`: a value made by one
+/// constructor, with its fields taken apart by position. `ctor` is the
+/// constructor as an expression -- a name or a dotted member, resolved the
+/// way any name is -- and `fields` the patterns for its fields, empty for a
+/// variant that has none. What makes it a test is the id the constructor
+/// stamps on what it makes (`scope.wrapper_of`), so it matches values of
+/// that constructor and nothing else: never a list or an array, however
+/// alike they look. See "Records are values of their own" in
+/// docs/notes/static-types.md.
+let record_p ctor fields span = [:record_p, ctor, fields, span];
 
 /// One `pattern => body`, with an optional guard checked after the pattern
 /// matched, so it can use what the pattern bound.
@@ -575,6 +595,9 @@ let rec show_pattern p =
             "%{" + str.join_str " " (list.map (fn kv -> show (list.nth 0 kv) + " => "
                                                         + show_pattern (list.nth 1 kv)) pairs) + "}",
         [:as_p, inner, n, _, _] => "(" + show_pattern inner + " as " + n + ")",
+        [:record_p, ctor, fields, _] =>
+            show ctor + (if list.is_empty fields { "" }
+                         else { "(" + str.join_str ", " (list.map show_pattern fields) + ")" }),
         other => "?" + to_string (other.[0]),
     }
 ;

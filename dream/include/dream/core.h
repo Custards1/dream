@@ -61,7 +61,10 @@ typedef enum dream_type {
     DREAM_TYPE_BIGSTR,
     /* Packed numbers with a shape: what the numeric operators and std.tensor
      * work on. Appended for the same reason DREAM_TYPE_BIGSTR was. */
-    DREAM_TYPE_TENSOR
+    DREAM_TYPE_TENSOR,
+    /* A value of a declared record or union: a fixed run of fields and the
+     * name of what it is. Appended for the same reason as the two above. */
+    DREAM_TYPE_RECORD
 } dream_type;
 
 /* `thread` was the original spelling in the language spec and is kept as an

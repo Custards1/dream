@@ -165,6 +165,11 @@ std::vector<TracePlace> error_trace(Process& p, Value err);
 /// followed by where it was raised, a line a place.
 std::string describe_failure(Process& p, Value err);
 
+/// A record's type as `type_of` names it, and as it is written: `Item`, and
+/// `Item.file` for a variant (see RecordObj). `v` must be a record.
+std::string record_type_name(Process& p, Value v);
+std::string record_shown_name(Process& p, Value v);
+
 /// A short, non-forcing description, for error messages.
 std::string describe(Process& p, Value v);
 

@@ -413,7 +413,7 @@ struct WellKnownAtoms {
     /// The name `type_of` answers for each surface type, indexed by
     /// `dream_type`. `DREAM_TYPE_PURE_FN` is the pure one; an impure function
     /// reports `impure_fn`, which is the entry after it.
-    uint32_t types[DREAM_TYPE_TENSOR + 1];
+    uint32_t types[DREAM_TYPE_RECORD + 1];
 };
 const WellKnownAtoms& well_known(Runtime& rt);
 

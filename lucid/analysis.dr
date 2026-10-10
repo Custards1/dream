@@ -1884,15 +1884,16 @@ when test {
         //
         // A `group` is a module of generated functions by the time anything
         // resolves it, so every one of these was answered out of
-        // `modules.records` rather than out of the program.
+        // `modules.records` rather than out of the program. Each is typed by
+        // the record it belongs to, since a `group`'s values are its own.
         test.case "a record's accessor says which field it reads"
-            $( test.eq! "`x record` -- reads `x` of the group `Point`"
+            $( test.eq! "`x record : Point -> :any` -- reads `x` of the group `Point`"
                         (hover_value! record_src 1 18) ),
         test.case "a record's setter says which field it replaces"
-            $( test.eq! "`set_y value record` -- replaces `y` in the group `Point`"
+            $( test.eq! "`set_y value record : :any -> Point -> Point` -- replaces `y` in the group `Point`"
                         (hover_value! record_src 1 28) ),
         test.case "a record's constructor is shown with its fields"
-            $( test.eq! "`make x y` -- builds the group `Point`"
+            $( test.eq! "`make x y : :any -> :any -> Point` -- builds the group `Point`"
                         (hover_value! record_src 1 41) ),
         test.case "a generated parameter is named, not sliced out of the file"
             $( test.eq! "make x y" (param_text "" (ast.param "make" [0, 0])
@@ -1929,10 +1930,10 @@ when test {
                         (hover_value! "mapping C { host, retries = 3 }\nlet main! = C.new \"h\";\n"
                                       1 14) ),
         test.case "`new` with nothing to default reads as the constructor it is"
-            $( test.eq! "`new x y` -- builds the group `Point`"
+            $( test.eq! "`new x y : :any -> :any -> Point` -- builds the group `Point`"
                         (hover_value! member_src 1 29) ),
         test.case "a record with no fields still shows its constructor"
-            $( test.eq! "`make ()` -- builds the struct `Empty`"
+            $( test.eq! "`make () : :any -> Empty` -- builds the struct `Empty`"
                         (hover_value! "struct Empty {}\nlet main! = Empty.make ();\n" 1 18) ),
         test.case "the keyword a record was written with survives the rewrite"
             $( test.eq! ["group", "struct", "mapping"]

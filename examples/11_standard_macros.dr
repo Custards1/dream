@@ -13,7 +13,7 @@ let main! = {
     console.print! (expand macros.pipe [1, 2, 3, 4]
         [list.map (fn x -> x * 2), list.filter (fn x -> x > 4), list.sum])
     console.print! (expand macros.cond [[false, "cold"], [true, "warm"]] "unknown")
-    console.print! (expand macros.and_all [true, false, 1 / 0 == 0])
+    console.print! (expand macros.and_all [true, false, list.head [] == 0])
 
     // Bounds and updates share their inputs instead of inserting them twice.
     console.print! (expand macros.clamp 120 0 100)

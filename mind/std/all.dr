@@ -114,8 +114,8 @@ let modules = ["std.agent", "std.array", "std.atom", "std.binary", "std.binary.i
 // through `std.json`, and asked to be itself again on the other side.
 
 when test {
-    // A `group` says only what nothing can tell it: its field names. The
-    // backing defaults to `:list`, which is what a group is.
+    // A `group` says only what nothing can tell it: its field names. Which
+    // record it is, it knows: the declaration fills in `record_id`.
     group Point derive std.record {
         x
         y
@@ -157,8 +157,8 @@ when test {
         test.case "to_map names the fields"
             $( test.eq! %{ :name => "ada", :age => 36 } (User.to_map ada) ),
         test.case "of_map is its inverse"      $( test.eq! ada (User.of_map (User.to_map ada)) ),
-        test.case "and keeps the backing"      $( test.eq! :array (type_of (User.of_map (User.to_map ada))) ),
-        test.case "a group keeps its backing"  $( test.eq! :list (type_of (Point.of_map (Point.to_map (Point.make 1 2)))) ),
+        test.case "and is a User again"        $( test.eq! :User (type_of (User.of_map (User.to_map ada))) ),
+        test.case "a group is itself again"    $( test.eq! :Point (type_of (Point.of_map (Point.to_map (Point.make 1 2)))) ),
         test.case "a mapping keeps its backing"
             $( test.eq! :map (type_of (Config.of_map (Config.to_map (Config.new "h")))) ),
         test.case "a missing field is ()"      $( test.eq! () (User.name (User.of_map %{ :age => 1 })) ),
@@ -285,7 +285,7 @@ when test {
         test.case "lazy checks reject a demanded bad element" $( test.raises!
             $( list.nth 2 (types.check_each :integer [1, 2, "bad"]) ) ),
         test.case "function contracts preserve unused arguments" $( test.eq! 7
-            ((types.function :integer :integer (fn ignored -> 7)) (1 / 0)) ),
+            ((types.function :integer :integer (fn ignored -> 7)) test.boom) ),
         test.case "function contracts check the result" $( test.raises!
             $( (types.function :integer :integer (fn n -> "wrong")) 1 ) ),
         test.case "server action types describe replies and transitions" $( test.eq! [true, false]

@@ -1269,9 +1269,10 @@ let parse_type c sp ts =
     };
 
 /// What can begin the pattern of a destructuring `let`: a list, an array or a
-/// map, or a parenthesised pattern.
+/// map, a parenthesised pattern, or a constructor -- `let Point(x, y) = p`.
 let starts_let_pattern ts =
-    at ts :lbracket || at ts :hash_bracket || at ts :percent_brace || at ts :lparen;
+    at ts :lbracket || at ts :hash_bracket || at ts :percent_brace || at ts :lparen ||
+        (at ts :ident && starts_constructor (lexer.value (peek ts)) (peek ts) (list.tail ts));
 
 /// `let [a, b] = pair`. Only the shape is read here. Which patterns a `let` may
 /// take is resolution's question, because a pattern that could fail to match
@@ -1610,12 +1611,80 @@ let rec parse_pattern_atom c ts = {
                 else if is_keyword (lexer.value t) {
                     err ("`" + to_string (lexer.value t) + "` is a keyword and cannot be a binding") sp
                 }
+                else if starts_constructor (lexer.value t) t rest { constructor_pattern c sp t rest }
                 else { ok (ast.bind_p (lexer.value t) sp) rest },
             :error => err (lexer.value t) sp,
             _ => err ("expected a pattern, found " + describe ts) sp,
         }
     }
 };
+
+/// A name followed by a `.`, or a capitalised one followed by a `(` with
+/// nothing between them, begins a constructor pattern: `Shape.circle(r)`,
+/// `Shape.empty`, `build.Input.file(p)`, `Point(x, y)`. A dotted name in a
+/// pattern was an error before, so it can mean this whatever its case. A
+/// name standing alone still binds, as it always has, and the `(` has to
+/// touch the name so that a parameter list -- `let f P (x as y)` -- reads as
+/// it did. The same spelling declares a variant (`union Shape { circle(radius)
+/// }`), which is the point of choosing it.
+let starts_constructor name t rest =
+    match peek rest {
+        () => false,
+        n => kind_of n == :dot ||
+             (is_capitalised name && kind_of n == :lparen && lexer.span_start n == lexer.span_end t),
+    };
+
+let is_capitalised name = {
+    let c = str.byte 0 name;
+    c >= 65 && c <= 90
+};
+
+/// The dotted path, as the expression parser would build it -- a `field`'s
+/// span starts where its base does -- then the fields, if there are any.
+let rec constructor_pattern c sp t rest = {
+    let rec path e ts =
+        if not (at ts :dot) { [e, ts] }
+        else {
+            match peek (list.tail ts) {
+                () => [e, ts],
+                n => if kind_of n != :ident { [e, ts] }
+                     else {
+                         let whole = ast.span_to (ast.span e)
+                                                 (ast.span_of (lexer.span_start n) (lexer.span_end n));
+                         path (ast.field_e e (lexer.value n) whole) (list.tail (list.tail ts))
+                     },
+            }
+        };
+    let [named, after] = path (ast.name_e (lexer.value t) sp) rest;
+    // `Point(x, y)` names a record, whose constructor is `Point.make`; a
+    // union's variant is written in lower case and is its own constructor.
+    let ctor = match named {
+        [:field, _, last, _] => if is_capitalised last { ast.field_e named "make" (ast.span named) } else { named },
+        _ => ast.field_e named "make" (ast.span named),
+    };
+    if not (at after :lparen) { ok (ast.record_p ctor [] (ast.span ctor)) after }
+    else {
+        match constructor_fields c [] (list.tail after) {
+            [:error, m, s] => err m s,
+            [:ok, fields, closed, done] =>
+                ok (ast.record_p ctor fields (ast.span_to (ast.span ctor) closed)) done,
+        }
+    }
+};
+
+/// `p, q, r)`: the patterns of a constructor's fields, and the `)` that ends
+/// them. Answers `[:ok, fields, span of the paren, rest]`.
+let rec constructor_fields c acc ts =
+    if at ts :rparen { [:ok, list.reverse acc, peek_span ts, list.tail ts] }
+    else {
+        match parse_pattern (grouped c) ts {
+            [:error, m, s] => [:error, m, s],
+            [:ok, p, rest] =>
+                if at rest :comma { constructor_fields c (list.cons p acc) (list.tail rest) }
+                else if at rest :rparen { [:ok, list.reverse (list.cons p acc), peek_span rest, list.tail rest] }
+                else { [:error, "expected `,` or `)` after a field of a constructor pattern", peek_span rest] },
+        }
+    };
 
 /// `[a, b]`, `[x, ..rest]`, `[x, ..]`. The rest is `()` when the length is
 /// fixed, `[name]` when it is bound, and `[()]` when it is ignored.

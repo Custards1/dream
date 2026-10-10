@@ -174,23 +174,26 @@ let origin = comp types.check Point.type (Point.new 1);
 // time is `static_types.py`'s business.
 let opaque x = x;
 let main! = {
-    console.print! [origin, types.accepts Point.type [1], types.accepts Point.type [],
-                    types.accepts Point.type [1, 2, 3], types.accepts Point.type ["x", 2]]
+    // A `group` is a value of its own, so its description accepts what its
+    // constructor made and nothing else -- not a list of the right fields.
+    console.print! [origin, types.accepts Point.type (Point.make 1 2), types.accepts Point.type [1, 0],
+                    types.accepts Point.type (Point.make (opaque "x") 2),
+                    types.accepts Point.type (Vector.make 1.0 2.0)]
     console.print! [types.accepts Vector.type (Vector.make 1.0 2.0),
                     types.accepts Vector.type [1.0, 2.0], types.accepts Vector.type #[1.0]]
     console.print! [types.accepts Config.type %{ :host => "local" },
                     types.accepts Config.type %{ :host => "local", :retries => "bad" },
                     types.accepts Config.type (Config.new "local")]
     console.print! [types.accepts Untyped.type (Untyped.make (1 / 0)),
-                    types.accepts Empty.type []]
+                    types.accepts Empty.type (Empty.make ()), types.accepts Empty.type []]
     console.print! [types.accepts Listy.type (Listy.make [1, 2] :ok),
                     types.accepts Listy.type (Listy.make [1, 2] (opaque :maybe))]
     console.print! (Point.make (opaque "still untyped") (opaque false))
     console.print! (try! { types.check Point.type (Point.set_x (opaque "bad") origin) }
                     catch e { error.kind e })
 };
-''', '[[1, 0], true, false, false, false]\n[true, false, false]\n[true, false, true]\n'
-     '[true, true]\n[true, false]\n["still untyped", false]\n:type_error\n')
+''', '[Point(1, 0), true, false, false, false]\n[true, false, false]\n[true, false, true]\n'
+     '[true, true, false]\n[true, false]\nPoint("still untyped", false)\n:type_error\n')
 
     # --- a failed check under comp is a failed compile -------------------------
     failure(prelude + 'type Int = :integer; let main! = comp types.check Int "bad";',

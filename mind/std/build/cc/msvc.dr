@@ -23,39 +23,39 @@ let value_text v = match v { () => "", s if type_of s == :string => s, x => to_s
 /// The flags one setting adds when compiling a source in `lang`.
 let compile_flags : cc.Toolchain -> :atom -> cc.Setting -> [:string];
 let compile_flags tc lang s = match s {
-    [:standard, l] if cc.standard_is_for lang l => match [lang, cc.standard_version l] {
+    cc.Setting.standard(l) if cc.standard_is_for lang l => match [lang, cc.standard_version l] {
         [:cxx, "23"] => ["/std:c++latest"],
         [:cxx, v] => ["/std:c++" + v],
         [_, v] => ["/std:c" + v],
     },
-    [:optimize, 0] => ["/Od"],
-    [:optimize, :size] => ["/O1"],
-    [:optimize, _] => ["/O2"],
-    [:debug_info, true] => ["/Z7"],
-    [:warnings, :none] => ["/W0"],
-    [:warnings, :default] => ["/W3"],
-    [:warnings, _] => ["/W4"],
-    [:warnings_as_errors, true] => ["/WX"],
-    [:define, n, ()] => ["/D" + n],
-    [:define, n, v] => ["/D" + n + "=" + value_text v],
-    [:include, d] => ["/I" + d],
-    [:rtti, false] if lang == :cxx => ["/GR-"],
-    [:sanitize, :address] => ["/fsanitize=address"],
-    [:flags_for, sel, fs] if cc.applies sel tc => fs,
-    [:define_for, sel, n] if cc.applies sel tc => ["/D" + n],
+    cc.Setting.optimize(0) => ["/Od"],
+    cc.Setting.optimize(:size) => ["/O1"],
+    cc.Setting.optimize(_) => ["/O2"],
+    cc.Setting.debug_info(true) => ["/Z7"],
+    cc.Setting.warnings(:none) => ["/W0"],
+    cc.Setting.warnings(:default) => ["/W3"],
+    cc.Setting.warnings(_) => ["/W4"],
+    cc.Setting.warnings_as_errors(true) => ["/WX"],
+    cc.Setting.define(n, ()) => ["/D" + n],
+    cc.Setting.define(n, v) => ["/D" + n + "=" + value_text v],
+    cc.Setting.include(d) => ["/I" + d],
+    cc.Setting.rtti(false) if lang == :cxx => ["/GR-"],
+    cc.Setting.sanitize(:address) => ["/fsanitize=address"],
+    cc.Setting.flags_for(sel, fs) if cc.applies sel tc => fs,
+    cc.Setting.define_for(sel, n) if cc.applies sel tc => ["/D" + n],
     _ => [],
 };
 
 /// The flags one setting adds to a link.
 let link_flags : cc.Toolchain -> cc.Setting -> [:string];
 let link_flags tc s = match s {
-    [:debug_info, true] => ["/DEBUG"],
-    [:sanitize, :address] => ["/INFERASANLIBS"],
-    [:system, l] => [l + ".lib"],
-    [:system_for, os, l] if os == cc.Toolchain.os tc => [l + ".lib"],
-    [:library_dir, d] => ["/LIBPATH:" + d],
-    [:link_file, p] => [p],
-    [:link_flags_for, sel, fs] if cc.applies sel tc => fs,
+    cc.Setting.debug_info(true) => ["/DEBUG"],
+    cc.Setting.sanitize(:address) => ["/INFERASANLIBS"],
+    cc.Setting.system(l) => [l + ".lib"],
+    cc.Setting.system_for(os, l) if os == cc.Toolchain.os tc => [l + ".lib"],
+    cc.Setting.library_dir(d) => ["/LIBPATH:" + d],
+    cc.Setting.link_file(p) => [p],
+    cc.Setting.link_flags_for(sel, fs) if cc.applies sel tc => fs,
     _ => [],
 };
 
@@ -63,7 +63,7 @@ let link_flags tc s = match s {
 let problems : cc.Toolchain -> [cc.Setting] -> [:string];
 let problems tc settings =
     list.flat_map (fn s -> match s {
-        [:sanitize, k] if k != :none && k != :address =>
+        cc.Setting.sanitize(k) if k != :none && k != :address =>
             ["MSVC has only the address sanitizer, not " + to_string k],
         _ => [],
     }) settings;

@@ -145,6 +145,7 @@ let node_runs = [
     [:block, 0, 1, 1],
     [:make_list, 0, 1, 1],
     [:make_array, 0, 1, 1],
+    [:record_make, 0, 1, 1],
     [:make_map, 0, 1, 2],
     [:switch_head, 1, 2, 1],
     [:switch_atom, 1, 2, 1],
@@ -322,11 +323,18 @@ let rebuild_leaf n s =
         },
     };
 
-/// A `field` with the string naming it renamed the same way.
+/// A `field` with the string naming it renamed the same way, and a
+/// `record_make` with the atom naming what it makes -- keeping the bit that
+/// says it is a variant.
 let remap_field n s = match remap s {
     () => n,
     m => match ir.node_op n {
         :field => set_operand 1 ((m.[:strs]).[ir.node_b n]) n,
+        :record_make => {
+            let c = ir.node_c n;
+            let bit = if c >= ir.record_variant { ir.record_variant } else { 0 };
+            set_operand 2 ((m.[:atoms]).[c - bit] + bit) n
+        },
         _ => n,
     },
 };

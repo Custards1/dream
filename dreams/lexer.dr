@@ -660,7 +660,7 @@ when test {
     let tests = [
         test.case "token range behavior preserves lazy payloads"
             $( test.eq! [[2, 7], 5, true, false]
-                        { let t = make :ident (1 / 0) 2 7 true 3;
+                        { let t = make :ident test.boom 2 7 true 3;
                           [span t, Token.byte_length t, Token.contains 2 t,
                            Token.contains 7 t] } ),
         // --- operators ---

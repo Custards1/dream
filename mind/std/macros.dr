@@ -213,26 +213,26 @@ when test {
 
     let tests = [
         test.case "when_true takes its body only when true"
-            $( test.eq! [7, ()] [expand when_true true 7, expand when_true false (1 / 0)] ),
+            $( test.eq! [7, ()] [expand when_true true 7, expand when_true false test.boom] ),
         test.case "unless skips its body when true"
-            $( test.eq! [(), 7] [expand unless true (1 / 0), expand unless false 7] ),
+            $( test.eq! [(), 7] [expand unless true test.boom, expand unless false 7] ),
         test.case "and_all short circuits"
-            $( test.false! (expand and_all [true, false, 1 / 0 == 0]) ),
+            $( test.false! (expand and_all [true, false, test.boom == 0]) ),
         test.case "or_any short circuits"
-            $( test.true! (expand or_any [false, true, 1 / 0 == 0]) ),
+            $( test.true! (expand or_any [false, true, test.boom == 0]) ),
         test.case "empty boolean chains have their identities"
             $( test.eq! [true, false] [expand and_all [], expand or_any []] ),
         test.case "single boolean chains still produce booleans"
             $( test.eq! [false, true] [expand and_all [false], expand or_any [true]] ),
         test.case "cond picks the first successful branch"
-            $( test.eq! 2 (expand cond [[false, 1 / 0], [true, 2], [1 / 0 == 0, 3]] (1 / 0)) ),
+            $( test.eq! 2 (expand cond [[false, test.boom], [true, 2], [test.boom == 0, 3]] test.boom) ),
         test.case "cond falls back, including for no branches"
             $( test.eq! [8, 9] [expand cond [[false, 0]] 8, expand cond [] 9] ),
         test.case "coalesce distinguishes absence from false, zero and empty"
             $( test.eq! [9, false, 0, [], #[], %{}]
-                [expand coalesce () 9, expand coalesce false (1 / 0),
-                 expand coalesce 0 (1 / 0), expand coalesce [] (1 / 0),
-                 expand coalesce #[] (1 / 0), expand coalesce %{} (1 / 0)] ),
+                [expand coalesce () 9, expand coalesce false test.boom,
+                 expand coalesce 0 test.boom, expand coalesce [] test.boom,
+                 expand coalesce #[] test.boom, expand coalesce %{} test.boom] ),
         test.case "coalesce evaluates a present expression once"
             $({
                 test.eq! 7 (expand coalesce (mark! :value 7) (mark! :fallback 9))
@@ -242,15 +242,15 @@ when test {
         test.case "if_some binds only in the present branch"
             $({
                 let value = 99;
-                test.eq! [8, 99] [expand if_some value 7 (value + 1) (1 / 0),
-                                 expand if_some value () (1 / 0) value]
+                test.eq! [8, 99] [expand if_some value 7 (value + 1) test.boom,
+                                 expand if_some value () test.boom value]
             }),
         test.case "with_some preserves absence and shares its binding"
-            $( test.eq! [(), 6] [expand with_some x () (1 / 0), expand with_some x 3 (x + x)] ),
+            $( test.eq! [(), 6] [expand with_some x () test.boom, expand with_some x 3 (x + x)] ),
         test.case "with_ok binds a success"
             $( test.eq! [:ok, 8] (expand with_ok value [:ok, 4] [:ok, value + value]) ),
         test.case "with_ok propagates an error without evaluating its body"
-            $( test.eq! [:error, :bad] (expand with_ok value [:error, :bad] (1 / 0)) ),
+            $( test.eq! [:error, :bad] (expand with_ok value [:error, :bad] test.boom) ),
         test.case "result bindings compose with distinct lexical scopes"
             $( test.eq! [:ok, 10] (expand with_ok x [:ok, 4]
                 (expand with_ok y [:ok, 6] [:ok, x + y])) ),
@@ -271,7 +271,7 @@ when test {
                 test.eq! [:collection, :key, :end] [recv! (), recv! (), recv! ()]
             }),
         test.case "an update does not force its replacement too early"
-            $( test.eq! 2 ((expand update [1, 2] 0 (fn x -> x / 0)).[1]) ),
+            $( test.eq! 2 ((expand update [1, 2] 0 (fn _ -> test.boom)).[1]) ),
         test.case "between includes both endpoints"
             $( test.eq! [false, true, true, false]
                 [expand between 0 1 3, expand between 1 1 3,
@@ -279,7 +279,7 @@ when test {
         test.case "between shares the value and skips the unused upper bound"
             $({
                 test.true! (expand between (mark! :value 2) 1 3)
-                test.false! (expand between 0 1 (1 / 0))
+                test.false! (expand between 0 1 test.boom)
                 send! (self! ()) :end
                 test.eq! [:value, :end] [recv! (), recv! ()]
             }),
@@ -288,12 +288,12 @@ when test {
                 [expand clamp 0 1 3, expand clamp 2 1 3, expand clamp 4 1 3] ),
         test.case "clamp shares bounds and skips the unused upper bound"
             $({
-                test.eq! 1 (expand clamp (mark! :value 0) (mark! :lower 1) (1 / 0))
+                test.eq! 1 (expand clamp (mark! :value 0) (mark! :lower 1) test.boom)
                 send! (self! ()) :end
                 test.eq! [:value, :lower, :end] [recv! (), recv! (), recv! ()]
             }),
         test.case "assert does not evaluate the message on success"
-            $( test.eq! () (expand assert true (1 / 0)) ),
+            $( test.eq! () (expand assert true test.boom) ),
         test.case "assert raises exactly its supplied message"
             $( test.eq! :failed (try! { expand assert false :failed } catch e { _error_payload e }) ),
         test.case "attempt returns a success result"
@@ -316,9 +316,9 @@ when test {
                 test.eq! [:value, [:observed, 5], :end] [recv! (), recv! (), recv! ()]
             }),
         test.case "tap evaluates even a pure observer"
-            $( test.raises! $( strict! (expand tap 5 (fn _ -> 1 / 0)) ) ),
+            $( test.raises! $( strict! (expand tap 5 (fn _ -> test.boom)) ) ),
         test.case "tap only forces the observer result to weak head normal form"
-            $( test.eq! 5 (expand tap 5 (fn _ -> [1, 1 / 0])) ),
+            $( test.eq! 5 (expand tap 5 (fn _ -> [1, test.boom])) ),
         test.case "nested generated temporaries do not capture caller bindings"
             $({
                 let saved = 100;

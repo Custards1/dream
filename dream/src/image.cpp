@@ -80,7 +80,7 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
             out.push_back(n.b);
             out.push_back(n.c);
             break;
-        case Op::Block: case Op::MakeList: case Op::MakeArray:
+        case Op::Block: case Op::MakeList: case Op::MakeArray: case Op::RecordMake:
             push_kids(n.a, n.b);
             break;
         case Op::MakeMap:
@@ -197,6 +197,7 @@ const char* op_name(Op op) {
         case Op::Not: return "not";
         case Op::MakeList: return "list";
         case Op::MakeArray: return "array";
+        case Op::RecordMake: return "record";
         case Op::MakeMap: return "map";
         case Op::Get: return "get";
         case Op::Set: return "set";
@@ -445,6 +446,28 @@ bool Image::parse(std::string& error) {
             accessors_[i] = Accessor{container.a, key.a, 0};
         }
     }
+    // The parameters a function forces before it does anything else: the run
+    // of strict `local` reads at the head of its body that `lower_body` emits
+    // for `!acc`. Only that prefix counts, because it is what makes evaluating
+    // the argument in the caller indistinguishable from forcing it on entry --
+    // nothing of the callee's has run yet either way, and the strict
+    // parameters are forced in the same order. See "Strict arguments are
+    // evaluated where they stand" in docs/notes/vm-performance.md.
+    strict_args_.assign(n_funcs_, 0);
+    for (uint32_t i = 0; i < n_funcs_; ++i) {
+        const auto& f = funcs_[i];
+        const auto& body = node(f.body);
+        if (Op(body.op) != Op::Block) continue;
+        uint32_t mask = 0;
+        for (uint32_t s = 0; s + 1 < body.b; ++s) {
+            const auto& stmt = node(kid(body.a + s));
+            if (Op(stmt.op) != Op::Local || !(stmt.flags & F_STRICT) ||
+                stmt.a >= f.arity || stmt.a >= 32)
+                break;
+            mask |= 1u << stmt.a;
+        }
+        strict_args_[i] = mask;
+    }
     return true;
 }
 
@@ -631,6 +654,10 @@ bool Image::validate(std::string& error) {
                 break;
             case Op::MakeMap:
                 if (!kids_ok(n.a, uint64_t(n.b) * 2)) return fail("bad map entry list");
+                break;
+            case Op::RecordMake:
+                if (!kids_ok(n.a, n.b)) return fail("bad record field list");
+                if ((n.c & RECORD_MAKE_ATOM) >= n_atoms_) return fail("bad record id");
                 break;
             case Op::SwitchHead: case Op::SwitchAtom:
                 if (!node_ok(n.a)) return fail("bad switch subject");

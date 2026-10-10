@@ -380,6 +380,8 @@ let rec pattern_names p =
         [:bind, n, _] => [n],
         [:literal, e, _] => mentioned e,
         [:as_p, inner, n, _, _] => list.cons n (pattern_names inner),
+        [:record_p, ctor, fields, _] =>
+            list.append (mentioned ctor) (list.concat (list.map (fn f -> pattern_names f) fields)),
         [:cons_p, head, tail, _, _] => list.append (pattern_names head) (pattern_names tail),
         [:list_p, items, rest, _]  =>
             list.append (list.concat (list.map (fn i -> pattern_names i) items)) (rest_name rest),

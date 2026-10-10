@@ -256,3 +256,126 @@ a type says what a value is, not whether it is evaluated. The escape-time loop
 written `if i >= limit { i } else if zr * zr + zi * zi > 4.0 ..` compiles
 nothing typed or untyped, because `zr` is not forced on the first path; the
 same loop with the two tests swapped is compiled either way.
+
+## Records are values of their own
+
+2026-10-09. A `group` was a list, a `struct` an array, and a union's variant
+the tagged list `[:circle, r]` (or the atom `:empty`). That was what made
+records cheap to add and what kept them from being types: `type_of` on a
+`User` said `:array`, the checker typed a read by position as `:any` because
+a list here was as often a record as a sequence, a union's tag could collide
+with any list that began with the same atom, and "is this a `User`?" could
+only mean "is it the right length". Now a `group`, a `struct` and every
+union variant is a value of its own; a `mapping` is still a map, because it is
+built from map literals and decoded JSON and is meant to be.
+
+**What a record is.** `RecordObj` in dream/src/value.hpp: the fields, lazy,
+by position, and one atom naming the declaration, qualified by its module --
+`app.Point` for a record, `app.Shape.circle` for a variant, which a flag bit
+marks. `type_of` answers the declaration's own name (`:Point`, `:Shape`),
+printing writes `Point(3, 4)` and `Shape.empty`, equality wants the same atom
+and equal fields, `compare` orders by the atom and then the fields, a variant
+with no fields is a map key by value as an atom is, and `send!`, `std.wire`
+(`WIRE_RECORD`), `std.image` and a `comp`'s answer carry one across as itself.
+Fields are read and changed through `get` and `set`, the opcodes an array's
+are, so the accessors `syntax.record` generates did not change at all -- and
+the interpreter's accessor shortcut, `thunk_for`'s read and the JIT's
+`dream_rt_peek` take a record where they took an array.
+
+**How one is made.** A constructor's body is `_record_of :app.Point false
+#[x, y]` (`syntax.constructed`), an ordinary call of a primitive, so that the
+resolver, the checker, the linter, the formatter and the language server see
+nothing new. Lowering recognises that exact shape and emits one `record_make`
+node instead (`lower.lower_apply`; opcode 81, `a`/`b` the fields, `c` the
+atom with the variant bit on top). The resolver files every constructor in
+its wrapper table as `[[:record, id, variant, rewritable, fields], plan,
+arity]` (`scope.constructor_of`), which does two things: a saturated call of a
+constructor whose fields are lazy and passed through in order becomes the
+`record_make` itself, as a call of an accessor becomes its `get`; and every
+part of a parallel build -- lowering's and the checker's -- can find the id of
+a constructor another part walked, because the wrapper table is the one thing
+each part is given whole. A constructor with a strict field is filed but not
+rewritten: its frame is what forces the field. Merging parts renumbers
+`record_make`'s atom as it renumbers `const_atom`'s (`opt.remap_field`, and
+`ShareArenas::rebuild_node` in C++); that was missed the first time, and a
+`Point` built in one part came out named after whatever atom had that index
+in another.
+
+**How one is matched.** `Shape.circle(r)`, `Shape.empty`, `Point(x, y)` --
+`[:record_p, ctor, fields, span]`, the constructor an expression resolved
+like any other, `Point(..)` meaning `Point.make`. It lowers to `_record_is id
+subject` and then each field by `_match_at`, as an array pattern's elements
+are; a name that is no constructor or the wrong number of fields is a compile
+error. A dotted name in a pattern was an error before, so any `a.b` there can
+begin one; a capitalised name needs its `(` to touch it, so `let f P (x)` still
+reads as it did. A member is compiled inside the declaration's own module,
+where `Shape` names nothing, so the loader reads `Shape.circle` in a member as
+the local `circle` (`syntax.own_names`) -- otherwise a member would have had
+to write a bare `empty`, which in a pattern binds anything.
+
+**What the checker does with it.** A description `[:constructed, id, [field
+types]]` becomes `[:nominal, id, [t, ..]]`, and `sub` holds it exactly: the
+same id and fields that fit, and nothing else -- not a tuple, not an array.
+A `group` and a `struct` now always give their generated functions
+signatures, so `Point.x [1, 2]` is an error where it used to be allowed. A
+constructor pattern binds its fields to that variant's field types, covers
+what that constructor made for exhaustiveness, and an arm whose pattern no
+value of a declared type could fit -- `[:circle, r]` against a `Shape` -- is
+reported, which is what found most of the migration below.
+`resolved_pattern` asks the resolution once per arm for every constructor in
+a pattern, because `covers`, `may_match` and `arm_misses` have only a pattern
+and a type to go on.
+
+**The bootstrap took two reseeds.** The seed has to parse whatever the
+compiler imports, and has to know a primitive by name before `std` may call
+it. So the first seed carried the VM's record kind, the four primitives and
+the lowering, with nothing in the compiler's own reach using any of it; the
+second could then parse constructor patterns in `std`. Four records the
+compiler used to describe *syntax* -- `Span`, `RecordField`, `RecordMember`
+and the IR's `Node` -- became plain list functions instead: syntax is lists
+that macros build and read, and an IR node is read by position in C++ by
+`vm.share_arenas`.
+
+**What moving to it found.** Most of the migration was mechanical -- `std.build`'s
+`Input`/`Op`/`Goal`, `std.build.cc`'s `Setting`, the PostgreSQL driver's
+`Message`, `ship`'s `Item`, `sleep`'s `Stage` -- but three things were not:
+
+- `std.sql.pg.db`'s `forced set p !v = set p v` was called with the value
+  second and the record third, so `!v` forced the record and left the list it
+  existed to force suspended. Invisible while a `Pending` was a list too; a
+  type error the day it was a record.
+- `random.split` hashed `to_string rng`, so its streams depended on how a
+  generator printed. It hashes the text it always hashed, spelled out, so a
+  recorded seed still replays.
+- `std.build`'s key encoding fell through to `"?" + type` for anything it did
+  not know, which would have given every record of a type the same key. A
+  record now encodes as its id and its fields.
+
+**What it costs.** A record is one word bigger than the array it replaced,
+for its id. A loop that makes a `struct`, reads both fields and sets one,
+three million times, same VM, compiled by the compiler before and after:
+
+| | before (array) | after (record) | |
+|---|---|---|---|
+| interpreted | 884 ms | 778 ms | -12% |
+| compiled | 106-114 ms | 111-113 ms | level |
+| reductions | 7.07 M | 4.08 M | -42% |
+| bytes allocated | 203 MB | 248 MB | +22% |
+
+The interpreter is faster because a constructor call is now the
+`record_make` itself rather than a call of `make`. The compiled loop was 20%
+*slower* until `Emitter::get` learnt to read a record's field inline, as it
+read an array's -- 24 bytes in rather than 16, which a `static_assert` beside
+`RecordObj` holds it to; before that every accessor in compiled code was a
+call of `dream_rt_get`. The self-compile, whose tokens and contexts are
+records now, is 2.59 s against 2.36-2.44 s before, with 3% more reductions and
+allocation -- over a compiler that also grew 3% in nodes in the same change,
+so the two are not separated here.
+
+**What is not done.** A record's field types cannot name another record
+declared beside it, because they are resolved inside the record's own module
+(`std.time.zone` writes `:any` where it means `Period`). `mapping` is still
+nominal only in name. And the dispatch on `type_of` that generic code does
+-- `match type_of v { :list => .. }` -- now sees `:Point` and falls to its
+default arm, which is right for a record and is the thing to check first when
+a walker that used to handle records stops.

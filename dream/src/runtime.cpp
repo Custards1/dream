@@ -43,8 +43,9 @@ Runtime::Runtime(bool owns_host_services)
         "integer", "float",  "char",   "bool",   "unit",    "string",
         "atom",    "list",   "array",  "map",    "pure_fn", "impure_fn",
         "module",  "error",  "process", "unknown", "bigstr",  "tensor",
+        "record",
     };
-    static_assert(std::size(kTypeNames) == DREAM_TYPE_TENSOR + 1,
+    static_assert(std::size(kTypeNames) == DREAM_TYPE_RECORD + 1,
                   "every surface type needs a name");
     for (size_t i = 0; i < std::size(kTypeNames); ++i) {
         wk_->types[i] = intern_atom(kTypeNames[i]);
