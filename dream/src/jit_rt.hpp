@@ -152,6 +152,9 @@ void dream_rt_set_tail(dream::Process* p, dream::Value cell, dream::Value tail);
 dream::Value dream_rt_make_list(dream::Process* p, uint32_t n, const dream::Value* items);
 dream::Value dream_rt_make_array(dream::Process* p, uint32_t n, const dream::Value* items);
 dream::Value dream_rt_make_record(dream::Process* p, uint32_t id, uint32_t n, const dream::Value* items);
+/// An empty map, as `%{}` makes one. A literal with entries forces its keys,
+/// and is left to the interpreter (see "What the interpreter evaluates").
+dream::Value dream_rt_make_map(dream::Process* p);
 
 /// The string, or the boxed float, for an image constant: the per-process
 /// shared copy the interpreter hands out, so a literal keeps one identity.
@@ -181,6 +184,10 @@ dream::Value dream_rt_snapshot(dream::Process* p, dream::Value closure, uint32_t
 
 /// The interpreter's own frame for this call adopted as the snapshot: the
 /// slots `binds` names get the thunks `dream_rt_snapshot` would have made.
+/// A remembered binding finished after a snapshot suspended it: settle the
+/// snapshot's thunk of it to `value` in place. See "A binding computed once"
+/// in jit.cpp.
+void dream_rt_settle(dream::Process* p, dream::Value frame, uint32_t slot, dream::Value value);
 void dream_rt_adopt(dream::Process* p, dream::Value frame, uint32_t nslots,
                     const dream::Value* vals, const uint32_t* binds);
 

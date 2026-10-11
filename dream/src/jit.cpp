@@ -462,8 +462,12 @@ int constant_condition(const Image& img, const Node& n) {
     return Op(condition.op) == Op::ConstBool ? int(condition.a != 0) : -1;
 }
 
-/// The ops the emitter can write. `Op::Capture` is deliberately absent:
-/// a capture lives in the frame, beyond the parameters this emitter reads. The
+/// The ops the emitter writes itself. Three more are decided in `check`,
+/// because whether they are written depends on more than the op: a capture
+/// (only a root has a closure to read it from), a map literal (only an empty
+/// one), and a big integer. Anything else pure is the interpreter's to
+/// evaluate -- see "What the interpreter evaluates" -- so this list is no
+/// longer what refuses a function, only what is written inline. The
 /// emitter used to refuse unsupported ops *after* the analysis had said yes, which cost nothing while a
 /// compile was one function -- the emitter gave up and the function was marked
 /// rejected. It is not free now: an emitter that gives up on a peer gives up on
@@ -481,7 +485,7 @@ bool op_is_supported(Op op) {
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::And: case Op::Or: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs:
         // Data. See "Lists, arrays and maps" and "Lazy positions" below.
-        case Op::ConstStr: case Op::Global:
+        case Op::ConstStr: case Op::Global: case Op::Builtin:
         case Op::ListIsEmpty: case Op::ListTail: case Op::Cons:
         case Op::MakeList: case Op::MakeArray: case Op::RecordMake: case Op::Get: case Op::Set:
             return true;
@@ -542,6 +546,7 @@ bool cheap_lazy(const Image& img, const std::vector<uint32_t>& binds, uint32_t a
         case Op::ConstInt:
             return fixnum_fits(img.integer(n.a));
         case Op::ConstBool: case Op::ConstChar: case Op::Unit: case Op::ConstAtom:
+        case Op::Builtin: case Op::Capture:
             return true;
         case Op::Local:
             if (n.a < arity) return true;
@@ -556,6 +561,40 @@ bool cheap_lazy(const Image& img, const std::vector<uint32_t>& binds, uint32_t a
             return false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// What the interpreter evaluates
+//
+// An op this file does not write used to refuse the whole function. Measured on
+// a self-compile run with every hot function compiled before it ran again
+// (`DREAM_JIT_SYNC=1 DREAM_JIT_WHY=1`), that was 612 refusals against 855
+// compiles, and nearly all of them were one node in an otherwise ordinary
+// body: the `%{}` default in every accessor of a `mapping`, which is every
+// accessor of the compiler's own state; a lambda reading what it captured; a
+// lambda being made; a module member passed as a value; a `try`.
+//
+// A suspension already says how to have the interpreter evaluate a node:
+// `suspend` makes a thunk of it against the frame this iteration would have
+// had, and forcing that thunk runs the node exactly where and as the
+// interpreter would have. A node in a *lazy* position has always been written
+// that way. One in an evaluated position can be written the same way and then
+// forced on the spot -- which is what the interpreter does when it reaches it,
+// with one thunk more -- and the rest of the function is compiled around it.
+//
+// What that may not cover is an effect, for the reason everything in this file
+// avoids one: compiled code orders nothing, and a call it makes may be run
+// again from the top. So a node marked impure is refused as before, and the
+// lowerer marks a node impure when anything under it is (`inherit` in
+// dreams/lower.dr), so the mark on the node is the answer for all of it.
+//
+// What the interpreter evaluates is invisible to the analysis: none of it is a
+// self call site, none of it counts as forcing a parameter, and none of it has
+// a definite force order. Each of those walks stops at such a node, which
+// claims less than the truth and is therefore always sound. The cost is the
+// thunk and, where an iteration has none yet, the frame; an op that is hot
+// enough to matter is worth writing out instead, as `Capture`, `Builtin` and
+// the empty map literal are.
+// ---------------------------------------------------------------------------
 
 /// The head and tail of a cell `n` builds: the opcode, or a saturated call of
 /// the builtin it is the opcode of, which is what an image `opt` has not
@@ -651,6 +690,9 @@ struct Analysis {
     /// this function: the list is built ahead of whoever reads it, a run of
     /// cells a call. See "Building ahead".
     std::unordered_set<uint32_t> cons_steps;
+    /// Nodes in evaluated positions that are suspended and forced on the spot
+    /// rather than written out. See "What the interpreter evaluates".
+    std::unordered_set<uint32_t> interpreted;
 };
 
 /// How many arguments a call handed to the machine may have. The helper takes
@@ -783,6 +825,7 @@ public:
             a.let_steps = let_steps_;
         }
         a.calls = calls_;
+        a.interpreted = interp_;
         // A parameter the signature declares `:float` starts the fixpoint as
         // one instead of as nothing. That is a guess about the value the
         // caller hands in, and the entry guards it exactly as it guards a slot
@@ -866,17 +909,31 @@ private:
 
         if (op == Op::Apply || is_primitive(op)) {
             if (check_apply(node, n, depth)) return true;
+            // Only a call refused for what it *is*. One whose argument was
+            // refused has already been offered to the interpreter at that
+            // argument, and what failed there would fail here.
+            if (kind_at(node) == CallKind::Refused && interpret(node, n)) return true;
             why(n, kind_at(node) == CallKind::Refused ? "a call this tier cannot make" : "an argument");
             return false;
         }
+        // A capture is read out of the closure the frame holds, which a root
+        // has and a peer -- a global function, entered with no frame -- does
+        // not; nor would a peer have anything to capture.
+        if (op == Op::Capture) {
+            if (peer_depth_ == 0 && n.a < f_.n_captures) return true;
+            return interpret(node, n);
+        }
+        // `%{}` is built in place; a literal with entries forces its keys, in
+        // order, and is the interpreter's.
+        if (op == Op::MakeMap) return n.b == 0 || interpret(node, n);
+        // An integer too big for a fixnum is a boxed constant the emitter has
+        // no way to name.
+        if (op == Op::ConstInt && !fixnum_fits(img_.integer(n.a))) return interpret(node, n);
         if (!op_is_supported(op)) {
+            if (interpret(node, n)) return true;
             why(n, "an operation this tier does not emit");
             return false;
         }
-        // An integer too big for a fixnum is a boxed constant the emitter has
-        // no way to name, so it is refused here rather than there -- same
-        // reason as the two ops missing from the list above.
-        if (op == Op::ConstInt && !fixnum_fits(img_.integer(n.a))) return false;
         if (op == Op::Local) {
             if (n.a >= f_.slots) return false;
             ++reads_[n.a];
@@ -946,6 +1003,19 @@ private:
                 return true;
         }
     }
+
+    /// Have the interpreter evaluate `node` where it stands: suspended against
+    /// this iteration's frame and forced at once. See "What the interpreter
+    /// evaluates". False for an effect, which compiled code may not perform,
+    /// and for a statement, which is not an expression with a value.
+    bool interpret(uint32_t node, const Node& n) {
+        if (n.flags & F_IMPURE) return false;
+        if (Op(n.op) == Op::Bind || Op(n.op) == Op::Nop) return false;
+        interp_.insert(node);
+        nested_calls_ = true;
+        return true;
+    }
+    bool interpreted(uint32_t node) const { return interp_.count(node) != 0; }
 
     /// `DREAM_JIT_WHY=1` says, for each function refused, the first node that
     /// refused it -- which is what to change in a library that wants a loop
@@ -1164,6 +1234,12 @@ private:
             *calls = true;
             return kMaxBindDuplication + 1;
         }
+        if (interpreted(idx)) {
+            // Run by the machine, so as much a call as any: a binding of one
+            // is remembered rather than run again at every read.
+            *calls = true;
+            return 1;
+        }
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
             case Op::Local:
@@ -1250,6 +1326,9 @@ private:
     /// Slots definitely forced when this node is reduced to WHNF.
     SlotSet strict_of(uint32_t node, int depth) {
         if (depth > 256) return 0;
+        // The interpreter may force anything under it, but nothing it forces
+        // is something compiled code was told it may evaluate early.
+        if (interpreted(node)) return 0;
         const Node& n = img_.node(node);
         switch (Op(n.op)) {
             case Op::Bind:
@@ -1397,8 +1476,14 @@ private:
     /// must stop appending.
     bool force_order(uint32_t idx, int depth, std::vector<uint32_t>& out) {
         if (depth > 128) return false;
+        // Work the interpreter does, which can raise: nothing after it is
+        // definite.
+        if (interpreted(idx)) return false;
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
+            case Op::Capture:
+                // Forcing what was captured is work that can raise.
+                return false;
             case Op::Bind:
                 return !(n.flags & F_STRICT) || force_order(n.b, depth + 1, out);
             case Op::Local:
@@ -1546,6 +1631,9 @@ private:
 
     void collect_calls(uint32_t idx, int depth, bool tail = false) {
         if (depth > 256) return;
+        // A self call the interpreter makes is an ordinary call, entering
+        // this function afresh; it is not a site of this body's.
+        if (interpreted(idx)) return;
         const Node& n = img_.node(idx);
         if (Op(n.op) == Op::Apply || is_primitive(Op(n.op))) {
             const CallKind kind = kind_at(idx);
@@ -1691,6 +1779,8 @@ private:
     /// result position, and a `let` of a self call read as the answer.
     std::unordered_set<uint32_t> steps_;
     std::unordered_set<uint32_t> let_steps_;
+    /// See "What the interpreter evaluates".
+    std::unordered_set<uint32_t> interp_;
     bool nested_calls_ = false;
     bool recurses_ = false;
     bool tail_self_ = false;
@@ -1703,6 +1793,7 @@ public:
     /// carried in one representation and read in the other.
     Ty ty(uint32_t idx, int depth) {
         if (depth > 256) return Ty::Any;
+        if (interpreted(idx)) return Ty::Any;
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
             case Op::ConstFloat: return Ty::Float;
@@ -1977,7 +2068,7 @@ public:
           ret_dbl_(preset && a.ret_dbl), eager_(a.eager), bind_inline_(a.bind_inline),
           bind_memo_(a.bind_memo), accumulate_(a.accumulate), steps_(a.steps),
           let_steps_(a.let_steps), cons_steps_(a.cons_steps),
-          kinds_(a.kinds), nested_calls_(a.nested_calls), peers_(peers),
+          kinds_(a.kinds), interp_(a.interpreted), nested_calls_(a.nested_calls), peers_(peers),
           preset_(preset), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
@@ -2067,6 +2158,12 @@ private:
     llvm::Value* lazy_array(uint32_t kids_off, uint32_t n);
 
     // --- lazy positions -----------------------------------------------------
+    /// A node the interpreter evaluates, where it stands. See "What the
+    /// interpreter evaluates".
+    JV interpreted(uint32_t idx, bool tail);
+    /// What a lambda captured, as it stands in its closure: unforced.
+    llvm::Value* capture_raw(uint32_t index);
+
     /// The value for an expression in a lazy position: built in place when
     /// that cannot be observed, suspended otherwise. Always tagged. See "Lazy
     /// positions" at the top of this file.
@@ -2240,6 +2337,8 @@ private:
     std::vector<llvm::Value*> memo_;
     /// How each call is made, as the analysis decided it.
     const std::unordered_map<uint32_t, CallKind> kinds_;
+    /// See "What the interpreter evaluates".
+    const std::unordered_set<uint32_t> interp_;
     const bool nested_calls_;
     /// The frame this iteration's suspensions share, or zero until one is
     /// needed. See `snapshot`.
@@ -2303,9 +2402,10 @@ private:
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
         rt_frame_slots_, rt_native_, rt_builtin_, rt_switch_head_,
-        rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_make_record_, rt_literal_str_,
+        rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_make_record_, rt_make_map_,
+        rt_literal_str_,
         rt_global_, rt_snapshot_, rt_thunk_, rt_apply_, rt_peek_, rt_adopt_, rt_yield_frame_,
-        rt_cons_after_, rt_set_tail_, rt_type_error_got_;
+        rt_cons_after_, rt_set_tail_, rt_type_error_got_, rt_settle_;
     /// The adopt arm of the `snapshot` being written, joined at its end.
     llvm::BasicBlock* pending_adopt_ = nullptr;
 };
@@ -2395,6 +2495,11 @@ void Emitter::declare_helpers() {
         "dream_rt_make_array", llvm::FunctionType::get(i64_, {ptr_, i32_, ptr_}, false));
     rt_make_record_ = mod_.getOrInsertFunction(
         "dream_rt_make_record", llvm::FunctionType::get(i64_, {ptr_, i32_, i32_, ptr_}, false));
+    rt_settle_ = mod_.getOrInsertFunction(
+        "dream_rt_settle",
+        llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), {ptr_, i64_, i32_, i64_}, false));
+    rt_make_map_ = mod_.getOrInsertFunction(
+        "dream_rt_make_map", llvm::FunctionType::get(i64_, {ptr_}, false));
     rt_literal_str_ = mod_.getOrInsertFunction(
         "dream_rt_literal_str", llvm::FunctionType::get(i64_, {ptr_, i32_}, false));
     rt_global_ = mod_.getOrInsertFunction(
@@ -2914,9 +3019,20 @@ llvm::Value* Emitter::snapshot() {
 // So such a binding is remembered: an alloca per binding per iteration, zero
 // until the first evaluated read fills it. A lazy read takes the value when it
 // is there and the snapshot's thunk when it is not, and the snapshot takes the
-// value too. The one order left is a snapshot made *before* the first evaluated
-// read: its slot already holds the binding's thunk, and something may hold that
-// thunk, so the evaluated read forces it rather than computing a second copy.
+// value too. A snapshot made *before* the first evaluated read already holds
+// the binding's thunk, and something may hold that thunk, so the evaluated read
+// forces it rather than computing a second copy.
+//
+// And a snapshot made *during* it -- by a lazy position inside the binding's
+// own expression, which is where `let run = match .. { spec => rebuild_run ..
+// }` makes one -- holds a thunk of the binding too, made before there was a
+// value to put there. Whatever reads that slot afterwards forces the thunk and
+// runs the binding a second time. Pure, so no answer changes; but in a function
+// that recursion re-enters through that binding, the work doubles at every
+// level. dreams/opt.dr's `rebuild_node` is that function, and compiled, a
+// four-second compile of a hello-world ran out of memory instead. So the value,
+// once computed, settles that thunk in place (`dream_rt_settle`), as forcing it
+// would have.
 
 void Emitter::make_iteration_state() {
     snap_ = b_.CreateAlloca(i64_, nullptr, "snap");
@@ -2975,6 +3091,16 @@ Emitter::JV Emitter::bound_value(uint32_t slot) {
         return failed_ ? none() : tag(phi);
     }
     llvm::Value* computed = box(v);
+    // A snapshot made while the value was being computed suspended the
+    // binding before it had one; settle that suspension now.
+    auto* settle = bb("bind.settle");
+    auto* settled = bb("bind.settled");
+    llvm::Value* late = b_.CreateLoad(i64_, snap_);
+    b_.CreateCondBr(b_.CreateICmpNE(late, i64(0)), settle, settled);
+    b_.SetInsertPoint(settle);
+    b_.CreateCall(rt_settle_, {proc_, late, i32c(int(slot)), computed});
+    b_.CreateBr(settled);
+    b_.SetInsertPoint(settled);
     auto* compute_end = b_.GetInsertBlock();
     b_.CreateBr(done);
 
@@ -3088,10 +3214,19 @@ Emitter::JV Emitter::lazy(uint32_t idx) {
             if (fixnum_fits(img_.integer(n.a))) return node(idx);
             return tag(suspend(idx));
         case Op::ConstBool: case Op::ConstChar: case Op::Unit: case Op::ConstAtom:
-        case Op::ConstStr:
+        case Op::ConstStr: case Op::Builtin:
             return node(idx);
         case Op::ConstFloat:
             return tag(box(node(idx)));
+        case Op::Capture:
+            // Handed on as it stands, as `thunk_for` hands on a capture.
+            if (preset_) return tag(suspend(idx));
+            return tag(capture_raw(n.a));
+        case Op::MakeMap:
+            // Building an empty map cannot be observed; one with entries
+            // forces its keys, and is suspended.
+            if (n.b == 0) return tag(b_.CreateCall(rt_make_map_, {proc_}));
+            return tag(suspend(idx));
         case Op::Local:
             if (n.a < binds_.size() && binds_[n.a] != NO_NODE) {
                 // A `let`'s name. Its value again when that is cheap, and
@@ -3259,6 +3394,24 @@ Emitter::JV Emitter::lazy(uint32_t idx) {
         default:
             return tag(suspend(idx));
     }
+}
+
+Emitter::JV Emitter::interpreted(uint32_t idx, bool tail) {
+    llvm::Value* th = suspend(idx);
+    // The answer of a root loop is forced by `enter_function` once the
+    // compiled call returns, as a parameter that is the answer is; there is
+    // no reason to run the machine underneath this call to do it first.
+    if (tail && root_loop_ && !accumulate_ && !ahead_first_) return tag(th);
+    return tag(force(th));
+}
+
+llvm::Value* Emitter::capture_raw(uint32_t index) {
+    // `frame->closure`, then `closure->caps()[index]`: a frame's closure is
+    // its first word after the header, and a closure's captures follow its
+    // sixteen bytes of header, function and count.
+    llvm::Value* closure = b_.CreateLoad(i64_, b_.CreateIntToPtr(b_.CreateAdd(frame_, i64(8)), ptr_));
+    return b_.CreateLoad(
+        i64_, b_.CreateIntToPtr(b_.CreateAdd(closure, i64(sizeof(ClosureObj) + 8 * uint64_t(index))), ptr_));
 }
 
 llvm::Value* Emitter::lazy_array(uint32_t kids_off, uint32_t n) {
@@ -3649,6 +3802,7 @@ Emitter::JV Emitter::float_order(Op op, JV a, JV bv) {
 
 Emitter::JV Emitter::node(uint32_t idx, bool tail) {
     if (failed_) return none();
+    if (interp_.count(idx)) return interpreted(idx, tail);
     if (tail && ahead_first_ && cons_steps_.count(idx)) return cons_step(idx);
     const Node& n = img_.node(idx);
     switch (Op(n.op)) {
@@ -3691,10 +3845,14 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
             if (tail && root_loop_ && !accumulate_) return load_slot_raw(n.a);
             return load_slot(n.a);
         case Op::Capture:
-            // A capture lives in the frame, and a compiled body is a function
-            // of its arguments. Unreachable: op_is_supported refuses it.
-            failed_ = true;
-            return none();
+            // The analysis admits one only in a root, which has a closure.
+            if (preset_) {
+                failed_ = true;
+                return none();
+            }
+            return tag(force(capture_raw(n.a)));
+        case Op::Builtin: return tag(i64(make_builtin(n.a)));
+        case Op::MakeMap: return lazy(idx);
         case Op::Force: return node(n.a);
         case Op::TypeIs: return type_test(n);
         case Op::If: return conditional(n, tail);
@@ -5336,6 +5494,8 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_make_list", reinterpret_cast<void*>(&dream_rt_make_list));
     add("dream_rt_make_array", reinterpret_cast<void*>(&dream_rt_make_array));
     add("dream_rt_make_record", reinterpret_cast<void*>(&dream_rt_make_record));
+    add("dream_rt_make_map", reinterpret_cast<void*>(&dream_rt_make_map));
+    add("dream_rt_settle", reinterpret_cast<void*>(&dream_rt_settle));
     add("dream_rt_literal_str", reinterpret_cast<void*>(&dream_rt_literal_str));
     add("dream_rt_global", reinterpret_cast<void*>(&dream_rt_global));
     add("dream_rt_snapshot", reinterpret_cast<void*>(&dream_rt_snapshot));

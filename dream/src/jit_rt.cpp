@@ -4,6 +4,7 @@
 
 #include "jit_rt.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -574,6 +575,9 @@ Value dream_rt_make_record(Process* p, uint32_t id, uint32_t n, const Value* ite
     return rec;
 }
 
+/// `%{}`: what `MakeMap` with no entries answers, a fresh empty map.
+Value dream_rt_make_map(Process* p) { return p->heap().make_map(0); }
+
 Value dream_rt_literal_str(Process* p, uint32_t index) { return literal_string_value(*p, index); }
 
 Value dream_rt_global(Process* p, uint32_t index) { return global_value(*p, index); }
@@ -602,6 +606,21 @@ Value dream_rt_yield_frame(Process* p, Value frame, uint32_t n, const Value* val
     auto* fo = static_cast<FrameObj*>(as_obj(fr));
     for (uint32_t i = 0; i < n && i < nslots; ++i) fo->slots()[i] = vals[i];
     return fr;
+}
+
+void dream_rt_settle(Process* p, Value frame, uint32_t slot, Value value) {
+    // The binding was suspended in this frame while compiled code was still
+    // computing it, and the computation has now finished. The thunk is
+    // updated exactly as forcing it would have updated it -- in place, so
+    // whatever already holds it sees the answer -- and is never run. One
+    // already forced, or being forced, is left alone: either it holds this
+    // answer or it is about to.
+    Value v = static_cast<FrameObj*>(as_obj(frame))->slots()[slot];
+    if (!is_obj(v, ObjType::Thunk)) return;
+    Obj* o = as_obj(v);
+    p->heap().remember_if_old(o, value);
+    std::atomic_ref<Value>(static_cast<IndirectObj*>(o)->target).store(value, std::memory_order_relaxed);
+    obj_type_store_release(o, ObjType::Indirect);
 }
 
 void dream_rt_adopt(Process* p, Value frame, uint32_t nslots, const Value* vals,

@@ -5,6 +5,7 @@
 #include "tensor.hpp"
 #include "bigint.hpp"
 
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -2850,24 +2851,52 @@ struct Limits {
     size_t stack;
     size_t heap_bytes;
 
+    /// What the command line said, which wins over the environment; zero for
+    /// a limit it did not mention. See `override_limits`.
+    static Limits& overrides() {
+        static Limits o{0, 0, 0};
+        return o;
+    }
+
     static const Limits& get() {
         static Limits l = [] {
-            auto from_env = [](const char* name, size_t fallback) {
-                if (const char* env = std::getenv(name)) {
-                    long long n = std::atoll(env);
-                    if (n > 0) return size_t(n);
-                }
+            auto pick = [](size_t given, const char* name, size_t fallback) {
+                if (given) return given;
+                size_t n = 0;
+                if (const char* env = std::getenv(name); env && parse_size(env, &n)) return n;
                 return fallback;
             };
+            const Limits& o = overrides();
             return Limits{
-                from_env("DREAM_MAX_DEPTH", size_t(4u) << 20),      // ~96 MB of continuations
-                from_env("DREAM_MAX_STACK", size_t(4u) << 20),      // ~32 MB of values
-                from_env("DREAM_MAX_HEAP", size_t(1u) << 30),       // 1 GB per process
+                pick(o.conts, "DREAM_MAX_DEPTH", size_t(4u) << 20),      // ~96 MB of continuations
+                pick(o.stack, "DREAM_MAX_STACK", size_t(4u) << 20),      // ~32 MB of values
+                pick(o.heap_bytes, "DREAM_MAX_HEAP", size_t(1u) << 30),  // 1 GB per process
             };
         }();
         return l;
     }
 };
+
+bool parse_size(const char* text, size_t* out) {
+    if (!text || !std::isdigit(static_cast<unsigned char>(*text))) return false;
+    char* end = nullptr;
+    const unsigned long long n = std::strtoull(text, &end, 10);
+    unsigned shift = 0;
+    switch (*end) {
+        case 'k': case 'K': shift = 10; ++end; break;
+        case 'm': case 'M': shift = 20; ++end; break;
+        case 'g': case 'G': shift = 30; ++end; break;
+        default: break;
+    }
+    if (shift && (*end == 'b' || *end == 'B')) ++end;
+    if (*end != '\0' || n == 0 || n > (~0ull >> shift)) return false;
+    *out = size_t(n << shift);
+    return true;
+}
+
+void override_limits(size_t conts, size_t stack, size_t heap_bytes) {
+    Limits::overrides() = Limits{conts, stack, heap_bytes};
+}
 
 size_t max_depth_limit() { return Limits::get().conts; }
 

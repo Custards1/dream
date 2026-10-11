@@ -815,9 +815,13 @@ rather than failing the whole program:
 
 | Limit | Default | Raises | Set with |
 |---|---|---|---|
-| pending continuations | 4,194,304 | `:stack_overflow` | `DREAM_MAX_DEPTH` |
-| value stack entries | 4,194,304 | `:stack_overflow` | `DREAM_MAX_STACK` |
-| heap bytes per process | 1 GiB | `:out_of_memory` | `DREAM_MAX_HEAP` |
+| pending continuations | 4,194,304 | `:stack_overflow` | `--max-depth`, `DREAM_MAX_DEPTH` |
+| value stack entries | 4,194,304 | `:stack_overflow` | `--max-stack`, `DREAM_MAX_STACK` |
+| heap bytes per process | 1 GiB | `:out_of_memory` | `--max-heap`, `DREAM_MAX_HEAP` |
+
+Each takes a number or a size with a unit -- `dream --max-heap 4G prog.dream`,
+`DREAM_MAX_HEAP=512M` -- in powers of 1024, and the option, which goes before
+the image, wins over the variable.
 
 These are ordinary errors: `try!` catches them, `join!` delivers them, and
 other processes carry on. A tail call uses no stack, so a loop never comes

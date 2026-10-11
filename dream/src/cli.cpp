@@ -28,7 +28,7 @@ namespace {
 const char* USAGE =
     "dream -- the Dream virtual machine\n"
     "\n"
-    "usage: dream <image> [options]\n"
+    "usage: dream [options] <image> [arguments for the program]\n"
     "\n"
     "<image> is a file, that file with `.dream` added, or either of those in\n"
     "the installation -- so `dream mind` runs ./mind.dream, or the installed one.\n"
@@ -45,6 +45,13 @@ const char* USAGE =
     "      --no-jit         stay in the interpreter\n"
     "      --any-target     run an image built for another platform anyway\n"
     "      --jit-threshold <n>  calls before a function is compiled\n"
+    "      --max-heap <size>    heap one process may grow to before it fails with\n"
+    "                           :out_of_memory: bytes, or 512M, 2G (default 1G;\n"
+    "                           also $DREAM_MAX_HEAP)\n"
+    "      --max-depth <n>      continuations one process may have pending\n"
+    "                           (default 4M; also $DREAM_MAX_DEPTH)\n"
+    "      --max-stack <n>      values one process may hold on its stack\n"
+    "                           (default 4M; also $DREAM_MAX_STACK)\n"
     "      --dump-jit <fn>  print the LLVM IR generated for a function, named or\n"
     "                       given as #N, its index -- generated functions share names\n"
     "      --mindv2         mindv2 path override\n"
@@ -350,6 +357,7 @@ int dream_main(int argc, char** argv) {
     bool dump = false, stats = false, use_jit = true, any_target = false;
     size_t profile_top = 0;
     uint32_t jit_threshold = 0;
+    size_t max_heap = 0, max_depth = 0, max_stack = 0;
 
     std::vector<std::string> program_args;
     bool past_image = false;
@@ -419,6 +427,15 @@ int dream_main(int argc, char** argv) {
             return 0;
         } else if (a == "--jit-threshold") {
             jit_threshold = uint32_t(std::stoul(next("--jit-threshold")));
+        } else if (a == "--max-heap" || a == "--max-depth" || a == "--max-stack") {
+            const std::string text = next(a.c_str());
+            size_t n = 0;
+            if (!parse_size(text.c_str(), &n)) {
+                std::fprintf(stderr, "dream: %s takes a size such as 4096, 512M or 2G, not `%s`\n",
+                             a.c_str(), text.c_str());
+                return 2;
+            }
+            (a == "--max-heap" ? max_heap : a == "--max-depth" ? max_depth : max_stack) = n;
         } else if (a == "--dump-jit") {
             dump_jit_fn = next("--dump-jit");
         } else if (!a.empty() && a[0] == '-') {
@@ -435,6 +452,9 @@ int dream_main(int argc, char** argv) {
             program_args.push_back(a);
         }
     }
+
+    // Before anything runs: the limits are read once, by the first process.
+    override_limits(max_depth, max_stack, max_heap);
 
     if (path.empty()) {
         std::fputs(USAGE, stderr);

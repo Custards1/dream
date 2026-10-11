@@ -53,6 +53,17 @@ bool apply_whnf_taking(Process& p, Value callee, Value* args, uint32_t argc, Val
 /// How many continuations a process may have pending: `DREAM_MAX_DEPTH`.
 size_t max_depth_limit();
 
+/// A count or a byte size as a person writes one: digits, then optionally a
+/// unit -- `k`, `m` or `g`, any case, with or without a trailing `b`, in powers
+/// of 1024. False for anything else, and for zero.
+bool parse_size(const char* text, size_t* out);
+
+/// The per-process limits, given on the command line (`--max-depth`,
+/// `--max-stack`, `--max-heap`). A zero leaves that one to its environment
+/// variable or its default. They are read once, when the first process runs,
+/// so this has to be called before that.
+void override_limits(size_t conts, size_t stack, size_t heap_bytes);
+
 /// The shared string for image string constant `index`, made once per process.
 Value literal_string_value(Process& p, uint32_t index);
 
