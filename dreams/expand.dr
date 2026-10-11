@@ -646,7 +646,7 @@ let evaluate_round! base s session0 jobs = {
 /// is a hole and an argument may name what does not exist, perform an effect,
 /// or be another `expand` the macro discards. What a macro *returns* is punched
 /// again on the next round, which is where a nested call is found.
-let rec punch tree acc = match tree {
+let rec punch tree !acc = match tree {
     [:expand, call, sp] => {
         let [calls, n] = acc;
         [[:expansion_hole, n, sp], [list.cons [call, sp] calls, n + 1]]

@@ -245,25 +245,19 @@ let rec binary_tail c level lhs ts = {
 /// and looser than application, so `not f x` is `not (f x)`.
 let rec parse_unary c ts = {
     let start = peek_span ts;
-    if at ts :minus {
-        match parse_unary c (list.tail ts) {
+    let op = match peek_kind ts {
+        :minus => :neg,
+        :tilde => :bnot,
+        :ident if peek_value ts == "not" => :not,
+        _ => (),
+    };
+    match op {
+        () => parse_apply c ts,
+        op => match parse_unary c (list.tail ts) {
             [:error, m, s] => err m s,
-            [:ok, e, rest] => ok (ast.unary_e :neg e (ast.span_to start (ast.span e))) rest,
-        }
+            [:ok, e, rest] => ok (ast.unary_e op e (ast.span_to start (ast.span e))) rest,
+        },
     }
-    else if at ts :tilde {
-        match parse_unary c (list.tail ts) {
-            [:error, m, s] => err m s,
-            [:ok, e, rest] => ok (ast.unary_e :bnot e (ast.span_to start (ast.span e))) rest,
-        }
-    }
-    else if is_kw ts "not" {
-        match parse_unary c (list.tail ts) {
-            [:error, m, s] => err m s,
-            [:ok, e, rest] => ok (ast.unary_e :not e (ast.span_to start (ast.span e))) rest,
-        }
-    }
-    else { parse_apply c ts }
 };
 
 /// Application is juxtaposition, and binds tighter than every operator: the
@@ -287,7 +281,7 @@ let rec parse_apply c ts =
             },
     };
 
-let rec gather_args c acc ts =
+let rec gather_args c !acc ts =
     if not (can_start_arg c ts) { ok acc ts }
     else {
         match parse_postfix c ts {
@@ -393,7 +387,7 @@ let rec index_operand c e ts build =
 /// and each `{..}` -- its tokens, lexed in place, and where its `}` is -- must
 /// be exactly one expression. Parsed as if parenthesised, since the braces
 /// already say where it ends.
-let rec parse_pieces parts acc = match parts {
+let rec parse_pieces parts !acc = match parts {
     [] => ok (list.reverse acc) [],
     [part, ..more] =>
         if type_of part == :string { parse_pieces more (list.cons (ast.str_e part ast.no_span) acc) }
@@ -495,7 +489,7 @@ let rec parse_sequence c sp ts closer build what =
         [:ok, [items, close], rest] => ok (build items (ast.span_to sp close)) rest,
     };
 
-let rec comma_list c acc ts closer what =
+let rec comma_list c !acc ts closer what =
     if at ts closer { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else {
         match parse_expr c ts {
@@ -512,7 +506,7 @@ let rec comma_list c acc ts closer what =
 /// `%{ k => v, .. }`. Keys are forced; values stay lazy.
 let rec parse_map c sp ts = map_entries (grouped c) [] ts sp;
 
-let rec map_entries c acc ts sp =
+let rec map_entries c !acc ts sp =
     if at ts :rbrace { ok (ast.map_e (list.reverse acc) (ast.span_to sp (peek_span ts))) (list.tail ts) }
     else {
         match parse_expr c ts {
@@ -608,7 +602,7 @@ let rec parse_lambda c sp ts =
             },
     };
 
-let rec lambda_params acc ts =
+let rec lambda_params !acc ts =
     if at ts :arrow { ok (list.reverse acc) (list.tail ts) }
     else if at ts :ident && not (is_keyword (peek_value ts)) {
         lambda_params (list.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
@@ -685,7 +679,7 @@ let rec parse_comp c impure sp ts =
 
 let rec parse_block c sp ts = block_stmts (allow_brace (ctx true (ctx_no_brace c) (ctx_indent c))) [] ts sp;
 
-let rec block_stmts c acc ts sp =
+let rec block_stmts c !acc ts sp =
     if at ts :semi { block_stmts c acc (list.tail ts) sp }
     else if at ts :rbrace {
         let end = ast.span_to sp (peek_span ts);
@@ -703,11 +697,15 @@ let rec block_stmts c acc ts sp =
     };
 
 /// A statement is a `let` declaration or an expression.
-let rec parse_statement c ts =
-    if is_kw ts "let" { parse_let c (peek_span ts) (list.tail ts) }
-    else if is_kw ts "let?" { parse_let_try c (peek_span ts) (list.tail ts) }
-    else if is_kw ts "type" { parse_type c (peek_span ts) (list.tail ts) }
-    else { parse_expr c ts };
+let rec parse_statement c ts = match peek_kind ts {
+    :ident => match peek_value ts {
+        "let" => parse_let c (peek_span ts) (list.tail ts),
+        "let?" => parse_let_try c (peek_span ts) (list.tail ts),
+        "type" => parse_type c (peek_span ts) (list.tail ts),
+        _ => parse_expr c ts,
+    },
+    _ => parse_expr c ts,
+};
 
 /// `let name params = body`, with `rec` optional. A block-local `let` that
 /// refers to itself needs `rec`; a top-level one does not, because every
@@ -986,7 +984,7 @@ let rec parse_type_union c ts =
             else { type_union_tail c [first] rest },
     };
 
-let rec type_union_tail c acc ts =
+let rec type_union_tail c !acc ts =
     if not (at ts :bar) {
         let parts = list.reverse acc;
         let span = ast.span_to (ast.span (list.head parts)) (ast.span (list.head acc));
@@ -1017,7 +1015,7 @@ let rec parse_type_apply c ts =
             },
     };
 
-let rec gather_type_args c acc ts =
+let rec gather_type_args c !acc ts =
     if not (type_starts_arg c ts) { ok acc ts }
     else {
         match parse_type_postfix c ts {
@@ -1173,7 +1171,7 @@ let rec parse_type_array c sp ts =
         },
     };
 
-let rec type_comma_list c acc ts closer what =
+let rec type_comma_list c !acc ts closer what =
     if at ts closer { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else {
         match parse_type_expr (grouped c) ts {
@@ -1222,7 +1220,7 @@ let rec parse_type_map_of c sp ts =
             },
     };
 
-let rec parse_type_record c sp acc ts =
+let rec parse_type_record c sp !acc ts =
     if at ts :rbrace {
         let span = ast.span_to sp (peek_span ts);
         ok (tagged "record" [ast.map_e (list.reverse acc) span] span) (list.tail ts)
@@ -1343,7 +1341,7 @@ let rec parse_let_pattern c sp ts =
 /// missing one is an error either way -- but a record body is a list whose
 /// entries may be bare names, so `name` and `age` on two lines have to be two
 /// fields and not one field of one parameter.
-let rec let_params c acc ts =
+let rec let_params c !acc ts =
     if at_end ts || not (token_continues c (list.head ts)) { ok (list.reverse acc) ts }
     else if at ts :ident && not (is_keyword (peek_value ts)) {
         let_params c (list.cons (ast.param (peek_value ts) (peek_span ts)) acc) (list.tail ts)
@@ -1406,7 +1404,7 @@ let rec param_pattern ts =
 
 /// The inside of `(a, b, c)`, already past the `(`. Each element is a pattern,
 /// and a name or `_` is the parameter it always was.
-let rec paren_params acc ts =
+let rec paren_params !acc ts =
     match parse_pattern (grouped top) ts {
         [:error, m, s] => err m s,
         [:ok, p, rest] => {
@@ -1465,7 +1463,7 @@ let rec parse_receive c sp ts =
 /// Arms as `match_arms` reads them, and an `after ms => body` that must come
 /// last: `[arms, after or (), close]`. `after` is only that when what follows
 /// it is not `=>` or `if`; otherwise it is a pattern binding a name.
-let rec receive_arms c acc ts =
+let rec receive_arms c !acc ts =
     if at ts :rbrace { ok [list.reverse acc, (), peek_span ts] (list.tail ts) }
     else if at_end ts { err "unterminated `receive!`: expected `}`" (peek_span ts) }
     else if is_kw ts "after" && not (at (list.tail ts) :fat_arrow) && not (is_kw (list.tail ts) "if") {
@@ -1511,7 +1509,7 @@ let rec receive_arms c acc ts =
 /// match ..` a declaration whose span covered its header and nothing else --
 /// invisible to anything that asks which declaration an offset is in, which
 /// is macro discovery, the outline, hover and go-to-definition.
-let rec match_arms c acc ts =
+let rec match_arms c !acc ts =
     if at ts :rbrace { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else if at_end ts { err "unterminated `match`: expected `}`" (peek_span ts) }
     else {
@@ -1703,7 +1701,7 @@ let rec constructor_pattern c sp t rest = {
 
 /// `p, q, r)`: the patterns of a constructor's fields, and the `)` that ends
 /// them. Answers `[:ok, fields, span of the paren, rest]`.
-let rec constructor_fields c acc ts =
+let rec constructor_fields c !acc ts =
     if at ts :rparen { [:ok, list.reverse acc, peek_span ts, list.tail ts] }
     else {
         match parse_pattern (grouped c) ts {
@@ -1719,7 +1717,7 @@ let rec constructor_fields c acc ts =
 /// fixed, `[name]` when it is bound, and `[()]` when it is ignored.
 let rec pattern_sequence c sp ts closer build what = pattern_items c [] ts closer build what sp;
 
-let rec pattern_items c acc ts closer build what sp =
+let rec pattern_items c !acc ts closer build what sp =
     if at ts closer { ok (build (list.reverse acc) () (ast.span_to sp (peek_span ts))) (list.tail ts) }
     else if at ts :dot_dot {
         let after = list.tail ts;
@@ -1749,7 +1747,7 @@ let rec pattern_items c acc ts closer build what sp =
 /// `%{ :k => p }` -- keys the pattern does not mention are ignored.
 let rec pattern_map c sp ts = pattern_map_entries c [] ts sp;
 
-let rec pattern_map_entries c acc ts sp =
+let rec pattern_map_entries c !acc ts sp =
     if at ts :rbrace { ok (ast.map_p (list.reverse acc) (ast.span_to sp (peek_span ts))) (list.tail ts) }
     else {
         match parse_expr c ts {
@@ -1927,7 +1925,7 @@ let rec parse_union_named c sp ts =
     };
 
 /// A union's type parameters: plain names, which its fields may use as types.
-let rec union_params acc ts =
+let rec union_params !acc ts =
     if at ts :ident && not (is_keyword (peek_value ts)) {
         if str.ends_with "!" (peek_value ts) {
             err "a type parameter must be pure" (peek_span ts)
@@ -2016,7 +2014,7 @@ let union_taken variants members n =
     || list.any (fn m -> ast.member_name m == n) members;
 
 /// `field : t, field, ..)`, already past the `(`: `[[fields, close], rest]`.
-let rec variant_fields c acc ts =
+let rec variant_fields c !acc ts =
     if at ts :rparen { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else if not (at ts :ident) || is_keyword (peek_value ts) {
         err ("expected a field name, found " + describe ts) (peek_span ts)
@@ -2388,7 +2386,7 @@ let c_symbol ts = match peek_kind ts {
 
 /// `field : t, ..}`, already past the `{`: `[[fields, close], rest]`. Fields
 /// are separated by `,` or a line break, as a record's are.
-let rec c_struct_fields c sname acc ts =
+let rec c_struct_fields c sname !acc ts =
     if at ts :comma { c_struct_fields c sname acc (list.tail ts) }
     else if at ts :rbrace { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else if not (at ts :ident) || is_keyword (peek_value ts) {
@@ -2600,7 +2598,7 @@ let rec names_something e =
     };
 
 /// A dotted path: `std.list`. Answers `[segments, rest]`.
-let rec dotted_path acc ts =
+let rec dotted_path !acc ts =
     if not (at ts :ident) { err ("expected a module name, found " + describe ts) (peek_span ts) }
     else {
         let acc2 = list.cons (peek_value ts) acc;
@@ -2642,7 +2640,7 @@ let rec parse_import c sp ts =
 
 /// `{ map, filter, sum as total }`
 /// Leave the closing brace for the caller to include in the import's span.
-let rec import_names acc ts =
+let rec import_names !acc ts =
     if at ts :rbrace { ok (list.reverse acc) ts }
     else if not (at ts :ident) {
         err ("expected a member name, found " + describe ts) (peek_span ts)
@@ -2816,7 +2814,7 @@ let rec cfg_name name ts =
     else { [name, ts] };
 
 /// The items of a file, or of a `mod`/`when` body when `braced` is true.
-let rec item_list c acc ts braced =
+let rec item_list c !acc ts braced =
     if at ts :semi { item_list c acc (list.tail ts) braced }
     else if braced && at ts :rbrace { ok (list.reverse acc) (list.tail ts) }
     else if at_end ts {
@@ -2853,7 +2851,7 @@ let rec item_list c acc ts braced =
 /// The other direction would lose an expansion silently, which is why the
 /// caller checks that the offsets and the declaration spans agree before
 /// trusting them.
-let rec expand_sites prev ts acc = match ts {
+let rec expand_sites prev ts !acc = match ts {
     [] => acc,
     [t, ..rest] => {
         let kind = lexer.kind t;

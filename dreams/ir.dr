@@ -577,7 +577,7 @@ let finish p = finish_rest p
 /// cons and the positions need no list of their own. A hole reads as `fill`,
 /// which is what `node_at` and `kid_at` answer for one.
 let table_list : :map -> :integer -> :any -> [:any] -> [:any];
-let rec table_list m i fill acc =
+let rec table_list m i fill !acc =
     if i < 0 { acc } else { table_list m (i - 1) fill (list.cons (m.[i else fill]) acc) };
 
 /// Everything `finish` makes but the arena itself, for a pass that reads the

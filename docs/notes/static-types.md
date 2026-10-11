@@ -3,9 +3,10 @@
 The checker, compile-time contracts, and what a signature buys the JIT. Moved out of `CLAUDE.md` on 2026-09-25; the prose is as it was, so a date or number in it is as of when it was written.
 
 `let add : :integer -> :integer -> :integer` is checked at compile time, by
-[dreams/typecheck.dr](../../dreams/typecheck.dr), which runs after `scope.resolve!`
-and before lowering and produces diagnostics and nothing else. Its header is
-the design; what is here is what to know before changing it.
+[dreams/typecheck.dr](../../dreams/typecheck.dr), which runs after resolution, lowering and compile-time evaluation. Its analysis
+contains diagnostics, contracts to run, and parameter hints for the JIT; it
+does not rewrite the IR. Its header is the design; what is here is what to know
+before changing it.
 
 **The three rules, and every false positive so far broke one of them.**
 Unannotated code is never an error (a name with no signature is `:any`); only
@@ -471,3 +472,93 @@ record could reach it. Four could, and did the wrong thing quietly:
   and was left as it is.
 
 **What is not done.** `mapping` is still nominal only in name.
+
+
+**The compiler using its own types (2026-10-11).** Private tagged lists became
+unions through scope, fusion, lowering, units, checking, contracts, the REPL,
+sessions and formatting. The constructors name the alternatives, and the
+patterns say which alternative a branch handles. Two changes also remove a
+collision with user values: a failed `comp` is `lower.Raised`, and a contract
+batch that could not run is `contract.Unrun`. Returning `[:comp_error, ..]`
+from a `comp`, or `:unrun` from a predicate, cannot impersonate either failure.
+
+Three bugs surfaced during that work. Source files had two representations,
+a record and a three-element list; they are always `diag.Source` now. A `()`
+arm could be called unreachable by the checker even when its subject admitted
+unit. Tuple patterns also failed to narrow the types of their components.
+The checker now handles both cases.
+
+The first signature pass covered AST, paths, configuration, lexing, fusion,
+syntax, packages and modules. The next added 257 signatures across scope,
+lowering, IR, optimization, checking, expansion, parsing, contracts and
+compilation; the new state declarations added their own accessor signatures
+and another 23 explicit signatures. Syntax aliases describe lists, not a new
+AST representation. Values whose contents genuinely vary remain `:any`;
+optional lookups that would spread unit checks into callers that already know
+the lookup succeeded remain unsigned. Neither choice invents a type guarantee.
+
+The state maps are mappings: loader and module, package set, program and image,
+then `scope.State`, `scope.Resolution`, `scope.Function`, `lower.Lowering` and
+`opt.State`. Their constructors, accessors and writes name the declared fields.
+The scope state and resolver remain maps, because `unit` stores the difference
+between a base and a completed walk and reapplies it on a cache hit. Function
+metadata remains a map too; its recursion flag is named `recursive`, since
+`rec` cannot name a declared field. The mapping declaration still provides no
+runtime nominal identity.
+
+The parser's unary and statement dispatch now match the next token rather
+than repeating an `if` chain. Finite accumulators in the parser, IR table
+flattening, optimizer child rebuilding, checker masks and arrow collection,
+scope collection and macro-hole walking are strict at loop entry. Only the
+spine is forced for lists. Conditional chains that ask different questions
+remain; changing every conditional into a guarded match is not required for
+these representation changes.
+
+Four protocols deliberately stay lists: macro-visible AST nodes,
+`[:ok, ..]`/`[:error, ..]` results used by `let?`, `[:crashed, e]` wrapping only
+compiler-owned values, and placeholder holes within syntax trees.
+
+Measured against `02ca40d`, the commit before the union migration, with the
+same `build-dream/bin/dream` VM, each compiler building its own source,
+interleaved, six runs each (medians):
+
+| | Before | After |
+|---|---:|---:|
+| Self-compile wall | 2.34 s | 2.70 s |
+| Self-compile CPU (all threads) | 11.96 s | 12.98 s |
+| `types` stage (`--time`) | 338 ms | 435 ms |
+
+**That is the input growing, not the compiler slowing.** The two compilers
+are building different programs: the source after the migration is 112
+modules and 4,456 functions against 78 and 3,972 -- every union, record and
+mapping is a module of generated constructors, accessors and signatures --
+and it carries several hundred more signatures to hold calls to. On inputs
+that did not change the new compiler is the faster one: `ship` 449 ms
+against 483, all of `std` with its tests 3.55 s against 3.67, the `types`
+stage 9-12% less on both. Stripping the 742 written signatures from a copy of
+the compiler's source takes the `types` stage from about 600 ms to 389 ms,
+which was the bound on what checking them could cost.
+
+Two things in the checker were spending most of that, and are fixed (the
+first measurement of this migration was +22% wall and +77% `types`):
+
+- **A named type was evaluated again at every unfolding.** `unfold` read a
+  declaration's description and built its type each time a comparison looked
+  inside a name -- a `mapping` of thirty fields, rebuilt for every argument
+  held to one. A type with no parameters unfolds to the same thing everywhere,
+  so `unfolded_table` builds each once with the checker. `types` 600 ms to
+  445.
+- **`refined_table` walked every named type eight times.** It stops at the
+  first depth that finds nothing new, which is exact: a depth is decided by
+  the table below it (see the comment there).
+
+And a call to a function with no type variables -- most of a program's own
+signatures -- no longer solves, substitutes or admits `()` per argument
+(`typed_apply`'s `generic`); that one is CPU rather than wall, since the check
+runs in parts.
+
+Where the `types` stage's wall time goes now, on a self-compile: building and
+sharing the checker 120 ms (sequential: evaluating every signature 31,
+finding unknown names 20, the rest small), the first check 155, the second
+check against inferred answers 140, ordering the results 23. Before the
+migration the same four were 70, 120, 120 and 21.

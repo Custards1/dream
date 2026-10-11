@@ -598,7 +598,7 @@ let rec rebuild_run spec n s = {
 
 /// Rebuild `many` children from `off`, collecting the new indices in reverse:
 /// `[state, reversed]`.
-let rec rebuild_kids off k many acc s =
+let rec rebuild_kids off k many !acc s =
     if k >= many { [s, acc] }
     else {
         let got = rebuild (kid_at (off + k) s) s;

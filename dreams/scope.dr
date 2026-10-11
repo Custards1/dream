@@ -611,7 +611,7 @@ let gathered g = list.map (fn i -> (Gather.entries g).[i]) (list.range 0 (Gather
 /// replacing an earlier one from a *different* module. Redefining a name from a
 /// module you derive is the point of deriving; redefining one from this very
 /// module is a mistake.
-let rec collect_lets l items acc s =
+let rec collect_lets l items !acc s =
     match items {
         [] => [acc, s],
         [oi, ..rest] => {
@@ -703,7 +703,7 @@ let expand_let_pattern item =
         _ => [item],
     };
 
-let rec collect_virtuals items acc =
+let rec collect_virtuals items !acc =
     match items {
         [] => acc,
         [oi, ..rest] =>
@@ -2863,7 +2863,7 @@ let modules_under l = {
 /// Every module an environment names, as `index => true`, and every namespace,
 /// as `prefix => true`: read off the environment whole, so that no way of
 /// naming a module is missed.
-let rec reached_modules v acc = match v {
+let rec reached_modules v !acc = match v {
     Ref.dream(t) if type_of t == :integer => acc.[t => true],
     Ref.group(p) if type_of p == :string => acc.[p => true],
     xs if type_of xs == :list => list.fold (fn a x -> reached_modules x a) acc xs,
@@ -2990,7 +2990,7 @@ let wrapper_arg params used e =
         _ => if literal_expr e { Arg.constant e } else { () },
     };
 
-let rec wrapper_args params used args acc =
+let rec wrapper_args params used args !acc =
     match args {
         [] => list.reverse acc,
         [a, ..rest] =>
@@ -3441,7 +3441,7 @@ let with_source c r tag strict args =
 /// The fuel is not a guess about how long a pipeline gets. It is what makes a
 /// compiler terminate on a program that will not run, which is the same reason
 /// unwrapping a chain of wrappers is capped.
-let rec peel c r e acc fuel =
+let rec peel c r e !acc fuel =
     if fuel <= 0 { () }
     else {
         match e {

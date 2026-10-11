@@ -474,6 +474,29 @@ The lessons that keep coming back:
 In Dream, write `match` rather than a long `if`/`else if` chain, and convert
 such a chain to a `match` when you come across one. There are plenty left.
 
+The compiler's private alternatives are unions: resolution meanings, fusion
+plans, checker types and formulas, and session outcomes. A failed `comp` and
+an unrun contract batch use private records, so a program cannot return a list
+or atom that looks like the compiler's own failure. Source files are always
+`diag.Source` records.
+
+Compiler state has declared fields: `modules.Loader` and `Module`,
+`package.Packages`, `scope.State`, `Resolution` and `Function`,
+`lower.Lowering`, `opt.State`, and `ir.Program` and `Image` are mappings.
+Use their accessors and setters. Keep the scope state and resolver as maps:
+the unit cache computes and reapplies their diffs. `scope.Function.recursive`
+is the function's recursion flag; the surface AST still uses its original
+list representation.
+
+Four list protocols must stay lists: the AST that macros receive,
+`[:ok, ..]`/`[:error, ..]` results consumed by `let?`, `[:crashed, e]` around
+compiler-owned results, and placeholder holes inside syntax trees. Signatures
+use `ast.Expr`, `Pattern`, `Decl`, `Param` and `Span` without changing those
+representations. Optional lookups may remain unsigned where their truthful
+unit alternative would require unrelated caller changes. Force finite loop
+accumulators with `!acc`; forcing a list's spine does not force its elements.
+See [Static types](docs/notes/static-types.md) for the migration and measurements.
+
 Comments in this codebase explain *why a thing is the way it is*, usually in
 full sentences, often several lines at the head of a section. Match that. The
 existing prose is the style guide — read the top of
