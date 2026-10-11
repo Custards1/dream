@@ -118,12 +118,18 @@ mapping Environment {
     derives = ()
 }
 
+let env : :string -> :integer -> Environment;
 let env name source = Environment.make name source %{} %{} %{} ();
 
+let env_name : Environment -> :string;
 let env_name e = Environment.name e;
+let env_source : Environment -> :integer;
 let env_source e = Environment.source e;
+let globals : Environment -> :map;
 let globals e = Environment.globals e;
+let aliases : Environment -> %{:string => Ref};
 let aliases e = Environment.aliases e;
+let only : Environment -> :map;
 let only e = Environment.only e;
 let derives e = Environment.derives e;
 
@@ -131,29 +137,37 @@ let derives e = Environment.derives e;
 /// numbered across the whole program, and a module's are contiguous, which is
 /// what lets an image record a module as a range rather than a list. The kind
 /// is for everything else -- diagnostics, and later a language server.
+let with_global : :string -> :atom -> :integer -> Environment -> Environment;
 let with_global n kind idx e = e.[:globals => (globals e).[n => [kind, idx]]];
 
 /// The index a global was given, or `()`.
 let global_index e n = expand macros.with_some g ((globals e).[n else ()]) (list.nth 1 g);
 
 let global_kind e n = expand macros.with_some g ((globals e).[n else ()]) (list.nth 0 g);
+let with_alias : :string -> Ref -> Environment -> Environment;
 let with_alias n r e     = e.[:aliases => (aliases e).[n => r]];
+let with_only : :string -> :any -> Environment -> Environment;
 let with_only n v e      = e.[:only => (only e).[n => v]];
+let without_only : :string -> Environment -> Environment;
 let without_only n e     = e.[:only => (map.remove n (only e))];
 
+let has_global : Environment -> :string -> :bool;
 let has_global e n = map.has n (globals e);
 let alias_of e n   = ((aliases e)).[n else ()];
 let only_of e n    = ((only e)).[n else ()];
 
 /// Names visible inside the module, sorted. The global behind a destructuring
 /// is an implementation detail, so completion must not offer it.
+let visible_names : Environment -> [:string];
 let visible_names e =
     list.sort (list.filter (fn n -> not (is_hidden_name n))
                            (list.map (fn kv -> list.head kv) (map.pairs (globals e))));
 
+let is_private : Environment -> :string -> :bool;
 let is_private e n = map.has n (e.[:private else (%{})]);
 
 /// Public names used by member completion and missing-member diagnostics.
+let exports : Environment -> [:string];
 let exports e = list.filter (fn n -> not (is_private e n)) (visible_names e);
 
 // --- diagnostics ---------------------------------------------------------------
@@ -176,10 +190,13 @@ let err_note span message note source ds =
 /// host modules are imported, and which range of globals belongs to which
 /// module. They are built here because this is the pass that hands out the
 /// indices they are keyed by.
+let state : :map;
 let state = %{ :envs => %{}, :pending => [], :diags => [], :next_global => 0,
                :imports => [], :global_recs => [], :module_recs => [] };
 
+let envs : :map -> %{:integer => Environment};
 let envs s    = s.[:envs else %{}];
+let next_global : :map -> :integer;
 let next_global s = s.[:next_global else 0];
 
 /// Take the next global index: `[state, index]`. Handing them out here, while
@@ -207,12 +224,17 @@ let s_global_recs_rev s = s.[:global_recs else []];
 let pending_rev s       = s.[:pending else []];
 let s_module_recs_rev s = s.[:module_recs else []];
 
+let s_imports : :map -> [[:any]];
 let s_imports s     = list.reverse (s_imports_rev s);
+let s_global_recs : :map -> [[:any]];
 let s_global_recs s = list.reverse (s_global_recs_rev s);
+let s_module_recs : :map -> [[:any]];
 let s_module_recs s = list.reverse (s_module_recs_rev s);
 
 /// How many there are, without putting them in order to find out.
+let s_global_recs_count : :map -> :integer;
 let s_global_recs_count s = list.length (s_global_recs_rev s);
+let pending_count : :map -> :integer;
 let pending_count s       = list.length (pending_rev s);
 
 /// Reserve the import record for a host module: `[state, index]`. The index is
@@ -227,7 +249,9 @@ let take_import path alias s =
 /// end; a module's is its import index, which is known now.
 let record_global gi name kind target s =
     s.[:global_recs => (list.cons [gi, name, kind, target] (s_global_recs_rev s))];
+let pending : :map -> [[:any]];
 let pending s = list.reverse (pending_rev s);
+let diags : :map -> [:map];
 let diags s   = s.[:diags else []];
 
 /// Module `mi`'s environment, and whether it has one yet. Modules are declared
@@ -235,6 +259,7 @@ let diags s   = s.[:diags else []];
 /// walk -- which is what `has_env` is asked, and it used to be spelled
 /// `mi < list.length (envs s)` because a list had no other way to say it.
 let env_at s mi  = (envs s).[mi else ()];
+let has_env : :map -> (:integer | :unit) -> :bool;
 let has_env s mi = map.has mi (envs s);
 
 /// Replace module `mi`'s environment.
@@ -254,6 +279,7 @@ let has_env s mi = map.has mi (envs s);
 /// lookup rather than a walk of the modules in front of the one asked for.
 /// Nothing wanted the order -- every reader indexes -- so the keys stay dense
 /// 0..n-1 and `has_env` is what the `mi < list.length` guards were.
+let set_env : :integer -> Environment -> :map -> :map;
 let set_env mi e s = s.[:envs => ((envs s).[mi => e])];
 
 let add_pending p s = s.[:pending => (list.cons p (pending_rev s))];
@@ -272,15 +298,21 @@ let dotted segs = str.join_str "." segs;
 /// segment of the path as written. `import a.b.c;` binds `c`.
 let default_alias segs given = match given { () => list.last segs, a => a };
 
+let decl_name : ast.Decl -> :string;
 let decl_name d   = list.nth 1 d;
+let decl_params : ast.Decl -> [ast.Param];
 let decl_params d = list.nth 2 d;
+let decl_body : ast.Decl -> :any;
 let decl_body d   = list.nth 3 d;
+let decl_rec : ast.Decl -> :bool;
 let decl_rec d    = list.nth 4 d;
+let decl_span : ast.Decl -> ast.Span;
 let decl_span d   = list.nth 5 d;
 
 /// A declaration is impure when its name says so. There is no other marker --
 /// the spelling *is* the declaration, which is why a call site can tell without
 /// looking anything up.
+let decl_impure : ast.Decl -> :bool;
 let decl_impure d = builtins.is_impure_name (decl_name d);
 
 let virtual_name v   = list.nth 1 v;
@@ -323,6 +355,7 @@ let param_names ps =
 /// An import is resolved against the enclosing modules first, so that
 /// `import io.{ quiet };` inside a module declaring `mod io { .. }` means that
 /// submodule rather than a file called `io` somewhere else.
+let relative_path : modules.Loader -> :integer -> :string -> :string;
 let relative_path l mi p =
     match modules.local_module l (modules.module_name (modules.module_at l mi)) p {
         () => p,
@@ -333,6 +366,7 @@ let relative_path l mi p =
 
 /// Every module name in the program, which is what a namespace is described in
 /// terms of: a package holds whatever modules were loaded under its prefix.
+let module_names : modules.Loader -> [:string];
 let module_names l = list.map (fn m -> modules.module_name m) (modules.modules l);
 
 /// `field` inside a namespace: the module `prefix.field` if there is one,
@@ -354,6 +388,7 @@ let group_member l prefix field = {
 
 /// What a namespace holds, for the note on a failed lookup: the names directly
 /// under it, without the ones further down -- `std.list` but not `std.list.x`.
+let group_contents : modules.Loader -> :string -> :string;
 let group_contents l prefix = {
     let at = str.byte_length prefix + 1;
     let inside = list.unique (list.filter (fn rest -> not (str.contains_str "." rest))
@@ -485,6 +520,7 @@ let declare_derive l mi d s = {
 ///
 /// Answers `[items, seen]`, each item paired with the module that owns it, so a
 /// diagnostic about inherited code points at the file it was written in.
+let effective_items : modules.Loader -> :integer -> [:integer] -> [[:any]];
 let rec effective_items l mi seen =
     if list.contains mi seen { [[], seen] }
     else {
@@ -606,6 +642,7 @@ let collect_let l owner d acc s = {
 
 let hidden_name pattern = "<let " + ast.show_pattern pattern + ">";
 
+let is_hidden_name : :string -> :bool;
 let is_hidden_name n = str.starts_with "<" n;
 
 /// The hidden global's body: the value, checked against the pattern.
@@ -881,6 +918,7 @@ let declare_one_let l mi od s = {
 /// fresh declaration binds is old news to an accumulation. Only the file index
 /// is refreshed, because a session re-reads its root each entry and the file it
 /// was parsed from moves.
+let declare_items! : modules.Loader -> :integer -> [ast.Decl] -> :map -> :map;
 let declare_items! l mi items s0 = {
     let s1 =
         if has_env s0 mi { s0 }
@@ -902,6 +940,7 @@ let declare_items! l mi items s0 = {
     report_clashes mi (module_span l mi) declared
 };
 
+let declare_module : modules.Loader -> :integer -> :map -> :map;
 let declare_module l mi s0 = {
     // Where this module's globals begin. They are contiguous because this is
     // the only thing handing out indices and it finishes one module before it
@@ -1036,11 +1075,13 @@ union Capture {
 /// rebuilding a list to change one entry costs the length of the list every
 /// time. On a program with a thousand functions that is the difference between
 /// compiling and not.
+let resolver : %{:integer => Environment} -> Resolution;
 let resolver es = %{ :envs => es, :frames => [], :diags => [], :refs => %{},
                      :binds => %{},
                      :funcs => %{}, :func_count => 0,
                      :bodies => [], :defs => [] };
 
+let r_envs : Resolution -> %{:integer => Environment};
 let r_envs r   = r.[:envs else %{}];
 
 /// Module `mi`'s environment, out of a finished resolution. The same lookup
@@ -1048,8 +1089,11 @@ let r_envs r   = r.[:envs else %{}];
 /// state -- `lower` and `lucid` both do, and both used to reach in with a
 /// `list.nth` of their own.
 let r_env_at r mi = (r_envs r).[mi else ()];
+let r_imports : Resolution -> [[:any]];
 let r_imports r     = r.[:imports else []];
+let r_global_recs : Resolution -> [[:any]];
 let r_global_recs r = r.[:global_recs else []];
+let r_module_recs : Resolution -> [[:any]];
 let r_module_recs r = r.[:module_recs else []];
 
 /// A global that names a function nothing lowered. It can only happen for a
@@ -1059,24 +1103,34 @@ let no_function = ();
 let frames r   = r.[:frames else []];
 let r_diags : Resolution -> [:map];
 let r_diags r  = r.[:diags else []];
+let refs : Resolution -> %{:integer => Meaning};
 let refs r     = r.[:refs else (%{})];
+let binds : Resolution -> :map;
 let binds r    = r.[:binds else (%{})];
+let func_map : Resolution -> %{:integer => :map};
 let func_map r   = r.[:funcs else (%{})];
+let func_count : Resolution -> :integer;
 let func_count r = r.[:func_count else 0];
 
 /// One function by index.
+let func_at : Resolution -> :integer -> :map;
 let func_at r i = ((func_map r)).[i else (%{})];
 
 /// Every function, in index order. Built on demand: what the walk needs is
 /// access by index, and what everything downstream wants is the sequence.
+let funcs : Resolution -> [:map];
 let funcs r = list.map (fn i -> func_at r i) (list.range 0 (func_count r));
 /// The bodies queued for the walk, in the order they were queued. Reversed in
 /// the state for the reason the three fields above are -- see the note there.
 let bodies_rev r = r.[:bodies else []];
+let bodies : Resolution -> [[:any]];
 let bodies r     = list.reverse (bodies_rev r);
+let bodies_count : Resolution -> :integer;
 let bodies_count r = list.length (bodies_rev r);
 /// Global index -> `Wrapper` for every wrapper. See "wrappers".
+let wrappers : Resolution -> %{:integer => Wrapper};
 let wrappers r = r.[:wrappers else (%{})];
+let defs : Resolution -> [[:any]];
 let defs r     = r.[:defs else []];
 
 // --- what deforestation left behind ------------------------------------------
@@ -1185,6 +1239,7 @@ let frame_count r = list.length (frames r);
 /// and the same offsets, and each walk resolves it differently: that is the
 /// whole point of deriving. So the module the body was resolved against is part
 /// of the key, or the last walk would quietly overwrite the others.
+let ref_key : :integer -> :integer -> :integer -> :integer;
 let ref_key ctx source start = (ctx * 65536 + source) * 4294967296 + start;
 
 /// True, having forced `v` and everything inside it on the way to saying so.
@@ -1280,10 +1335,15 @@ let func_rec name arity impure is_rec thunk span source =
     %{ :name => name, :arity => arity, :impure => impure, :rec => is_rec,
        :thunk => thunk, :span => span, :source => source, :slots => 0, :captures => [] };
 
+let func_name : :map -> :string;
 let func_name f  = f.[:name else ""];
+let func_arity : :map -> :integer;
 let func_arity f = f.[:arity else 0];
+let func_slots : :map -> :integer;
 let func_slots f = f.[:slots else 0];
+let func_captures : :map -> [Capture];
 let func_captures f = f.[:captures else []];
+let func_impure : :map -> :bool;
 let func_impure f = f.[:impure else false];
 
 /// Reserve a function and push a frame for it. The index is stable: functions
@@ -1463,6 +1523,7 @@ mapping Context {
     source = 0
 }
 
+let ctx : modules.Loader -> :integer -> :integer -> Context;
 let ctx l mi source = Context.make l mi source;
 
 let ctx_l c = Context.l c;
@@ -2032,6 +2093,7 @@ let takes_apart p =
 /// A binder is recorded where its name starts, a pattern parameter where its
 /// pattern starts, a destructuring `let`'s value where the `let` starts -- and no
 /// name starts at a `]` or a `}`.
+let checked_span : ast.Pattern -> ast.Span;
 let checked_span p = match pattern_shape p {
     [:cons_p, _, _, operator_span, _] => operator_span,
     shape => { let e = ast.span_end (ast.span shape); ast.span_of (e - 1) e },
@@ -2165,6 +2227,7 @@ let check_body l p r = {
 /// the declared state this produces -- reads them as it reads an import. A
 /// nested module may read its parent's `priv` names (`encloses`), as code
 /// written in the parent's file always could.
+let inherit_enclosing : modules.Loader -> :map -> :map;
 let inherit_enclosing l s =
     list.fold (fn acc mi -> match modules.module_within (modules.module_at l mi) {
         () => acc,
@@ -2204,6 +2267,7 @@ let encloses e mi target = target == mi || list.contains target (within e);
 /// Declare every module a loader holds, in the loader's order. A fresh compile
 /// does this and then checks everything; session mode declares a slice of its
 /// root on top of the carried result for a warm start.
+let declare! : modules.Loader -> :map;
 let declare! l =
     inherit_enclosing l (list.fold (fn acc mi -> declare_module l mi acc) state
                                    (list.range 0 (modules.module_count l)));
@@ -2259,6 +2323,7 @@ let shared_stub p = {
 /// A span offset alone does not say which declaration: a file is several
 /// modules and two files have offsets in common, so the source index goes in
 /// front of it -- the same shape `ref_key` uses for the same reason.
+let root_key : :integer -> :integer -> :integer;
 let root_key source start = source * 4294967296 + start;
 
 /// Resolve the bodies reachable from `roots`, and stub the rest.
@@ -2285,6 +2350,7 @@ let root_key source start = source * 4294967296 + start;
 /// held to which macros this round happened to call, and so to the program
 /// rather than to the package it came from. Naming the roots by where they
 /// were written is what lets expansion say "the transformers" instead.
+let resolve_reachable! : modules.Loader -> :map -> (:map | :unit) -> Resolution;
 let resolve_reachable! l declared roots = {
     let es = envs declared;
     let all = pending declared;
@@ -2368,6 +2434,7 @@ let resolve_reachable! l declared roots = {
 /// package the transformers came from. It is resolved on its own now and
 /// thrown away -- the caller wants `refs` and `r_diags` and nothing else, so
 /// there is no global to declare and no body to lower.
+let resolve_names! : modules.Loader -> :map -> [[:any]] -> Resolution;
 let resolve_names! l declared ps = {
     let initial = (resolver (envs declared)).[:imports => s_imports declared]
         .[:module_recs => s_module_recs declared].[:diags => diags declared];
@@ -2385,6 +2452,7 @@ let resolve_names! l declared ps = {
 /// A fresh compile calls this the way `resolve!` always has -- `from` 0, `s_pre`
 /// the empty `state` -- so one function serves both, and a session cannot take
 /// a different path from a build of the same text.
+let resolve_from! : modules.Loader -> :map -> Resolution -> :integer -> :map -> Resolution;
 let resolve_from! l declared r0 from s_pre = {
     let walked = list.fold (fn acc p -> check_body l p acc) (walk_base l declared r0 from)
                            (list.drop from (pending declared));
@@ -2527,14 +2595,17 @@ let parts r = r.[:parts else ()];
 /// Where a part's function indices and invented globals start in the whole
 /// program's, relative to where the declarations left them: `[functions,
 /// globals]`. What `lower` renumbers a part's arena by.
+let part_offsets : Resolution -> [:integer, :integer];
 let part_offsets r = r.[:part_offsets else [0, 0]];
 
 /// The first index an invented global may have: every index below it is a
 /// declaration's, and is the same in every part.
+let invented_from : Resolution -> :integer;
 let invented_from r = r.[:invented_from else 0];
 
 /// The bodies a part walked, `[position, body]` each, the position being the
 /// body's place in the whole program's queue.
+let part_bodies : Resolution -> [[:any]];
 let part_bodies r = r.[:part_bodies else []];
 
 /// Walk some bodies -- `[position, pending entry]` each -- from the shared
@@ -2606,6 +2677,7 @@ let merge_parts declared r0 base walked = {
 /// the starting state and every part are shared (`vm.share!`), so what crosses
 /// between processes is pointers; see "resolving in parts" for what the
 /// answer does and does not hold.
+let resolve_parts! : modules.Loader -> :any -> Resolution;
 let resolve_parts! l cache = {
     let declared = declare! l;
     let r0 = ((((((((resolver (envs declared))).[:imports => (s_imports declared)])).[:module_recs => (s_module_recs declared)])).[:diags => (diags declared)])).[:fuse => true];
@@ -2863,6 +2935,7 @@ let params_all_used plan arity =
     list.count (fn step -> match step { Arg.param(_) => true, Arg.constant(_) => false }) plan == arity;
 
 /// The plan of a wrapper that passes every parameter on, in order.
+let passed_on : :integer -> [Arg];
 let passed_on arity = list.map (fn k -> Arg.param k) (list.range 0 arity);
 
 /// A target that can be named from another module's frame. A local or a capture
@@ -3520,6 +3593,7 @@ let rec check_chain c e r =
 
 /// Just the diagnostics, for a caller that only wants to know whether the
 /// program is well formed.
+let check! : modules.Loader -> [:map];
 let check! l = r_diags (resolve! l);
 
 // --- asking the resolver questions ---------------------------------------------
@@ -3543,6 +3617,7 @@ let definition r mi name = {
 };
 
 /// Every global a module defines, in declaration order -- a document outline.
+let module_defs : Resolution -> :integer -> [[:any]];
 let module_defs r mi = list.filter (fn d -> list.nth 0 d == mi) (defs r);
 // --- tests -------------------------------------------------------------------
 

@@ -47,6 +47,7 @@ import std.types;
 /// the finished image and what each `comp` came to.
 type Lowering = :map;
 
+let lowering : scope.Resolution -> ir.Program -> :integer -> Lowering;
 let lowering r p source =
     %{ :r => r, :prog => p, :source => source, :ctx => 0, :diags => [],
        // Which node is each function's body. Filled in as the functions are
@@ -64,20 +65,30 @@ let lowering r p source =
        // emitted -- see "deforestation" below.
        :subst => %{} };
 
+let res : Lowering -> scope.Resolution;
 let res l    = l.[:r else ()];
+let prog : Lowering -> ir.Program;
 let prog l   = l.[:prog else ir.program];
+let source : Lowering -> :integer;
 let source l = l.[:source else 0];
 /// The module whose names this body was resolved against. Not always the module
 /// it was written in: a body inherited through `derive` is lowered once per
 /// deriving module, and resolves differently each time.
+let ctx : Lowering -> :integer;
 let ctx l = l.[:ctx else 0];
+let l_diags : Lowering -> [:map];
 let l_diags l = l.[:diags else []];
 
+let set_prog : ir.Program -> Lowering -> Lowering;
 let set_prog p l = l.[:prog => p];
+let set_res : scope.Resolution -> Lowering -> Lowering;
 let set_res r l = l.[:r => r];
+let set_source : :integer -> Lowering -> Lowering;
 let set_source i l = l.[:source => i];
+let set_ctx : :integer -> Lowering -> Lowering;
 let set_ctx i l = l.[:ctx => i];
 
+let func_bodies : Lowering -> %{:integer => :integer};
 let func_bodies l = l.[:func_bodies else (%{})];
 /// The node index is forced before it is stored, for the reason `ir.settled`
 /// gives: an unforced one is a thunk holding the frame that would compute it,
@@ -92,6 +103,7 @@ let set_func_body fi n l =
 let subst l = l.[:subst else (%{})];
 let set_subst m l = l.[:subst => m];
 
+let pending_comp : Lowering -> [[:any]];
 let pending_comp l = l.[:pending_comp else []];
 let add_comp node fi span l =
     l.[:pending_comp => (list.append (pending_comp l) [[node, fi, source l, span]])];
@@ -106,6 +118,7 @@ let add_comp node fi span l =
 /// Nothing in the image depends on it.
 let comp_values : Lowering -> :map;
 let comp_values l = l.[:comp_values else (%{})];
+let comp_key : :integer -> ast.Span -> :integer;
 let comp_key source span = source * 4294967296 + ast.span_start span;
 
 let complain span message l =
@@ -116,13 +129,16 @@ let warn span message note l =
                      [diag.in_source (source l) (diag.with_note note (diag.warning span message))])];
 
 /// Emit a node: `[lowering, index]`.
+let emit : ir.Node -> Lowering -> [Lowering, :integer];
 let emit n l = {
     let [program, index] = ir.push_node n (prog l);
     [set_prog program l, index]
 };
 
+let emit_leaf : :atom -> Lowering -> [Lowering, :integer];
 let emit_leaf op l = emit (ir.leaf op) l;
 
+let kids : [:any] -> Lowering -> [Lowering, :integer];
 let kids xs l = {
     let [program, offset] = ir.push_kids xs (prog l);
     [set_prog program l, offset]
@@ -162,6 +178,7 @@ let slot_at span l =
 /// literal at the top of a definition pays once. The lower bound is spelled as
 /// arithmetic because it was written before a seed that could read it as a
 /// literal existed.
+let const_int : :integer -> Lowering -> [Lowering, :integer];
 let const_int v l =
     if v > 4611686018427387903 || v < 0 - 4611686018427387903 - 1 {
         let [l1, digits] = const_str (to_string v) l;
@@ -171,28 +188,34 @@ let const_int v l =
         emit (ir.node :const_int index ir.no_node ir.no_node) (set_prog program l)
     };
 
+let const_float : :float -> Lowering -> [Lowering, :integer];
 let const_float v l = {
     let [program, index] = ir.intern_float v (prog l);
     emit (ir.node :const_float index ir.no_node ir.no_node) (set_prog program l)
 };
 
+let const_str : :string -> Lowering -> [Lowering, :integer];
 let const_str v l = {
     let [program, index] = ir.intern_str v (prog l);
     emit (ir.node :const_str index ir.no_node ir.no_node) (set_prog program l)
 };
 
+let const_atom : :string -> Lowering -> [Lowering, :integer];
 let const_atom v l = {
     let [program, index] = ir.intern_atom v (prog l);
     emit (ir.node :const_atom index ir.no_node ir.no_node) (set_prog program l)
 };
 
+let const_char : :char -> Lowering -> [Lowering, :integer];
 let const_char c l = emit (ir.node :const_char (char.code c) ir.no_node ir.no_node) l;
+let const_bool : :bool -> Lowering -> [Lowering, :integer];
 let const_bool b l = emit (ir.node :const_bool (if b { 1 } else { 0 }) ir.no_node ir.no_node) l;
 
 // --- calls ----------------------------------------------------------------------
 
 /// `f a b` is one node with two arguments, not two nested calls: currying is the
 /// language's story about partial application, not the VM's about call frames.
+let emit_apply : :integer -> [:integer] -> Lowering -> [Lowering, :integer];
 let emit_apply callee args l = {
     let placed = kids args l;
     let made = emit (ir.node :apply callee (list.nth 1 placed) (list.length args))
@@ -212,6 +235,7 @@ let emit_apply callee args l = {
 /// An ordinary call: a saturated call of a wrapper is the call it stands for.
 /// See "wrappers" in `scope` -- the rewrite removes a frame that bound nothing
 /// but the arguments the inner call was going to get.
+let lower_apply : ast.Expr -> [ast.Expr] -> ast.Span -> Lowering -> [Lowering, :integer];
 let lower_apply callee args span l = {
     let found = callee_resolution callee l;
     match [found, args] {
@@ -250,6 +274,7 @@ let lower_call found callee args span l =
 /// `record_make`: the fields, each in a lazy position, and the id as an atom
 /// of the image, with the top bit of `c` saying whether it names a variant.
 /// See `RecordMake` in dream/src/image.hpp.
+let lower_record : :string -> :bool -> [ast.Expr] -> Lowering -> [Lowering, :integer];
 let lower_record id variant fields l = {
     let done = lower_all fields l;
     let placed = kids (list.nth 1 done) (list.head done);
@@ -518,6 +543,7 @@ let emit_resolution found l =
 
 // --- expressions -----------------------------------------------------------------
 
+let lower_expr : ast.Expr -> Lowering -> [Lowering, :integer];
 let rec lower_expr e l =
     match e {
         [:int, v, _]   => const_int v l,
@@ -1306,6 +1332,7 @@ let places_key r bodies = {
 /// kids of its own, and the compiler's image grew 13% for its two thousand
 /// sites; as one call the builtin, the path and the small integers are shared
 /// constants and a site is the call and its four kids.
+let match_failure : :integer -> ast.Span -> Lowering -> [Lowering, :integer];
 let match_failure subject span l = {
     let at = place_of span l;
     let path = const_str (list.nth 0 at) l;
@@ -1744,6 +1771,7 @@ let mark_targets n l =
 /// now, and an index does not care when it was filled in -- but keeping it means
 /// a dump reads in the order the program was written.
 /// Intern a string and answer `[lowering, index]`.
+let strk : :string -> Lowering -> [Lowering, :integer];
 let strk text l = { let got = ir.intern_str text (prog l); [set_prog (list.head got) l, list.nth 1 got] };
 
 /// Push one function's captures into the shared pool and answer where they
@@ -1770,6 +1798,7 @@ let place_captures caps l = {
 /// The function records, as an image stores them. The two halves of a function
 /// meet here: `scope` knows its name, arity, frame size and captures, and
 /// lowering knows which node its body turned out to be.
+let link_funcs : scope.Resolution -> :map -> Lowering -> [Lowering, [:map]];
 let link_funcs r bodies l = link_funcs_from r bodies l 0;
 
 /// `[path, line, col]` where a function was written, from the places table,
@@ -1791,6 +1820,7 @@ let func_place r f = match (places r).[f.[:source else ()] else ()] {
 /// added, so the records before them -- and the capture runs their functions
 /// placed -- are never rebuilt. `link_funcs` is this with `from` 0 on the empty
 /// list, which is why the two share the fold below.
+let link_funcs_from : scope.Resolution -> :map -> Lowering -> :integer -> [Lowering, [:map]];
 let link_funcs_from r bodies l from = {
     let zip = list.zip (list.drop from (scope.funcs r))
                        (list.range from (list.length (scope.funcs r)));
@@ -1827,6 +1857,7 @@ let link_globals r l = link_globals_from r l 0;
 
 /// `link_globals`, from global record `from` onward, appending to a carried
 /// image `globals` list -- the sibling of `link_funcs_from`, same reason.
+let link_globals_from : scope.Resolution -> Lowering -> :integer -> [Lowering, [:map]];
 let link_globals_from r l from = {
     let fresh = list.drop from (scope.r_global_recs r);
     let built = list.fold (fn acc g -> {
@@ -1845,6 +1876,7 @@ let link_globals_from r l from = {
     [list.head built, list.reverse (list.nth 1 built)]
 };
 
+let link_imports : scope.Resolution -> Lowering -> [Lowering, [:map]];
 let link_imports r l = {
     let built = list.fold (fn acc i -> {
         let path = strk (list.nth 0 i) (list.head acc);
@@ -1856,6 +1888,7 @@ let link_imports r l = {
     [list.head built, list.reverse (list.nth 1 built)]
 };
 
+let link_modules : modules.Loader -> scope.Resolution -> Lowering -> [Lowering, [:map]];
 let link_modules ld r l = {
     let built = list.fold (fn acc m -> {
         let mi = list.nth 0 m;
@@ -1912,6 +1945,7 @@ let settle_body l =
 /// session calls it over the one body an entry added, into the arena it
 /// carried. Nodes are appended and a node's index never moves, so a carried
 /// arena is safe for exactly the reason the whole-program arena always was.
+let lower_from : scope.Resolution -> Lowering -> [[:any]] -> Lowering;
 let lower_from r low bodies =
     list.fold_strict (fn acc b -> {
         let src = list.nth 1 b;
@@ -2030,6 +2064,7 @@ let rec comp_reach todo seen fns p funcs globals = match todo {
 ///
 /// Running the optimized arena rather than the lowered one is the same
 /// program: `opt` is the pass every build runs before its image is written.
+let comp_image : [:integer] -> Lowering -> :string;
 let comp_image fis l = if in_parts l { parts_image fis l } else { whole_image fis l };
 
 let whole_image fis l = {
@@ -2092,6 +2127,7 @@ let rec settle_comp_order! rows done built l =
         }
     };
 
+let settle_comps! : Lowering -> Lowering;
 let settle_comps! l = {
     let pend = pending_comp l;
     if list.is_empty pend { l }
@@ -2188,10 +2224,12 @@ let link_rest! ld r lowered = {
 // does, in the same order.
 
 /// How many parts a program is lowered in. See above for why it is fixed.
+let part_count : :integer;
 let part_count = 4;
 
 /// Lower some of the program's bodies, `[position, body]` each, into an arena
 /// of their own, share it, and answer the part `link_parts` merges.
+let lower_part : scope.Resolution -> [[:any]] -> :map;
 let lower_part r numbered = {
     let walked = list.fold_strict (fn acc nb -> {
         let [low, shared, bodies, notes] = acc;
@@ -2400,6 +2438,7 @@ let share_parts_elsewhere! work =
 /// turned into tables to be written and flattened back -- which was most of
 /// the time a warm build of a large program spent after sharing, and all of it
 /// for a build with no `comp` in it.
+let patched : Lowering -> ir.Image -> ir.Image;
 let patched l img = {
     let p = prog l;
     let nodes = ir.Image.nodes img;
@@ -2628,6 +2667,7 @@ let intern_atom_at strs si p = {
 /// been laid out: the constant pools merged, every function's record linked
 /// against where its body lies in the parts, and the parts as
 /// `opt.optimize_parts` reads them: `%{ :prog, :base, :arenas }`.
+let link_head : scope.Resolution -> [[:integer, :integer]] -> [:map] -> :map;
 let link_head r offsets parts = {
     // Arrays, since each is read by a part's index in a loop over the parts:
     // a list read that way is a walk to the part, every time, and the loop
@@ -2679,6 +2719,7 @@ let link_head r offsets parts = {
 // walk over the shapes data comes in, and nothing else needs to be handled: the
 // evaluator refuses to hand back a closure or a process in the first place.
 
+let emit_const : :any -> Lowering -> [Lowering, :integer];
 let rec emit_const v l =
     match type_of v {
         :integer => const_int v l,

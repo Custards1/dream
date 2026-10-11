@@ -14,6 +14,7 @@ import dreams.scope;
 import dreams.syntax;
 import std.map;
 
+let has_expansion : :any -> :bool;
 let rec has_expansion tree = match type_of tree {
     :list => match tree {
         [:expand, _, _] => true,
@@ -25,6 +26,7 @@ let rec has_expansion tree = match type_of tree {
 // Syntax contains many scalar fields (names, tags and offsets). Reject those
 // before list matching, and walk children without a predicate closure at each
 // level of the tree.
+let has_expansion_in : [:any] -> :bool;
 let rec has_expansion_in trees = match trees {
     [] => false,
     [tree, ..rest] => has_expansion tree || has_expansion_in rest,
@@ -36,12 +38,15 @@ let macro_let item = match item {
 
 /// Unexpanded runtime expressions are deliberately unavailable to a transformer.
 /// A demanded placeholder raises instead of silently manufacturing a value.
+let stage : :any -> :any;
 let rec stage tree = match tree {
     [:expand, _, sp] => ast.binary_e :div (ast.int_e 1 sp) (ast.int_e 0 sp) sp,
     [:macro, _, _, _, _] => stage (macro_let tree),
     _ => if type_of tree == :list { list.map (fn x -> stage x) tree } else { tree },
 };
+let replace_module : modules.Loader -> :integer -> modules.Module -> modules.Loader;
 let replace_module l mi m = modules.set_module mi m l;
+let with_items : modules.Module -> [ast.Decl] -> modules.Module;
 let with_items m items = m.[:items => items];
 let loader s = s.[:loader else ()];
 let next s = s.[:next else 3221225472];
@@ -208,6 +213,7 @@ let macro_definition l reference = {
 /// `comp` inside a macro dependency is evaluated only if that dependency is
 /// demanded by the macro VM. Unrelated runtime `comp!` effects must not run for
 /// every expansion. Its isolated function already has the right environment.
+let staged_lowering : lower.Lowering -> lower.Lowering;
 let staged_lowering low = {
     let ready = list.fold (fn acc [placeholder, function, .._] -> {
         let [lowered, closure] = lower.emit (ir.node :make_closure function ir.no_node ir.no_node) acc;
@@ -233,6 +239,7 @@ let staged_lowering low = {
 /// all succeed builds exactly one of these; one whose macro genuinely fails
 /// builds a second and fails the same way, which is a compile that was not
 /// going to finish.
+let prepare! : modules.Loader -> :map;
 let prepare! l = prepare_work! l (work_of l);
 
 /// Where every transformer in the program is written, as `scope.root_key`s.
@@ -281,6 +288,7 @@ let stage_program l work = {
         with_items m (list.map macro_let (modules.module_items m))) replaced
 };
 
+let prepare_work! : modules.Loader -> [:any] -> :map;
 let prepare_work! l work = {
     let staged = stage_program l work;
     let declared = scope.declare! staged;
@@ -306,6 +314,7 @@ let prepare_work! l work = {
 /// `vm.call_image!` finds a transformer by the name of its module and its own
 /// and `MODS` is the only statement in the container of which globals are
 /// whose. Without it the image loads, runs, and has no member of any name.
+let invocation_image : modules.Loader -> scope.Resolution -> ir.Image;
 let invocation_image ld resolved = {
     let low = staged_lowering (map.remove :image (lower.lower_program resolved));
     let ms = lower.link_modules ld resolved low;
@@ -848,6 +857,7 @@ let picks_of l mi = {
 /// Where it does walk, it walks the items rather than indexing them: a
 /// `list.nth i items` inside a fold over `0..length` is a walk per
 /// declaration, which is a module's declarations squared.
+let work_of : modules.Loader -> [:any];
 let work_of l = {
     let picks = list.map (fn mi -> picks_of l mi) (list.range 0 (modules.module_count l));
     let seen = list.fold (fn acc [_, source, _, _, picked] ->
@@ -872,6 +882,7 @@ let work_of l = {
 /// it was known to mention and is asked again -- which is a handful of modules
 /// rather than the program, and is the reason the rest of them can keep the
 /// loader's answer across the copy expansion stages against.
+let apply_items : modules.Loader -> [[:any]] -> modules.Loader;
 let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
     let current = modules.module_at acc mi;
     replace_module acc mi
@@ -886,6 +897,7 @@ let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
 /// declarations, and it is the path that gives a real failure the diagnostic
 /// it had before any batching existed -- so a build that is going to fail
 /// fails the same way, having spent the time only because it was failing.
+let sequential! : modules.Loader -> modules.Loader;
 let sequential! l =
     list.fold (fn s mi -> {
         let m = modules.module_at (loader s) mi;
@@ -950,12 +962,14 @@ let sequential! l =
         }) s (list.range 0 (list.length items))
     }) %{ :loader => l, :next => 3221225472 } (list.range 0 (modules.module_count l));
 
+let expand! : modules.Loader -> modules.Loader;
 let expand! l = if modules.failed l { l } else { expand_work! l (work_of l) };
 
 /// `work` is every declaration with an `expand` in it, which is also the
 /// answer to whether there is anything to do: finding it is a walk of the
 /// whole program's syntax, and asking first whether the walk is worth making
 /// was the same walk again.
+let expand_work! : modules.Loader -> [:any] -> modules.Loader;
 let expand_work! l work = {
     let start = %{ :loader => l, :next => 3221225472 };
     // Finding the work is the one phase every compile pays, macros or not, so

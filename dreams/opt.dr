@@ -159,7 +159,9 @@ let edge_map = list.fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
 let run_map = list.fold (fn m e -> m.[(list.nth 0 e) => [list.nth 1 e, list.nth 2 e, list.nth 3 e]])
                         (%{}) node_runs;
 
+let edges_of : :atom -> [:integer];
 let edges_of op = edge_map.[op else []];
+let run_of : :atom -> [:integer] | :unit;
 let run_of op = run_map.[op else ()];
 
 /// An opcode with no children at all: every operand it has is a number that
@@ -171,11 +173,14 @@ let leaf_map = list.fold (fn m e -> m.[(list.nth 0 e) => false])
                          (list.fold (fn m e -> m.[(list.nth 0 e) => false])
                                     (%{}) node_edges)
                          node_runs;
+let is_leaf : :atom -> :bool;
 let is_leaf op = leaf_map.[op else true];
 
 /// Operand `k` of a node, and a node with operand `k` replaced. A node is
 /// `[op, flags, a, b, c]`, so operand `k` is at position `k + 2`.
+let operand : :integer -> ir.Node -> :any;
 let operand k n = n.[k + 2 else ir.no_node];
+let set_operand : :integer -> :any -> ir.Node -> ir.Node;
 let set_operand k v n = n.[k + 2 => v];
 
 /// Whether two equal copies of this node may become one.
@@ -190,6 +195,7 @@ let set_operand k v n = n.[k + 2 => v];
 /// the right one -- but a shared site is one that can meet more than one module,
 /// and a cache that misses is worse than no sharing. There are 842 of them in
 /// `dreams` against 47,000 nodes saved, so this costs nothing worth having.
+let shareable : ir.Node -> :bool;
 let shareable n = ir.node_op n != :field;
 
 // --- the rebuild state ----------------------------------------------------------
@@ -605,14 +611,17 @@ let place_captures f s = {
 /// untouched, which is what makes this safe to drop into the middle of a build:
 /// the constant pools keep their indices, so every `int`, `str` and `atom` node
 /// still names what it named, and `funcs` changes in exactly two fields.
+let optimize : ir.Image -> ir.Image;
 let optimize img =
     optimize_tables img (array.of_list (ir.Image.nodes img)) (array.of_list (ir.Image.kids img));
 
 /// The same, for a program as `lower` builds it: straight from its tables,
 /// which a read indexes as well as it does an array, so the arena is never
 /// flattened into the lists an image of it would hold -- only the rebuild is.
+let optimize_program : ir.Program -> ir.Image;
 let optimize_program p = optimize_tables (ir.finish_rest p) (ir.nodes p) (ir.kids p);
 
+let optimize_tables : ir.Image -> (:array | :map) -> (:array | :map) -> ir.Image;
 let optimize_tables img nodes kids = {
     let walked = walk_funcs (ir.Image.funcs img) (fresh img nodes kids);
     finished img (list.head walked) (list.reverse (list.nth 1 walked))
@@ -638,6 +647,7 @@ let enter_body nodes kids type_ids s =
 /// `type_ids` for a program whose pools are still growing: which atom index is
 /// each of the ten names a runtime type test can be fused against. Ten lookups
 /// in each pool's own index, so it is cheap enough to ask for every body.
+let type_ids_in : ir.Pool -> ir.Pool -> %{:integer => :integer};
 let type_ids_in strs atoms =
     list.fold (fn m kv -> {
         let [name, code] = kv;
@@ -655,6 +665,7 @@ let type_ids_in strs atoms =
 /// body as `part * part_base + node`. Part 0 holds no nodes: it is the linked
 /// program's own kids pool, where the functions' captures are. See "several
 /// arenas at once".
+let optimize_parts : ir.Image -> :array -> :integer -> ir.Image;
 let optimize_parts img parts invented_from = optimize_parts_filled img parts invented_from %{};
 
 /// The same, with each settled `comp` placeholder read as the part-0 node its
@@ -664,6 +675,7 @@ let optimize_parts img parts invented_from = optimize_parts_filled img parts inv
 /// The walk is the VM's (`vm.share_arenas`), and is `optimize_parts_by_hand`
 /// step for step: this is a whole-program walk a warm build cannot keep
 /// between builds, and in Dream it was a map insert and a `to_string` per node.
+let optimize_parts_filled : ir.Image -> :array -> :integer -> :map -> ir.Image;
 let optimize_parts_filled img parts invented_from filled = {
     let [nodes, kids, funcs] = vm.share_arenas [(ir.Image.funcs img), parts, invented_from, filled,
                                                 edge_map, run_map, part_base];
@@ -672,6 +684,7 @@ let optimize_parts_filled img parts invented_from filled = {
 
 /// The walk `vm.share_arenas` makes, as the definition of it: the tests below
 /// hold the two to each other.
+let optimize_parts_by_hand : ir.Image -> :array -> :integer -> :map -> ir.Image;
 let optimize_parts_by_hand img parts invented_from filled = {
     let s0 = ((((((fresh img #[] #[]).[:parts => parts]).[:memo_leaves => true]))
                 .[:invented_from => invented_from]).[:filled => filled]);
@@ -702,6 +715,7 @@ let walk_funcs fs s0 =
 
 /// A constant leaf with its pool index renamed through `m`, and any other node
 /// as it is: a constant's operand is the only one a part numbers for itself.
+let remap_leaf_by : :map -> ir.Node -> ir.Node;
 let remap_leaf_by m n = match ir.node_op n {
     :const_int => set_operand 0 ((m.[:ints]).[ir.node_a n]) n,
     :const_float => set_operand 0 ((m.[:floats]).[ir.node_a n]) n,

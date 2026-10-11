@@ -48,6 +48,7 @@ import dreams.typecheck;
 // spelling lowered to the constants that rebuild it, the way `lower.emit_const`
 // does for a `comp`'s answer.
 
+let emit_datum : :any -> lower.Lowering -> [lower.Lowering, :integer];
 let rec emit_datum d l = match d {
     typecheck.Datum.atom(n) => lower.const_atom n l,
     typecheck.Datum.list(xs) => datum_seq :make_list xs (list.length xs) l,
@@ -70,6 +71,7 @@ let rec emit_datum d l = match d {
 
 /// A record, as `datum_seq` makes a sequence: the fields, then the
 /// `record_make` naming them, its id the atom `c` says.
+let datum_record : [:any] -> :integer -> lower.Lowering -> [lower.Lowering, :integer];
 let datum_record items c l = {
     let done = list.fold (fn acc x -> {
         let got = emit_datum x (list.head acc);
@@ -81,6 +83,7 @@ let datum_record items c l = {
 
 /// The children first, then the run of kids naming them, then the node: a
 /// kid is an index, so it can only be written once what it names exists.
+let datum_seq : :atom -> [:any] -> :integer -> lower.Lowering -> [lower.Lowering, :integer];
 let datum_seq op items n l = {
     let done = list.fold (fn acc x -> {
         let got = emit_datum x (list.head acc);
@@ -96,6 +99,7 @@ let datum_seq op items n l = {
 /// short-circuiting `and` and `or`, so a union stops at the first member that
 /// accepts and a list stops at the first element that does not -- the same
 /// order `types.accepts` asks in.
+let emit_formula : (typecheck.Formula | :bool) -> lower.Lowering -> [lower.Lowering, :integer];
 let rec emit_formula f l = match f {
     typecheck.Formula.pred(gi, path, d) => {
         let g = lower.emit (ir.node :global gi ir.no_node ir.no_node) l;
@@ -111,6 +115,7 @@ let rec emit_formula f l = match f {
     b => lower.const_bool (b == true) l,
 };
 
+let chain : :atom -> [(typecheck.Formula | :bool)] -> lower.Lowering -> [lower.Lowering, :integer];
 let rec chain op fs l = match fs {
     [one] => emit_formula one l,
     [first, ..rest] => {
@@ -124,6 +129,7 @@ let rec chain op fs l = match fs {
 /// One element of the batch: the formula, or `:raised` if asking it raised.
 /// Slot 0 is where a `try` puts what it caught, which is why the function this
 /// goes into has one slot and no parameters.
+let emit_guarded : (typecheck.Formula | :bool) -> lower.Lowering -> [lower.Lowering, :integer];
 let emit_guarded f l = {
     let body = emit_formula f l;
     let handler = lower.const_atom "raised" (list.head body);
@@ -135,6 +141,7 @@ let emit_guarded f l = {
 /// The linked program with one function more, answering every contract's
 /// formula as a list, and that function's index: `[bytes, function]`. The
 /// bytes hold only what that function can reach.
+let batch_image : lower.Lowering -> [typecheck.Contract] -> [:string, :integer];
 let batch_image low contracts = {
     let done = list.fold (fn acc c -> {
         let got = emit_guarded (typecheck.Contract.formula c) (list.head acc);
@@ -157,6 +164,7 @@ let batch_image low contracts = {
 };
 
 /// What a contract that did not hold says, at the place its value was written.
+let broken : typecheck.Contract -> :any -> :map;
 let broken c answer = {
     let why = match answer {
         :raised => "checking it raised at compile time",
@@ -175,6 +183,7 @@ struct Unrun { why }
 
 /// Every contract that does not hold, as diagnostics. Impure because asking is
 /// running the program, and a program with no contracts runs nothing.
+let settle! : lower.Lowering -> [typecheck.Contract] -> [:map];
 let settle! low contracts =
     if list.is_empty contracts { [] }
     else {

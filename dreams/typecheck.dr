@@ -113,11 +113,13 @@ let primitives = %{
     "error" => :error, "module" => :module, "bigstr" => :bigstr, "tensor" => :tensor,
 };
 
+let members : (Ty | :atom) -> [(Ty | :atom)];
 let members t = match t { Ty.one_of(ts) => ts, _ => [t] };
 
 /// One union of all of these, flattened, without repeats. `:any` absorbs the
 /// lot and `:never` contributes nothing, which is what makes `raise!` in one
 /// branch of an `if` leave the other branch's type as the answer.
+let union_of : [(Ty | :atom)] -> Ty | :atom;
 let union_of ts = {
     let flat = list.concat (list.map (fn t -> members t) ts);
     if list.contains :any flat { :any }
@@ -132,6 +134,7 @@ let union_of ts = {
     }
 };
 
+let join : (Ty | :atom) -> (Ty | :atom) -> Ty | :atom;
 let join a b = if a == b { a } else { union_of [a, b] };
 
 /// A literal's kind, for binding a type variable. `list.map (fn x -> 1) xs` is
@@ -170,6 +173,7 @@ let rec flexible t = match t {
 
 /// A type as it would be written in a signature, which is what a diagnostic
 /// should quote back.
+let show : (Ty | :atom) -> :string;
 let rec show t = match t {
     Ty.lit(:atom, n) => ":" + n,
     Ty.lit(:string, v) => "\"" + v + "\"",
@@ -228,6 +232,7 @@ mapping Checker {
     hints = false
 }
 
+let res : Checker -> scope.Resolution;
 let res k = Checker.r k;
 
 /// Where an expression is being checked: the module whose names it resolves
@@ -245,8 +250,10 @@ mapping Here {
     narrowed = %{}
 }
 
+let here : :integer -> :integer -> :any -> Here;
 let here mi source owner = Here.make mi source %{} %{} %{} owner %{};
 
+let with_local : :string -> (Ty | :atom) -> Here -> Here;
 let with_local n t h = Here.set_locals ((Here.locals h).[n => t]) h;
 
 /// A diagnostic, unless it would point into generated code: a record's or a
@@ -687,6 +694,7 @@ let kind_fits s p = match s {
     _ => s == p,
 };
 
+let fits : Checker -> (Ty | :atom) -> (Ty | :atom) -> :bool;
 let fits k s t = sub k s t fuel;
 
 // --- solving a callee's type variables -----------------------------------------------------
@@ -765,7 +773,9 @@ let same_shapes k p ms = match kinds_of k p {
     ks => list.all (fn m -> kinds_of k m == ks) ms,
 };
 
+let is_flex : :any -> :bool;
 let is_flex t = match t { Ty.flex(_) => true, _ => false };
+let is_union : :any -> :bool;
 let is_union t = match t { Ty.one_of(_) => true, _ => false };
 
 /// A type with what has been solved put in. `settle` also turns what was not
@@ -2652,6 +2662,7 @@ let contract_of k h e t expected why ds =
     },
 } };
 
+let is_contract : :any -> :bool;
 let is_contract x = match x { Contract(_, _, _, _, _) => true, _ => false };
 
 let contract_place c = Contract.source c * 4294967296 + ast.span_start (Contract.span c);
@@ -2770,6 +2781,7 @@ let sig_table l r =
     }) [%{}, []] (list.range 0 (modules.module_count l));
 
 /// The whole checker, ready to walk bodies: `[checker, diagnostics]`.
+let checker : modules.Loader -> scope.Resolution -> [Checker, [:any]];
 let checker l r = {
     let named = named_table l r;
     let [sigs, ds] = sig_table l r;
@@ -2799,6 +2811,7 @@ let heads_of k l = list.fold (fn acc i ->
     }) %{} (list.range 0 (modules.module_count l));
 
 /// One declaration's body, against its signature if it has one.
+let check_decl : Checker -> [:any] -> [:any] -> [:any];
 let check_decl k b ds = list.head (check_decl_inferring k b ds);
 
 /// The same, and what the body says an unsigned declaration answers:
@@ -2806,6 +2819,7 @@ let check_decl k b ds = list.head (check_decl_inferring k b ds);
 /// answers something more definite than `:any` (see "what an unsigned
 /// function answers"). The type comes from the walk the check makes anyway,
 /// so asking it costs nothing.
+let check_decl_inferring : Checker -> [:any] -> [:any] -> [[:any], :any];
 let check_decl_inferring k b ds = {
     let [mi, source, d, _] = b;
     let n = scope.decl_name d;
@@ -3041,6 +3055,7 @@ let as_inferred d =
 /// Both checks of every body, in order: `[first, second]`, the second `[]`
 /// for each body when there was nothing for it to know. The shape
 /// `concluded` reads, and what a build in parallel puts together in parts.
+let checked_twice : Checker -> [[:any]] -> [[:any], [:any]];
 let checked_twice k bodies = {
     let first = list.map (fn b -> check_decl_inferring k b []) bodies;
     match inferring k (list.map (fn one -> list.nth 1 one) first) {
@@ -3054,6 +3069,7 @@ let checked_twice k bodies = {
 /// agree, and the answer is the first's. Asked of the resolver's table, by a
 /// walk of the body's syntax that stops at the first such name -- most
 /// bodies name none, and the walk is a small part of what checking one costs.
+let check_again : Checker -> Checker -> [:any] -> [:any];
 let check_again k k2 b = {
     let [mi, source, d, _] = b;
     if names_inferred k k2 mi source (scope.decl_body d) { check_decl k2 b [] } else { [] }
@@ -3076,6 +3092,7 @@ let newly_typed k k2 found = match found {
 /// Every type error in a resolved program, in the order the bodies were
 /// written. A body inherited through `derive` is walked once per module that
 /// derives it, and what it says is said once.
+let check_program : modules.Loader -> scope.Resolution -> [:map];
 let check_program l r = Analysis.diags (analyze l r %{});
 
 /// Everything a signature says about a program, from one checker: the type
@@ -3088,6 +3105,7 @@ let check_program l r = Analysis.diags (analyze l r %{});
 /// where nothing has been run.
 struct Analysis { diags, contracts, float_params, integer_params }
 
+let analyze : modules.Loader -> scope.Resolution -> :map -> Analysis;
 let analyze l r comps = {
     let [k, ds0] = prepared l r comps;
     let [first, second] = checked_twice k (scope.bodies r);
@@ -3099,6 +3117,7 @@ let analyze l r comps = {
 /// bodies, which is why the two are apart -- a build checks the bodies in
 /// several processes at once (`compile.analyze_parallel!`), each handed the one
 /// checker this makes.
+let prepared : modules.Loader -> scope.Resolution -> :map -> [Checker, [:any]];
 let prepared l r comps = {
     let [k0, ds0] = checker l r;
     [with_comp_globals r (Checker.set_comps comps k0), ds0]
@@ -3123,6 +3142,7 @@ let tables k = [Checker.named k, Checker.sigs k, Checker.uses k, Checker.comps k
 /// the `comp`s came to -- is the whole program's. So are the wrappers, which is
 /// where a constructor pattern finds the id of a constructor some other part
 /// walked (`constructor_id`), as lowering's parts are given them.
+let with_resolution : Checker -> scope.Resolution -> Checker;
 let with_resolution k r = Checker.set_r (r.[:wrappers => scope.wrappers (Checker.r k)]) k;
 
 /// The analysis, given what each body said on its own -- `check_decl k b []`,
@@ -3131,6 +3151,7 @@ let with_resolution k r = Checker.set_r (r.[:wrappers => scope.wrappers (Checker
 /// threads the diagnostics through a body only to add to them, never to read
 /// them, so what one body adds is the same whatever came before it, and
 /// laying the bodies' answers end to end is the fold `analyze` used to be.
+let concluded : Checker -> scope.Resolution -> [:any] -> [[:any]] -> [[:any]] -> Analysis;
 let concluded k r ds0 said again = {
     let inferred = list.map (fn pair -> warned (list.head pair) (list.nth 1 pair)) (list.zip said again);
     let found = list.fold (fn ds c -> c + ds) ds0 (said + inferred);

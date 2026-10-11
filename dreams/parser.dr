@@ -32,13 +32,20 @@ import std.map;
 
 // --- results ----------------------------------------------------------------
 
+let ok : :any -> :any -> [:any];
 let ok value rest = [:ok, value, rest];
+let err : :string -> ast.Span -> [:any];
 let err message span = [:error, message, span];
 
+let is_ok : [:any] -> :bool;
 let is_ok r = r.[0] == :ok;
+let value_of : [:any] -> :any;
 let value_of r = list.nth 1 r;
+let rest_of : [:any] -> [lexer.Token];
 let rest_of r = list.nth 2 r;
+let message_of : [:any] -> :string;
 let message_of r = list.nth 1 r;
+let span_of : [:any] -> ast.Span;
 let span_of r = list.nth 2 r;
 
 // --- the layout context -----------------------------------------------------
@@ -52,31 +59,43 @@ group Context {
     allow_brace self = set_no_brace false self
 }
 
+let ctx : :bool -> :bool -> :integer -> Context;
 let ctx = Context.make;
+let ctx_nl : Context -> :bool;
 let ctx_nl c = Context.nl c;
+let ctx_no_brace : Context -> :bool;
 let ctx_no_brace c = Context.no_brace c;
+let ctx_indent : Context -> :integer;
 let ctx_indent c = Context.indent c;
 
 /// Inside a bracket group: newlines stop mattering, and a `{` is an argument
 /// again. `( .. )`, `[ .. ]`, `$( .. )`, `#[ .. ]` and `%{ .. }` all do this.
 /// Braces are deliberately not in that list -- a block is newline-sensitive.
+let grouped : Context -> Context;
 let grouped c = Context.grouped c;
 
+let no_brace : Context -> Context;
 let no_brace c = Context.forbid_brace c;
+let allow_brace : Context -> Context;
 let allow_brace c = Context.allow_brace c;
 
+let top : Context;
 let top = ctx true false 0;
 
 // --- tokens -----------------------------------------------------------------
 
+let at_end : [lexer.Token] -> :bool;
 let at_end ts = list.is_empty ts;
 let peek ts = if at_end ts { () } else { list.head ts };
+let peek_kind : [lexer.Token] -> :atom;
 let peek_kind ts = if at_end ts { :eof } else { lexer.kind (list.head ts) };
 let peek_value ts = if at_end ts { () } else { lexer.value (list.head ts) };
+let peek_span : [lexer.Token] -> ast.Span;
 let peek_span ts =
     if at_end ts { ast.no_span }
     else { lexer.span (list.head ts) };
 
+let at : [lexer.Token] -> :atom -> :bool;
 let at ts k = peek_kind ts == k;
 
 /// The grammar asks several questions of the same token -- can it begin an
@@ -86,11 +105,13 @@ let at ts k = peek_kind ts == k;
 /// becomes O(1); the peeks are the walk that remains. The decision points
 /// below fetch the token once and read its fields directly, which is the same
 /// `list.head` followed by the same array gets -- just not repeated.
+let kind_of : lexer.Token -> :atom;
 let kind_of t = lexer.kind t;
 
 /// Does this token continue the statement being parsed, or start a new one?
 /// A line break ends a statement unless the line is indented past the
 /// statement it follows -- the same cue a reader goes by.
+let token_continues : Context -> lexer.Token -> :bool;
 let token_continues c t =
     if not (ctx_nl c) { true }
     else if not (lexer.starts_line t) { true }
@@ -117,25 +138,31 @@ priv let set_of names = list.fold (fn m n -> m.[n => true]) %{} names;
 priv let keyword_set = comp set_of keywords;
 priv let non_starter_set = comp set_of non_starters;
 
+let is_kw : [lexer.Token] -> :string -> :bool;
 let is_kw ts word = at ts :ident && peek_value ts == word;
 // Record introducers are contextual: existing code can still bind `group`.
+let is_keyword : :string -> :bool;
 let is_keyword name = match name {
     "group" => false,
     "struct" => false,
     "mapping" => false,
     _ => map.has name keyword_set,
 };
+let is_non_starter : :string -> :bool;
 let is_non_starter name = map.has name non_starter_set;
 
 /// The token after this one, for the single place that needs to look ahead:
 /// telling `.field` from a `.` that is something else.
+let peek2_kind : [lexer.Token] -> :atom;
 let peek2_kind ts = if at_end ts { :eof } else { peek_kind (list.tail ts) };
 
 /// Parse `f` as a statement: its indentation is whatever column it starts at.
+let at_statement : Context -> [lexer.Token] -> Context;
 let at_statement c ts = ctx (ctx_nl c) (ctx_no_brace c) (if at_end ts { 0 } else { lexer.col (list.head ts) });
 
 /// Name the next thing in the stream. A lexical error token carries its own
 /// message as its value, so it names itself.
+let describe : [lexer.Token] -> :string;
 let describe ts =
     if at_end ts { "the end of the file" }
     else {
@@ -158,6 +185,7 @@ let expect ts k what =
 
 // --- expressions ------------------------------------------------------------
 
+let parse_expr : Context -> [lexer.Token] -> [:any];
 let parse_expr c ts = parse_pipe c ts;
 
 /// `x |> f a` feeds `x` in as the last argument. Left-associative, and looser
@@ -1524,6 +1552,7 @@ let rec arm_guard_and_body c pat ts = {
 
 // --- patterns ---------------------------------------------------------------
 
+let parse_pattern : Context -> [lexer.Token] -> [:any];
 let rec parse_pattern c ts =
     match parse_cons_pattern c ts {
         [:error, m, s] => err m s,
@@ -1755,6 +1784,7 @@ let rec pattern_map_entries c acc ts sp =
 /// the moment it reaches it, at an expression or pattern position. Walking the
 /// whole stream once for a lookup that the walk beneath already performs was
 /// five percent of a compile.
+let parse_expression : :string -> [:any];
 let parse_expression src =
     match parse_expr top (lexer.tokens src) {
         [:error, m, s] => err m s,
@@ -1771,6 +1801,7 @@ let parse_expression src =
 // module `m` as the module `m.util`, so from that point on a submodule and a
 // file are the same thing to every later pass.
 
+let parse_item : Context -> [lexer.Token] -> [:any];
 let rec parse_item c ts = {
     let sp = peek_span ts;
     match peek_kind ts {
@@ -2847,6 +2878,7 @@ let rec expand_sites prev ts acc = match ts {
 ///
 /// As with `parse_expression`, a lexical error is already a token in the
 /// stream, and a top-level item position is where it ends up.
+let parse_module : :string -> [:any];
 let parse_module src = {
     let ts = lexer.tokens src;
     match item_list top [] ts false {
