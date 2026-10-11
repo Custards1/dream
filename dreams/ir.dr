@@ -230,14 +230,19 @@ type Program = :map;
 /// into the order the image lays it out in.
 type Image = :map;
 
-/// `[op, flags, a, b, c]`. The VM's record also carries a 16-bit `aux` field
-/// that nothing generates yet; it is written as zero and left out here rather
-/// than threaded through every constructor unused.
+/// `Node(op, flags, a, b, c)`. The VM's record also carries a 16-bit `aux`
+/// field that nothing generates yet; it is written as zero and left out here
+/// rather than threaded through every constructor unused.
 ///
-/// A list and not a record, because it is read by position on the other side
-/// of a native: `vm.share_arenas` walks the arena in C++ and reads each node
-/// as the five things it is.
-let node op a b c = [op, 0, a, b, c];
+/// A record, read by position: `n.[0]` is the op and `n.[k + 2]` operand `k`,
+/// as when a node was the list `[op, flags, a, b, c]`, and the natives that
+/// walk an arena in C++ (`vm.share_arenas`, `vm.node_section`) read either.
+/// It was a list for their sake, and a list was five cells and a walk to its
+/// last field. A program is tens of thousands of these, built and rebuilt by
+/// every pass, so the record is a third of the bytes and every read one load.
+struct Node { op, flags, a, b, c }
+
+let node op a b c = Node.make op 0 a b c;
 let node_op n = n.[0];
 let node_flags n = n.[1];
 let node_a n = n.[2];
@@ -376,14 +381,14 @@ let cleared p = ((((p.[:nodes => %{}]).[:node_count => 0]).[:kids => %{}]).[:kid
                     .[:impure => false];
 
 /// The node at an index. Every edge in the arena is one of these.
-let node_at : :integer -> Program -> [:any];
+let node_at : :integer -> Program -> Node;
 let node_at i p = ((nodes p)).[i else (leaf :nop)];
 
 let kid_at : :integer -> Program -> :integer | :atom;
 let kid_at i p = ((kids p)).[i else no_node];
 
 /// Append a node: `[program, index]`.
-let push_node : [:any] -> Program -> [Program, :integer];
+let push_node : Node -> Program -> [Program, :integer];
 let push_node n p = {
     let i = node_count p;
     if settled n {

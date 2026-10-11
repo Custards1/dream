@@ -1814,6 +1814,10 @@ void take_switch(Process& p, uint32_t node, Value subject, Value frame) {
     const Node& n = img_of(p).node(node);
     subject = resolve(subject);
     if (Op(n.op) == Op::SwitchAtom) {
+        // A record is keyed by its id, which is how a `match` over a union
+        // jumps to its variant's arm (`arm_key` in dreams/lower.dr). The id
+        // is in the header, so nothing is forced to read it.
+        if (is_obj(subject, ObjType::Record)) subject = static_cast<RecordObj*>(as_obj(subject))->id();
         eval_node(p, switch_target(p, n, subject), frame);
         return;
     }

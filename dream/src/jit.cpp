@@ -56,6 +56,7 @@
 // The fast paths are inline; every slow path calls the interpreter's own
 // helper, so the two tiers cannot drift apart on what an operation means.
 
+#include <functional>
 #include <pthread.h>
 #include <sched.h>
 #include "jit.hpp"
@@ -178,6 +179,12 @@ constexpr uint32_t kMaxBindDuplication = 8;
 /// more than one read. Its *work* is done once whatever this says -- see "A
 /// binding computed once" -- so this bounds the size of the compiled body.
 constexpr uint32_t kMaxMemoCode = 64;
+
+/// The most nodes a switch's targets may come to, together, before it is
+/// written as the chain of arms it jumps into instead (`Emitter::switch_node`).
+/// Each target is a suffix of one chain, so writing them all is quadratic in
+/// the arms; `std.types.check` took nine seconds to compile that way.
+constexpr uint32_t kMaxSwitchCode = 1024;
 
 /// How many cells one compiled call of a list builder makes before it suspends
 /// the rest. See "Building ahead". A bound on work and memory nobody may ever
@@ -1103,7 +1110,18 @@ private:
         if (n.a < f_.arity || n.a >= f_.slots) return false;
         // One slot, one binding. Bound twice, a read means whichever came
         // before it, and this has no way to say which that was.
-        if (binds_[n.a] != NO_NODE) return false;
+        //
+        // The same `bind` met again is not a second binding. A `match` that
+        // starts with a switch jumps *into* its chain of arms, so each target
+        // is a suffix of that chain and the walk reaches an arm's binds once
+        // through the chain and once through the switch. Refusing that refused
+        // every function whose `match` had a switch -- a union's, and a list's
+        // tagged by atoms -- and said nothing about why.
+        if (binds_[n.a] != NO_NODE) {
+            if (binds_[n.a] == n.b && strict_binds_[n.a] == ((n.flags & F_STRICT) != 0)) return true;
+            why(n, "a slot bound twice");
+            return false;
+        }
         binds_[n.a] = n.b;
         strict_binds_[n.a] = (n.flags & F_STRICT) != 0;
         // A strict binding runs where it stands, so it is checked here. Any
@@ -3800,7 +3818,84 @@ Emitter::JV Emitter::block(const Node& n, bool tail) {
     return last;
 }
 
+/// The nodes under `node` as the emitter would write them, a tree and not a
+/// graph, or `limit` once there are that many.
+static uint32_t written_size(const Image& img, uint32_t node, uint32_t limit, int depth = 0) {
+    if (node == NO_NODE || depth > 256) return 0;
+    const Node& n = img.node(node);
+    uint32_t size = 1;
+    auto add = [&](uint32_t k) {
+        if (size < limit) size += written_size(img, k, limit - size, depth + 1);
+    };
+    switch (Op(n.op)) {
+        case Op::If: add(n.a); add(n.b); add(n.c); break;
+        case Op::Block: for (uint32_t i = 0; i < n.b; ++i) add(img.kid(n.a + i)); break;
+        case Op::SwitchAtom: case Op::SwitchHead:
+            add(n.a);
+            for (uint32_t i = 1; i < n.c; i += 2) add(img.kid(n.b + i));
+            add(img.kid(n.b + n.c - 1));
+            break;
+        case Op::Bind: add(n.b); break;
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+        case Op::And: case Op::Or: case Op::Get: case Op::Set:
+            add(n.a); add(n.b); break;
+        case Op::Force: case Op::Neg: case Op::Not: add(n.a); break;
+        case Op::Apply: add(n.a); for (uint32_t i = 0; i < n.c; ++i) add(img.kid(n.b + i)); break;
+        // The rest are leaves, or hold their parts in lazy positions the
+        // emitter writes as a call: one node is near enough.
+        default: break;
+    }
+    return std::min(size, limit);
+}
+
+/// The first arm of the chain a switch jumps into, or `NO_NODE`.
+///
+/// Every target is a suffix of that chain (`dispatch` in dreams/lower.dr): an
+/// arm is an `if` whose `else` is the arm below it. So the head is the one
+/// target no other target reaches down its `else`s. A target that is itself a
+/// switch -- the atom switch under a head switch -- is looked through.
+static uint32_t chain_head(const Image& img, const Node& sw) {
+    std::vector<uint32_t> targets;
+    std::function<void(const Node&)> collect = [&](const Node& s) {
+        for (uint32_t i = 1; i <= s.c; i += 2) {
+            uint32_t t = img.kid(s.b + (i < s.c ? i : s.c - 1));
+            Op op = Op(img.node(t).op);
+            if (op == Op::SwitchAtom || op == Op::SwitchHead) collect(img.node(t));
+            else targets.push_back(t);
+            if (i >= s.c) break;
+        }
+    };
+    collect(sw);
+    std::unordered_set<uint32_t> below;
+    for (uint32_t t : targets) {
+        for (uint32_t at = t; Op(img.node(at).op) == Op::If && img.node(at).c != NO_NODE;) {
+            at = img.node(at).c;
+            if (!below.insert(at).second) break;
+        }
+    }
+    uint32_t head = NO_NODE;
+    for (uint32_t t : targets) {
+        if (below.count(t)) continue;
+        if (head != NO_NODE && head != t) return NO_NODE;
+        head = t;
+    }
+    return head;
+}
+
 Emitter::JV Emitter::switch_node(const Node& n, bool tail) {
+    // Too many arms to write each target out: the chain once, from its head.
+    // That is the program the switch was a shortcut through -- it skips only
+    // arms that cannot match, and forces nothing the chain would not.
+    {
+        uint32_t total = 0;
+        for (uint32_t i = 1; i < n.c && total < kMaxSwitchCode; i += 2)
+            total += written_size(img_, img_.kid(n.b + i), kMaxSwitchCode);
+        if (total >= kMaxSwitchCode) {
+            uint32_t head = chain_head(img_, n);
+            if (head != NO_NODE) return node(head, tail);
+        }
+    }
     JV subject = node(n.a);
     if (failed_ || !subject.v) return none();
     llvm::Value* key = box(subject);
@@ -3814,6 +3909,32 @@ Emitter::JV Emitter::switch_node(const Node& n, bool tail) {
         b_.SetInsertPoint(raised);
         emit_raise(key);
         b_.SetInsertPoint(ready);
+    } else {
+        // A record is keyed by its id, as the interpreter's `take_switch`
+        // keys it: the atom whose index is the header word beside the length,
+        // without the variant bit. Built inline, so a `match` over a union is
+        // one load and a jump table.
+        auto* obj = bb("switch.obj");
+        auto* rec = bb("switch.record");
+        auto* keyed = bb("switch.keyed");
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateCondBr(is_heap_ptr(key), obj, keyed);
+        b_.SetInsertPoint(obj);
+        llvm::Value* type = b_.CreateLoad(i8_, b_.CreateIntToPtr(key, ptr_));
+        b_.CreateCondBr(b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Record))),
+                        rec, keyed);
+        b_.SetInsertPoint(rec);
+        llvm::Value* tag = b_.CreateZExt(
+            b_.CreateLoad(i32_, b_.CreateIntToPtr(b_.CreateAdd(key, i64(12)), ptr_)), i64_);
+        llvm::Value* id = b_.CreateOr(b_.CreateShl(b_.CreateAnd(tag, i64(~RECORD_VARIANT & 0xffffffffu)), 8),
+                                      i64(make_atom(0)));
+        b_.CreateBr(keyed);
+        b_.SetInsertPoint(keyed);
+        auto* k = b_.CreatePHI(i64_, 3);
+        k->addIncoming(key, entry);
+        k->addIncoming(key, obj);
+        k->addIncoming(id, rec);
+        key = k;
     }
     auto* fallback = bb("switch.default");
     auto* done = bb("switch.end");

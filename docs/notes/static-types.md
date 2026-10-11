@@ -384,10 +384,55 @@ both fields three million times, one image, the VM before and after:
 | interpreted | 941-960 ms | 955-969 ms | level |
 | compiled | 303-319 ms | 303-315 ms | level |
 
-Records are 36% of what that loop allocates; frames are most of the rest. The self-compile, whose tokens and contexts are
-records now, is 2.59 s against 2.36-2.44 s before, with 3% more reductions and
-allocation -- over a compiler that also grew 3% in nodes in the same change,
-so the two are not separated here.
+Records are 36% of what that loop allocates; frames are most of the rest.
+
+**What a type is worth at run time.** A `match` over a union used to ask
+`_record_is` of each arm in turn. A constructor arm now has a key, its
+record's id, and `switch_atom` keys a record by that id (`arm_key` in
+dreams/lower.dr; `take_switch`, `Emitter::switch_node`), so the match jumps
+to the variant's arm -- the id is in the header, so reading it forces
+nothing. Wiring that up found that the JIT had never compiled a function
+whose `match` had a switch, of any kind: a switch's targets are suffixes of
+the arm chain, so the analysis met each arm's `bind` twice and refused it as
+"one slot, one binding", silently. The same node met again is the same
+binding now. Writing every target out is quadratic in the arms, though --
+`std.types.check` took nine seconds to compile -- so past `kMaxSwitchCode`
+nodes the emitter writes the chain once, from its head, which is the program
+the switch was a shortcut through. A 4-variant match, two million times:
+
+| | before | after |
+|---|---|---|
+| union, interpreted | 1348 ms | 1158 ms |
+| union, compiled | 151 ms | 152 ms |
+| tagged list, interpreted | 2005 ms | 1976 ms |
+| tagged list, compiled | 1641 ms | 251 ms |
+
+**The compiler, written for it.** On the same input and VM, the compiler
+built with records was 1.2% more reductions than the one before them -- the
+checker checking the signatures records generate, spread thinly over `sub`,
+`infer` and `solve`. Two changes more than paid that back (CPU seconds of a
+self-compile, all threads, median of six): `typecheck.sub`, the checker's
+hottest function, matches on its parameters in four steps instead of on a
+pair it built every call (12.69 s to 12.53 s; its reductions 9.9 M to 3.9 M);
+and an IR node is `ir.Node`, a record, instead of a five-cell list
+(12.53 s to 12.31 s, a fifth fewer bytes per node and one load per field).
+Three other rewrites measured worse and were not kept: `list.fold` walks in
+`lint` turned into hand-written recursions, a pre-walk in
+`lazy_accumulators` that `uses`' early exit already made pointless, and
+`skip_trivia` split to match on a parameter, which moved its reductions
+without removing any.
+
+The checker's own types went the same way: `[:fn, a, b]`, `[:named, ..]` and
+the rest of the tagged lists are the variants of `typecheck.Ty`, with the
+kinds (`:integer`, `:any`, ..) left as atoms, which a switch keys as cheaply.
+Every `match` the checker makes on a type now jumps by the record's id, and a
+field is one load. `fn` and `union` are keywords, so those two are `arrow`
+and `one_of`. The `types` stage went from 382-392 ms to 327-329 ms, the
+whole self-compile from 12.32 s to 12.10 s of CPU (median of eight,
+interleaved), and from 255.8 M reductions to 248.9 M, with allocation level.
+Ninety-four programs -- every example, every program under
+dream/tests/programs, `std`'s tests, `mind`, `lucid` and `ship` -- report the
+same diagnostics and compile to the same bytes under both checkers.
 
 **A record sees the file it is written in.** A record is a `mod` once the
 loader has read it, and a module sees only what it declares and imports --

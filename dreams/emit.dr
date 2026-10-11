@@ -164,14 +164,14 @@ let t_type = tag 84 89 80 69;   // TYPE
 /// far on each one.
 let concat_map f xs = str.concat_all (list.map f xs);
 
-let node_bytes [op, flags, a, b, c] =
+let node_bytes n =
     str.concat_all [
-        u8 (match ir.opcode op { () => 0, code => code }),
-        u8 flags,
+        u8 (match ir.opcode (ir.node_op n) { () => 0, code => code }),
+        u8 (ir.node_flags n),
         u16 0,
-        index a,
-        index b,
-        index c,
+        index (ir.node_a n),
+        index (ir.node_b n),
+        index (ir.node_c n),
     ];
 
 /// The node and kid sections, which are most of an image: the VM writes them

@@ -1515,9 +1515,21 @@ let rec lower_match scrutinee arms span l = {
 /// What an arm's pattern says about the subjects it could match: `[:head, n]`
 /// for a list whose first element is the atom `n`, `[:atom, n]` for the atom
 /// itself, and `:any` for everything else.
-let rec arm_key p = match p {
-    [:as_p, inner, _, _, _] => arm_key inner,
+///
+/// A constructor pattern is keyed by its record's id, as an atom: `switch_atom`
+/// keys a record by its id (`take_switch`, `Emitter::switch_node`), so a
+/// `match` over a union jumps to the arm for the variant in hand instead of
+/// asking `_record_is` of each arm above it. The id is in the record's header,
+/// so reading it forces nothing the chain would not have. That an atom spelled
+/// like an id gets the same key is harmless: the switch only skips arms that
+/// cannot match, and the arm it lands on still runs its own test.
+let rec arm_key p l = match p {
+    [:as_p, inner, _, _, _] => arm_key inner l,
     [:literal, [:atom, n, _], _] => [:atom, n],
+    [:record_p, ctor, _, _] => match constructor_of ctor l {
+        [id, _, _] => [:atom, id],
+        _ => :any,
+    },
     [:list_p, [[:literal, [:atom, n, _], _], .._], _, _] => [:head, n],
     // A `union struct` variant: `switch_head` reads an array's first element
     // as it reads a cell's head, and the arm's own test still tells the two
@@ -1566,7 +1578,7 @@ let switch_node op kind tags keys suffixes held default l = {
 /// The node a `match` starts at: a switch into `chain` when enough arms name a
 /// tag, and `chain` itself otherwise.
 let dispatch arms suffixes held chain l = {
-    let keys = list.map (fn a -> arm_key (ast.arm_pattern a)) arms;
+    let keys = list.map (fn a -> arm_key (ast.arm_pattern a) l) arms;
     let heads = tags_of :head keys;
     let atoms = tags_of :atom keys;
     // Everything in front of the first tagged-cell arm is an atom literal.

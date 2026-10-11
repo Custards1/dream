@@ -3838,6 +3838,11 @@ struct ShareArenas {
             auto* a = static_cast<ArrayObj*>(as_obj(c));
             return uint64_t(i) < a->len ? resolve(a->items()[i]) : d;
         }
+        // A node is a record (`ir.Node`), read by position as its list was.
+        if (is_obj(c, ObjType::Record)) {
+            auto* r = static_cast<RecordObj*>(as_obj(c));
+            return uint64_t(i) < r->len ? resolve(r->items()[i]) : d;
+        }
         if (is_obj(c, ObjType::Map)) {
             Value found;
             return map_lookup(p, c, make_fixnum(i), &found) ? resolve(found) : d;
@@ -4114,11 +4119,16 @@ NativeResult vm_node_section(Process& p, Value, Value* args, uint32_t) {
     for (Value cur = nodes; is_obj(cur, ObjType::Cons); cur = resolve(static_cast<ConsObj*>(as_obj(cur))->tail)) {
         Value n = resolve(static_cast<ConsObj*>(as_obj(cur))->head);
         Value f[5];
-        Value walk = n;
-        for (int k = 0; k < 5; ++k) {
-            if (!is_obj(walk, ObjType::Cons)) return type_fail(p, "node_section: a node is [op, flags, a, b, c]");
-            f[k] = resolve(static_cast<ConsObj*>(as_obj(walk))->head);
-            walk = resolve(static_cast<ConsObj*>(as_obj(walk))->tail);
+        if (is_obj(n, ObjType::Record) && static_cast<RecordObj*>(as_obj(n))->len == 5) {
+            // `ir.Node`, the compiler's; the list is what `share_arenas` hands back.
+            for (int k = 0; k < 5; ++k) f[k] = resolve(static_cast<RecordObj*>(as_obj(n))->items()[k]);
+        } else {
+            Value walk = n;
+            for (int k = 0; k < 5; ++k) {
+                if (!is_obj(walk, ObjType::Cons)) return type_fail(p, "node_section: a node is [op, flags, a, b, c]");
+                f[k] = resolve(static_cast<ConsObj*>(as_obj(walk))->head);
+                walk = resolve(static_cast<ConsObj*>(as_obj(walk))->tail);
+            }
         }
         Value code;
         int64_t op = map_lookup(p, codes, f[0], &code) && is_fixnum(resolve(code)) ? fixnum_value(resolve(code)) : 0;
