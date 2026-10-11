@@ -958,8 +958,8 @@ let location a mi span =
 /// recording where a name was bound rather than only that it was.
 let rec located a found =
     match found {
-        [:local, _, span] => match module_of a { () => (), mi => location a mi span },
-        [:global, mi, name, _] =>
+        scope.Meaning.local(_, span) => match module_of a { () => (), mi => location a mi span },
+        scope.Meaning.global(mi, name, _) =>
             match scope.definition (resolved a) mi name {
                 () => (),
                 d => location_in a (list.nth 1 d) (list.nth 2 d),
@@ -971,7 +971,7 @@ let rec located a found =
         // and `location` would make a URI out of it.
         // A foreign block's are the same, and go to the line that declared
         // them.
-        [:member, [:dream, target], field, _] =>
+        scope.Meaning.member(scope.Ref.dream(target), field, _) =>
             match generated_location a target field {
                 () => match scope.definition (resolved a) target field {
                           () => (),
@@ -983,7 +983,7 @@ let rec located a found =
         // time the program is resolved -- expansion rewrites the declaration
         // -- so the way to it is the way to any other global, and the wrapper
         // is only there to say what this occurrence was.
-        [:macro, inner] => located a inner,
+        scope.Meaning.expanded(inner) => located a inner,
         // A builtin and a host module's member are not written in Dream, so
         // there is nowhere to go.
         _ => (),
@@ -1009,7 +1009,7 @@ let rec navigation_expr tree here end =
     };
 
 let rec namespace_location a ref = match ref {
-    [:dream, target] => match [record_of a target, foreign_of a target] {
+    scope.Ref.dream(target) => match [record_of a target, foreign_of a target] {
         [r, _] if r != () => match modules.find (loader a) (record_owner r) {
             () => (),
             owner => location a owner (record_span r),
@@ -1036,7 +1036,7 @@ let rec namespace_location a ref = match ref {
             })
         },
     },
-    [:group, name] => match package.find (modules.packages (loader a)) name {
+    scope.Ref.group(name) => match package.find (modules.packages (loader a)) name {
         () => (),
         p => match package.manifest p {
             "" => match list.filter (fn m ->
@@ -1073,12 +1073,12 @@ let rec navigation_target a mi e = {
             [:name, n, _] => {
                 let env = scope.r_env_at (resolved a) mi;
                 match scope.only_of env n {
-                    [ref, member, _] => located a [:member, ref, member, ()],
-                    _ => located a [:global, mi, n, ()],
+                    [ref, member, _] => located a (scope.Meaning.member ref member ()),
+                    _ => located a (scope.Meaning.global mi n ()),
                 }
             },
             [:field, obj, field, _] => match scope.as_namespace c (resolved a) obj {
-                [ref, _] => located a [:member, ref, field, ()],
+                [ref, _] => located a (scope.Meaning.member ref field ()),
                 _ => (),
             },
             _ => (),
@@ -1101,8 +1101,8 @@ let definition_at a line character = match module_of a {
             (modules.module_source (modules.module_at (loader a) mi)) here;
         // Real locals take precedence over identically named module aliases.
         let direct = match found {
-            [:local, _, _] => located a found,
-            [:capture, _, _] => located a found,
+            scope.Meaning.local(_, _) => located a found,
+            scope.Meaning.capture(_, _) => located a found,
             _ => match expr {
                 () => (),
                 e => if shadowed { () } else { navigation_target a mi e },
@@ -1123,9 +1123,9 @@ let definition_at a line character = match module_of a {
                         let target = modules.find (loader a)
                             (scope.relative_path (loader a) mi dotted);
                         match target {
-                            target if target != () => namespace_location a [:dream, target],
+                            target if target != () => namespace_location a (scope.Ref.dream target),
                             _ => match package.find (modules.packages (loader a)) dotted {
-                                p if p != () => namespace_location a [:group, dotted],
+                                p if p != () => namespace_location a (scope.Ref.group dotted),
                                 _ => {
                                     let selected = match imp {
                                         [:import, _, _, names, _] if names != () =>
@@ -1179,36 +1179,36 @@ let describe_local a offset name =
 
 let describe a offset name found =
     match found {
-        [:local, _, _] => describe_local a offset name,
-        [:capture, idx, _] =>
+        scope.Meaning.local(_, _) => describe_local a offset name,
+        scope.Meaning.capture(idx, _) =>
             describe_local a offset name
             + " (captured from an enclosing function, capture " + to_string idx + ")",
-        [:global, mi, name, _] =>
+        scope.Meaning.global(mi, name, _) =>
             "`" + shown_signature a mi name + "` -- " + global_phrase a mi name
             + " of module `" + modules.module_name (modules.module_at (loader a) mi) + "`"
             + inherited_note a mi name,
-        [:builtin, name] => "`" + builtins.signature name + "` -- a builtin",
-        [:member, [:dream, target], field, _] =>
+        scope.Meaning.builtin(name) => "`" + builtins.signature name + "` -- a builtin",
+        scope.Meaning.member(scope.Ref.dream(target), field, _) =>
             match generated_role a target field {
                 () => "`" + shown_signature a target field + "` of module `"
                       + modules.module_name (modules.module_at (loader a) target) + "`"
                       + inherited_note a target field,
                 role => "`" + shown_signature a target field + "` -- " + role,
             },
-        [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
+        scope.Meaning.member(scope.Ref.native(p, _), field, _) => "`" + field + "` of the host module `" + p + "`",
         // An `expand` site. The declaration is an ordinary global by now, so
         // the signature and the module come from the same place they would for
         // one; what is worth saying extra is that this runs at compile time.
-        [:macro, [:global, mi, n, _]] =>
+        scope.Meaning.expanded(scope.Meaning.global(mi, n, _)) =>
             "`" + shown_signature a mi n + "` -- a macro of module `"
             + modules.module_name (modules.module_at (loader a) mi) + "`",
-        [:macro, [:member, [:dream, target], field, _]] =>
+        scope.Meaning.expanded(scope.Meaning.member(scope.Ref.dream(target), field, _)) =>
             "`" + shown_signature a target field + "` -- a macro of module `"
             + modules.module_name (modules.module_at (loader a) target) + "`",
-        [:macro, inner] => describe a offset name inner,
-        [:closure, _] => "a function",
-        [:thunk, _] => "a thunk",
-        [:match, _] => "the subject of a match",
+        scope.Meaning.expanded(inner) => describe a offset name inner,
+        scope.Meaning.closure(_) => "a function",
+        scope.Meaning.thunk(_) => "a thunk",
+        scope.Meaning.subject(_) => "the subject of a match",
         other => to_string other,
     };
 
@@ -1265,13 +1265,13 @@ let inlay_hints a first last = match module_of a {
         let f = modules.file_at l si;
         let src = diag.source_text f;
         let placed = list.concat (list.map (fn hint -> {
-            let [_, _, span, name, params, shown] = hint;
+            let span = typecheck.Hint.span hint;
             // A span past 2^31 is generated code, which is in no file.
             if ast.span_start span >= 2147483648 { [] }
             else {
-                match hint_offset src (diag.origin_span f span) name params {
+                match hint_offset src (diag.origin_span f span) (typecheck.Hint.name hint) (typecheck.Hint.params hint) {
                     () => [],
-                    at => [[at, shown]],
+                    at => [[at, typecheck.Hint.shown hint]],
                 }
             }
         }) (typecheck.hints l (resolved a) si));
@@ -1374,10 +1374,10 @@ let identity a mi toks binders offset name =
                     () => declared_identity a source toks offset name,
                     id => id,
                 },
-                [:local, _, _] => local_identity a offset name,
-                [:capture, _, _] => local_identity a offset name,
-                [:global, m, n, _] if n == name => [:global, m, n],
-                [:member, [:dream, t], f, _] if f == name => [:global, t, f],
+                scope.Meaning.local(_, _) => local_identity a offset name,
+                scope.Meaning.capture(_, _) => local_identity a offset name,
+                scope.Meaning.global(m, n, _) if n == name => [:global, m, n],
+                scope.Meaning.member(scope.Ref.dream(t), f, _) if f == name => [:global, t, f],
                 _ => declared_identity a source toks offset name,
             }
         },
@@ -1460,8 +1460,8 @@ let global_sites a target name = {
         let start = key % 4294967296;
         let si = (key / 4294967296) % 65536;
         let hit = match what {
-            [:global, m, n, _] => m == target && n == name,
-            [:member, [:dream, t], f, _] => t == target && f == name,
+            scope.Meaning.global(m, n, _) => m == target && n == name,
+            scope.Meaning.member(scope.Ref.dream(t), f, _) => t == target && f == name,
             _ => false,
         };
         if not hit || start >= 2147483648 { [] }

@@ -606,7 +606,7 @@ let place_captures f s = {
 /// the constant pools keep their indices, so every `int`, `str` and `atom` node
 /// still names what it named, and `funcs` changes in exactly two fields.
 let optimize img =
-    optimize_tables img (array.of_list (img.[:nodes else []])) (array.of_list (img.[:kids else []]));
+    optimize_tables img (array.of_list (ir.Image.nodes img)) (array.of_list (ir.Image.kids img));
 
 /// The same, for a program as `lower` builds it: straight from its tables,
 /// which a read indexes as well as it does an array, so the arena is never
@@ -614,15 +614,15 @@ let optimize img =
 let optimize_program p = optimize_tables (ir.finish_rest p) (ir.nodes p) (ir.kids p);
 
 let optimize_tables img nodes kids = {
-    let walked = walk_funcs (img.[:funcs else []]) (fresh img nodes kids);
+    let walked = walk_funcs (ir.Image.funcs img) (fresh img nodes kids);
     finished img (list.head walked) (list.reverse (list.nth 1 walked))
 };
 
 /// A state to walk from: the arena to read, and nothing written yet.
 let fresh img nodes kids = {
-    let strings = array.of_list (img.[:strs else []]);
+    let strings = array.of_list (ir.Image.strs img);
     let ids = list.map (fn at -> type_codes.[strings.[at else ""] else ()])
-                      (img.[:atoms else []]);
+                      (ir.Image.atoms img);
     let type_ids = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
                             %{} (list.zip (list.range 0 (list.length ids)) ids);
     (state nodes kids).[:type_ids => type_ids]
@@ -665,9 +665,9 @@ let optimize_parts img parts invented_from = optimize_parts_filled img parts inv
 /// step for step: this is a whole-program walk a warm build cannot keep
 /// between builds, and in Dream it was a map insert and a `to_string` per node.
 let optimize_parts_filled img parts invented_from filled = {
-    let [nodes, kids, funcs] = vm.share_arenas [img.[:funcs else []], parts, invented_from, filled,
+    let [nodes, kids, funcs] = vm.share_arenas [(ir.Image.funcs img), parts, invented_from, filled,
                                                 edge_map, run_map, part_base];
-    ((img.[:nodes => nodes]).[:kids => kids]).[:funcs => funcs]
+    img |> ir.Image.set_nodes nodes |> ir.Image.set_kids kids |> ir.Image.set_funcs funcs
 };
 
 /// The walk `vm.share_arenas` makes, as the definition of it: the tests below
@@ -685,7 +685,7 @@ let optimize_parts_by_hand img parts invented_from filled = {
         [settle (list.head caps),
          list.cons (((f.[:body => (list.nth 1 got)])).[:captures_off => (list.nth 1 caps)])
                    (list.nth 1 acc)]
-    }) [s0, []] (img.[:funcs else []]);
+    }) [s0, []] (ir.Image.funcs img);
     finished img (list.head walked) (list.reverse (list.nth 1 walked))
 };
 
@@ -712,7 +712,8 @@ let remap_leaf_by m n = match ir.node_op n {
 
 /// The image a finished walk describes.
 let finished img s funcs =
-    ((((img.[:nodes => list.reverse (out s)])).[:kids => list.reverse (out_kids s)])).[:funcs => funcs];
+    img |> ir.Image.set_nodes (list.reverse (out s)) |> ir.Image.set_kids (list.reverse (out_kids s))
+        |> ir.Image.set_funcs funcs;
 
 when test {
     import std.test;
@@ -732,13 +733,13 @@ when test {
                   :n_captures => list.nth 1 (list.nth 1 pair) })
                (list.zip bodies caps) };
 
-    let nodes_of img = img.[:nodes else []];
-    let kids_of img = img.[:kids else []];
+    let nodes_of img = ir.Image.nodes img;
+    let kids_of img = ir.Image.kids img;
     let bodies_of img = list.map (fn f -> f.[:body else ir.no_node])
-                                 (img.[:funcs else []]);
+                                 (ir.Image.funcs img);
     let caps_of img = list.map (fn f -> [f.[:captures_off else 0],
                                          f.[:n_captures else 0]])
-                               (img.[:funcs else []]);
+                               (ir.Image.funcs img);
 
     /// `local 0` twice over, as two bodies.
     let two_locals = optimize (image [ir.node :local 0 ir.no_node ir.no_node,

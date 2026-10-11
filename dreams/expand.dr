@@ -154,7 +154,7 @@ let merge_meter a b = {
 /// The meter, on the loader, for a tool to read. `modules.macro_meter` is the
 /// other end and says why it is kept there.
 let publish_meter s l =
-    if not (metering s) { l } else { modules.put :macro_meter (meter_of s) l };
+    if not (metering s) { l } else { modules.Loader.set_macro_meter (meter_of s) l };
 let fail s mi sp message =
     put_loader (modules.complain sp message (modules.module_source (modules.module_at (loader s) mi))
                                 (loader s)) s;
@@ -168,14 +168,14 @@ let fail s mi sp message =
 /// rather than about the code it turned into -- see `modules.expansions`.
 ///
 /// The offset is the *source* one, from the call as written, not the freshened
-/// copy the wrapper was compiled from. `[:macro, reference]` rather than the
-/// reference alone, because by the time anything reads this the macro is an
+/// copy the wrapper was compiled from. `scope.Meaning.expanded` rather than
+/// the reference alone, because by the time anything reads this the macro is an
 /// ordinary global -- `macro_let` has rewritten the declaration -- and the
 /// wrapper is the only thing left saying it was ever anything else.
 let note_macro s mi start reference = {
     let l = loader s;
-    put_loader (modules.put :expansions (modules.expansions l
-        + [[mi, modules.module_source (modules.module_at l mi), start, [:macro, reference]]]) l) s
+    put_loader (modules.Loader.set_expansions (modules.expansions l
+        + [[mi, modules.module_source (modules.module_at l mi), start, scope.Meaning.expanded reference]]) l) s
 };
 
 /// The module a reference names and the name it names there, or `()`.
@@ -187,8 +187,8 @@ let note_macro s mi start reference = {
 /// a module's name and the contiguous range of globals that belong to it --
 /// which is the only statement in the container of which globals are whose.
 let macro_target reference = match reference {
-    [:global, mi, name, _] => [mi, name],
-    [:member, [:dream, mi], name, _] => [mi, name],
+    scope.Meaning.global(mi, name, _) => [mi, name],
+    scope.Meaning.member(scope.Ref.dream(mi), name, _) => [mi, name],
     _ => (),
 };
 
@@ -309,7 +309,7 @@ let prepare_work! l work = {
 let invocation_image ld resolved = {
     let low = staged_lowering (map.remove :image (lower.lower_program resolved));
     let ms = lower.link_modules ld resolved low;
-    ir.finish (((lower.prog (list.head ms))).[:modules => (list.nth 1 ms)])
+    ir.finish (ir.Program.set_modules (list.nth 1 ms) (lower.prog (list.head ms)))
 };
 
 /// The two halves of a call, which is all a session needs of one.

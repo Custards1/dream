@@ -49,18 +49,28 @@ import std.num;
 /// constant time, and a token is exactly the fixed-shape record arrays are for.
 struct Token derive dreams.source_range { kind, value, span_start, span_end, starts_line, col }
 
+let make : :atom -> :any -> :integer -> :integer -> :bool -> :integer -> Token;
 let make = Token.make;
+let kind : Token -> :atom;
 let kind = Token.kind;
+let value : Token -> :any;
 let value = Token.value;
+let span_start : Token -> :integer;
 let span_start = Token.span_start;
+let span_end : Token -> :integer;
 let span_end = Token.span_end;
+let span : Token -> [:integer, :integer];
 let span t = Token.span t;
+let starts_line : Token -> :bool;
 let starts_line = Token.starts_line;
+let col : Token -> :integer;
 let col = Token.col;
 
+let is_error : Token -> :bool;
 let is_error t = kind t == :error;
 
 /// The source text a token was cut from.
+let text_of : :string -> Token -> :string;
 let text_of s t = str.slice (span_start t) (Token.byte_length t) s;
 
 // --- byte classes -----------------------------------------------------------
@@ -544,17 +554,19 @@ let rec stream s i col nl = {
 };
 
 /// Every token in `s`, as a lazy list. This is the interface the parser wants.
+let tokens : :string -> [Token];
 let tokens s = stream s 0 1 false;
 
 // --- the strict form --------------------------------------------------------
 
-let rec find_error ts =
-    if list.is_empty ts { () }
-    else if is_error (list.head ts) { list.head ts }
-    else { find_error (list.tail ts) };
+let rec find_error ts = match ts {
+    [] => (),
+    [t, ..rest] => if is_error t { t } else { find_error rest },
+};
 
 /// The whole file at once: `[:ok, tokens]`, or `[:error, message, offset]`.
 /// For a caller that wants a diagnosis rather than a stream to pull on.
+let lex : :string -> [:ok, [Token]] | [:error, :string, :integer];
 let lex s = {
     let ts = tokens s;
     let bad = find_error ts;

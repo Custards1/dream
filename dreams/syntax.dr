@@ -7,6 +7,7 @@ import dreams.ast;
 import std.array;
 import std.map;
 
+let is_span : :any -> :bool;
 let is_span x = match x {
     [a, b] => type_of a == :integer && type_of b == :integer,
     _ => false,
@@ -15,6 +16,7 @@ let is_span x = match x {
 /// Fresh offsets in a reserved part of the 32-bit source-offset space.
 /// Returns [tree, next_offset]. A copied argument must be freshened too: a
 /// macro may insert it twice, under two different lexical scopes.
+let fresh : :any -> :integer -> [:any];
 let rec fresh tree next =
     if type_of tree != :list || list.is_empty tree { [tree, next] }
     // A strict parameter keeps its span second and its marker last, so the
@@ -85,6 +87,7 @@ let rec literal value span = match type_of value {
 /// would throw away the only spans a diagnostic inside it could point at.
 /// Generated spans live above 2^31 and written ones below, so the two cannot
 /// collide.
+let record : :atom -> :string -> [[:any]] -> [[:any]] -> ast.Span -> ast.Decl;
 let record kind name fields members span = record_derived "" kind name fields members [] span;
 
 /// A member's body, with `Shape.circle` read as the `circle` it means.
@@ -105,6 +108,7 @@ let rec own_names owner e =
 /// `_record_of :id variant #[fields..]`: what a constructor's body is, and the
 /// one shape lowering turns into a `record_make` (`lower.lower_apply`) and
 /// the resolver files as a constructor (`scope.constructor_of`).
+let constructed : :string -> :bool -> [ast.Expr] -> ast.Span -> ast.Expr;
 let constructed id variant items span =
     ast.apply_e (ast.name_e "_record_of" span)
                 [ast.atom_e id span, ast.bool_e variant span, ast.array_e items span] span;
@@ -112,12 +116,15 @@ let constructed id variant items span =
 /// The id a declaration's values carry: the module it was declared in, then
 /// its own name. `owner` is empty only for a declaration read with no module
 /// around it, which is a test's.
+let qualified : :string -> :string -> :string;
 let qualified owner name = if owner == "" { name } else { owner + "." + name };
 
 /// The global a `derive dyn` record's values carry in slot 0. Angle brackets
 /// cannot be written, so it can name nothing else.
+let dispatch_table_name : :string;
 let dispatch_table_name = "<dispatch>";
 
+let record_derived : :string -> :atom -> :string -> [[:any]] -> [[:any]] -> [ast.Decl] -> ast.Span -> ast.Decl;
 let record_derived owner kind name fields members bases span =
     list.head (record_parts owner kind name fields members bases span);
 
@@ -127,6 +134,7 @@ let record_derived owner kind name fields members bases span =
 /// -- `type Ps = [Period]`, a field's `: Period`, `types.check Period v` --
 /// where a name has to be a value and the module is not one. A signature
 /// never reads it: the checker asks for the module first (`typecheck.type_ref`).
+let record_parts : :string -> :atom -> :string -> [[:any]] -> [[:any]] -> [ast.Decl] -> ast.Span -> [ast.Decl];
 let record_parts owner kind name fields members bases span = {
     let named f = ast.name_e (ast.field_name f) (ast.field_span f);
     // `derive dyn`: every value carries its record's dispatch table in slot 0
@@ -307,6 +315,7 @@ let arrow a b = ast.list_e [ast.atom_e "fn" (ast.span b), a, b] (ast.span b);
 /// is unobservable for the pure expression a guard has to be. The arms and the
 /// timeout keep the spans they were written at, so a mistake in one is
 /// reported where it is.
+let receive_e : [ast.Arm] -> [ast.Expr] | :unit -> ast.Span -> ast.Expr;
 let receive_e arms after span = {
     let at_ = span;
     let n x = ast.name_e x at_;
@@ -385,6 +394,7 @@ let receive_e arms after span = {
 /// The description is then a function of them, as a parameterised `type` is,
 /// and the constructors' signatures say `a -> Option a` -- `a` being free in a
 /// signature is what makes it a type variable.
+let union_decl : :string -> :string -> [ast.Param] -> [[:any]] -> [[:any]] -> :atom -> ast.Span -> [ast.Decl];
 let union_decl owner name params variants members kind span = {
     let at_ = span;
     let field_t f = match list.nth 2 f { () => ast.atom_e "any" at_, t => t };
@@ -458,6 +468,7 @@ let union_decl owner name params variants members kind span = {
 /// Everything here assumes the entries were checked by `foreign_problem`,
 /// which the parser runs so that a C type that means nothing is reported where
 /// it was written.
+let foreign_decl : :string -> ast.Expr | :unit -> [[:any]] -> ast.Span -> ast.Decl;
 let foreign_decl name library entries span = {
     let at_ = span;
     let env = foreign_env name entries;
@@ -538,6 +549,7 @@ priv let foreign_env lib entries = %{
 
 /// The first thing wrong with a `foreign` block's entries, as `[message,
 /// span]`, or `()`. The parser asks, because only it can report one.
+let foreign_problem : ast.Expr | :unit -> [[:any]] -> [:string, ast.Span] | :unit;
 let foreign_problem lib entries = {
     let env = foreign_env lib entries;
     let problem r = match r { [:error, m, sp] => [m, sp], _ => () };
@@ -734,12 +746,14 @@ let sequence check xs = type_of xs == :list && list.all check xs;
 let pair check_a check_b p = match p { [a, b] => check_a a && check_b b, _ => false };
 let string x = type_of x == :string;
 let optional check x = x == () || check x;
+let parameter : :any -> :bool;
 let rec parameter p = match p {
     [n, sp] => (n == () || string n) && is_span sp,
     [n, sp, (), :strict] => string n && is_span sp,
     [(), sp, pat] => is_span sp && pattern pat,
     _ => false,
 };
+let pattern : :any -> :bool;
 let rec pattern p = match p {
     [:wildcard, sp] => is_span sp,
     [:bind, n, sp] => string n && is_span sp,
@@ -755,6 +769,7 @@ let rec pattern p = match p {
 let rest_pattern p = match p {
     () => true, [()] => true, [n, sp] => string n && is_span sp, _ => false,
 };
+let statement : :any -> :bool;
 let rec statement e = match e {
     [:let, n, ps, b, rec_, sp] => string n && sequence parameter ps && expression b
                               && type_of rec_ == :bool && is_span sp,
@@ -762,6 +777,7 @@ let rec statement e = match e {
     [:sig, n, _, sp] => string n && is_span sp,
     _ => expression e,
 };
+let expression : :any -> :bool;
 let rec expression e = match e {
     [:int, v, sp] => type_of v == :integer && is_span sp,
     [:float, v, sp] => type_of v == :float && is_span sp,
@@ -814,6 +830,7 @@ let arm a = match a {
 /// Purity is the name's, as it is for a `foreign` block: `check!` is bound
 /// with `image.function`, and an entry without a `!` may be called from pure
 /// code because the program says the function it names is pure.
+let image_decl : :string -> ast.Expr -> [[:any]] -> ast.Span -> ast.Decl;
 let image_decl name source entries span = {
     let at_ = span;
     let name_ n = ast.name_e n at_;
@@ -846,6 +863,7 @@ let image_decl name source entries span = {
 /// parameter that is a function is refused here rather than at the first
 /// call. And a member of no parameters is a value, which is computed once and
 /// cannot be an effect: an effect of nothing takes `()`, as everywhere else.
+let image_problem : :string -> [[:any]] -> [:string, ast.Span] | :unit;
 let image_problem img entries =
     list.fold (fn found e -> if found != () { found } else {
         match e {

@@ -48,16 +48,60 @@ import std.array;
 // owns its member table. A package is neither: it is a namespace holding
 // modules, and only what is inside one is a value.
 
-let dream_ref mi     = [:dream, mi];
-/// A host module keeps a global holding the module value, because its members
-/// are looked up at run time -- the host owns the table. The index travels with
-/// the reference so that a member reached through it needs nothing looked up
-/// again later.
-let native_ref path g = [:native, path, g];
-let group_ref prefix = [:group, prefix];
+union Ref {
+    // A Dream module, by its index in the loader.
+    dream(module)
+    // A host module keeps a global holding the module value, because its
+    // members are looked up at run time -- the host owns the table. The index
+    // travels with the reference so that a member reached through it needs
+    // nothing looked up again later.
+    native(path, global)
+    // A package: a namespace holding modules, by its dotted prefix.
+    group(prefix)
+}
 
-let ref_kind r = r.[0];
-let ref_target r = list.nth 1 r;
+// --- what a name means ----------------------------------------------------------
+//
+// What resolution records at each name occurrence (`record`, read back with
+// `resolution`), and at the few other places lowering has to be told what this
+// pass decided: a block, a function written inline, a `comp`, a `match`. Every
+// pass after this one reads these rather than resolving anything again.
+//
+// These were tagged lists -- `[:global, mi, name, gi]` -- and so was `Ref`. As
+// records, a `match` on one jumps by the variant's id, and a pattern cannot
+// mistake one for a syntax node that happens to start with the same atom:
+// `[:block, impure]` and the block `[:block, stmts, span]` were told apart
+// only by their length. `comp` and `match` are keywords, hence `compiled` and
+// `subject`.
+union Meaning {
+    // A slot in this function's frame, and where the name was bound.
+    local(slot, span)
+    // A capture threaded in from an enclosing function (see `capture`).
+    capture(index, span)
+    // A global of module `module`.
+    global(module, name, index)
+    builtin(name)
+    // A member reached through a module, `list.map`, or brought in by
+    // `import a.{x}`. `index` is the global for a Dream module and `()` for a
+    // host's, whose table is looked up at run time.
+    member(ref, field, index)
+    // A block, and whether effects were allowed where it was written: lowering
+    // forces its statements only inside an impure function.
+    block(impure)
+    // A function written inline, by its index: `$( .. )`, `fn ..`, a local
+    // `let f x = ..`.
+    thunk(func)
+    closure(func)
+    // A `comp`, by the function it became, and whether it was `comp!`.
+    compiled(func, impure)
+    // The slot a `match` holds its subject in.
+    subject(slot)
+    // The name after an `expand`, and what it resolved to. By the time
+    // anything reads this the macro is an ordinary global, and this is the
+    // only thing left saying it was ever anything else (`expand.note_macro`).
+    // `macro` is a keyword.
+    expanded(reference)
+}
 
 // --- a module's environment ---------------------------------------------------
 
@@ -300,11 +344,11 @@ let group_member l prefix field = {
             let deeper = candidate + ".";
             if list.any (fn n -> str.starts_with deeper n) (module_names l)
                || list.contains candidate (modules.namespaces l) {
-                group_ref candidate
+                Ref.group candidate
             }
             else { () }
         },
-        target => dream_ref target,
+        target => Ref.dream target,
     }
 };
 
@@ -326,7 +370,7 @@ let rec declare_import_names mi r p names span s =
         let e = env_at acc mi;
         let bound = default_alias [list.nth 0 sel] (list.nth 1 sel);
         let inaccessible = match r {
-            [:dream, target] => target != mi && has_env acc target
+            Ref.dream(target) => target != mi && has_env acc target
                 && is_private (env_at acc target) (list.nth 0 sel),
             _ => false,
         };
@@ -377,7 +421,7 @@ let rec declare_import l mi imp s = {
                         complain span ("`" + p + "` is a package, so `.{ .. }` has no members to take")
                                  (env_source e) s
                     }
-                    else { set_env mi (with_alias alias (group_ref p) e) s }
+                    else { set_env mi (with_alias alias (Ref.group p) e) s }
                 }
                 else if not (list.contains p (modules.natives l)) {
                     complain span ("cannot find module `" + p + "`") (env_source e) s
@@ -392,19 +436,19 @@ let rec declare_import l mi imp s = {
                     let noted = record_global g alias :module (list.nth 1 brought)
                                               (list.head brought);
                     if takes_members {
-                        declare_import_names mi (native_ref p g) p names span noted
+                        declare_import_names mi (Ref.native p g) p names span noted
                     }
                     else {
                         // A value as well as a namespace, so a bare mention of
                         // the alias yields the module itself.
                         set_env mi (with_global alias :module g
-                                        (with_alias alias (native_ref p g) e))
+                                        (with_alias alias (Ref.native p g) e))
                                 noted
                     }
                 },
             target =>
-                if takes_members { declare_import_names mi (dream_ref target) p names span s }
-                else { set_env mi (with_alias alias (dream_ref target) e) s },
+                if takes_members { declare_import_names mi (Ref.dream target) p names span s }
+                else { set_env mi (with_alias alias (Ref.dream target) e) s },
         }
     }
 };
@@ -429,7 +473,7 @@ let declare_derive l mi d s = {
                     if map.has (list.head kv) (aliases acc) { acc }
                     else { with_alias (list.head kv) (list.nth 1 kv) acc })
                     e (map.pairs (aliases (env_at s base)));
-                set_env mi (((with_alias (default_alias written ()) (dream_ref base)
+                set_env mi (((with_alias (default_alias written ()) (Ref.dream base)
                                                      inherited)).[:derives => base]) s
             },
     }
@@ -973,8 +1017,10 @@ let frame_staged f = Frame.staged f;
 /// slots, or in one of *its* captures. Threading it down like this is what lets
 /// a closure three levels deep reach a name without any frame in between having
 /// to know why it is holding it.
-let cap_local slot   = [:local, slot];
-let cap_capture idx  = [:capture, idx];
+union Capture {
+    local(slot)
+    outer(index)
+}
 
 // --- the resolver's state --------------------------------------------------------
 //
@@ -1029,7 +1075,7 @@ let funcs r = list.map (fn i -> func_at r i) (list.range 0 (func_count r));
 let bodies_rev r = r.[:bodies else []];
 let bodies r     = list.reverse (bodies_rev r);
 let bodies_count r = list.length (bodies_rev r);
-/// Global index -> `[target, plan, arity]` for every wrapper. See "wrappers".
+/// Global index -> `Wrapper` for every wrapper. See "wrappers".
 let wrappers r = r.[:wrappers else (%{})];
 let defs r     = r.[:defs else []];
 
@@ -1069,7 +1115,7 @@ let fuses r    = r.[:fuse else false];
 let fusion r ctx source span =
     match ((fusions r)).[(ref_key ctx source (ast.span_start span)) else ()] {
         () => (),
-        p => if fuse.plan_span p == span { p } else { () },
+        p => if fuse.Plan.span p == span { p } else { () },
     };
 
 /// What the current frame has staged, and how to change it. Both answer
@@ -1090,7 +1136,7 @@ let staged_use r n = ((staged_now r)).[n else ()];
 let staged_here r n span =
     match staged_use r n {
         () => (),
-        st => if fuse.staged_span st == span { st } else { () },
+        st => if fuse.Staged.span st == span { st } else { () },
     };
 
 // What lowering has to be told, because it must make the same decision and
@@ -1098,13 +1144,20 @@ let staged_here r n span =
 // stands for the body of one. A pass that disagreed with this one would either
 // lower a stage twice or build a loop over a name nothing bound.
 
+/// What `staging` answers: the stage a name stands for, written elsewhere, or
+/// that this is the `let` that used to bind one.
+union Staging {
+    body(expr)
+    elided
+}
+
 let staged_table r = r.[:staged else (%{})];
 
 let record_staged ctx source span what r =
     r.[:staged => (((staged_table r)).[(ref_key ctx source (ast.span_start span)) => what])];
 
-/// `[:body, expr]` where a name stands for a stage written elsewhere,
-/// `:elided` at the `let` that used to bind it, or `()`.
+/// `Staging.body` where a name stands for a stage written elsewhere,
+/// `Staging.elided` at the `let` that used to bind it, or `()`.
 let staging r ctx source span =
     ((staged_table r)).[(ref_key ctx source (ast.span_start span)) else ()];
 
@@ -1348,10 +1401,10 @@ let rec capture i name r =
                     let up = capture (i + 1) name r;
                     match list.nth 1 up {
                         () => [list.head up, ()],
-                        ci => [list.head up, cap_capture ci],
+                        ci => [list.head up, Capture.outer ci],
                     }
                 },
-                found => [r, cap_local (list.nth 1 found)],
+                found => [r, Capture.local (list.nth 1 found)],
             };
             match list.nth 1 from {
                 () => [list.head from, ()],
@@ -1377,10 +1430,10 @@ let resolve_in_frames name r =
                 let got = capture 0 name r;
                 match list.nth 1 got {
                     () => [list.head got, ()],
-                    ci => [list.head got, [:capture, ci, ast.no_span]],
+                    ci => [list.head got, Meaning.capture ci ast.no_span],
                 }
             },
-            found => [r, [:local, list.nth 1 found, list.nth 2 found]],
+            found => [r, Meaning.local (list.nth 1 found) (list.nth 2 found)],
         }
     };
 
@@ -1439,7 +1492,7 @@ let note_effect c span what r =
 let check_member c r_ref shown field span r = {
     let r1 =
         match r_ref {
-            [:dream, target] => {
+            Ref.dream(target) => {
                 let e = env_of c r target;
                 if is_private e field && not (encloses (ctx_env c r) (ctx_mi c) target) {
                     report c span ("member `" + shown + "." + field + "` is private") r
@@ -1450,7 +1503,7 @@ let check_member c r_ref shown field span r = {
                     // image is written, which is the whole point of compiling
                     // the program as a whole.
                     record (ctx_mi c) (ctx_source c) span
-                           [:member, r_ref, field, global_index e field] r
+                           (Meaning.member r_ref field (global_index e field)) r
                 }
                 else {
                     report_note c span
@@ -1464,11 +1517,11 @@ let check_member c r_ref shown field span r = {
             // A host module keeps its lookup until run time -- the host owns
             // the member table -- so what is recorded is the module's own
             // global and the field name to ask it for.
-            [:native, _, _] => record (ctx_mi c) (ctx_source c) span [:member, r_ref, field, ()] r,
+            Ref.native(_, _) => record (ctx_mi c) (ctx_source c) span (Meaning.member r_ref field ()) r,
             // A namespace holds modules, not members. Reaching here means the
             // name was used one level too shallow, as in `std.map` for
             // `std.list.map`.
-            [:group, prefix] =>
+            Ref.group(prefix) =>
                 report_note c span ("`" + prefix + "` is a package, not a module")
                     (group_contents (ctx_l c) prefix + "; `" + field
                      + "` would have to be inside one") r,
@@ -1476,7 +1529,7 @@ let check_member c r_ref shown field span r = {
         };
     if builtins.is_impure_name field {
         match r_ref {
-            [:dream, _] => note_effect c span ("the impure function `" + shown + "." + field + "`") r1,
+            Ref.dream(_) => note_effect c span ("the impure function `" + shown + "." + field + "`") r1,
             _ => note_effect c span ("the impure member `" + field + "`") r1,
         }
     }
@@ -1490,10 +1543,10 @@ let check_member c r_ref shown field span r = {
 /// `mod field { .. }` creates.
 let submodule c r target field =
     match alias_of (env_of c r target) field {
-        [:dream, inner] =>
+        Ref.dream(inner) =>
             if modules.module_name (modules.module_at (ctx_l c) inner)
                == modules.module_name (modules.module_at (ctx_l c) target) + "." + field {
-                dream_ref inner
+                Ref.dream inner
             }
             else { () },
         _ => (),
@@ -1511,12 +1564,12 @@ let rec as_namespace c r e =
                 () => (),
                 base =>
                     match list.head base {
-                        [:group, prefix] =>
+                        Ref.group(prefix) =>
                             match group_member (ctx_l c) prefix field {
                                 () => (),
                                 inner => [inner, list.nth 1 base + "." + field],
                             },
-                        [:dream, target] =>
+                        Ref.dream(target) =>
                             match submodule c r target field {
                                 () => (),
                                 inner => [inner, list.nth 1 base + "." + field],
@@ -1571,7 +1624,7 @@ let body_lints_warned c n ps body r =
 let not_a_value c m shown span r =
     report_note c span ("`" + shown + "` is a module, not a value")
         (match m {
-             [:group, _] => "use a module inside it, as in `" + shown + ".something.member`",
+             Ref.group(_) => "use a module inside it, as in `" + shown + ".something.member`",
              _ => "use one of its members, as in `" + shown + ".something`",
          }) r;
 
@@ -1600,11 +1653,11 @@ let check_name c name span r = {
             () =>
                 if has_global e name {
                     record (ctx_mi c) (ctx_source c) span
-                           [:global, ctx_mi c, name, global_index e name] r0
+                           (Meaning.global (ctx_mi c) name (global_index e name)) r0
                 }
                 else if builtins.is_builtin name {
                     primitive_named c name span
-                        (record (ctx_mi c) (ctx_source c) span [:builtin, name] r0)
+                        (record (ctx_mi c) (ctx_source c) span (Meaning.builtin name) r0)
                 }
                 else {
                     match only_of e name {
@@ -1615,7 +1668,7 @@ let check_name c name span r = {
                                 // A Dream module is a compile-time namespace,
                                 // not a value, so say that rather than claiming
                                 // the name does not exist.
-                                [:dream, _] => not_a_value c (dream_ref 0) name span r0,
+                                Ref.dream(_) => not_a_value c (Ref.dream 0) name span r0,
                                 _ => report c span
                                          ("cannot find `" + name + "` in this scope") r0,
                             },
@@ -1682,8 +1735,8 @@ let rec check_expr c e r =
         [:name, n, span] =>
             match staged_use r n {
                 () => check_name c n span r,
-                st => record_staged (ctx_mi c) (ctx_source c) span [:body, fuse.staged_body st]
-                          (check_expr c (fuse.staged_body st) r),
+                st => record_staged (ctx_mi c) (ctx_source c) span (Staging.body (fuse.Staged.body st))
+                          (check_expr c (fuse.Staged.body st) r),
             },
 
         [:field, obj, field, span] =>
@@ -1701,14 +1754,14 @@ let rec check_expr c e r =
                     // `math.deep` where `deep` is a submodule: a namespace one
                     // level further in, and still not a value.
                     let deeper = match m {
-                        [:dream, target] => submodule c r target field,
-                        [:group, prefix] => group_member (ctx_l c) prefix field,
+                        Ref.dream(target) => submodule c r target field,
+                        Ref.group(prefix) => group_member (ctx_l c) prefix field,
                         _ => (),
                     };
                     match deeper {
                         () =>
                             match m {
-                                [:group, prefix] =>
+                                Ref.group(prefix) =>
                                     report_note c span
                                         ("`" + shown + "` has no module `" + field + "`")
                                         (group_contents (ctx_l c) prefix) r,
@@ -1746,7 +1799,7 @@ let rec check_expr c e r =
             // block and no longer, so the enclosing frame's are put back after.
             let saved = staged_now r;
             let entered = stage_block c stmts
-                              (record (ctx_mi c) (ctx_source c) span [:block, impure_ok r] r);
+                              (record (ctx_mi c) (ctx_source c) span (Meaning.block (impure_ok r)) r);
             set_staged saved (pop_scope (check_block c stmts (push_scope entered)))
         },
 
@@ -1756,7 +1809,7 @@ let rec check_expr c e r =
         [:thunk, x, span] => {
             let started = begin_func "<thunk>" 0 false true false true span (ctx_source c) r;
             let fi = list.nth 1 started;
-            record (ctx_mi c) (ctx_source c) span [:thunk, fi]
+            record (ctx_mi c) (ctx_source c) span (Meaning.thunk fi)
                    (end_func fi (check_expr c x (list.head started)))
         },
 
@@ -1783,7 +1836,7 @@ let rec check_expr c e r =
             let started = begin_func "<lambda>" (list.length ps) false (impure_ok r) false false span (ctx_source c) r;
             let fi = list.nth 1 started;
             let bound = bind_params c ps (list.head started);
-            record (ctx_mi c) (ctx_source c) span [:closure, fi] (end_func fi (check_expr c body bound))
+            record (ctx_mi c) (ctx_source c) span (Meaning.closure fi) (end_func fi (check_expr c body bound))
         },
 
         // A compile-time expression becomes a function of its own, because
@@ -1795,7 +1848,7 @@ let rec check_expr c e r =
             let started = begin_func "<comp>" 0 impure impure false true span (ctx_source c) (set_frames [] r);
             let fi = list.nth 1 started;
             let walked = end_func fi (check_expr c x (list.head started));
-            record (ctx_mi c) (ctx_source c) span [:comp, fi, impure] (set_frames outer walked)
+            record (ctx_mi c) (ctx_source c) span (Meaning.compiled fi impure) (set_frames outer walked)
         },
         [:list, xs, _]  => list.fold (fn acc x -> check_expr c x acc) r xs,
         [:array, xs, _] => list.fold (fn acc x -> check_expr c x acc) r xs,
@@ -1811,7 +1864,7 @@ let rec check_expr c e r =
             let r1 = check_expr c scrutinee r;
             let scoped = push_scope r1;
             let held = bind_one (ctx_mi c) (ctx_source c) "_" span scoped;
-            let r2 = record (ctx_mi c) (ctx_source c) span [:match, list.nth 1 held] (list.head held);
+            let r2 = record (ctx_mi c) (ctx_source c) span (Meaning.subject (list.nth 1 held)) (list.head held);
             pop_scope (list.fold (fn acc arm -> check_arm c arm acc) r2 arms)
         },
 
@@ -1885,7 +1938,7 @@ let rec check_block c stmts r =
                                                      is_rec false span (ctx_source c) pre;
                             let fi = list.nth 1 started;
                             let bound = bind_params c ps (list.head started);
-                            record (ctx_mi c) (ctx_source c) span [:closure, fi]
+                            record (ctx_mi c) (ctx_source c) span (Meaning.closure fi)
                                    (end_func fi (check_expr c body
                                                     (lazy_accumulators_warned c n ps body bound)))
                         };
@@ -2128,7 +2181,7 @@ let inherited outer oe e = {
     let binds e n = has_global e n || only_of e n != ();
     let lendable n = not (is_hidden_name n);
     let values = list.fold (fn acc [n, _] ->
-        if lendable n && not (binds acc n) { with_only n [dream_ref outer, n, env_name oe] acc } else { acc })
+        if lendable n && not (binds acc n) { with_only n [Ref.dream outer, n, env_name oe] acc } else { acc })
         e (map.pairs (globals oe));
     let members = list.fold (fn acc [n, sel] ->
         if lendable n && not (binds acc n) { with_only n sel acc } else { acc })
@@ -2390,7 +2443,7 @@ let finish_walk declared r0 s_pre walked bs candidates = {
                 match wrapper_from walked by_global candidate {
                     () => acc,
                     found =>
-                        if target_global (list.head found) == gi { acc }
+                        if target_global (Wrapper.target found) == gi { acc }
                         else { acc.[gi => found] },
                 },
         }
@@ -2668,8 +2721,8 @@ let modules_under l = {
 /// as `prefix => true`: read off the environment whole, so that no way of
 /// naming a module is missed.
 let rec reached_modules v acc = match v {
-    [:dream, t] if type_of t == :integer => acc.[t => true],
-    [:group, p] if type_of p == :string => acc.[p => true],
+    Ref.dream(t) if type_of t == :integer => acc.[t => true],
+    Ref.group(p) if type_of p == :string => acc.[p => true],
     xs if type_of xs == :list => list.fold (fn a x -> reached_modules x a) acc xs,
     m if type_of m == :map => list.fold (fn a kv -> reached_modules (list.nth 1 kv) a) acc (map.pairs m),
     _ => acc,
@@ -2723,6 +2776,32 @@ let unit_key r = r.[:unit_key else ()];
 // variadic native means "everything at this call site", and an unsaturated
 // call, or one with arguments to spare, is left alone.
 
+/// One argument of a wrapper's body, as the call site will rebuild it: the
+/// caller's k-th argument, or a literal.
+union Arg {
+    param(index)
+    constant(expr)
+}
+
+/// What a wrapper's call becomes when it is not a call: one container
+/// operation (`:get` or `:set`) on the call's arguments, or a record made of
+/// them (see `constructor_of`).
+union Inline {
+    op(kind)
+    record(id, variant, rewritable, fields)
+}
+
+/// The call a wrapper stands for. `target` is the `Meaning` of the function
+/// called, or an `Inline`; `plan` is an `Arg` for each argument it is given;
+/// `arity` is how many the wrapper takes, which a call must pass exactly.
+struct Wrapper { target, plan : [Arg], arity : :integer }
+
+/// What a body can say about being a wrapper by itself (`wrapper_candidate`).
+union Candidate {
+    wrapper(found)
+    rename(target)
+}
+
 let literal_expr e =
     match e {
         [:int, _, _]   => true,
@@ -2750,9 +2829,8 @@ let param_slot params name = {
     go 0
 };
 
-/// One argument of a wrapper's body, as the call site will rebuild it:
-/// `[:param, k]` for "the caller's k-th argument", `[:const, expr]` for a
-/// literal, or `()` for anything that cannot be moved.
+/// One argument of a wrapper's body, as the call site will rebuild it: an
+/// `Arg`, or `()` for anything that cannot be moved.
 let wrapper_arg params used e =
     match e {
         [:name, n, _] => {
@@ -2762,9 +2840,9 @@ let wrapper_arg params used e =
             // two places, and the same work would be done twice where the
             // wrapper's frame did it once.
             else if list.contains k used { () }
-            else { [:param, k] }
+            else { Arg.param k }
         },
-        _ => if literal_expr e { [:const, e] } else { () },
+        _ => if literal_expr e { Arg.constant e } else { () },
     };
 
 let rec wrapper_args params used args acc =
@@ -2773,27 +2851,28 @@ let rec wrapper_args params used args acc =
         [a, ..rest] =>
             match wrapper_arg params used a {
                 () => (),
-                [:param, k] => wrapper_args params (list.cons k used) rest
-                                          (list.cons [:param, k] acc),
+                Arg.param(k) => wrapper_args params (list.cons k used) rest
+                                             (list.cons (Arg.param k) acc),
                 plan => wrapper_args params used rest (list.cons plan acc),
             },
     };
 
 /// Does this plan pass on every parameter? Each appears at most once already,
 /// so counting them is enough.
-let params_all_used plan arity = {
-    let passed = list.filter (fn step -> list.head step == :param) plan;
-    list.length passed == arity
-};
+let params_all_used plan arity =
+    list.count (fn step -> match step { Arg.param(_) => true, Arg.constant(_) => false }) plan == arity;
+
+/// The plan of a wrapper that passes every parameter on, in order.
+let passed_on arity = list.map (fn k -> Arg.param k) (list.range 0 arity);
 
 /// A target that can be named from another module's frame. A local or a capture
 /// cannot: it means something only inside the body it was written in.
 let wrapper_target_ok t =
     match t {
-        [:builtin, _] => true,
-        [:member, [:native, _, _], _, _] => true,
-        [:member, [:dream, _], _, _] => true,
-        [:global, _, _, _] => true,
+        Meaning.builtin(_) => true,
+        Meaning.member(Ref.native(_, _), _, _) => true,
+        Meaning.member(Ref.dream(_), _, _) => true,
+        Meaning.global(_, _, _) => true,
         _ => false,
     };
 
@@ -2801,12 +2880,12 @@ let wrapper_target_ok t =
 /// stands for itself.
 let target_global t =
     match t {
-        [:global, _, _, g] => g,
-        [:member, [:dream, _], _, g] => g,
+        Meaning.global(_, _, g) => g,
+        Meaning.member(Ref.dream(_), _, g) => g,
         _ => (),
     };
 
-/// The call this declaration stands for: `[target, plan, arity]`, or `()`.
+/// The call this declaration stands for: a `Wrapper`, or `()`.
 ///
 /// A record's or a union's constructor is filed here too, whatever it looks
 /// like, because the table is where lowering finds what a constructor makes:
@@ -2818,8 +2897,8 @@ let wrapper_of r mi source d =
     };
 
 /// A constructor, as `syntax.record` and `syntax.union_decl` write one --
-/// `_record_of :id variant #[fields..]` -- as `[[:record, id, variant,
-/// rewritable, fields], plan, arity]`.
+/// `_record_of :id variant #[fields..]` -- as a `Wrapper` whose target is an
+/// `Inline.record`.
 ///
 /// `rewritable` says a call may become the `record_make` itself, the way a
 /// wrapper's call becomes the call it stands for: only when its fields are
@@ -2834,9 +2913,8 @@ let constructor_of d =
             let passed = list.map (fn f -> match f { [:name, n, _] => n, _ => () }) fields;
             let rewritable = not (list.any ast.param_strict params)
                              && passed == list.map ast.param_name params;
-            [[:record, id, variant, rewritable, list.length fields],
-             list.map (fn k -> [:param, k]) (list.range 0 (list.length params)),
-             list.length params]
+            Wrapper.make (Inline.record id variant rewritable (list.length fields))
+                         (passed_on (list.length params)) (list.length params)
         },
         _ => (),
     };
@@ -2874,7 +2952,7 @@ let plain_wrapper_of r mi source d = {
                             // image -- the argument is dead, but the hole it
                             // leaves is not.
                             if params_all_used plan (list.length params) {
-                                [target, plan, list.length params]
+                                Wrapper.make target plan (list.length params)
                             } else { () },
                     }
                 }
@@ -2890,8 +2968,8 @@ let plain_wrapper_of r mi source d = {
     }
 };
 
-/// What a body can say about being a wrapper by itself: `[:wrapper, found]`
-/// when it is one outright, `[:rename, target]` when it is a bare name that may
+/// What a body can say about being a wrapper by itself: `Candidate.wrapper`
+/// when it is one outright, `Candidate.rename` when it is a bare name that may
 /// be a rename, or `()`. A rename needs the target's function to say its
 /// arity, and so the whole program's functions, which is why `wrapper_from`
 /// finishes it: a walk made in parts can only ask a body about its own name
@@ -2907,14 +2985,13 @@ let wrapper_candidate r b = {
                       [:field, _, _, span] => resolution r mi source span,
                       _ => (),
                   };
-                  if target_global target == () { () } else { [:rename, target] }
+                  if target_global target == () { () } else { Candidate.rename target }
               },
-        found => [:wrapper, found],
+        found => Candidate.wrapper found,
     }
 };
 
-/// The wrapper a candidate comes to, given every function: `[target, plan,
-/// arity]`, or `()`.
+/// The `Wrapper` a candidate comes to, given every function, or `()`.
 ///
 /// A declaration that only renames a function -- `let node_op = Node.op;`,
 /// `let nth = list.nth;` -- is the wrapper it amounts to, with every parameter
@@ -2934,26 +3011,26 @@ let wrapper_candidate r b = {
 /// arity is what says a call is saturated, and a global with no parameters is a
 /// value rather than a function.
 let wrapper_from r by_global candidate = match candidate {
-    [:wrapper, found] => found,
-    [:rename, target] => match by_global.[target_global target else ()] {
+    Candidate.wrapper(found) => found,
+    Candidate.rename(target) => match by_global.[target_global target else ()] {
         () => (),
         fi => {
             let arity = func_arity (func_at r fi);
             if arity < 1 { () }
-            else { [target, list.map (fn k -> [:param, k]) (list.range 0 arity), arity] }
+            else { Wrapper.make target (passed_on arity) arity }
         },
     },
     _ => (),
 };
 
-/// A wrapper whose body is one container operation: `[[:op, kind], plan, arity]`.
+/// A wrapper whose body is one container operation: its target an `Inline.op`.
 /// The plan is the operands in order, and each is held to the rule a call's
 /// arguments are: a parameter used exactly once, or a literal.
 let op_wrapper params kind operands =
     match wrapper_args params [] operands [] {
         () => (),
         plan =>
-            if params_all_used plan (list.length params) { [[:op, kind], plan, list.length params] }
+            if params_all_used plan (list.length params) { Wrapper.make (Inline.op kind) plan (list.length params) }
             else { () },
     };
 
@@ -2993,7 +3070,7 @@ let static_global es mi e =
             else {
                 match only_of e0 n {
                     [m, field, _] =>
-                        match m { [:dream, t] => global_index (es.[t else ()]) field, _ => () },
+                        match m { Ref.dream(t) => global_index (es.[t else ()]) field, _ => () },
                     _ => (),
                 }
             }
@@ -3002,7 +3079,7 @@ let static_global es mi e =
             match obj {
                 [:name, a, _] =>
                     match alias_of (es.[mi else ()]) a {
-                        [:dream, t] => global_index (es.[t else ()]) field,
+                        Ref.dream(t) => global_index (es.[t else ()]) field,
                         _ => (),
                     },
                 _ => (),
@@ -3087,7 +3164,7 @@ let callee_global c r e =
                 else {
                     match only_of e0 n {
                         [m, field, _] =>
-                            match m { [:dream, t] => global_index (env_of c r t) field, _ => () },
+                            match m { Ref.dream(t) => global_index (env_of c r t) field, _ => () },
                         _ => (),
                     }
                 }
@@ -3097,7 +3174,7 @@ let callee_global c r e =
                 () => (),
                 base =>
                     match list.head base {
-                        [:dream, t] => global_index (env_of c r t) field,
+                        Ref.dream(t) => global_index (env_of c r t) field,
                         _ => (),
                     },
             },
@@ -3106,13 +3183,23 @@ let callee_global c r e =
 
 let role_at c r e = match callee_global c r e { () => (), g => ((roles r)).[g else ()] };
 
-/// A pipeline this pass can fuse, as `[source tag, source arguments, seed,
-/// step, strict]`, or `()`.
+/// A pipeline this pass can fuse: what its source is, what its sink does with
+/// each element, and the stages between, in the order the elements meet them.
+struct Fusion {
+    source_tag
+    source_args
+    seed
+    step
+    strict : :bool
+    steps = []
+}
+
+/// The pipeline written as this call, as a `Fusion`, or `()`.
 let fuse_shape c r callee args =
     if not (spelled_like_a_role r callee) { () }
     else {
         match role_at c r callee {
-            [:sink, tag, n, strict] =>
+            fuse.Role.sink(tag, n, strict) =>
                 if list.length args != n { () } else { with_source c r tag strict args },
             _ => (),
         }
@@ -3131,11 +3218,11 @@ let stage_block c stmts r = {
     let found = fuse.staged_lets (fn body -> stage_shaped r body) stmts;
     if list.is_empty found { r }
     else {
-        let seen = list.fold (fn acc st -> acc.[(fuse.staged_name st) => st])
+        let seen = list.fold (fn acc st -> acc.[(fuse.Staged.name st) => st])
                              (staged_now r) found;
         set_staged seen
             (list.fold (fn acc st ->
-                record_staged (ctx_mi c) (ctx_source c) (fuse.staged_span st) :elided acc)
+                record_staged (ctx_mi c) (ctx_source c) (fuse.Staged.span st) Staging.elided acc)
              r found)
     }
 };
@@ -3194,9 +3281,9 @@ let with_source c r tag strict args =
                 match sink_step tag strict (list.nth 0 src) (list.nth 1 src) args {
                     () => (),
                     shape =>
-                        if reaches_frame r (list.nth 3 shape) { () }
+                        if reaches_frame r (Fusion.step shape) { () }
                         else if not (fuse.affordable steps (sink_uses shape)) { () }
-                        else { list.append shape [steps] }
+                        else { Fusion.set_steps steps shape }
                 }
             }
         },
@@ -3214,13 +3301,13 @@ let rec peel c r e acc fuel =
         match e {
             [:apply, callee, cargs, _] =>
                 match role_at c r callee {
-                    [:source, stag, n] =>
+                    fuse.Role.source(stag, n) =>
                         if list.length cargs != n { () } else { [[stag, cargs], acc] },
-                    [:step, stag, n] =>
+                    fuse.Role.step(stag, n) =>
                         if list.length cargs != n { () }
                         else {
                             peel c r (list.nth 1 cargs)
-                                 (list.cons [stag, list.nth 0 cargs] acc) (fuel - 1)
+                                 (list.cons (fuse.Stage.make stag (list.nth 0 cargs)) acc) (fuel - 1)
                         },
                     _ => (),
                 },
@@ -3231,7 +3318,7 @@ let rec peel c r e acc fuel =
             [:name, n, _] =>
                 match staged_use r n {
                     () => (),
-                    st => peel c r (fuse.staged_body st) acc (fuel - 1),
+                    st => peel c r (fuse.Staged.body st) acc (fuel - 1),
                 },
             _ => (),
         }
@@ -3242,23 +3329,23 @@ let rec peel c r e acc fuel =
 /// around it. The same three conditions a fold's function is held to, and for
 /// the same three reasons.
 let step_ok r st =
-    match fuse.step_lambda st {
+    match fuse.Stage.lambda st {
         [:lambda, ps, body, _] =>
             list.length ps == 1
             && ast.param_pattern (list.nth 0 ps) == ()
             // The loop inlines the body and has nowhere to put the force.
             && not (ast.param_strict (list.nth 0 ps))
             && not (list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body))
-            && not (reaches_frame r [:ast, body, ps]),
+            && not (reaches_frame r (fuse.Step.written body ps)),
         _ => false,
     };
 
 /// How many times the consumer reads each element -- which is how many times
 /// the stage in front of it has to be written out.
 let sink_uses shape =
-    match list.nth 3 shape {
-        [:ast, body, ps] => fuse.uses (ast.param_name (list.nth 1 ps)) body,
-        _ => 1,
+    match Fusion.step shape {
+        fuse.Step.written(body, ps) => fuse.uses (ast.param_name (list.nth 1 ps)) body,
+        fuse.Step.op(_) => 1,
     };
 
 /// What the accumulator does with each element: a lambda written at the call
@@ -3283,21 +3370,25 @@ let sink_step tag strict stag src_args args =
                     // no longer sequences -- see "what a body mentions" in
                     // `fuse`.
                     else if list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body) { () }
-                    else { [stag, src_args, [:expr, list.nth 1 args], [:ast, body, ps], strict] },
+                    else {
+                        Fusion.new stag src_args (fuse.Seed.written (list.nth 1 args))
+                                   (fuse.Step.written body ps) strict
+                    },
                 _ => (),
             },
-        op => [stag, src_args, [:int, if op == :mul { 1 } else { 0 }], [:op, op], strict],
+        op => Fusion.new stag src_args (fuse.Seed.number (if op == :mul { 1 } else { 0 }))
+                         (fuse.Step.op op) strict,
     };
 
 /// Does the step reach a name the frame around it holds? The loop is a global,
 /// which has no captures, so a body that does cannot become one.
 let reaches_frame r step =
     match step {
-        [:ast, body, ps] => {
+        fuse.Step.written(body, ps) => {
             let ours = list.map (fn p -> ast.param_name p) ps;
             list.any (fn n -> not (list.contains n ours) && in_scope r n) (fuse.mentioned body)
         },
-        _ => false,
+        fuse.Step.op(_) => false,
     };
 
 /// Take the next global for a loop nobody wrote: `[r, index]`.
@@ -3314,9 +3405,6 @@ let take_fused_global name fi r = {
 
 let record_fusion ctx source span p r =
     r.[:fusions => (((fusions r)).[(ref_key ctx source (ast.span_start span)) => p])];
-
-/// The plan's step, without the parameter list that only this pass needed.
-let step_for_plan step = match step { [:ast, body, _] => [:ast, body], s => s };
 
 /// Walk a pipeline that is going to be fused, and record the plan.
 ///
@@ -3335,15 +3423,11 @@ let step_for_plan step = match step { [:ast, body, _] => [:ast, body], s => s };
 let check_fused c e shape r = {
     let span = ast.span e;
     let args = list.nth 2 e;
-    let stag = list.nth 0 shape;
-    let src_args = list.nth 1 shape;
-    let seed = list.nth 2 shape;
-    let step = list.nth 3 shape;
-    let strict = list.nth 4 shape;
-    let steps = list.nth 5 shape;
+    let stag = Fusion.source_tag shape;
+    let seed = Fusion.seed shape;
 
     let r1 = check_chain c (list.last args) (check_expr c (list.nth 1 e) r);
-    let r2 = match seed { [:expr, x] => check_expr c x r1, _ => r1 };
+    let r2 = match seed { fuse.Seed.written(x) => check_expr c x r1, fuse.Seed.number(_) => r1 };
 
     let started = begin_func (fuse.loop_name stag) fuse.arity false (impure_ok r2)
                              true false span (ctx_source c) r2;
@@ -3352,11 +3436,11 @@ let check_fused c e shape r = {
     // frame is as wide as the loop's arity before a stage takes a slot.
     let reserved = reserve_slot (fuse.arity - 1) (list.head started);
 
-    let staged = walk_steps c steps (fuse.element_slot stag) [] [] reserved;
+    let staged = walk_steps c (Fusion.steps shape) (fuse.element_slot stag) [] [] reserved;
     let elem = list.nth 1 staged;
     let inner =
-        match step {
-            [:ast, body, ps] => {
+        match Fusion.step shape {
+            fuse.Step.written(body, ps) => {
                 let acc_p = list.nth 0 ps;
                 let elem_p = list.nth 1 ps;
                 let scoped = push_scope (list.nth 0 staged);
@@ -3367,13 +3451,13 @@ let check_fused c e shape r = {
                                  fuse.acc_slot (list.nth 1 acc_p) scoped);
                 pop_scope (check_expr c body bound)
             },
-            _ => list.nth 0 staged,
+            fuse.Step.op(_) => list.nth 0 staged,
         };
     let walked = end_func fi inner;
     let taken = take_fused_global (fuse.loop_name stag) fi walked;
     record_fusion (ctx_mi c) (ctx_source c) span
-        (fuse.plan span fi (list.nth 1 taken) [stag, src_args] seed
-                    (step_for_plan step) strict (list.nth 2 staged) (list.nth 3 staged) elem)
+        (fuse.Plan.make span fi (list.nth 1 taken) [stag, Fusion.source_args shape] seed
+                        (Fusion.step shape) (Fusion.strict shape) (list.nth 2 staged) (list.nth 3 staged) elem)
         (list.head taken)
 };
 
@@ -3399,12 +3483,12 @@ let rec walk_steps c steps slot guards subst r =
             let bound = bind_at (ctx_mi c) (ctx_source c) (ast.param_name p) slot
                                 (list.nth 1 p) scoped;
             let walked = pop_scope (check_expr c body bound);
-            if list.nth 0 st == :filter {
+            if fuse.Stage.tag st == :filter {
                 walk_steps c rest slot (list.append guards [body]) subst walked
             }
             else {
                 let fresh = bind_one (ctx_mi c) (ctx_source c) "_"
-                                     (ast.span (fuse.step_lambda st)) walked;
+                                     (ast.span (fuse.Stage.lambda st)) walked;
                 walk_steps c rest (list.nth 1 fresh) guards
                            (list.append subst [[list.nth 1 fresh, body]]) (list.head fresh)
             }
@@ -3418,7 +3502,7 @@ let rec check_chain c e r =
     match e {
         [:apply, callee, cargs, _] =>
             match role_at c r callee {
-                [:step, _, _] => check_chain c (list.nth 1 cargs) (check_expr c callee r),
+                fuse.Role.step(_, _) => check_chain c (list.nth 1 cargs) (check_expr c callee r),
                 // The source: its arguments are evaluated where they were
                 // written, so they are resolved in this frame like any other.
                 _ => list.fold (fn acc a -> check_expr c a acc) (check_expr c callee r) cargs,
@@ -3430,7 +3514,7 @@ let rec check_chain c e r =
         // bought -- nothing it names is bound again in between, so the two
         // positions resolve alike.
         [:name, n, _] =>
-            match staged_use r n { () => r, st => check_chain c (fuse.staged_body st) r },
+            match staged_use r n { () => r, st => check_chain c (fuse.Staged.body st) r },
         _ => r,
     };
 
@@ -3793,45 +3877,51 @@ when test {
         // working it out again -- and what a language server will read to
         // answer "what is this, and where does it come from".
         test.case "a parameter resolves to a slot in its own frame"
-            $( test.eq! [:local, 0]
+            $( test.eq! 0
                         { let src = "let f x = x;";
-                          let got = at (resolved! src) 0 0 (str.find "x;" src);
-                          [list.nth 0 got, list.nth 1 got] } ),
+                          match at (resolved! src) 0 0 (str.find "x;" src) {
+                              Meaning.local(slot, _) => slot,
+                              other => other,
+                          } } ),
         test.case "a local records where it was bound"
             $( test.eq! true
                         { let src = "let f x = x;";
-                          let got = at (resolved! src) 0 0 (str.find "x;" src);
-                          ast.span_start (list.nth 2 got) == str.find "x =" src } ),
+                          match at (resolved! src) 0 0 (str.find "x;" src) {
+                              Meaning.local(_, bound) => ast.span_start bound == str.find "x =" src,
+                              _ => false,
+                          } } ),
         test.case "a second local gets the next slot"
-            $( test.eq! [[:local, 0], [:local, 1]]
+            $( test.eq! [0, 1]
                         { let src = "let f a b = a + b;";
                           let r = resolved! src;
-                          list.map (fn o -> { let g = at r 0 0 o; [list.nth 0 g, list.nth 1 g] })
+                          list.map (fn o -> match at r 0 0 o { Meaning.local(slot, _) => slot, other => other })
                                    [str.find "a +" src, str.find "b;" src] } ),
         test.case "a global resolves to its module and its index"
-            $( test.eq! [:global, 0, "a", 0]
+            $( test.eq! (Meaning.global 0 "a" 0)
                         { let src = "let a = 1;\nlet f = a;";
                           at (resolved! src) 0 0 (str.find "a;" src) } ),
         test.case "a builtin resolves as a builtin"
-            $( test.eq! [:builtin, "len"]
+            $( test.eq! (Meaning.builtin "len")
                         { let src = "let f xs = len xs;";
                           at (resolved! src) 0 0 (str.find "len" src) } ),
         test.case "a host module's member is recorded with the module it came from"
-            $( test.eq! [:member, [:native, "std.io", 0], "stdout!", ()]
+            $( test.eq! (Meaning.member (Ref.native "std.io" 0) "stdout!" ())
                         { let src = "import std.io;\nlet f! x = io.stdout! x;";
                           at (resolved! src) 0 0 (str.find "io.stdout!" src) } ),
 
         // --- captures ---
         test.case "a name from the enclosing function becomes a capture"
-            $( test.eq! [:capture, 0]
+            $( test.eq! 0
                         { let src = "let f x = fn y -> x;";
-                          let g = at (resolved! src) 0 0 (str.find "x;" src);
-                          [list.nth 0 g, list.nth 1 g] } ),
+                          match at (resolved! src) 0 0 (str.find "x;" src) {
+                              Meaning.capture(index, _) => index,
+                              other => other,
+                          } } ),
         test.case "the lambda records what it captures and where from"
-            $( test.eq! [[:local, 0]]
+            $( test.eq! [Capture.local 0]
                         (func_captures (list.nth 1 (funcs (resolved! "let f x = fn y -> x;")))) ),
         test.case "a capture is threaded through every frame in between"
-            $( test.eq! [[[:local, 0]], [[:capture, 0]]]
+            $( test.eq! [[Capture.local 0], [Capture.outer 0]]
                         { let r = resolved! "let f a = fn b -> fn c -> a;";
                           [func_captures (list.nth 1 (funcs r)),
                            func_captures (list.nth 2 (funcs r))] } ),
@@ -3865,21 +3955,21 @@ when test {
                         { let r = resolved! "let f = $( 1 );";
                           [list.length (funcs r), func_name (list.nth 1 (funcs r))] } ),
         test.case "a lambda is recorded at the span that made it"
-            $( test.eq! [:closure, 1]
+            $( test.eq! (Meaning.closure 1)
                         { let src = "let f = fn x -> x;";
                           at (resolved! src) 0 0 (str.find "fn x" src) } ),
 
         // --- wrappers ---
         test.case "a body that is one get of its parameters is a wrapper"
-            $( test.eq! [:op, :get]
+            $( test.eq! (Inline.op :get)
                         (match map.pairs (wrappers (resolved! "let get m k d = m.[k else d];")) {
-                             [[_, w]] => list.head w,
+                             [[_, w]] => Wrapper.target w,
                              other => other,
                          }) ),
         test.case "so is one set"
-            $( test.eq! [:op, :set]
+            $( test.eq! (Inline.op :set)
                         (match map.pairs (wrappers (resolved! "let put m k v = m.[k => v];")) {
-                             [[_, w]] => list.head w,
+                             [[_, w]] => Wrapper.target w,
                              other => other,
                          }) ),
         // The rule a call's arguments are held to: a parameter used twice would
@@ -3893,12 +3983,12 @@ when test {
                         (list.map (fn d -> list.nth 2 d)
                                   (module_defs (resolved! "let a = 1;\nlet b = 2;") 0)) ),
         test.case "a module's globals are numbered from where the module starts"
-            $( test.eq! [[:global, 0, "a", 0], [:global, 0, "b", 1]]
+            $( test.eq! [Meaning.global 0 "a" 0, Meaning.global 0 "b" 1]
                         { let src = "let a = 1;\nlet b = a;\nlet f = b;";
                           let r = resolved! src;
                           [at r 0 0 (str.find "a;\nlet f" src), at r 0 0 (str.find "b;" src)] } ),
         test.case "an imported host module takes a global of its own"
-            $( test.eq! [:global, 0, "io", 0]
+            $( test.eq! (Meaning.global 0 "io" 0)
                         { let src = "import std.io;\nlet f = io;";
                           // The use, not the mention inside the import.
                           at (resolved! src) 0 0 (str.find "f = io" src + 4) } ),

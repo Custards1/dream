@@ -323,7 +323,7 @@ let rendered b = diag.render_all (files b) (diags b);
 /// -- an alias of a module -- has no parameters to describe.
 let param_masks : ir.Image -> %{ :integer => :integer } -> [[:integer, :integer]];
 let param_masks img by_global = {
-    let globals = img.[:globals else []];
+    let globals = ir.Image.globals img;
     let found = list.fold (fn acc [gi, mask] -> {
         let g = globals.[gi else ()];
         if g == () || g.[:kind else ir.global_module] != ir.global_function { acc }
@@ -345,10 +345,11 @@ let image b = {
     let built = if not (Options.optimize o) { arena }
                 else { match Build.shared b { () => optimizer.optimize arena, done => done } };
     let hints f = if Options.types o { param_masks built (f (Build.facts b)) } else { [] };
-    built.[:payloads => Options.payloads o]
-         .[:payload_names => Options.payload_names o]
-         .[:float_params => hints typecheck.Analysis.float_params]
-         .[:integer_params => hints typecheck.Analysis.integer_params]
+    built
+        |> ir.Image.set_payloads (Options.payloads o)
+        |> ir.Image.set_payload_names (Options.payload_names o)
+        |> ir.Image.set_float_params (hints typecheck.Analysis.float_params)
+        |> ir.Image.set_integer_params (hints typecheck.Analysis.integer_params)
 };
 
 /// The image as the bytes a `.dream` file holds, payload excepted.

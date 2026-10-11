@@ -399,7 +399,7 @@ let type_ref k mi n = match env_of k mi {
     () => (),
     e => {
         let as_module = match scope.alias_of e n {
-            [:dream, target] => module_type k target,
+            scope.Ref.dream(target) => module_type k target,
             _ => (),
         };
         match as_module {
@@ -428,11 +428,11 @@ let module_type k target = match env_of k target {
 /// `union Setting` in `cc` is the module the union became, and the global of
 /// the same name beside it holds a run-time description this pass cannot read.
 let member_type k r_ref field = match r_ref {
-    [:dream, target] => match env_of k target {
+    scope.Ref.dream(target) => match env_of k target {
         () => (),
         e => {
             let as_module = match scope.alias_of e field {
-                [:dream, inner] => module_type k inner,
+                scope.Ref.dream(inner) => module_type k inner,
                 _ => (),
             };
             match as_module {
@@ -449,14 +449,14 @@ let member_type k r_ref field = match r_ref {
 let rec dotted_module k mi e = match e {
     [:name, n, _] => match env_of k mi {
         () => (),
-        env => match scope.alias_of env n { [:dream, t] => t, _ => () },
+        env => match scope.alias_of env n { scope.Ref.dream(t) => t, _ => () },
     },
     [:field, obj, f, _] => match dotted_module k mi obj {
         () => (),
         t => match env_of k t {
             () => (),
             env => match scope.alias_of env f {
-                [:dream, inner] =>
+                scope.Ref.dream(inner) =>
                     if modules.module_name (modules.module_at (Checker.l k) inner)
                        == modules.module_name (modules.module_at (Checker.l k) t) + "." + f { inner }
                     else { () },
@@ -475,7 +475,7 @@ let type_dotted k ev e args = match e {
                 std_types f args
             }
             else {
-                match member_type k (scope.dream_ref t) f {
+                match member_type k (scope.Ref.dream t) f {
                     () => :any,
                     gi => named_type k gi args,
                 }
@@ -808,9 +808,9 @@ let builtin_type n = match n {
 /// What a name means here. The resolver already decided which declaration a
 /// name is; this only asks that declaration's signature.
 let name_type k h n sp = match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
-    [:global, _, _, gi] => global_type k h gi,
-    [:member, _, _, gi] => if gi == () { :any } else { global_type k h gi },
-    [:builtin, b] => builtin_type b,
+    scope.Meaning.global(_, _, gi) => global_type k h gi,
+    scope.Meaning.member(_, _, gi) => if gi == () { :any } else { global_type k h gi },
+    scope.Meaning.builtin(b) => builtin_type b,
     _ => (Here.locals h).[n else :any],
 };
 
@@ -1475,8 +1475,8 @@ let rec resolved_pattern k h p = match p {
     [:record_p, ctor, fields, sp] => {
         let at = match ctor { [:name, _, s] => s, [:field, _, _, s] => s, _ => () };
         let id = match scope.resolution (res k) (Here.mi h) (Here.source h) at {
-            [:global, _, _, g] => constructor_id k g,
-            [:member, [:dream, _], _, g] => constructor_id k g,
+            scope.Meaning.global(_, _, g) => constructor_id k g,
+            scope.Meaning.member(scope.Ref.dream(_), _, g) => constructor_id k g,
             _ => (),
         };
         [:ctor_p, id, list.map (fn f -> resolved_pattern k h f) fields, sp]
@@ -1496,13 +1496,28 @@ let rec resolved_pattern k h p = match p {
 /// is held to it -- a name, as exhaustiveness asks -- and only a pattern that
 /// fails every member, so an arm left over after the others covered
 /// everything, `_ =>`, is not one: a wildcard fits anything.
+///
+/// Nor is an arm for `()`. A type the checker inferred for an unsigned
+/// function has had its `()` taken out (`answer_type`), because `()` is
+/// "nothing there" and a body answering it on one path is not promising a
+/// union. So `match group_member .. { () => .., inner => .. }`, against a
+/// function that answers a `Ref` or nothing, is the test that the answer was
+/// something -- and saying it can never be `()` is the one thing about it that
+/// is certainly wrong.
 let dead_arm k h st p ds = match st {
+    _ if tests_for_unit p => ds,
     Ty.named(shown, _, _) => {
         let ms = flat_members k st;
         if list.is_empty ms || list.any (fn m -> may_match k p m) ms { ds }
         else { bad h (ast.span p) ("this arm can never match: a `" + shown + "` is not " + pattern_kind p) ds }
     },
     _ => ds,
+};
+
+let rec tests_for_unit p = match p {
+    [:literal, [:unit, _], _] => true,
+    [:as_p, inner, _, _, _] => tests_for_unit inner,
+    _ => false,
 };
 
 let pattern_kind p = match p {
@@ -1518,7 +1533,7 @@ let pattern_kind p = match p {
 /// The id the constructor global `g` stamps on what it makes, from the
 /// resolver's wrappers (`scope.constructor_of`), or `()`.
 let constructor_id k g = match (scope.wrappers (res k)).[g else ()] {
-    [[:record, id, _, _, _], _, _] => id,
+    scope.Wrapper(scope.Inline.record(id, _, _, _), _, _) => id,
     _ => (),
 };
 
@@ -1726,12 +1741,51 @@ let keeping k t keep = {
 };
 
 /// What is left of `t` for the arms below one whose pattern is `p`: every
-/// member `p` certainly matches is gone. Unchanged -- the same value, still
+/// member `p` certainly matches is gone, and every member it matches part of
+/// is cut down to the rest (`left_of`). Unchanged -- the same value, still
 /// folded if it was a named type -- when nothing is.
 let without k t p = {
     let ms = flat_members k t;
-    let kept = list.filter (fn m -> not (covers p (peel k m 8))) ms;
-    if list.length kept == list.length ms { t } else { union_of kept }
+    let kept = list.concat (list.map (fn m -> left_of k p m) ms);
+    if kept == ms { t } else { union_of kept }
+};
+
+/// What is left of one member `m` once `p` has taken what it certainly
+/// matches: nothing, when it takes all of it; and for a tuple taken apart by a
+/// list pattern that takes *everything* at every position but one, the tuple
+/// with that position cut down by the pattern there. So after
+///
+///     match split_root spec { [(), dir] => .., [n, dir] => .. }
+///
+/// the second arm's `n` is a `:string` and not `:string | :unit`: a pair whose
+/// first element was `()` went to the first arm, whatever its second was.
+/// With two positions open the pattern takes a corner of the product, which
+/// is no tuple, so the member is left whole -- which only ever narrows less.
+let left_of k p m = {
+    let pm = peel k m 8;
+    if covers p pm { [] }
+    else {
+        match [p, pm] {
+            [[:list_p, items, (), _], Ty.tuple(ts)] if list.length items == list.length ts =>
+                match list.filter (fn j -> not (takes_all (list.nth j items))) (list.range 0 (list.length ts)) {
+                    [j] => match without k (list.nth j ts) (list.nth j items) {
+                        same if same == list.nth j ts => [m],
+                        :never => [],
+                        rest => [Ty.tuple (list.take j ts + [rest] + list.drop (j + 1) ts)],
+                    },
+                    _ => [m],
+                },
+            _ => [m],
+        }
+    }
+};
+
+/// A pattern that matches anything at all: a name or `_`, under any `as`.
+let rec takes_all p = match p {
+    [:bind, _, _] => true,
+    [:wildcard, _] => true,
+    [:as_p, inner, _, _, _] => takes_all inner,
+    _ => false,
 };
 
 /// What `t` is in an arm whose pattern is `p`: the members `p` could match.
@@ -1890,9 +1944,9 @@ let callee_probe k h f = match f {
 };
 
 let resolved_probe k h sp = match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
-    [:builtin, "type_of"] => :type_of,
-    [:global, _, _, gi] => if (Checker.heads k).[gi else false] { :head } else { () },
-    [:member, _, _, gi] if gi != () => if (Checker.heads k).[gi else false] { :head } else { () },
+    scope.Meaning.builtin("type_of") => :type_of,
+    scope.Meaning.global(_, _, gi) => if (Checker.heads k).[gi else false] { :head } else { () },
+    scope.Meaning.member(_, _, gi) if gi != () => if (Checker.heads k).[gi else false] { :head } else { () },
     _ => (),
 };
 
@@ -2030,10 +2084,10 @@ let narrow_at k h n sp x f local = if str.ends_with "!" n { h } else {
     if nt == t { h }
     else {
         match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
-            [:global, _, _, gi] => Here.set_narrowed ((Here.narrowed h).[gi => nt]) h,
-            [:member, _, _, gi] if gi != () => Here.set_narrowed ((Here.narrowed h).[gi => nt]) h,
-            [:member, _, _, _] => h,
-            [:builtin, _] => h,
+            scope.Meaning.global(_, _, gi) => Here.set_narrowed ((Here.narrowed h).[gi => nt]) h,
+            scope.Meaning.member(_, _, gi) if gi != () => Here.set_narrowed ((Here.narrowed h).[gi => nt]) h,
+            scope.Meaning.member(_, _, _) => h,
+            scope.Meaning.builtin(_) => h,
             _ => if local { with_local n nt h } else { h },
         }
     }
@@ -2193,9 +2247,9 @@ let element_misses p t = match p {
 // to answer `true` for the value to be accepted, as a formula over them --
 //
 //     true | false                  settled here, from the structure alone
-//     [:pred, gi, path, datum]      apply the predicate at `path` inside global
+//     Formula.pred(gi, path, datum) apply the predicate at `path` inside global
 //                                   `gi`'s value to the datum
-//     [:all, [f, ..]]  [:any, [f, ..]]
+//     Formula.all([f, ..])  Formula.any([f, ..])
 //
 // -- because which predicates matter depends on the structure: a union is
 // accepted by *any* member, so `Port | :unit` holds a `()` without running
@@ -2219,59 +2273,62 @@ let element_misses p t = match p {
 // compiled.
 
 /// A compile-time value as the checker holds it. Scalars are themselves; the
-/// rest are tagged, so that an atom the compiler never interned and a list
-/// that happens to begin with one cannot be confused:
-///
-///     [:atom_d, name]   [:list_d, [d, ..]]   [:array_d, [d, ..]]   [:map_d, [[k, v], ..]]
-///     [:record_d, id, variant, [d, ..]]   a value of a `group`, `struct` or union
-///
-/// A value read from syntax is spelled this way directly, and one a `comp`
-/// produced is converted, so the two meet on equal terms.
+/// rest are a `Datum`, so that an atom the compiler never interned and a list
+/// that happens to begin with one cannot be confused. A value read from syntax
+/// is spelled this way directly, and one a `comp` produced is converted, so
+/// the two meet on equal terms.
+union Datum {
+    atom(name)
+    list(items)
+    array(items)
+    // `[key, value]` per entry, each a datum.
+    map(pairs)
+    // A value of a `group`, `struct` or union.
+    record(id, variant, fields)
+}
+
 let atom_name v = str.slice 1 (str.byte_length (to_string v) - 1) (to_string v);
 
 let rec datum_of v = match type_of v {
-    :atom => [:atom_d, atom_name v],
-    :list => [:list_d, list.map (fn x -> datum_of x) v],
-    :array => [:array_d, list.map (fn x -> datum_of x) (array.to_list v)],
-    :map => [:map_d, list.map (fn kv -> [datum_of (list.nth 0 kv), datum_of (list.nth 1 kv)]) (map.pairs v)],
+    :atom => Datum.atom (atom_name v),
+    :list => Datum.list (list.map (fn x -> datum_of x) v),
+    :array => Datum.array (list.map (fn x -> datum_of x) (array.to_list v)),
+    :map => Datum.map (list.map (fn kv -> [datum_of (list.nth 0 kv), datum_of (list.nth 1 kv)]) (map.pairs v)),
     _ => match types.record_id v {
         () => v,
-        id => [:record_d, atom_name id, types.is_variant v, list.map (fn x -> datum_of x) (types.record_fields v)],
+        id => Datum.record (atom_name id) (types.is_variant v) (list.map (fn x -> datum_of x) (types.record_fields v)),
     },
 };
 
 /// The type of exactly this value.
-let rec datum_type d = match type_of d {
-    :integer => Ty.lit :integer d,
-    :float => Ty.lit :float d,
-    :string => Ty.lit :string d,
-    :char => Ty.lit :char d,
-    :bool => Ty.lit :bool d,
-    :unit => :unit,
-    :list => match d {
-        [:atom_d, n] => Ty.lit :atom n,
-        [:list_d, xs] => Ty.tuple (list.map (fn x -> datum_type x) xs),
-        [:array_d, xs] => Ty.array_t (list.map (fn x -> datum_type x) xs),
-        [:map_d, ps] => Ty.record (list.map (fn p -> [datum_type (list.nth 0 p), datum_type (list.nth 1 p)]) ps),
-        [:record_d, id, _, xs] => Ty.nominal id (list.map (fn x -> datum_type x) xs),
-        _ => :any,
+let rec datum_type d = match d {
+    Datum.atom(n) => Ty.lit :atom n,
+    Datum.list(xs) => Ty.tuple (list.map (fn x -> datum_type x) xs),
+    Datum.array(xs) => Ty.array_t (list.map (fn x -> datum_type x) xs),
+    Datum.map(ps) => Ty.record (list.map (fn p -> [datum_type (list.nth 0 p), datum_type (list.nth 1 p)]) ps),
+    Datum.record(id, _, xs) => Ty.nominal id (list.map (fn x -> datum_type x) xs),
+    _ => match type_of d {
+        :integer => Ty.lit :integer d,
+        :float => Ty.lit :float d,
+        :string => Ty.lit :string d,
+        :char => Ty.lit :char d,
+        :bool => Ty.lit :bool d,
+        kind => kind,
     },
-    kind => kind,
 };
 
-let rec show_datum d = match type_of d {
-    :string => "\"" + d + "\"",
-    :char => "'" + str.of_chars [d] + "'",
-    :list => match d {
-        [:atom_d, n] => ":" + n,
-        [:list_d, xs] => "[" + str.join_str ", " (list.map (fn x -> show_datum x) xs) + "]",
-        [:array_d, xs] => "#[" + str.join_str ", " (list.map (fn x -> show_datum x) xs) + "]",
-        [:map_d, ps] => "%{" + str.join_str ", " (list.map (fn p ->
-                            show_datum (list.nth 0 p) + " => " + show_datum (list.nth 1 p)) ps) + "}",
-        [:record_d, id, _, xs] => shown_id id + "(" + str.join_str ", " (list.map (fn x -> show_datum x) xs) + ")",
+let rec show_datum d = match d {
+    Datum.atom(n) => ":" + n,
+    Datum.list(xs) => "[" + str.join_str ", " (list.map (fn x -> show_datum x) xs) + "]",
+    Datum.array(xs) => "#[" + str.join_str ", " (list.map (fn x -> show_datum x) xs) + "]",
+    Datum.map(ps) => "%{" + str.join_str ", " (list.map (fn p ->
+                        show_datum (list.nth 0 p) + " => " + show_datum (list.nth 1 p)) ps) + "}",
+    Datum.record(id, _, xs) => shown_id id + "(" + str.join_str ", " (list.map (fn x -> show_datum x) xs) + ")",
+    _ => match type_of d {
+        :string => "\"" + d + "\"",
+        :char => "'" + str.of_chars [d] + "'",
         _ => to_string d,
     },
-    _ => to_string d,
 };
 
 /// A datum short enough to quote in a message. A `comp` may produce a table of
@@ -2295,16 +2352,16 @@ let comp_datum k h sp = {
 let rec syntax_datum k h e = match e {
     [:int, v, _] => [v],
     [:str, v, _] => [v],
-    [:atom, n, _] => [[:atom_d, n]],
+    [:atom, n, _] => [Datum.atom n],
     [:float, v, _] => [v],
     [:char, v, _] => [v],
     [:bool, v, _] => [v],
     [:unit, _] => [()],
     [:unary, :neg, [:int, v, _], _] => [0 - v],
     [:unary, :neg, [:float, v, _], _] => [0.0 - v],
-    [:list, xs, _] => data_of k h xs (fn ds -> [:list_d, ds]),
-    [:array, xs, _] => data_of k h xs (fn ds -> [:array_d, ds]),
-    [:map, kvs, _] => data_of k h (list.concat kvs) (fn ds -> [:map_d, chunk_pairs ds]),
+    [:list, xs, _] => data_of k h xs (fn ds -> Datum.list ds),
+    [:array, xs, _] => data_of k h xs (fn ds -> Datum.array ds),
+    [:map, kvs, _] => data_of k h (list.concat kvs) (fn ds -> Datum.map (chunk_pairs ds)),
     [:comp, _, _, sp] => comp_datum k h sp,
     _ => (),
 };
@@ -2324,11 +2381,11 @@ let rec chunk_pairs xs = match xs {
 /// because that is the type it was given. A record is not one, because a
 /// record type admits keys it does not name.
 let rec singleton t = match t {
-    Ty.lit(:atom, n) => [[:atom_d, n]],
+    Ty.lit(:atom, n) => [Datum.atom n],
     Ty.lit(_, v) => [v],
     :unit => [()],
-    Ty.tuple(ts) => all_singletons ts (fn ds -> [:list_d, ds]),
-    Ty.array_t(ts) => all_singletons ts (fn ds -> [:array_d, ds]),
+    Ty.tuple(ts) => all_singletons ts (fn ds -> Datum.list ds),
+    Ty.array_t(ts) => all_singletons ts (fn ds -> Datum.array ds),
     _ => (),
 };
 
@@ -2337,18 +2394,26 @@ let all_singletons ts wrap = {
     if list.any (fn g -> g == ()) got { () } else { [wrap (list.map (fn g -> list.head g) got)] }
 };
 
-/// Settled formulas stay bools, so a contract that needs no predicate costs
+/// What has to hold for a known value to be accepted, where a predicate
+/// decides it. A formula with no predicate left in it is settled, and is
+/// `true` or `false` instead: so a contract that needs no predicate costs
 /// nothing to recognise and nothing to discard.
+union Formula {
+    pred(global, path, datum)
+    all(formulas)
+    any(formulas)
+}
+
 let f_all fs = {
     let kept = list.filter (fn f -> f != true) fs;
     if list.contains false kept { false }
-    else { match kept { [] => true, [one] => one, _ => [:all, kept] } }
+    else { match kept { [] => true, [one] => one, _ => Formula.all kept } }
 };
 
 let f_any fs = {
     let kept = list.filter (fn f -> f != false) fs;
     if list.contains true kept { true }
-    else { match kept { [] => false, [one] => one, _ => [:any, kept] } }
+    else { match kept { [] => false, [one] => one, _ => Formula.any kept } }
 };
 
 let static_fit k d t = fits k (datum_type d) t;
@@ -2375,30 +2440,30 @@ let rec refinement k d t n =
             },
             Ty.one_of(ts) => f_any (list.map (fn m -> refinement k d m (n - 1)) ts),
             Ty.list_of(e) => match d {
-                [:list_d, xs] => f_all (list.map (fn x -> refinement k x e (n - 1)) xs),
+                Datum.list(xs) => f_all (list.map (fn x -> refinement k x e (n - 1)) xs),
                 _ => static_fit k d t,
             },
             Ty.array_of(e) => match d {
-                [:array_d, xs] => f_all (list.map (fn x -> refinement k x e (n - 1)) xs),
+                Datum.array(xs) => f_all (list.map (fn x -> refinement k x e (n - 1)) xs),
                 _ => static_fit k d t,
             },
             Ty.tuple(ts) => match d {
-                [:list_d, xs] if list.length xs == list.length ts =>
+                Datum.list(xs) if list.length xs == list.length ts =>
                     f_all (list.map (fn p -> refinement k (list.nth 0 p) (list.nth 1 p) (n - 1)) (list.zip xs ts)),
                 _ => static_fit k d t,
             },
             Ty.array_t(ts) => match d {
-                [:array_d, xs] if list.length xs == list.length ts =>
+                Datum.array(xs) if list.length xs == list.length ts =>
                     f_all (list.map (fn p -> refinement k (list.nth 0 p) (list.nth 1 p) (n - 1)) (list.zip xs ts)),
                 _ => static_fit k d t,
             },
             Ty.map_of(kt, vt) => match d {
-                [:map_d, ps] => f_all (list.map (fn p -> f_all [refinement k (list.nth 0 p) kt (n - 1),
+                Datum.map(ps) => f_all (list.map (fn p -> f_all [refinement k (list.nth 0 p) kt (n - 1),
                                                                 refinement k (list.nth 1 p) vt (n - 1)]) ps),
                 _ => static_fit k d t,
             },
             Ty.record(fields) => match d {
-                [:map_d, ps] => f_all (list.cons (static_fit k d t) (list.map (fn f ->
+                Datum.map(ps) => f_all (list.cons (static_fit k d t) (list.map (fn f ->
                     match entry_typed ps (list.nth 0 f) {
                         () => true,
                         [v] => refinement k v (list.nth 1 f) (n - 1),
@@ -2420,35 +2485,35 @@ let rec refine_desc k d mi desc gi path n =
         match desc {
             [:list, [[:atom, tag, _], ..parts], _] => match [tag, parts] {
                 ["refine", [base, _]] =>
-                    f_all [refine_desc k d mi base gi (path + [1]) (n - 1), [:pred, gi, path + [2], d]],
+                    f_all [refine_desc k d mi base gi (path + [1]) (n - 1), Formula.pred gi (path + [2]) d],
                 ["named", [_, inner]] => refine_desc k d mi inner gi (path + [2]) (n - 1),
                 ["union", [[:list, ts, _]]] =>
                     f_any (list.map (fn it -> refine_desc k d mi (list.nth 1 it) gi (path + [1, list.nth 0 it]) (n - 1))
                                     (list.enumerate ts)),
                 ["list_of", [e]] => match d {
-                    [:list_d, xs] => f_all (list.map (fn x -> refine_desc k x mi e gi (path + [1]) (n - 1)) xs),
+                    Datum.list(xs) => f_all (list.map (fn x -> refine_desc k x mi e gi (path + [1]) (n - 1)) xs),
                     _ => false,
                 },
                 ["array_of", [e]] => match d {
-                    [:array_d, xs] => f_all (list.map (fn x -> refine_desc k x mi e gi (path + [1]) (n - 1)) xs),
+                    Datum.array(xs) => f_all (list.map (fn x -> refine_desc k x mi e gi (path + [1]) (n - 1)) xs),
                     _ => false,
                 },
                 ["tuple", [[:list, ts, _]]] => match d {
-                    [:list_d, xs] if list.length xs == list.length ts => positions k xs ts mi gi (path + [1]) n,
+                    Datum.list(xs) if list.length xs == list.length ts => positions k xs ts mi gi (path + [1]) n,
                     _ => false,
                 },
                 ["array", [[:list, ts, _]]] => match d {
-                    [:array_d, xs] if list.length xs == list.length ts => positions k xs ts mi gi (path + [1]) n,
+                    Datum.array(xs) if list.length xs == list.length ts => positions k xs ts mi gi (path + [1]) n,
                     _ => false,
                 },
                 ["map_of", [kt, vt]] => match d {
-                    [:map_d, ps] => f_all (list.map (fn p ->
+                    Datum.map(ps) => f_all (list.map (fn p ->
                         f_all [refine_desc k (list.nth 0 p) mi kt gi (path + [1]) (n - 1),
                                refine_desc k (list.nth 1 p) mi vt gi (path + [2]) (n - 1)]) ps),
                     _ => false,
                 },
                 ["record", [[:map, fields, _]]] => match d {
-                    [:map_d, ps] => f_all (list.map (fn f -> match syntax_datum k (here mi 0 "") (list.nth 0 f) {
+                    Datum.map(ps) => f_all (list.map (fn f -> match syntax_datum k (here mi 0 "") (list.nth 0 f) {
                         () => whole,
                         [key] => match entry_for ps key {
                             () => false,
@@ -2481,15 +2546,15 @@ let shape_field k d kind mi gi path n it = {
         [:list, [key, desc, _], _] => {
             let at = path + [2, i, 1];
             match [kind, d] {
-                ["map", [:map_d, ps]] => match syntax_datum k (here mi 0 "") key {
+                ["map", Datum.map(ps)] => match syntax_datum k (here mi 0 "") key {
                     [kd] => match entry_for ps kd {
                         () => true,
                         [v] => refine_desc k v mi desc gi at (n - 1),
                     },
                     () => true,
                 },
-                ["list", [:list_d, xs]] => if i < list.length xs { refine_desc k (list.nth i xs) mi desc gi at (n - 1) } else { true },
-                ["array", [:array_d, xs]] => if i < list.length xs { refine_desc k (list.nth i xs) mi desc gi at (n - 1) } else { true },
+                ["list", Datum.list(xs)] => if i < list.length xs { refine_desc k (list.nth i xs) mi desc gi at (n - 1) } else { true },
+                ["array", Datum.array(xs)] => if i < list.length xs { refine_desc k (list.nth i xs) mi desc gi at (n - 1) } else { true },
                 _ => true,
             }
         },
@@ -2500,7 +2565,7 @@ let shape_field k d kind mi gi path n it = {
 /// A contract for datum `d`, written at `span`, where `expected` was wanted --
 /// or nothing, when no predicate stands between the value and the type.
 ///
-/// It rides in the diagnostics list, as a list where a diagnostic is a map,
+/// It rides in the diagnostics list, a record where a diagnostic is a map,
 /// because it is found by the same walk and at the same places: threading a
 /// second accumulator through every function of that walk would be a change to
 /// all of them for something most programs never make. `check_program` takes
@@ -2509,12 +2574,16 @@ let contract k expected why span d h ds =
     if ast.span_start span >= 2147483648 { ds }
     else {
         match refinement k d expected 24 {
-            f if type_of f == :list =>
-                list.cons [:contract, Here.source h, span, why + " should be `" + show expected + "`",
-                           brief (show_datum d), f] ds,
-            _ => ds,
+            true => ds,
+            false => ds,
+            f => list.cons (Contract.make (Here.source h) span (why + " should be `" + show expected + "`")
+                                          (brief (show_datum d)) f) ds,
         }
     };
+
+/// A known value meeting a refinement: where it was written, what was wanted
+/// and how the value reads, for the message, and the `Formula` that decides it.
+struct Contract { source, span, wanted, shown, formula }
 
 /// Whether a declaration's description has a `where` in it anywhere, through
 /// the names it mentions. Worked out once per type, when the checker is built,
@@ -2583,9 +2652,9 @@ let contract_of k h e t expected why ds =
     },
 } };
 
-let is_contract x = type_of x == :list;
+let is_contract x = match x { Contract(_, _, _, _, _) => true, _ => false };
 
-let contract_place c = list.nth 1 c * 4294967296 + ast.span_start (list.nth 2 c);
+let contract_place c = Contract.source c * 4294967296 + ast.span_start (Contract.span c);
 
 /// A global with no signature whose whole body is a `comp` is the value the
 /// `comp` produced, so that is its type wherever it is used:
@@ -2637,7 +2706,7 @@ let rec unknown_types k ev t source ds = match t {
         () => list.cons (diag.in_source source (diag.error sp ("cannot find the module in front of `." + f + "`"))) ds,
         m =>
             if modules.module_name (modules.module_at (Checker.l k) m) == "std.types" { ds }
-            else if member_type k (scope.dream_ref m) f != () { ds }
+            else if member_type k (scope.Ref.dream m) f != () { ds }
             else { list.cons (diag.in_source source (diag.error sp ("cannot find the type `" + f + "` in `"
                         + modules.module_name (modules.module_at (Checker.l k) m) + "`"))) ds },
     },
@@ -2766,8 +2835,12 @@ let check_decl_inferring k b ds = {
 // `lucid`'s inlay hints. The type is the one this checker gave the binding --
 // the same one every later statement is checked against -- so a hint can never
 // disagree with a diagnostic. A hint rides in the diagnostics a walk threads,
-// as `[:hint, source, span, name, params, type]`, and only when the checker
-// was made to want them (`Checker.hints`): a build never makes one.
+// as a `Hint`, and only when the checker was made to want them
+// (`Checker.hints`): a build never makes one.
+
+/// The type a binding was given, `shown` as a signature would write it, for
+/// the `let` or declaration at `span` binding `name` with `params`.
+struct Hint { source, span, name, params, shown }
 
 /// `ds` with a hint for the statement `st`, which bound a value of type `t`,
 /// when the checker wants hints and the type says something a reader could
@@ -2780,7 +2853,7 @@ let hinted k h st t ds =
             [:let, n, ps, body, _, sp] => match hint_type t body {
                 () => ds,
                 ":unit" if str.ends_with "!" n => ds,
-                shown => list.cons [:hint, Here.source h, sp, n, ps, shown] ds,
+                shown => list.cons (Hint.make (Here.source h) sp n ps shown) ds,
             },
             _ => ds,
         }
@@ -2802,14 +2875,14 @@ let hint_type t body = match body {
     },
 };
 
-let is_hint x = match x { [:hint, .._] => true, _ => false };
+let is_hint x = match x { Hint(_, _, _, _, _) => true, _ => false };
 
-/// Every hint for the bodies written in file `source`: `[:hint, source, span,
-/// name, params, shown]` each, `span` the declaration's or the `let`'s. The
+/// Every hint for the bodies written in file `source`, each at the span of its
+/// declaration or its `let`. The
 /// whole program is checked once first, for what its unsigned functions
 /// answer (see the section below), so that a hint knows what a call of one
 /// is; then this file's bodies are walked again wanting hints.
-let hints : modules.Loader -> scope.Resolution -> :integer -> [[:any]];
+let hints : modules.Loader -> scope.Resolution -> :integer -> [Hint];
 let hints l r source = {
     let [k, _] = prepared l r %{};
     let bodies = scope.bodies r;
@@ -2828,8 +2901,8 @@ let hints l r source = {
                 () => local,
                 // An action that answers nothing: what it does is the point.
                 ":unit" if str.ends_with "!" (scope.decl_name d) => local,
-                shown => list.cons [:hint, source, scope.decl_span d, scope.decl_name d,
-                                    scope.decl_params d, shown] local,
+                shown => list.cons (Hint.make source (scope.decl_span d) (scope.decl_name d)
+                                              (scope.decl_params d) shown) local,
             },
         }
     }) mine)
@@ -2995,8 +3068,8 @@ let rec names_inferred k k2 mi source e = match e {
 };
 
 let newly_typed k k2 found = match found {
-    [:global, _, _, gi] => not (map.has gi (Checker.uses k)) && map.has gi (Checker.uses k2),
-    [:member, _, _, gi] if gi != () => not (map.has gi (Checker.uses k)) && map.has gi (Checker.uses k2),
+    scope.Meaning.global(_, _, gi) => not (map.has gi (Checker.uses k)) && map.has gi (Checker.uses k2),
+    scope.Meaning.member(_, _, gi) if gi != () => not (map.has gi (Checker.uses k)) && map.has gi (Checker.uses k2),
     _ => false,
 };
 

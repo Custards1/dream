@@ -217,7 +217,7 @@ let lower_apply callee args span l = {
     match [found, args] {
         // A record, as its constructor writes it: one `record_make`, and no
         // array of fields made only to be copied out of.
-        [[:builtin, "_record_of"], [[:atom, id, _], [:bool, variant, _], [:array, fields, _]]] =>
+        [scope.Meaning.builtin("_record_of"), [[:atom, id, _], [:bool, variant, _], [:array, fields, _]]] =>
             lower_record id variant fields l,
         _ => lower_call found callee args span l,
     }
@@ -226,11 +226,11 @@ let lower_apply callee args span l = {
 let lower_call found callee args span l =
     match unwrap found args 8 l {
         // ..and a wrapper around a `get` or a `set` is that operation.
-        [[:op, kind], actual] => lower_expr (op_expr kind actual span) l,
+        [scope.Inline.op(kind), actual] => lower_expr (op_expr kind actual span) l,
         // A constructor whose fields are all lazy is the record it makes; one
         // with a strict field is called, so its frame forces the field.
-        [[:record, id, variant, true, _], actual] => lower_record id variant actual l,
-        [[:record, _, _, false, _], _] => {
+        [scope.Inline.record(id, variant, true, _), actual] => lower_record id variant actual l,
+        [scope.Inline.record(_, _, false, _), _] => {
             let f = lower_callee callee found l;
             let done = lower_all args (list.head f);
             emit_apply (list.nth 1 f) (list.nth 1 done) (list.head done)
@@ -265,14 +265,14 @@ let lower_record id variant fields l = {
 /// where every constructor is filed with the id it stamps (`scope.wrapper_of`).
 let constructor_of ctor l =
     match callee_resolution ctor l {
-        [:global, _, _, g]           => constructor_at g l,
-        [:member, [:dream, _], _, g] => constructor_at g l,
+        scope.Meaning.global(_, _, g) => constructor_at g l,
+        scope.Meaning.member(scope.Ref.dream(_), _, g) => constructor_at g l,
         _ => (),
     };
 
 let constructor_at g l =
     match ((scope.wrappers (res l))).[g else ()] {
-        [[:record, id, variant, _, fields], _, _] => [id, variant, fields],
+        scope.Wrapper(scope.Inline.record(id, variant, _, fields), _, _) => [id, variant, fields],
         _ => (),
     };
 
@@ -329,8 +329,8 @@ let callee_resolution callee l =
 let wrapper_actuals plan args =
     list.map (fn step ->
         match step {
-            [:param, k] => list.nth k args,
-            [:const, e] => e,
+            scope.Arg.param(k) => list.nth k args,
+            scope.Arg.constant(e) => e,
         }) plan;
 
 /// The container operation a wrapper stands for, rebuilt around a call's own
@@ -352,8 +352,8 @@ let rec unwrap found args fuel l =
     if fuel <= 0 { () }
     else {
         match found {
-            [:global, _, _, g]           => unwrap_global found g args fuel l,
-            [:member, [:dream, _], _, g] => unwrap_global found g args fuel l,
+            scope.Meaning.global(_, _, g) => unwrap_global found g args fuel l,
+            scope.Meaning.member(scope.Ref.dream(_), _, g) => unwrap_global found g args fuel l,
             _ => (),
         }
     };
@@ -361,7 +361,7 @@ let rec unwrap found args fuel l =
 let unwrap_global found g args fuel l =
     match ((scope.wrappers (res l))).[g else ()] {
         () => (),
-        [target, plan, arity] =>
+        scope.Wrapper(target, plan, arity) =>
             if list.length args != arity { () }
             else {
                 let actual = wrapper_actuals plan args;
@@ -398,17 +398,17 @@ let rec builtin_alias found fuel l =
     if fuel <= 0 { () }
     else {
         match found {
-            [:builtin, _]                => found,
-            [:global, _, _, g]           => builtin_alias_global g fuel l,
-            [:member, [:dream, _], _, g] => builtin_alias_global g fuel l,
+            scope.Meaning.builtin(_) => found,
+            scope.Meaning.global(_, _, g) => builtin_alias_global g fuel l,
+            scope.Meaning.member(scope.Ref.dream(_), _, g) => builtin_alias_global g fuel l,
             _ => (),
         }
     };
 
 let builtin_alias_global g fuel l =
     match ((scope.wrappers (res l))).[g else ()] {
-        [target, plan, arity] =>
-            if plan == list.map (fn k -> [:param, k]) (list.range 0 arity) {
+        scope.Wrapper(target, plan, arity) =>
+            if plan == scope.passed_on arity {
                 builtin_alias target (fuel - 1) l
             } else { () },
         _ => (),
@@ -446,9 +446,9 @@ let emit_target found l = {
 /// The name a resolution ends in, which is what says whether it is impure.
 let resolved_name found =
     match found {
-        [:builtin, name] => name,
-        [:global, _, name, _] => name,
-        [:member, _, field, _] => field,
+        scope.Meaning.builtin(name) => name,
+        scope.Meaning.global(_, name, _) => name,
+        scope.Meaning.member(_, field, _) => field,
         _ => "",
     };
 
@@ -494,17 +494,17 @@ let emit_resolution_or found span l = emit_resolution found l;
 /// because a wrapper's call site emits a resolution it did not read off a name.
 let emit_resolution found l =
     match found {
-        [:local, slot, _]   => emit_local slot l,
-        [:capture, idx, _]  => emit (ir.node :capture idx ir.no_node ir.no_node) l,
-        [:global, _, _, g]  => emit (ir.node :global g ir.no_node ir.no_node) l,
-        [:builtin, name]    => builtin_ref name l,
-        [:closure, fi]      => emit (ir.node :make_closure fi ir.no_node ir.no_node) l,
-        [:thunk, fi]        => emit (ir.node :make_thunk fi ir.no_node ir.no_node) l,
+        scope.Meaning.local(slot, _) => emit_local slot l,
+        scope.Meaning.capture(idx, _) => emit (ir.node :capture idx ir.no_node ir.no_node) l,
+        scope.Meaning.global(_, _, g) => emit (ir.node :global g ir.no_node ir.no_node) l,
+        scope.Meaning.builtin(name) => builtin_ref name l,
+        scope.Meaning.closure(fi) => emit (ir.node :make_closure fi ir.no_node ir.no_node) l,
+        scope.Meaning.thunk(fi) => emit (ir.node :make_thunk fi ir.no_node ir.no_node) l,
         // A Dream module's member is one global, known at compile time. A host
         // module's is a field of the module value, looked up at run time,
         // because the host owns the table.
-        [:member, [:dream, _], _, g] => emit (ir.node :global g ir.no_node ir.no_node) l,
-        [:member, [:native, _, mg], field, _] => {
+        scope.Meaning.member(scope.Ref.dream(_), _, g) => emit (ir.node :global g ir.no_node ir.no_node) l,
+        scope.Meaning.member(scope.Ref.native(_, mg), field, _) => {
             let obj = emit (ir.node :global mg ir.no_node ir.no_node) l;
             let named = ir.intern_str field (prog (list.head obj));
             emit (ir.node :field (list.nth 1 obj) (list.nth 1 named) ir.no_node)
@@ -534,7 +534,7 @@ let rec lower_expr e l =
         // whole of what staging does when the pipeline turns out not to fuse.
         [:name, n, span] =>
             match scope.staging (res l) (ctx l) (source l) span {
-                [:body, body] => lower_expr body l,
+                scope.Staging.body(body) => lower_expr body l,
                 _ => lower_name n span l,
             },
         [:field, _, _, span] => lower_field e span l,
@@ -636,7 +636,7 @@ let rec lower_expr e l =
         // expression may call any of it.
         [:comp, _, body, span] =>
             match lookup span l {
-                [:comp, fi, _] => {
+                scope.Meaning.compiled(fi, _) => {
                     let inner = lower_expr body l;
                     let done = set_func_body fi (list.nth 1 inner)
                                              (mark_tail (list.nth 1 inner) (list.head inner));
@@ -686,8 +686,9 @@ let rec lower_expr e l =
 /// A nested function: lower its body, remember which node that was, and emit
 /// the instruction that builds the closure or thunk.
 let rec lower_function span op ps body l =
-    match lookup span l {
-        [_, fi] => {
+    match function_at (lookup span l) {
+        () => emit_leaf :unit l,
+        fi => {
             let inner = lower_body ps body l;
             let done = set_func_body fi (list.nth 1 inner)
                                      (mark_tail (list.nth 1 inner) (list.head inner));
@@ -700,8 +701,14 @@ let rec lower_function span op ps body l =
             }
             else { made }
         },
-        _ => emit_leaf :unit l,
     };
+
+/// The function a closure or a thunk was resolved to, or `()`.
+let function_at found = match found {
+    scope.Meaning.closure(fi) => fi,
+    scope.Meaning.thunk(fi) => fi,
+    _ => (),
+};
 
 /// A function's body, with its strict parameters forced and its pattern
 /// parameters taken apart in front of it.
@@ -804,7 +811,7 @@ let rec lower_block stmts span l = {
             // A `let` whose body was written where it is read binds nothing and
             // lowers to nothing. It contributes no node, so it is not a
             // statement whose value could be discarded either.
-            [:let, _, _, _, _, sp] if scope.staging (res l) (ctx l) (source l) sp == :elided =>
+            [:let, _, _, _, _, sp] if scope.staging (res l) (ctx l) (source l) sp == scope.Staging.elided =>
                 acc,
             // A signature is a promise to the type checker. It lowers to
             // nothing, so it is not a statement either.
@@ -842,7 +849,7 @@ let rec lower_block stmts span l = {
     // written rather than whenever something happens to want the value. Inside
     // a pure one there are no effects to have, so it is dead code -- and
     // forcing it would only risk raising an error the program never asked for.
-    let impure_here = match lookup span (list.head done) { [:block, yes] => yes, _ => false };
+    let impure_here = match lookup span (list.head done) { scope.Meaning.block(yes) => yes, _ => false };
     let pairs = list.nth 1 done;
     let stmt_nodes = list.map (fn pair -> list.nth 0 pair) pairs;
     let sequenced =
@@ -909,14 +916,13 @@ let local_node slot l = emit (ir.node :local slot ir.no_node ir.no_node) l;
 let lower_fused p l = {
     let outer = subst l;
     let built = set_subst outer (fused_body p (set_subst (subst_of p) l));
-    let inits = lower_all (list.nth 1 (fuse.plan_source p)) built;
+    let inits = lower_all (list.nth 1 (fuse.Plan.source p)) built;
     let seeded =
-        match fuse.plan_seed p {
-            [:expr, e] => lower_expr e (list.head inits),
-            [:int, v]  => const_int v (list.head inits),
-            _          => emit_leaf :unit (list.head inits),
+        match fuse.Plan.seed p {
+            fuse.Seed.written(e) => lower_expr e (list.head inits),
+            fuse.Seed.number(v)  => const_int v (list.head inits),
         };
-    let callee = emit (ir.node :global (fuse.plan_gi p) ir.no_node ir.no_node)
+    let callee = emit (ir.node :global (fuse.Plan.gi p) ir.no_node ir.no_node)
                       (list.head seeded);
     emit_apply (list.nth 1 callee)
                (list.append (list.nth 1 inits) [list.nth 1 seeded])
@@ -925,12 +931,12 @@ let lower_fused p l = {
 
 let subst_of p =
     list.fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
-              (%{}) (fuse.plan_subst p);
+              (%{}) (fuse.Plan.subst p);
 
 /// The loop itself, emitted into the same arena as everything else -- a
 /// function is a body node and a descriptor, not an arena of its own.
 let fused_body p l = {
-    let stag = list.nth 0 (fuse.plan_source p);
+    let stag = list.nth 0 (fuse.Plan.source p);
     let replicating = stag == :replicate;
 
     // Done: `range` stops at its limit, `replicate` when there is nothing left
@@ -953,7 +959,7 @@ let fused_body p l = {
     // not be taken -- the turn that leaves the accumulator alone.
     let taken = self_turn p replicating (fn l0 -> fused_step p l0) (list.head answer);
     let advanced =
-        match fuse.plan_guards p {
+        match fuse.Plan.guards p {
             [] => taken,
             gs => {
                 let cond = lower_guards gs (list.head taken);
@@ -970,7 +976,7 @@ let fused_body p l = {
             },
         };
     let otherwise =
-        if fuse.plan_strict p { forced_acc (list.nth 1 advanced) (list.head advanced) }
+        if fuse.Plan.strict p { forced_acc (list.nth 1 advanced) (list.head advanced) }
         else { advanced };
 
     let made = emit (ir.node :if (list.nth 1 done) (list.nth 1 answer) (list.nth 1 otherwise))
@@ -980,7 +986,7 @@ let fused_body p l = {
         set_flag (list.nth 1 done) ir.f_strict
             (inherit i [list.nth 1 done, list.nth 1 answer, list.nth 1 otherwise]
                      (list.head made));
-    set_func_body (fuse.plan_fi p) i (mark_tail i settled)
+    set_func_body (fuse.Plan.fi p) i (mark_tail i settled)
 };
 
 /// One turn of the loop: the cursor moved on, whatever the source carries
@@ -997,7 +1003,7 @@ let self_turn p replicating acc_at l = {
                           (list.nth 1 cur) (list.nth 1 one) (list.head one);
     let carried = local_node fuse.carried_slot (list.head advanced);
     let acc = acc_at (list.head carried);
-    let callee = emit (ir.node :global (fuse.plan_gi p) ir.no_node ir.no_node)
+    let callee = emit (ir.node :global (fuse.Plan.gi p) ir.no_node ir.no_node)
                       (list.head acc);
     emit_apply (list.nth 1 callee)
                [list.nth 1 advanced, list.nth 1 carried, list.nth 1 acc]
@@ -1020,15 +1026,14 @@ let lower_guards gs l =
 /// `scope` bound to these very slots, or the operator `sum` and `product`
 /// stand for.
 let fused_step p l =
-    match fuse.plan_step p {
-        [:ast, body] => lower_expr body l,
-        [:op, op] => {
+    match fuse.Plan.step p {
+        fuse.Step.written(body, _) => lower_expr body l,
+        fuse.Step.op(op) => {
             let a = local_node fuse.acc_slot l;
-            let x = emit_local (fuse.plan_elem p) (list.head a);
+            let x = emit_local (fuse.Plan.elem p) (list.head a);
             binary (if op == :mul { :mul } else { :add })
                    (list.nth 1 a) (list.nth 1 x) (list.head x)
         },
-        _ => emit_leaf :unit l,
     };
 
 /// `fold_strict`, which forces each step before taking the next.
@@ -1249,7 +1254,7 @@ let places_of ld = list.fold (fn acc i -> {
     let src = modules.file_at ld i;
     // The text itself is left behind: only its line starts and the ranges a
     // macro generated are wanted, and this table is shared with every part.
-    let origins = [diag.source_path src, "", diag.origins src];
+    let origins = diag.Source.make (diag.source_path src) "" (diag.origins src);
     // Left lazy: `vm.share!` forces it where the table is shared, and a whole
     // lowering builds a file's table only once a `match` in it asks.
     acc.[i => [shown_path ld (diag.source_path src), diag.line_starts (diag.source_text src), origins]]
@@ -1512,9 +1517,17 @@ let rec lower_match scrutinee arms span l = {
 // match a cell, so for a cell the first thing the chain does is force its head
 // to compare it with a tag.
 
-/// What an arm's pattern says about the subjects it could match: `[:head, n]`
-/// for a list whose first element is the atom `n`, `[:atom, n]` for the atom
-/// itself, and `:any` for everything else.
+/// What an arm's pattern says about the subjects it could match.
+union Key {
+    // A list -- or an array -- whose first element is the atom `tag`.
+    head(tag)
+    // The atom `tag` itself, or a record whose id it is (see `arm_key`).
+    atom(tag)
+    // Anything else.
+    any
+}
+
+/// The `Key` of an arm whose pattern is `p`.
 ///
 /// A constructor pattern is keyed by its record's id, as an atom: `switch_atom`
 /// keys a record by its id (`take_switch`, `Emitter::switch_node`), so a
@@ -1525,17 +1538,17 @@ let rec lower_match scrutinee arms span l = {
 /// cannot match, and the arm it lands on still runs its own test.
 let rec arm_key p l = match p {
     [:as_p, inner, _, _, _] => arm_key inner l,
-    [:literal, [:atom, n, _], _] => [:atom, n],
+    [:literal, [:atom, n, _], _] => Key.atom n,
     [:record_p, ctor, _, _] => match constructor_of ctor l {
-        [id, _, _] => [:atom, id],
-        _ => :any,
+        [id, _, _] => Key.atom id,
+        _ => Key.any,
     },
-    [:list_p, [[:literal, [:atom, n, _], _], .._], _, _] => [:head, n],
+    [:list_p, [[:literal, [:atom, n, _], _], .._], _, _] => Key.head n,
     // A `union struct` variant: `switch_head` reads an array's first element
     // as it reads a cell's head, and the arm's own test still tells the two
     // apart, so a list arm and an array arm with one tag share a key safely.
-    [:array_p, [[:literal, [:atom, n, _], _], .._], _, _] => [:head, n],
-    _ => :any,
+    [:array_p, [[:literal, [:atom, n, _], _], .._], _, _] => Key.head n,
+    _ => Key.any,
 };
 
 /// The position of the first element `pred` accepts, or `()`.
@@ -1548,25 +1561,30 @@ let find_index pred xs = find_index_from 0 pred xs;
 /// Fewer tags than this and the chain is already cheap.
 let min_switch = 3;
 
-/// The distinct tags of one kind, in the order the arms first name them.
-let tags_of kind keys = list.fold (fn acc k -> match k {
-    [kd, n] if kd == kind && not (list.contains n acc) => list.append acc [n],
-    _ => acc,
+/// The distinct tags `pick` finds in the keys, in the order the arms first
+/// name them.
+let tags_of pick keys = list.fold (fn acc k -> match pick k {
+    () => acc,
+    n => if list.contains n acc { acc } else { list.append acc [n] },
 }) [] keys;
 
+let head_tag k = match k { Key.head(n) => n, _ => () };
+let atom_tag k = match k { Key.atom(n) => n, _ => () };
+
 /// The chain suffix of the first arm that could match: the first whose key is
-/// one of `fits`, or `:any`. The last suffix is the `match_error` raise.
+/// one of `fits`, or `Key.any`. The last suffix is the `match_error` raise.
 let first_fit fits keys suffixes =
-    match find_index (fn k -> k == :any || list.contains k fits) keys {
+    match find_index (fn k -> k == Key.any || list.contains k fits) keys {
         () => list.nth (list.length keys) suffixes,
         j => list.nth j suffixes,
     };
 
-/// A switch node over `tags`, keyed on `kind`, with `default` for everything else.
-let switch_node op kind tags keys suffixes held default l = {
+/// A switch node over `tags`, each the `Key` that `keyed` makes of it, with
+/// `default` for everything else.
+let switch_node op keyed tags keys suffixes held default l = {
     let entries = list.fold (fn acc n -> {
         let key = const_atom n (list.head acc);
-        [list.head key, list.append (list.nth 1 acc) [list.nth 1 key, first_fit [[kind, n]] keys suffixes]]
+        [list.head key, list.append (list.nth 1 acc) [list.nth 1 key, first_fit [keyed n] keys suffixes]]
     }) [l, []] tags;
     let subject = emit (ir.node :local held ir.no_node ir.no_node) (list.head entries);
     let run = list.append (list.nth 1 entries) [default];
@@ -1579,33 +1597,33 @@ let switch_node op kind tags keys suffixes held default l = {
 /// tag, and `chain` itself otherwise.
 let dispatch arms suffixes held chain l = {
     let keys = list.map (fn a -> arm_key (ast.arm_pattern a) l) arms;
-    let heads = tags_of :head keys;
-    let atoms = tags_of :atom keys;
+    let heads = tags_of head_tag keys;
+    let atoms = tags_of atom_tag keys;
     // Everything in front of the first tagged-cell arm is an atom literal.
-    let head_ok = match find_index (fn k -> match k { [:head, _] => true, _ => false }) keys {
+    let head_ok = match find_index (fn k -> head_tag k != ()) keys {
         () => false,
-        j => list.all (fn k -> match k { [:atom, _] => true, _ => false }) (list.take j keys),
+        j => list.all (fn k -> atom_tag k != ()) (list.take j keys),
     };
     let use_heads = head_ok && list.length heads >= min_switch;
     let use_atoms = list.length atoms >= min_switch || (use_heads && not (list.is_empty atoms));
-    let head_tags = list.map (fn n -> [:head, n]) heads;
+    let head_tags = list.map Key.head heads;
     // Under a `switch_head`, only a cell whose head names no tag, or something
     // that is not a cell, reaches the atom switch -- and a cell of either kind
     // can only be matched by an `:any` arm. On its own, a cell may be matched
     // by any tagged-cell arm, so none of them may be skipped.
     let atom_default = if use_heads { first_fit [] keys suffixes } else { first_fit head_tags keys suffixes };
     let by_atom = if not use_atoms { [l, ()] }
-                  else { switch_node :switch_atom :atom atoms keys suffixes held atom_default l };
+                  else { switch_node :switch_atom Key.atom atoms keys suffixes held atom_default l };
     if not use_heads {
         match list.nth 1 by_atom { () => [l, chain], node => by_atom }
     } else {
         // Not a cell, or a cell whose head is no tag: the atom switch when
         // there is one, and otherwise the first arm that is not a tagged cell.
         let fallback = match list.nth 1 by_atom {
-            () => first_fit (list.map (fn n -> [:atom, n]) atoms) keys suffixes,
+            () => first_fit (list.map Key.atom atoms) keys suffixes,
             node => node,
         };
-        switch_node :switch_head :head heads keys suffixes held fallback (list.head by_atom)
+        switch_node :switch_head Key.head heads keys suffixes held fallback (list.head by_atom)
     }
 };
 
@@ -1735,8 +1753,8 @@ let strk text l = { let got = ir.intern_str text (prog l); [set_prog (list.head 
 let place_captures caps l = {
     let encoded = list.map (fn c ->
         match c {
-            [:local, slot] => ir.encode_capture false slot,
-            [:capture, idx] => ir.encode_capture true idx,
+            scope.Capture.local(slot) => ir.encode_capture false slot,
+            scope.Capture.outer(idx) => ir.encode_capture true idx,
             _ => 0,
         }) caps;
     kids encoded l
@@ -1914,7 +1932,9 @@ let lower_program r = {
     let is = link_imports r (list.head gs);
     let linked = list.head is;
 
-    let p = ((((((prog linked)).[:funcs => (list.nth 1 fs)])).[:globals => (list.nth 1 gs)])).[:imports => (list.nth 1 is)];
+    let p = prog linked
+        |> ir.Program.set_funcs (list.nth 1 fs) |> ir.Program.set_globals (list.nth 1 gs)
+        |> ir.Program.set_imports (list.nth 1 is);
     ((set_prog p linked)).[:image => (ir.finish p)]
 };
 
@@ -2026,8 +2046,8 @@ let whole_image fis l = {
     let cut = list.map (fn pair -> {
         let [fi, f] = pair;
         if map.has fi reached { f } else { f.[:body => stub] }
-    }) (list.zip (list.range 0 (list.length (img.[:funcs else []]))) (img.[:funcs else []]));
-    emit.to_binary (opt.optimize (img.[:funcs => cut]))
+    }) (list.zip (list.range 0 (list.length (ir.Image.funcs img))) (ir.Image.funcs img));
+    emit.to_binary (opt.optimize (ir.Image.set_funcs cut img))
 };
 
 /// Settle them in an order where nothing is evaluated before what it reads.
@@ -2113,7 +2133,9 @@ let link_rest! ld r lowered = {
     let sourced = strk (modules.module_path (modules.module_at ld
                             (modules.module_count ld - 1)))
                        (list.head named);
-    let p = ((((((((prog (list.head sourced))).[:modules => (list.nth 1 ms)])).[:entry => (find_entry ld r)])).[:module_name => (list.nth 1 named)])).[:source_name => (list.nth 1 sourced)];
+    let p = prog (list.head sourced)
+        |> ir.Program.set_modules (list.nth 1 ms) |> ir.Program.set_entry (find_entry ld r)
+        |> ir.Program.set_module_name (list.nth 1 named) |> ir.Program.set_source_name (list.nth 1 sourced);
     ((set_prog p (list.head sourced))).[:image => (ir.finish p)]
 };
 
@@ -2321,8 +2343,8 @@ let link_parallel! ld r cache = {
 /// `[global, wrapper]` sorted: what its lowering reads of the table.
 let reached_wrappers all r = {
     let used = list.fold (fn m [_, meaning] -> match meaning {
-        [:global, _, _, gi] if gi != () => m.[gi => true],
-        [:member, _, _, gi] if gi != () => m.[gi => true],
+        scope.Meaning.global(_, _, gi) if gi != () => m.[gi => true],
+        scope.Meaning.member(_, _, gi) if gi != () => m.[gi => true],
         _ => m,
     }) (%{}) (map.pairs (scope.refs r));
     let rec close seen todo = match todo {
@@ -2380,13 +2402,13 @@ let share_parts_elsewhere! work =
 /// for a build with no `comp` in it.
 let patched l img = {
     let p = prog l;
-    let nodes = img.[:nodes else []];
-    let kids = img.[:kids else []];
+    let nodes = ir.Image.nodes img;
+    let kids = ir.Image.kids img;
     let n_nodes = list.length nodes;
     let n_kids = list.length kids;
-    let tables = ((((((p.[:nodes => %{}]).[:node_count => n_nodes])
-                    .[:kids => %{}]).[:kid_count => n_kids]))
-                    .[:funcs => img.[:funcs else []]]);
+    let tables = p |> ir.Program.set_nodes %{} |> ir.Program.set_node_count n_nodes
+                   |> ir.Program.set_kids %{} |> ir.Program.set_kid_count n_kids
+                   |> ir.Program.set_funcs (ir.Image.funcs img);
     let placed = list.head (list.fold_strict (fn acc n -> {
         let [m, i] = acc;
         [if ir.node_op n == :unit && ir.is_node (ir.node_a n) { m.[ir.node_a n => i] } else { m }, i + 1]
@@ -2409,8 +2431,9 @@ let patched l img = {
         }
     }) (set_prog tables l) (pending_comp l);
     let q = prog filled;
-    ((ir.finish_rest q).[:nodes => overlaid nodes (ir.nodes q) n_nodes (ir.node_count q) (ir.leaf :nop)])
-        .[:kids => overlaid kids (ir.kids q) n_kids (ir.kid_count q) ir.no_node]
+    ir.finish_rest q
+        |> ir.Image.set_nodes (overlaid nodes (ir.nodes q) n_nodes (ir.node_count q) (ir.leaf :nop))
+        |> ir.Image.set_kids (overlaid kids (ir.kids q) n_kids (ir.kid_count q) ir.no_node)
 };
 
 /// `xs`, the first `n` entries of an arena, with what a table wrote over them
@@ -2445,7 +2468,7 @@ let overlaid xs written n count fill =
 /// The parts, with part 0 as this lowering's own arena now.
 let current_arenas l = {
     let p = prog l;
-    (l.[:arenas]).[0 => ((((l.[:arenas]).[0]).[:nodes => ir.nodes p]).[:kids => ir.kids p])]
+    (l.[:arenas]).[0 => ((l.[:arenas]).[0] |> ir.Program.set_nodes (ir.nodes p) |> ir.Program.set_kids (ir.kids p))]
 };
 
 /// What the functions `todo` start from can reach, walked across the parts:
@@ -2508,7 +2531,7 @@ let parts_image fis l = {
         let [fi, f] = pair;
         if map.has fi reached { f } else { f.[:body => stub] }
     }) (list.zip (list.range 0 (list.length (ir.funcs p))) (ir.funcs p));
-    emit.to_binary (opt.optimize_parts_filled ((ir.finish_rest p).[:funcs => cut]) (current_arenas l3)
+    emit.to_binary (opt.optimize_parts_filled (ir.Image.set_funcs cut (ir.finish_rest p)) (current_arenas l3)
                                               (l.[:invented_from else 0]) (l.[:filled else (%{})]))
 };
 
@@ -2557,16 +2580,25 @@ let rec settle_parts_order! rows done built l =
         }
     };
 
+/// A `comp` whose evaluation raised, as what its `try!` caught. A record of the
+/// compiler's own, so that no value a program can produce -- the list
+/// `[:comp_error, e]` was one -- is taken for a failure.
+struct Raised { why }
+
+/// The failure of a `comp`, reported where it is written. It used to be
+/// reported with no span at all, which for a compile-time API is the difference
+/// between "this call is wrong" and "something in the program is".
+let comp_failed src span why l =
+    l.[:diags => (list.append (l_diags l)
+                    [diag.in_source src (diag.error span
+                        ("this compile-time expression could not be evaluated: " + to_string why))])];
+
 /// `settle_comp!` for a lowering made in parts: see `settle_parts_comps!`.
 let settle_part_comp! bytes one l = {
     let [_, fi, src, span] = one;
-    let value = try! { vm.eval_image! bytes } catch e { [:comp_error, e] };
+    let value = try! { vm.eval_image! bytes } catch e { Raised.make e };
     match value {
-        [:comp_error, why] =>
-            l.[:diags => (list.append (l_diags l)
-                            [diag.in_source src (diag.error span
-                                ("this compile-time expression could not be evaluated: "
-                                 + to_string why))])],
+        Raised(why) => comp_failed src span why l,
         v => {
             let built = emit_const v l;
             let placed = (list.head built).[:filled => ((list.head built).[:filled else (%{})]).[fi => list.nth 1 built]];
@@ -2589,7 +2621,7 @@ let intern_each intern vs p = {
 /// pool -- interned into the program's atom pool by the name's index there.
 let intern_atom_at strs si p = {
     let got = ir.intern (strs.[si]) (ir.atoms p);
-    [p.[:atoms => list.head got], list.nth 1 got]
+    [ir.Program.set_atoms (list.head got) p, list.nth 1 got]
 };
 
 /// The linked program of a lowering made in parts, before anything in it has
@@ -2628,8 +2660,9 @@ let link_head r offsets parts = {
     let fs = link_funcs r bodies base;
     let gs = link_globals r (list.head fs);
     let is = link_imports r (list.head gs);
-    let p = ((((prog (list.head is)).[:funcs => (list.nth 1 fs)]).[:globals => (list.nth 1 gs)]))
-                .[:imports => (list.nth 1 is)];
+    let p = prog (list.head is)
+        |> ir.Program.set_funcs (list.nth 1 fs) |> ir.Program.set_globals (list.nth 1 gs)
+        |> ir.Program.set_imports (list.nth 1 is);
     let arenas = array.of_list (list.cons %{ :nodes => ir.nodes p, :kids => ir.kids p }
         (list.map (fn k -> %{ :nodes => array.of_list ((pa.[k]).[:nodes]),
                               :kids => array.of_list ((pa.[k]).[:kids]),
@@ -2714,17 +2747,9 @@ let rec const_seq op items l = {
 /// with only the entry changed -- see `emit.with_entry`.
 let settle_comp! bytes_of one l = {
     let [node, fi, src, span] = one;
-    let value = try! { vm.eval_image! (bytes_of fi) }
-                catch e { [:comp_error, e] };
+    let value = try! { vm.eval_image! (bytes_of fi) } catch e { Raised.make e };
     match value {
-        // Reported where the `comp` is written. It used to be reported with no
-        // span at all, which for a compile-time API is the difference between
-        // "this call is wrong" and "something in the program is".
-        [:comp_error, why] =>
-            l.[:diags => (list.append (l_diags l)
-                            [diag.in_source src (diag.error span
-                                ("this compile-time expression could not be evaluated: "
-                                 + to_string why))])],
+        Raised(why) => comp_failed src span why l,
         v => {
             let built = emit_const v l;
             // The placeholder keeps its index -- everything already points at
@@ -2755,8 +2780,8 @@ let all_diags r l = list.append (scope.r_diags r) (l_diags l);
 let dump : Lowering -> :string;
 let dump l = {
     let img = image l;
-    let fs = img.[:funcs else []];
-    let strs = img.[:strs else []];
+    let fs = ir.Image.funcs img;
+    let strs = ir.Image.strs img;
     let name_of i = if i < list.length strs { list.nth i strs } else { "?" };
     str.join_str "\n"
         (list.append

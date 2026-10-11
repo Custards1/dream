@@ -251,12 +251,12 @@ let member_item a target e n =
 
 let member_items a segs =
     match namespace_of a segs {
-        [:dream, target] => {
+        scope.Ref.dream(target) => {
             let e = scope.r_env_at (analysis.resolved a) target;
             list.map (fn n -> member_item a target e n)
                      (analysis.declared_members a target (scope.exports e))
         },
-        [:group, prefix] =>
+        scope.Ref.group(prefix) =>
             list.map (fn n -> item n kind_module ("module " + prefix + "." + n)
                                    ("A module in package `" + prefix + "`.") rank_local)
                      (group_names (analysis.loader a) prefix),
@@ -264,7 +264,7 @@ let member_items a segs =
         // the *embedder* registered is named to the compiler with
         // `--host-module` but is not in this VM, and `host_members` answers
         // `()` for it: nothing offered, which is what was offered before.
-        [:native, path, _] =>
+        scope.Ref.native(path, _) =>
             match vm.host_members path {
                 () => [],
                 members => list.map (fn member -> host_item path member) members,
@@ -321,7 +321,7 @@ let import_items a e = {
         list.map (fn kv -> {
             let n = list.head kv;
             match list.nth 1 kv {
-                [:dream, target] =>
+                scope.Ref.dream(target) =>
                     match [analysis.record_of a target, analysis.foreign_of a target] {
                         // A `foreign` block is reached the same way, and is
                         // a module the author wrote here rather than one
@@ -348,9 +348,9 @@ let import_items a e = {
                                                              fs),
                                      } + ".") rank_import,
                     },
-                [:native, p, _] => item n kind_module ("host module " + p)
+                scope.Ref.native(p, _) => item n kind_module ("host module " + p)
                                         "An imported host module." rank_import,
-                [:group, prefix] => item n kind_module ("package " + prefix)
+                scope.Ref.group(prefix) => item n kind_module ("package " + prefix)
                                          "An imported package." rank_import,
                 _ => item n kind_module "" "An import." rank_import,
             }
@@ -413,7 +413,7 @@ let macro_name_items a =
 /// The macros of the module a chain names, for `expand a.b.|`.
 let macro_member_items a segs =
     match namespace_of a segs {
-        [:dream, target] => {
+        scope.Ref.dream(target) => {
             let e = scope.r_env_at (analysis.resolved a) target;
             list.map (fn n -> item n kind_function (analysis.shown_signature a target n)
                                    ("A macro of module `"
@@ -422,7 +422,7 @@ let macro_member_items a segs =
                      (list.filter (fn n -> analysis.is_macro a target n) (scope.exports e))
         },
         // A package is a step on the way to a module that has one.
-        [:group, _] => member_items a segs,
+        scope.Ref.group(_) => member_items a segs,
         // A host module's members are natives, and none of them is a macro.
         _ => [],
     };

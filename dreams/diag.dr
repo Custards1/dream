@@ -21,23 +21,34 @@ import dreams.ast;
 
 // --- a source file ----------------------------------------------------------
 
-/// The name to print and the text to point into.
-group Source { path, text }
+/// The name to print and the text to point into, and -- for a file macro
+/// expansion generated -- `[start, end, span]` for each range of it, mapping
+/// it back to the call it came from. Generated occurrences keep offsets of
+/// their own, unique for resolution, and the range map is what puts a
+/// diagnostic back where the author wrote something.
+group Source { path, text, origins = [] }
 
-let source = Source.make;
+let source : :string -> :string -> Source;
+let source path text = Source.new path text;
+let source_path : Source -> :string;
 let source_path s = Source.path s;
+let source_text : Source -> :string;
 let source_text s = Source.text s;
+let origins : Source -> [[:any]];
+let origins s = Source.origins s;
 
-/// Generated occurrences keep unique offsets for resolution and a range map
-/// back to their macro call for diagnostics. Ordinary sources remain pairs.
-let origins s = match s { [_, _, ranges] => ranges, _ => [] };
+/// Where the author wrote what `sp` was generated from: `sp` itself, unless it
+/// falls in a range macro expansion made.
+let origin_span : Source -> ast.Span -> ast.Span;
 let origin_span s sp = {
     let found = list.filter (fn r -> ast.span_start sp >= list.nth 0 r
                                  && ast.span_start sp < list.nth 1 r) (origins s);
     match found { [] => sp, [r, .._] => list.nth 2 r }
 };
+
+let with_origin : :integer -> :integer -> ast.Span -> Source -> Source;
 let with_origin start end sp s =
-    [source_path s, source_text s, list.cons [start, end, origin_span s sp] (origins s)];
+    Source.set_origins (list.cons [start, end, origin_span s sp] (origins s)) s;
 
 // --- a diagnostic -----------------------------------------------------------
 
@@ -58,13 +69,16 @@ let warning span message = Diagnostic.make :warning span message () 0;
 
 let severity : :map -> :atom;
 let severity d = Diagnostic.severity d;
+let span : :map -> ast.Span;
 let span d = Diagnostic.span d;
 let message : :map -> :string;
 let message d = Diagnostic.message d;
+let note : :map -> :string | :unit;
 let note d = Diagnostic.note d;
 let source_of : :map -> :integer;
 let source_of d = Diagnostic.source d;
 
+let with_note : :string -> :map -> :map;
 let with_note n d = Diagnostic.set_note n d;
 
 /// Which file the span points into. Set as the diagnostic leaves the pass that

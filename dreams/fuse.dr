@@ -22,79 +22,63 @@
 // because that is where nodes are made.
 
 import std.list;
+import std.map;
 import std.str;
+
+import dreams.ast;
 
 // --- the vocabulary ---------------------------------------------------------
 //
 // A pipeline is a *source* that produces elements and a *sink* that consumes
-// them. Each entry is `[member name, tag, arity]`, where the arity is the
-// saturated call this pass will look at and nothing else: an unsaturated call
-// is a partial application, which is a value rather than a loop.
+// them, with *steps* between. Each member's arity is the saturated call this
+// pass will look at and nothing else: an unsaturated call is a partial
+// application, which is a value rather than a loop.
 //
-// The list is deliberately short. Every member named here has to have its loop
-// written out by hand in `lower`, and a member whose loop is not written is
-// simply not fused -- the call it was always compiled to still works.
+// The table is deliberately short. Every member named here has to have its
+// loop written out by hand in `lower`, and a member whose loop is not written
+// is simply not fused -- the call it was always compiled to still works.
 
-/// Sources: a call that produces a list out of nothing.
-let sources = [
+/// What a member of `std.list` is to this pass.
+union Role {
+    // A call that produces a list out of nothing.
+    source(tag, arity)
+    // A call that turns a list into another list, one element at a time.
+    //
+    // A step is not a loop of its own. It is a *stage*, spliced into the one
+    // loop the sink drives: `map`'s function becomes the expression the next
+    // stage reads, and `filter`'s becomes a condition around the rest of the
+    // body.
+    step(tag, arity)
+    // A call that folds a list down to one value. The tag says which
+    // accumulator shape the loop gets: `:fold` takes the step from a lambda
+    // written at the call site; `:add` and `:mul` are the step, because `sum`
+    // and `product` are folds whose function nobody wrote down.
+    sink(tag, arity, strict)
+}
+
+let roles = %{
     // `range from until` counts up to but not including `until`.
-    ["range", :range, 2],
+    "range" => Role.source :range 2,
     // `replicate n x` is the same counter, counting down, handing back the
     // same value every time -- the *same* value, not a copy, which is what the
     // fused loop has to preserve as well.
-    ["replicate", :replicate, 2],
-];
-
-/// Steps: a call that turns a list into another list, one element at a time.
-///
-/// A step is not a loop of its own. It is a *stage*, spliced into the one loop
-/// the sink drives: `map`'s function becomes the expression the next stage
-/// reads, and `filter`'s becomes a condition around the rest of the body.
-let steps = [
-    ["map", :map, 2],
-    ["filter", :filter, 2],
-];
-
-/// Sinks: a call that folds a list down to one value.
-///
-/// The tag says which accumulator shape the loop gets. `:fold` takes the step
-/// from a lambda written at the call site; `:add` and `:mul` are the step,
-/// because `sum` and `product` are folds whose function nobody wrote down.
-let sinks = [
-    ["fold",        :fold, 3, false],
-    ["fold_strict", :fold, 3, true],
-    ["sum",         :add,  1, false],
-    ["product",     :mul,  1, false],
-];
-
-/// What a member of `std.list` is to this pass, or `()`:
-/// `[:source, tag, arity]`, `[:step, tag, arity]` or `[:sink, tag, arity, strict]`.
-let role_of name = {
-    let src = found_in sources name;
-    let stp = found_in steps name;
-    let snk = found_in sinks name;
-    if src != () { [:source, list.nth 1 src, list.nth 2 src] }
-    else if stp != () { [:step, list.nth 1 stp, list.nth 2 stp] }
-    else if snk != () { [:sink, list.nth 1 snk, list.nth 2 snk, list.nth 3 snk] }
-    else { () }
+    "replicate" => Role.source :replicate 2,
+    "map" => Role.step :map 2,
+    "filter" => Role.step :filter 2,
+    "fold" => Role.sink :fold 3 false,
+    "fold_strict" => Role.sink :fold 3 true,
+    "sum" => Role.sink :add 1 false,
+    "product" => Role.sink :mul 1 false,
 };
 
-let found_in table name = {
-    let hit = list.filter (fn s -> list.nth 0 s == name) table;
-    if list.is_empty hit { () } else { list.head hit }
-};
+/// What a member of `std.list` is to this pass, or `()`.
+let role_of : :string -> Role | :unit;
+let role_of name = roles.[name else ()];
 
 /// Every name this pass knows, which is what a caller building the index of
 /// global to role has to ask about.
-let member_names =
-    list.append (list.map (fn s -> list.nth 0 s) sources)
-                (list.append (list.map (fn s -> list.nth 0 s) steps)
-                             (list.map (fn s -> list.nth 0 s) sinks));
-
-let role_kind r = r.[0];
-let role_tag r = list.nth 1 r;
-let role_arity r = list.nth 2 r;
-let role_strict r = list.nth 3 r;
+let member_names : [:string];
+let member_names = list.sort (map.keys roles);
 
 // --- the plan ---------------------------------------------------------------
 //
@@ -105,39 +89,39 @@ let role_strict r = list.nth 3 r;
 // honest: nothing is evaluated that was not evaluated before, and nothing
 // twice.
 
-/// `source` is `[tag, argument expressions]`; `step` is `[:ast, expr]` for a
-/// fold whose function was written at the call site, or `[:op, tag]` for `sum`
-/// and `product`.
-mapping Plan {
-    span = [0, 0]
-    fi = 0
-    gi = 0
-    source = []
-    seed = ()
-    step = []
-    strict = false
-    guards = []
-    subst = []
-    elem = 0
+/// What a fold's accumulator does with each element: the lambda written at the
+/// call site, as its body and its parameters, or the operator `sum` and
+/// `product` stand for.
+union Step {
+    written(body, params)
+    op(tag)
 }
 
-let plan span fi gi source seed step strict guards subst elem = Plan.make span fi gi source seed step strict guards subst elem;
+/// What the accumulator starts as: the seed written at the call site, or the
+/// identity of the operator `sum` and `product` stand for.
+union Seed {
+    written(expr)
+    number(value)
+}
 
-let plan_span p = Plan.span p;
-let plan_fi p = Plan.fi p;
-let plan_gi p = Plan.gi p;
-let plan_source p = Plan.source p;
-let plan_seed p = Plan.seed p;
-let plan_step p = Plan.step p;
-let plan_strict p = Plan.strict p;
-/// The conditions the `filter`s became, in the order the elements meet them.
-let plan_guards p = Plan.guards p;
-/// `[slot, expression]` for each stage whose output has no slot of its own.
-/// See "a stage that has no slot" below.
-let plan_subst p = Plan.subst p;
-/// The slot the element the sink sees is read from -- the source's own, when
-/// no `map` came between them.
-let plan_elem p = Plan.elem p;
+/// `source` is `[tag, argument expressions]`.
+struct Plan {
+    span
+    fi
+    gi
+    source
+    seed : Seed
+    step : Step
+    strict : :bool
+    // The conditions the `filter`s became, in the order the elements meet them.
+    guards
+    // `[slot, expression]` for each stage whose output has no slot of its own.
+    // See "a stage that has no slot" below.
+    subst
+    // The slot the element the sink sees is read from -- the source's own,
+    // when no `map` came between them.
+    elem
+}
 
 /// Where the loop keeps things. Every fused loop has the same three
 /// parameters, whichever source it came from: a cursor the source advances, a
@@ -145,12 +129,17 @@ let plan_elem p = Plan.elem p;
 /// element -- and the accumulator. Three rather than two so that a `range`'s
 /// limit is a parameter and not a capture: the JIT compiles a function of its
 /// arguments, and a capture is a frame it would have to keep.
+let cursor_slot : :integer;
 let cursor_slot = 0;
+let carried_slot : :integer;
 let carried_slot = 1;
+let acc_slot : :integer;
 let acc_slot = 2;
+let arity : :integer;
 let arity = 3;
 
 /// Which slot holds the element a source hands to its consumer.
+let element_slot : :atom -> :integer;
 let element_slot tag = if tag == :replicate { carried_slot } else { cursor_slot };
 
 // --- a stage that has no slot -----------------------------------------------
@@ -180,6 +169,7 @@ let element_slot tag = if tag == :replicate { carried_slot } else { cursor_slot 
 /// An over-count, because `mentioned` does not track binders: a body that
 /// shadows the parameter is charged for uses that are not the parameter's.
 /// Over-counting can only refuse a fusion that would have been affordable.
+let uses : :string -> ast.Expr -> :integer;
 let uses name e = list.length (list.filter (fn n -> n == name) (mentioned e));
 
 /// The node count of an expression built only from names, literals, operators
@@ -227,6 +217,7 @@ let max_repeated_size = 12;
 /// place its output is read. A `map` multiplies -- its input is read once per
 /// occurrence of its parameter, in each copy of its body. A `filter` adds --
 /// the element is read by the condition as well as by everything after it.
+let affordable : [Stage] -> :integer -> :bool;
 let affordable steps sink_uses = {
     let rec go ss t =
         match ss {
@@ -234,7 +225,7 @@ let affordable steps sink_uses = {
             [st, ..rest] => {
                 let body = step_body st;
                 let u = uses (step_param st) body;
-                if list.nth 0 st == :filter {
+                if Stage.tag st == :filter {
                     if t + u > max_duplication { false } else { go rest (t + u) }
                 }
                 else {
@@ -248,10 +239,15 @@ let affordable steps sink_uses = {
     go (list.reverse steps) sink_uses
 };
 
-/// A stage is `[tag, the lambda it was written with]`.
-let step_lambda st = list.nth 1 st;
-let step_body st = list.nth 2 (step_lambda st);
-let step_params st = list.nth 1 (step_lambda st);
+/// A stage of a pipeline: `map` or `filter`, and the lambda it was written
+/// with, as syntax.
+struct Stage { tag : :atom, lambda }
+
+let step_body : Stage -> ast.Expr;
+let step_body st = list.nth 2 (Stage.lambda st);
+let step_params : Stage -> [ast.Param];
+let step_params st = list.nth 1 (Stage.lambda st);
+let step_param : Stage -> :string;
 let step_param st = param_name_of (list.nth 0 (step_params st));
 
 // --- the name a fused loop goes by ------------------------------------------
@@ -262,10 +258,12 @@ let step_param st = param_name_of (list.nth 0 (step_params st));
 // kept out of a module's exports and out of an outline for the same reason the
 // hidden global behind a destructuring is.
 
+let loop_name : :atom -> :string;
 let loop_name tag = "<fused " + tag_name tag + ">";
 
 /// An atom's name without its colon. `to_string` keeps the colon, which is
 /// right everywhere else and wrong in the middle of a sentence.
+let tag_name : :atom -> :string;
 let tag_name tag = { let s = to_string tag; str.slice 1 (str.byte_length s - 1) s };
 
 // --- what a body mentions ---------------------------------------------------
@@ -293,6 +291,7 @@ let tag_name tag = { let s = to_string tag; str.slice 1 (str.byte_length s - 1) 
 // fusion that would have been sound, and the alternative -- tracking binders
 // through every shape the syntax comes in -- is a second resolver.
 
+let mentioned : ast.Expr -> [:string];
 let mentioned e = mentioned_in true e;
 
 /// The same, stopping at every function boundary: what this *frame* writes
@@ -303,6 +302,7 @@ let mentioned e = mentioned_in true e;
 /// altogether and once here is read in this frame and nowhere else, which is
 /// what a stage has to be before its body can be moved -- a lambda that read
 /// it would want it as a capture, and a fused loop is a global and has none.
+let mentioned_here : ast.Expr -> [:string];
 let mentioned_here e = mentioned_in false e;
 
 let rec mentioned_in deep e =
@@ -348,6 +348,7 @@ let mentioned_all deep es = list.concat (list.map (fn e -> mentioned_in deep e) 
 /// as a pattern. A pattern parameter has no name of its own, and the names it
 /// binds are found by walking it -- which is why a fold whose function takes
 /// one is refused outright rather than scanned.
+let param_name_of : ast.Param -> :string;
 let param_name_of p = match list.nth 0 p { () => "", n => n };
 
 let rec mentioned_stmts deep stmts =
@@ -375,6 +376,7 @@ let rec mentioned_arms deep arms =
                                  (mentioned_in deep (list.nth 2 a)))) arms);
 
 /// Every name a pattern writes down, binders and the keys it compares by.
+let pattern_names : ast.Pattern -> [:string];
 let rec pattern_names p =
     match p {
         [:bind, n, _] => [n],
@@ -431,6 +433,7 @@ let rest_name rest = match rest { [n, _] => [n], _ => [] };
 // which costs the answer.
 
 /// Every name a statement binds.
+let stmt_binds : ast.Decl -> [:string];
 let stmt_binds st =
     match st {
         [:let, n, _, _, _, _] => [n],
@@ -454,12 +457,13 @@ let stmt_reads deep st =
     };
 
 /// The `let`s in a block whose body may be written where it is read instead:
-/// `[name, body, span]` for each, in the order they appear.
+/// A `Staged` for each, in the order they appear.
 ///
 /// `shaped` is asked first and asked about the body alone, because it is what
 /// keeps this off the compiler's hot path. Most blocks contain no pipeline, and
 /// for those the whole question costs one pattern match per statement; the walk
 /// that counts uses runs only once something in the block could fuse.
+let staged_lets : (ast.Expr -> :bool) -> [ast.Decl] -> [Staged];
 let staged_lets shaped stmts = {
     let n = list.length stmts;
     if not (list.any (fn st -> stageable shaped st) stmts) { [] }
@@ -497,7 +501,7 @@ let staged_lets shaped stmts = {
                         else if list.count (fn u -> u == name) later != 1 { [] }
                         else if list.contains name after { [] }
                         else if list.any (fn u -> list.contains u after) (mentioned body) { [] }
-                        else { [[name, body, span]] }
+                        else { [Staged.make name body span] }
                     },
                 _ => [],
             }) (list.range 0 n))
@@ -507,15 +511,15 @@ let staged_lets shaped stmts = {
 /// A `let` that binds one name to one expression, which is the only shape a
 /// value can be written at its use site from. A `let` with parameters is a
 /// function, and a `let rec` names itself in its own body.
+let stageable : (ast.Expr -> :bool) -> ast.Decl -> :bool;
 let stageable shaped st =
     match st {
         [:let, _, ps, body, is_rec, _] => list.is_empty ps && not is_rec && shaped body,
         _ => false,
     };
 
-let staged_name s = list.nth 0 s;
-let staged_body s = list.nth 1 s;
-let staged_span s = list.nth 2 s;
+/// A `let` whose body may be written where it is read instead.
+struct Staged { name, body, span }
 
 // --- tests ------------------------------------------------------------------
 
@@ -524,9 +528,9 @@ when test {
 
     let tests = [
         test.case "a source is recognised by name"
-            $( test.eq! [:source, :range, 2] (role_of "range") ),
+            $( test.eq! (Role.source :range 2) (role_of "range") ),
         test.case "a sink is recognised by name"
-            $( test.eq! [:sink, :fold, 3, true] (role_of "fold_strict") ),
+            $( test.eq! (Role.sink :fold 3 true) (role_of "fold_strict") ),
         test.case "a member with no role is not invented"
             $( test.eq! () (role_of "sort") ),
         test.case "every name has a role"
@@ -565,5 +569,5 @@ when test {
     let nm n = [:name, n, nowhere];
     let call f args = [:apply, [:name, f, nowhere], args, nowhere];
     let bind n body = [:let, n, [], body, false, nowhere];
-    let staged_names stmts = list.map (fn st -> staged_name st) (staged_lets (fn _ -> true) stmts);
+    let staged_names stmts = list.map (fn st -> Staged.name st) (staged_lets (fn _ -> true) stmts);
 }

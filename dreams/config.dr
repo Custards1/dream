@@ -44,22 +44,30 @@ mapping Configuration {
     here = ()
 }
 
+let flags : Configuration -> %{:string => :bool};
 let flags c = Configuration.flags c;
+let values : Configuration -> %{:string => :string};
 let values c = Configuration.values c;
+let scoped : Configuration -> %{:string => %{:string => :string}};
 let scoped c = Configuration.scoped c;
 
 /// A configuration with nothing defined. `defaults!` is what a compilation
 /// actually starts from; this is what a test starts from.
+let empty : Configuration;
 let empty = Configuration.new ();
 
+let define : :string -> Configuration -> Configuration;
 let define name c = Configuration.set_flags ((flags c).[name => true]) c;
 
+let set : :string -> :string -> Configuration -> Configuration;
 let set key value c = Configuration.set_values ((values c).[key => value]) c;
 
 /// The name a package's settings are filed under.
+let canonical : Configuration -> :string -> :string;
 let canonical c key = (Configuration.aliases c).[key else key];
 
 /// Set `name` to `value` for package `key` alone.
+let set_in : :string -> :string -> :string -> Configuration -> Configuration;
 let set_in key name value c = {
     let k = canonical c key;
     let now = (scoped c).[k else (%{})];
@@ -72,24 +80,23 @@ let set_in key name value c = {
 /// "none". The scope is marked with a colon rather than a dot because a key may
 /// have dots in it and a name may not; a bare scoped name is `true`, the value
 /// a `bool` option is written with.
+let define_arg : :string -> Configuration -> Configuration;
 let define_arg arg c = {
     let at = str.find "=" arg;
     let lhs = if at < 0 { arg } else { str.slice 0 at arg };
     let rhs = if at < 0 { () } else { str.slice (at + 1) (str.byte_length arg - at - 1) arg };
     let colon = str.find ":" lhs;
-    match [colon >= 0, rhs] {
-        [true, _] => {
-            let key = str.slice 0 colon lhs;
-            let name = str.slice (colon + 1) (str.byte_length lhs - colon - 1) lhs;
-            set_in key name (match rhs { () => "true", v => v }) c
-        },
-        [false, ()] => define arg c,
-        [false, v] => set lhs v c,
+    if colon >= 0 {
+        let key = str.slice 0 colon lhs;
+        let name = str.slice (colon + 1) (str.byte_length lhs - colon - 1) lhs;
+        set_in key name (match rhs { () => "true", v => v }) c
     }
+    else { match rhs { () => define arg c, v => set lhs v c } }
 };
 
 /// The same configuration, read from inside package `key`'s modules. `()` is
 /// a module that belongs to no package, which sees the program's settings only.
+let within : :string | :unit -> Configuration -> Configuration;
 let within key c = Configuration.set_here (match key { () => (), k => canonical c k }) c;
 
 /// Refile every scope under its canonical name, now that the names are known:
@@ -97,6 +104,7 @@ let within key c = Configuration.set_here (match key { () => (), k => canonical 
 /// is keyed by it until here. Answers `[configuration, unknown keys]`, a key
 /// being unknown when `known` says so -- a `-D` that names no package is a
 /// typo, and a typo that is quietly ignored is the worst answer to one.
+let with_aliases : %{:string => :string} -> (:string -> :bool) -> Configuration -> [:any];
 let with_aliases aliases known c = {
     let named = Configuration.set_aliases aliases c;
     let refiled = list.fold (fn m [k, table] -> {
@@ -112,6 +120,7 @@ let with_aliases aliases known c = {
 /// when it is not, so the program's settings answer instead. A dotted name is
 /// only ever an option, so `[:ok, ()]` for one nobody set rather than falling
 /// through to a flag no `-D` could have spelled.
+let option : Configuration -> :string -> [:ok, :string | :unit] | :unit;
 let option c name = {
     let dot = str.find "." name;
     match dot >= 0 {
@@ -130,15 +139,18 @@ let option c name = {
     }
 };
 
+let define_args : [:string] -> Configuration -> Configuration;
 let rec define_args args c =
     match args {
         [] => c,
         [a, ..rest] => define_args rest (define_arg a c),
     };
 
+let is_defined : :string -> Configuration -> :bool;
 let is_defined name c = map.has name (flags c);
 
 /// The value of a setting, or `()` when it has none.
+let value : :string -> Configuration -> :string | :unit;
 let value key c = ((values c)).[key else ()];
 
 // --- what the compiler knows about itself -----------------------------------
@@ -146,6 +158,7 @@ let value key c = ((values c)).[key else ()];
 /// The platform atom as the string a `when` compares against. `to_string` of an
 /// atom keeps the leading `:`, which is not what `os == "linux"` is written
 /// with, so the colon comes off here rather than at every comparison.
+let platform_name : :atom -> :string;
 let platform_name p = { let s = to_string p; str.slice 1 (str.byte_length s - 1) s };
 
 /// `os`, `arch` and `family`, filled in from the machine this is running on.
@@ -154,6 +167,7 @@ let platform_name p = { let s = to_string p; str.slice 1 (str.byte_length s - 1)
 /// nothing else, so `arch` is left undefined rather than guessed at. An
 /// undefined setting makes `when arch == "x86_64"` false, which is the safe
 /// way to be wrong -- the alternative is code compiled for the wrong machine.
+let defaults! : :unit -> Configuration;
 let defaults! () = {
     let os_name = platform_name (os.platform ());
     empty
@@ -165,6 +179,7 @@ let defaults! () = {
 
 /// The vocabulary the parser produces for `when`: `true`/`false`, a bare flag,
 /// `setting == "value"`, and `not` / `&&` / `||` over those.
+let eval : Configuration -> [:any] -> :bool;
 let rec eval c cond =
     match cond {
         [:const, b]     => b,
@@ -195,6 +210,7 @@ let rec eval c cond =
 /// Windows branch as surely as it holds the Linux one. So the loader keeps
 /// this for every condition it evaluates, and the image's target is pinned by
 /// it (`target.from_reads`).
+let reads : [:any] -> [:string];
 let rec reads cond =
     match cond {
         [:flag, name]   => [name],
@@ -209,6 +225,7 @@ let rec reads cond =
 
 /// Every flag and setting, one per line, sorted -- what `--print-cfg` shows.
 /// Settings are quoted so that a value with a space in it still reads as one.
+let describe : Configuration -> [:string];
 let describe c = {
     let named = list.map (fn [name, _] -> name) (map.pairs (flags c));
     let valued = list.map (fn [name, value] -> name + " = \"" + value + "\"")
