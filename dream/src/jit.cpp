@@ -77,6 +77,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -5422,38 +5423,134 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
 // tests use to make sure a function's *compiled* body is the one they exercise
 // -- and for `DREAM_JIT_SYNC`, when that is wanted anywhere else.
 
+// Several compile threads, not one.
+//
+// A self-compile makes about a thousand functions hot, and compiling all of
+// them costs LLVM a minute of CPU against a program that runs for under three
+// seconds -- so one thread working through the queue reaches the first few
+// dozen before the program is over, and the rest are interpreted to the end.
+// Most machines have cores the program is not using. So there is a pool of
+// compile threads (`DREAM_JIT_THREADS`, `--jit-threads`), each taking the
+// hottest function waiting rather than the oldest (`take_hottest`), and the CPU
+// budget below is shared between them: the pool runs at normal priority while
+// what it has spent together is inside it, and at `SCHED_IDLE` past it, where
+// it gets the idle cores and nothing else.
+//
+// Every compile has a context and a module of its own, and the program's image
+// and runtime are only read, so the threads share nothing while they work but
+// the two tables a finished compile is written into (`mutex`) and LLJIT,
+// which is built to be added to from several threads. Its compiler is the one
+// thing that was not, which is why it is ours (`SizedCompiler`).
+
+/// The code generator: a target machine per module, made fresh for each one,
+/// which is what lets several threads generate code at once -- LLJIT's own
+/// compiler shares one -- and at the level the module's size calls for.
+///
+/// By the time a module reaches code generation, O2 has already done the
+/// optimizing that matters, and what the generator's own optimization buys is
+/// register allocation and instruction selection for tight loops. Measured on
+/// the benchmark loops, that is real: `sum` 43 -> 68 ms and `collatz` 66 -> 107
+/// with the fast generator. But it is paid in proportion to size, and on a
+/// self-compile the 232 modules over `kFastCodegenInsts` were 88% of the 29 s
+/// spent generating code; the fast generator did all of it in 3.6 s. Every
+/// benchmark kernel is under 400 instructions. So a large module is generated
+/// fast and a small one well -- marked by the flag `dream.fast`.
+class SizedCompiler : public llvm::orc::IRCompileLayer::IRCompiler {
+public:
+    explicit SizedCompiler(llvm::orc::JITTargetMachineBuilder jtmb)
+        : IRCompiler(llvm::orc::irManglingOptionsFromTargetOptions(jtmb.getOptions())),
+          jtmb_(std::move(jtmb)) {}
+
+    llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> operator()(llvm::Module& m) override {
+        llvm::orc::JITTargetMachineBuilder b = jtmb_;
+        b.setCodeGenOptLevel(m.getModuleFlag("dream.fast") ? llvm::CodeGenOptLevel::None
+                                                           : llvm::CodeGenOptLevel::Default);
+        auto tm = b.createTargetMachine();
+        if (!tm) return tm.takeError();
+        return llvm::orc::SimpleCompiler(**tm)(m);
+    }
+
+private:
+    const llvm::orc::JITTargetMachineBuilder jtmb_;
+};
+
+/// Instructions, after O2, past which a module's code is generated fast. See
+/// `SizedCompiler`.
+constexpr size_t kFastCodegenInsts = 1000;
+
+/// How many compile threads, unless `--jit-threads` says: `DREAM_JIT_THREADS`,
+/// or two. More is not faster for a program of a few seconds: on a
+/// self-compile (24 threads, 12 cores) one, two and four threads finished
+/// within the noise of each other, eight was 8% slower and sixteen 60% slower
+/// -- they compile more, and what they compile cannot repay itself in a run
+/// that short, while they take cores, cache and the hyperthread beside a
+/// program thread. A run long enough to want everything compiled wants
+/// `--precompile` instead.
+unsigned default_jit_threads() {
+    if (const char* v = std::getenv("DREAM_JIT_THREADS")) {
+        const long n = std::atol(v);
+        if (n > 0) return unsigned(n);
+    }
+    return 2;
+}
+
 struct Jit::Impl {
     explicit Impl(Runtime& r) : rt(r) {}
 
     Runtime& rt;
     std::unique_ptr<llvm::orc::LLJIT> lljit;
+    std::once_flag jit_once;
+    std::string jit_error;
+    /// Guards `compiled` and `rejected`, and nothing that runs long.
     std::mutex mutex;
     std::unordered_map<uint32_t, CompiledFn> compiled;
     std::unordered_set<uint32_t> rejected;
     uint32_t threshold = 32;
     std::atomic<uint64_t> compiled_count{0};
-    bool initialized = false;
+    /// Makes each compile's entry symbol unique, so two compiles of one
+    /// function -- two workers forcing it synchronously at once -- cannot
+    /// define the same name twice.
+    std::atomic<uint64_t> serial{0};
 
-    // The compile thread and its queue, guarded by `queue_mutex` -- a lock of
-    // their own, so an entry that queues a function never waits on a compile.
+    // The compile threads and their queue, guarded by `queue_mutex` -- a lock
+    // of their own, so an entry that queues a function never waits on a
+    // compile.
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     std::deque<uint32_t> queue;
-    std::thread worker;
+    std::vector<std::thread> workers;
+    unsigned threads = default_jit_threads();
     bool stopping = false;
+    /// CPU the compile threads have spent between them. See `jit_within_budget`.
+    std::atomic<int64_t> jit_ns{0};
     const bool force_sync = std::getenv("DREAM_JIT_SYNC") != nullptr;
 
     bool ensure_jit(std::string* error);
+    bool create_jit();
 };
 
 bool Jit::Impl::ensure_jit(std::string* error) {
-    if (lljit) return true;
-    if (!initialized) {
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-        initialized = true;
-    }
-    auto built = llvm::orc::LLJITBuilder().create();
+    std::call_once(jit_once, [this] { create_jit(); });
+    if (!lljit && error) *error = jit_error;
+    return lljit != nullptr;
+}
+
+bool Jit::Impl::create_jit() {
+    std::string* error = &jit_error;
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    // Code generation is ours rather than LLJIT's default, for two reasons:
+    // the default compiler is not safe to call from several threads at once,
+    // and several compile threads is the point (see "Compiling in the
+    // background"); and the level it generates code at is chosen per module,
+    // by size (see `SizedCompiler`).
+    auto built = llvm::orc::LLJITBuilder()
+                     .setCompileFunctionCreator(
+                         [](llvm::orc::JITTargetMachineBuilder jtmb)
+                             -> llvm::Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+                             return std::make_unique<SizedCompiler>(std::move(jtmb));
+                         })
+                     .create();
     if (!built) {
         if (error) *error = llvm::toString(built.takeError());
         return false;
@@ -5530,7 +5627,9 @@ Jit::~Jit() {
         impl_->queue.clear();
     }
     impl_->queue_cv.notify_all();
-    if (impl_->worker.joinable()) impl_->worker.join();
+    for (std::thread& w : impl_->workers) {
+        if (w.joinable()) w.join();
+    }
     impl_->rt.set_jit(nullptr);
 }
 
@@ -5543,9 +5642,10 @@ int64_t cpu_nanos(clockid_t clock) {
     return int64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec;
 }
 
-/// How much CPU the compile thread may take at normal priority: an allowance
-/// every program gets, plus a share of what the process has spent so far. See
-/// `compile_worker`. `DREAM_JIT_SHARE` is the share as a percentage.
+/// How much CPU the compile threads may take between them at normal priority:
+/// an allowance every program gets, plus a share of what the process has spent
+/// so far. See `compile_worker`. `DREAM_JIT_SHARE` is the share as a
+/// percentage.
 bool jit_within_budget(int64_t jit_ns) {
     static const int64_t share_pct = [] {
         if (const char* v = std::getenv("DREAM_JIT_SHARE")) return int64_t(std::atoll(v));
@@ -5603,24 +5703,48 @@ void Jit::compile_worker() {
             std::unique_lock<std::mutex> g(impl_->queue_mutex);
             impl_->queue_cv.wait(g, [&] { return impl_->stopping || !impl_->queue.empty(); });
             if (impl_->stopping) return;
-            func_index = impl_->queue.front();
-            impl_->queue.pop_front();
+            func_index = take_hottest();
         }
 #if defined(__linux__)
-        set_idle(!jit_within_budget(cpu_nanos(self_clock)));
+        set_idle(!jit_within_budget(impl_->jit_ns.load(std::memory_order_relaxed)));
+        const int64_t spent_before = cpu_nanos(self_clock);
 #endif
-        CompiledFn fn = nullptr;
-        {
+        CompiledFn fn = compile_one(func_index, nullptr);
+        if (!fn) {
             std::lock_guard<std::mutex> g(impl_->mutex);
-            fn = compile_locked(func_index, nullptr);
-            if (!fn) impl_->rejected.insert(func_index);
+            impl_->rejected.insert(func_index);
         }
+#if defined(__linux__)
+        impl_->jit_ns.fetch_add(cpu_nanos(self_clock) - spent_before, std::memory_order_relaxed);
+#endif
         // From "queued" only: nothing else moves a queued function, but a
         // compare-exchange says so rather than relying on it.
         CompiledFn expected = queued();
         cached_[func_index].compare_exchange_strong(expected, fn ? fn : rejected(),
                                                     std::memory_order_acq_rel);
     }
+}
+
+uint32_t Jit::take_hottest() {
+    // The queue is in the order functions *became* hot, which is not the
+    // order they matter in: a function that crossed the threshold early may
+    // be called a handful of times more, and one that crossed it late may
+    // be the loop the rest of the program runs in. `tier` keeps counting a
+    // function while it waits, so the count says which is which. A linear
+    // walk, because it is short beside a compile -- a thousand entries at
+    // the very most, against milliseconds of LLVM.
+    auto best = impl_->queue.begin();
+    uint32_t most = 0;
+    for (auto it = impl_->queue.begin(); it != impl_->queue.end(); ++it) {
+        const uint32_t n = counts_[*it].load(std::memory_order_relaxed);
+        if (n > most) {
+            most = n;
+            best = it;
+        }
+    }
+    const uint32_t func_index = *best;
+    impl_->queue.erase(best);
+    return func_index;
 }
 
 void Jit::set_threshold(uint32_t calls) {
@@ -5648,20 +5772,31 @@ CompiledFn Jit::on_enter(uint32_t func_index) {
             std::lock_guard<std::mutex> g(impl_->queue_mutex);
             if (impl_->stopping) return nullptr;
             impl_->queue.push_back(func_index);
-            if (!impl_->worker.joinable()) impl_->worker = std::thread([this] { compile_worker(); });
+            // The pool is started by the first function to get hot, all of
+            // it at once: a thread waiting on an empty queue costs nothing.
+            if (impl_->workers.empty()) {
+                for (unsigned i = 0; i < impl_->threads; ++i) {
+                    impl_->workers.emplace_back([this] { compile_worker(); });
+                }
+            }
         }
         impl_->queue_cv.notify_one();
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> g(impl_->mutex);
-    auto it = impl_->compiled.find(func_index);
-    if (it != impl_->compiled.end()) return it->second;
-    if (impl_->rejected.count(func_index)) return nullptr;
+    {
+        std::lock_guard<std::mutex> g(impl_->mutex);
+        auto it = impl_->compiled.find(func_index);
+        if (it != impl_->compiled.end()) return it->second;
+        if (impl_->rejected.count(func_index)) return nullptr;
+    }
 
-    CompiledFn fn = compile_locked(func_index, nullptr);
+    CompiledFn fn = compile_one(func_index, nullptr);
     if (!fn) {
-        impl_->rejected.insert(func_index);
+        {
+            std::lock_guard<std::mutex> g(impl_->mutex);
+            impl_->rejected.insert(func_index);
+        }
         cached_[func_index].store(rejected(), std::memory_order_release);
         return nullptr;
     }
@@ -5681,31 +5816,105 @@ void Jit::deoptimize(uint32_t func_index) {
 }
 
 CompiledFn Jit::compile(uint32_t func_index, std::string* error) {
-    std::lock_guard<std::mutex> g(impl_->mutex);
-    return compile_locked(func_index, error);
+    return compile_one(func_index, error);
 }
 
-CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
-    auto it = impl_->compiled.find(func_index);
-    if (it != impl_->compiled.end()) return it->second;
+// Compiling ahead.
+//
+// A function is compiled once it is hot because most functions never are, and
+// compiling one is not cheap: a self-compile's thousand hot functions cost LLVM
+// a minute of CPU, against three seconds of program. But compiled, those
+// functions do the same work in about two thirds of the CPU. So a program that
+// runs long enough to repay the compile -- or a run where only the run's own
+// speed matters -- can have everything compiled first, on every core, while
+// nothing else wants them. That is `--precompile`.
+//
+// Nothing about what is compiled changes. A function the tier refuses is
+// marked so, which is what being refused when hot would have done, and the
+// interpreter runs it.
+Jit::Precompiled Jit::precompile(unsigned threads) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const Image& img = impl_->rt.image();
+    const uint32_t n = uint32_t(img.func_count());
+    std::atomic<uint32_t> next{0};
+    std::atomic<uint32_t> compiled{0};
+    std::atomic<uint32_t> refused{0};
+    auto work = [&] {
+        for (;;) {
+            const uint32_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) return;
+            // A thunk or a parameterless global: the tier never takes one, and
+            // asking costs an analysis.
+            if (img.func(i).arity == 0) continue;
+            CompiledFn fn = compile_one(i, nullptr);
+            if (fn) {
+                compiled.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                refused.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> g(impl_->mutex);
+                impl_->rejected.insert(i);
+            }
+            cached_[i].store(fn ? fn : rejected(), std::memory_order_release);
+        }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned k = 1; k < std::max(1u, threads); ++k) pool.emplace_back(work);
+    work();
+    for (std::thread& t : pool) t.join();
+    Precompiled out;
+    out.compiled = compiled.load();
+    out.refused = refused.load();
+    out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return out;
+}
+
+void Jit::set_threads(unsigned n) {
+    std::lock_guard<std::mutex> g(impl_->queue_mutex);
+    // Only before the pool has started; it is started once, whole.
+    if (impl_->workers.empty() && n > 0) impl_->threads = n;
+}
+
+CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
+    {
+        std::lock_guard<std::mutex> g(impl_->mutex);
+        auto it = impl_->compiled.find(func_index);
+        if (it != impl_->compiled.end()) return it->second;
+    }
     // `DREAM_JIT_TRACE=1` prints every compile, whether it was taken and what
     // LLVM charged for it -- the number that decided compiling in the
     // background, and the one to read before widening the tier again.
     // The function's name is printed beside its index, as `--profile` names
     // it, so that a trace says which of a library's functions the tier took.
+    // With the time split three ways -- writing the IR, optimizing it, and
+    // generating code -- and the module's size before and after O2, which is
+    // what the last two are proportional to.
     struct Trace {
+        using Clock = std::chrono::steady_clock;
         uint32_t fi;
         CompiledFn* result;
         const Image* img;
-        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        Clock::time_point t0 = Clock::now();
+        Clock::time_point emitted{}, optimized{};
+        size_t insts_in = 0, insts_out = 0;
+        static double ms(Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        }
         ~Trace() {
             static const bool on = std::getenv("DREAM_JIT_TRACE") != nullptr;
             if (!on) return;
-            const double ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count();
+            const Clock::time_point t3 = Clock::now();
             StringRef name = img->str(img->func(fi).name);
-            std::fprintf(stderr, "; jit fn#%u %.*s %s %.2f ms\n", fi, int(name.len), name.data,
-                         *result ? "compiled" : "refused", ms);
+            if (!*result) {
+                std::fprintf(stderr, "; jit fn#%u %.*s refused %.2f ms\n", fi, int(name.len),
+                             name.data, ms(t0, t3));
+                return;
+            }
+            std::fprintf(stderr,
+                         "; jit fn#%u %.*s compiled %.2f ms (emit %.2f, opt %.2f, codegen %.2f; "
+                         "%zu -> %zu insts%s)\n",
+                         fi, int(name.len), name.data, ms(t0, t3), ms(t0, emitted),
+                         ms(emitted, optimized), ms(optimized, t3), insts_in, insts_out,
+                         insts_out > kFastCodegenInsts ? ", fast codegen" : "");
         }
     };
     CompiledFn traced = nullptr;
@@ -5717,7 +5926,8 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);
     mod->setDataLayout(impl_->lljit->getDataLayout());
 
-    std::string name = "dream_fn_" + std::to_string(func_index);
+    std::string name = "dream_fn_" + std::to_string(func_index) + "_" +
+                       std::to_string(impl_->serial.fetch_add(1, std::memory_order_relaxed));
     if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index, name)) {
         if (error) *error = "not compilable by this tier";
         return nullptr;
@@ -5726,6 +5936,15 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     // Standard optimization pipeline: without it the tag arithmetic and the
     // repeated slot loads dominate, and the compiled loop is barely faster
     // than the interpreter.
+    auto instructions = [&] {
+        size_t n = 0;
+        for (const llvm::Function& f : *mod) {
+            for (const llvm::BasicBlock& b : f) n += b.size();
+        }
+        return n;
+    };
+    trace.emitted = std::chrono::steady_clock::now();
+    trace.insts_in = instructions();
     llvm::PassBuilder pb;
     llvm::LoopAnalysisManager lam;
     llvm::FunctionAnalysisManager fam;
@@ -5738,6 +5957,11 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     pb.crossRegisterProxies(lam, fam, cgam, mam);
     auto mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
     mpm.run(*mod, mam);
+    trace.optimized = std::chrono::steady_clock::now();
+    trace.insts_out = instructions();
+    if (trace.insts_out > kFastCodegenInsts) {
+        mod->addModuleFlag(llvm::Module::Warning, "dream.fast", 1);
+    }
 
     if (auto err = impl_->lljit->addIRModule(
             llvm::orc::ThreadSafeModule(std::move(mod), std::move(ctx)))) {
@@ -5750,14 +5974,19 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
         return nullptr;
     }
     auto fn = sym->toPtr<CompiledFn>();
+    {
+        // Two compiles of one function can race only on the synchronous
+        // path; the first to finish is the one every later caller gets.
+        std::lock_guard<std::mutex> g(impl_->mutex);
+        auto [at, fresh] = impl_->compiled.emplace(func_index, fn);
+        if (fresh) ++impl_->compiled_count;
+        fn = at->second;
+    }
     traced = fn;
-    impl_->compiled[func_index] = fn;
-    ++impl_->compiled_count;
     return fn;
 }
 
 std::string Jit::dump_ir(uint32_t func_index) {
-    std::lock_guard<std::mutex> g(impl_->mutex);
     const Image& img = impl_->rt.image();
     auto ctx = std::make_unique<llvm::LLVMContext>();
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);

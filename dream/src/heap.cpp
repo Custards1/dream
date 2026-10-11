@@ -1716,9 +1716,22 @@ void Heap::pin_conservative(bool full) {
     // each block is walked once however many words point into it. A nursery
     // block is one run of objects with no index, so finding the object an
     // address is inside is a walk from the block's start.
+    //
+    // Most words are not candidates at all, and saying so costs two compares
+    // rather than a binary search: a fixnum or any other immediate has a tag
+    // bit set, an object is eight-byte aligned, and a return address or a
+    // pointer into the stack is usually outside every block. On a precompiled
+    // self-compile, where almost every collection runs under compiled code,
+    // the search was most of this function and this function was 8% of the
+    // run.
+    if (ranges.empty()) return;
+    const uintptr_t lowest = ranges.front().lo;
+    uintptr_t highest = 0;
+    for (const Range& r : ranges) highest = std::max(highest, r.hi);
     std::vector<std::pair<size_t, uintptr_t>> hits;
     for (const uintptr_t* w = cons_lo_; w < cons_hi_; ++w) {
         const uintptr_t a = *w;
+        if ((a & 7) != 0 || a < lowest || a >= highest) continue;
         auto it = std::upper_bound(ranges.begin(), ranges.end(), a,
                                    [](uintptr_t key, const Range& r) { return key < r.lo; });
         if (it == ranges.begin()) continue;
