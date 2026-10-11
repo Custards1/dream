@@ -1047,19 +1047,25 @@ the atom its values carry (below).
   over as many lines as it is indented past.
 - **A default** (`y = 0`) is what `new` fills in, and, for a `mapping`, what
   reading the field answers when the map has nothing there. It is compiled
-  inside the record's module, so it may not name anything from the enclosing
-  one.
+  inside the record's module, which sees the names of the file it is written
+  in (see [Modules](#modules)).
 - **A member** is an entry with parameters (`say_hi self = ..`): an ordinary
   function compiled inside the record's module, where the accessors,
-  setters and other members are in scope without an import. Having
+  setters and other members are in scope without an import, as is
+  everything the file around it declares and imports. Having
   parameters is the whole of what tells a member from a field. `self` is
   just a name. A member may be impure; a field may not.
 - **A field annotation** (`x : :integer`) contributes to `Point.type`, a
   description of the record. Every `group` and `struct` gives its generated
   functions signatures -- `Point.x : Point -> :any` -- so the checker knows a
   `Point` from a list; a `mapping` gives them only when a field is annotated.
-  A field's type cannot yet name another record declared beside it: it is
-  resolved inside the record's module, where its siblings are not visible.
+  A field's type may name another record declared beside it
+  (`initial : Period`), and the checker holds `make` and the setters to it.
+- **The record's name is a type** wherever a type is written: the parent
+  module holds a global of that name whose value is `Point.type`, as a
+  union's does, so `type Ps = [Point]` and `types.check Point v` work.
+  `Point.make` still reaches the module, since a name before a dot is looked
+  up as a module first.
 - **A strict field** (`!x`, or `(strict x)`) is forced before it is stored:
   it is a [strict parameter](#strict-parameters) of `make`, `new` and
   `set_x`. A suspended field holds whatever its frame reached, and a record
@@ -1184,7 +1190,13 @@ util.deep.answer       // 42
 
 Inside module `m`, `mod util { .. }` *is* the module `m.util`, which `m`
 imports, so a submodule and a file are the same thing to everything after
-the parser. A module does not re-export what it imports. An import is
+the parser -- with one difference, which is lexical: a `mod` sees the names
+of the module it is written in. Every global, import and imported member of
+`m` that `util` does not bind itself is in scope inside it, `priv` ones
+included, and a `mod` two levels in sees both. Its own names win. A record or
+a union is a `mod` (§10), which is how a member calls the function declared
+above it. A module in a file of its own sees nothing it did not import:
+`std.time.zone` is not inside `std.time`. A module does not re-export what it imports. An import is
 resolved relative to the current module first, so `import util.{helper}` in
 a module that declares `mod util` means that submodule.
 

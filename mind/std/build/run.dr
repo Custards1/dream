@@ -75,7 +75,10 @@ let rec forced! v = {
     match type_of v {
         :list => fold! (fn _ x -> forced! x) () v,
         :map => fold! (fn _ pair -> forced! (list.nth 1 pair)) () (_map_pairs v),
-        _ => (),
+        :array => fold! (fn _ x -> forced! x) () (_array_to_list v),
+        // A record -- `Input`, `Goal` and the rest are -- by its fields; its
+        // `type_of` is its own name, so it is what reaches here.
+        _ => if _record_id v != () { fold! (fn _ x -> forced! x) () (_array_to_list (_record_fields v)) } else { () },
     }
     v
 };

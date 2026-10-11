@@ -264,6 +264,11 @@ private:
     std::atomic<size_t> io_waiters_{0};
     std::atomic<uint64_t> total_reductions_{0};
     std::atomic<bool> deadlocked_{false};
+    /// The process `run` was handed, and whether it has failed. An error
+    /// nothing caught in the root ends the run there, live processes or not:
+    /// see `finish`.
+    std::atomic<uint64_t> root_id_{0};
+    std::atomic<bool> root_failed_{false};
 
     /// Timed waits, by deadline. One thread sleeps until the earliest and
     /// wakes whoever it belongs to; `timer_index_` is how a cancel finds an

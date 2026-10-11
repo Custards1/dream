@@ -1441,7 +1441,7 @@ let check_member c r_ref shown field span r = {
         match r_ref {
             [:dream, target] => {
                 let e = env_of c r target;
-                if is_private e field && target != ctx_mi c {
+                if is_private e field && not (encloses (ctx_env c r) (ctx_mi c) target) {
                     report c span ("member `" + shown + "." + field + "` is private") r
                 }
                 else if has_global e field {
@@ -2085,14 +2085,75 @@ let check_body l p r = {
     done.[:bodies => (list.cons [mi, source, d, fi] (bodies_rev done))]
 };
 
+// --- what a nested module sees ---------------------------------------------------
+
+/// A module written inside another sees the names around it.
+///
+/// `mod`, and so every `struct`, `group` and `union`, is hoisted out to a
+/// module of its own (`modules.hoist_mod!`), and a module sees only what it
+/// declares and imports. That made a record an island in the file it was
+/// written in: a member could not call the helper declared above it, and a
+/// field could not be typed with the record declared beside it -- `Rule`'s
+/// `standard : Period` in std.time.zone had to be `:any`. It cannot import
+/// its parent instead, because the parent imports it and imports form a tree.
+///
+/// So once every module has declared its names, each nested one is handed its
+/// parent's: every global, import and `import a.{x}` member the parent binds
+/// and it does not, as though it had written `import parent.{ name }` for
+/// each, and every alias the same way. Its own names win, which is what a
+/// lexical scope means, and nothing that resolved before resolves differently.
+/// The parents go first -- a parent is recorded after what is hoisted out of
+/// it, so that is the order from the last module down -- so a module two
+/// levels in sees its grandparent's names through its parent's.
+///
+/// The names are lent as import entries rather than copied as globals, so
+/// what they resolve to is the parent's global, and everything downstream --
+/// lowering, the type checker's `type_ref`, the unit cache's key, which holds
+/// the declared state this produces -- reads them as it reads an import. A
+/// nested module may read its parent's `priv` names (`encloses`), as code
+/// written in the parent's file always could.
+let inherit_enclosing l s =
+    list.fold (fn acc mi -> match modules.module_within (modules.module_at l mi) {
+        () => acc,
+        outer_name => match modules.find l outer_name {
+            () => acc,
+            outer => if has_env acc outer && has_env acc mi {
+                         set_env mi (inherited outer (env_at acc outer) (env_at acc mi)) acc
+                     } else { acc },
+        },
+    }) s (list.reverse (list.range 0 (modules.module_count l)));
+
+/// `e`, a module written inside module `outer`, lent `oe`'s names.
+let inherited outer oe e = {
+    let binds e n = has_global e n || only_of e n != ();
+    let lendable n = not (is_hidden_name n);
+    let values = list.fold (fn acc [n, _] ->
+        if lendable n && not (binds acc n) { with_only n [dream_ref outer, n, env_name oe] acc } else { acc })
+        e (map.pairs (globals oe));
+    let members = list.fold (fn acc [n, sel] ->
+        if lendable n && not (binds acc n) { with_only n sel acc } else { acc })
+        values (map.pairs (only oe));
+    let named = list.fold (fn acc [n, r] ->
+        if alias_of acc n == () { with_alias n r acc } else { acc })
+        members (map.pairs (aliases oe));
+    named.[:within => list.cons outer (within oe)]
+};
+
+/// The modules `e` was written inside, nearest first.
+let within e = e.[:within else []];
+
+/// May code in module `mi` read module `target`'s private names? Its own, and
+/// those of every module it was written inside.
+let encloses e mi target = target == mi || list.contains target (within e);
+
 // --- the entry point ---------------------------------------------------------
 
 /// Declare every module a loader holds, in the loader's order. A fresh compile
 /// does this and then checks everything; session mode declares a slice of its
 /// root on top of the carried result for a warm start.
 let declare! l =
-    list.fold (fn acc mi -> declare_module l mi acc) state
-              (list.range 0 (modules.module_count l));
+    inherit_enclosing l (list.fold (fn acc mi -> declare_module l mi acc) state
+                                   (list.range 0 (modules.module_count l)));
 
 /// The one body every declaration the reachability walk did not reach shares:
 /// the same `1 / 0` an unexpanded `expand` is staged as, declared once.
@@ -3492,6 +3553,17 @@ when test {
         test.case "nested modules enforce private visibility"
             $( test.eq! "member `a.x` is private"
                 (first (checked! "mod a { priv let x = 1; } let main! = a.x;")) ),
+        // A `mod` sees the module it is written in (`inherit_enclosing`).
+        test.case "a nested module sees its parent's names, private ones too"
+            $( test.eq! [] (checked! "priv let x = 1; mod h { let z = 2; } mod a { let y = x + h.z; } let main! = a.y;") ),
+        test.case "a nested module's own name wins over its parent's"
+            $( test.eq! [] (checked! "let x = \"s\"; mod a { let x = 1; let y = x + 1; } let main! = a.y;") ),
+        test.case "two levels in, the grandparent's names are seen"
+            $( test.eq! [] (checked! "let x = 1; mod a { mod b { let y = x; } } let main! = a.b.y;") ),
+        test.case "a record's field may be typed with the record beside it"
+            $( test.eq! [] (checked! "struct P { x } struct R { p : P } let main! = R.make (P.make 1);") ),
+        test.case "a record's member may call the function beside it"
+            $( test.eq! [] (checked! "let twice n = n * 2; struct P { x, doubled self = twice (x self) } let main! = P.doubled (P.make 1);") ),
         test.case "conditional private bindings remain private"
             $( test.eq! "member `a.x` is private"
                 (first (checked_two! "when true { priv let x = 1; }"

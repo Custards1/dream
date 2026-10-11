@@ -361,7 +361,12 @@ The lessons that keep coming back:
   — an ordinary function compiled inside the generated module, where the
   accessors are globals. Having parameters is the whole of what tells the two
   apart, and entries are separated by `,` or by a line break, as a block's
-  statements are by `;`.
+  statements are by `;`. Like every `mod`, the generated module sees the
+  names of the file it is written in (`scope.inherit_enclosing`), so a field
+  can be typed `: Period` and a member can call its neighbours; and the
+  parent gets a global `P` holding `P.type`, so `P` is a type in a
+  description too. A record's header is an array's 16 bytes: the id is an
+  atom index packed beside the length (`RecordObj::tag`).
 - `type Name params = description` names an **optional type**: a description
   that is an ordinary value, checked only where a program asks. Its
   right-hand side, and a record field's `: annotation`, are read in a grammar

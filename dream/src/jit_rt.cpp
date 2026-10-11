@@ -458,7 +458,7 @@ int dream_rt_set(Process* p, Value c, Value k, Value v, Value* out) {
             return 0;
         }
         auto* src = static_cast<RecordObj*>(as_obj(c));
-        Value copy = p->heap().make_record(src->id, src->flags, n);
+        Value copy = p->heap().make_record(src->tag, n);
         auto* dst = static_cast<RecordObj*>(as_obj(copy));
         for (uint32_t j = 0; j < n; ++j) {
             Value item = uint32_t(i) == j ? v : src->items()[j];
@@ -567,8 +567,8 @@ Value dream_rt_make_array(Process* p, uint32_t n, const Value* items) {
 
 Value dream_rt_make_record(Process* p, uint32_t id, uint32_t n, const Value* items) {
     // `id` is the node's `c`: an image atom index, and the variant bit.
-    Value rec = p->heap().make_record(make_atom(p->runtime().image_atom(id & RECORD_MAKE_ATOM)),
-                                      (id & RECORD_MAKE_VARIANT) ? RECORD_VARIANT : 0, n);
+    Value rec = p->heap().make_record(
+        p->runtime().image_atom(id & RECORD_MAKE_ATOM) | (id & RECORD_MAKE_VARIANT), n);
     auto* r = static_cast<RecordObj*>(as_obj(rec));
     for (uint32_t i = 0; i < n; ++i) r->items()[i] = items[i];
     return rec;

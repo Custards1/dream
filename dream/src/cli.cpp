@@ -556,8 +556,15 @@ int dream_main(int argc, char** argv) {
 
     bool clean = sched.run(root);
 
+    // The root's failure first: a run ends when the root fails, with the
+    // processes it started possibly still alive (`Scheduler::finish`), and
+    // that is not a deadlock.
     int status = 0;
-    if (!clean) {
+    if (root->failed) {
+        std::string text = describe_failure(*root, root->exit_value);
+        std::fprintf(stderr, "dream: uncaught error: %s\n", text.c_str());
+        status = 1;
+    } else if (!clean) {
         std::fprintf(stderr,
                      "dream: deadlock -- every process is waiting for a message that "
                      "cannot arrive\n");
@@ -565,10 +572,6 @@ int dream_main(int argc, char** argv) {
         // that a program is stuck, which the person running it already knew;
         // the useful part is which process is parked on which thing.
         sched.dump("deadlock");
-        status = 1;
-    } else if (root->failed) {
-        std::string text = describe_failure(*root, root->exit_value);
-        std::fprintf(stderr, "dream: uncaught error: %s\n", text.c_str());
         status = 1;
     }
 

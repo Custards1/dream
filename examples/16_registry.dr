@@ -37,7 +37,7 @@ mod store {
     };
 }
 
-/// Ask for `name` until the answer is something other than `was`.
+/// Ask for `name` until it names a process, and one other than `was`.
 ///
 /// A supervisor is asynchronous. The child ending, the watcher reporting it,
 /// the supervisor starting a replacement and that replacement registering
@@ -46,9 +46,14 @@ mod store {
 /// each time round. It answers whatever it has when it runs out of patience,
 /// so a genuine disagreement shows up as wrong output rather than as a program
 /// that never ends.
+///
+/// "Moved on" has to mean a new process, not just a different answer: between
+/// the registry dropping the dead server and the replacement registering, the
+/// name is free, and `()` differs from `was` too. Settling on that sent the
+/// next remote call to nobody, about one run in forty.
 let rec settle! reg name was tries = {
     let p = registry.whereis! reg name;
-    if p != was || tries <= 0 { p } else { settle! reg name was (tries - 1) }
+    if (p != was && p != ()) || tries <= 0 { p } else { settle! reg name was (tries - 1) }
 };
 
 let main! = {

@@ -85,6 +85,12 @@ let module_path m = Module.path m;
 let module_source m = Module.source m;
 let module_items m = Module.items m;
 
+/// The module a `mod` was written inside -- and so a record's or a union's,
+/// which the loader writes as one -- or `()` for a file's own module. Its name
+/// alone cannot say: `std.time.zone` is a file, not a `mod` of `std.time`.
+/// `scope.inherit_enclosing` is what reads it.
+let module_within m = m.[:within else ()];
+
 // --- the loader --------------------------------------------------------------
 
 let loader packages cfg search_paths host_modules = {
@@ -490,7 +496,9 @@ let expand_items owner cfg items = {
     let inherited = list.filter whole_import flat;
     list.concat (list.map (fn item ->
         match item {
-            // A record's members are written in the file and read as if they
+            // A record is a module and, in the parent, a global of the same
+            // name holding its description -- see `syntax.record_parts`.
+            // Its members are written in the file and read as if they
             // were, so they see what the file imports. Its module is a `mod`
             // of its own, which would otherwise see nothing -- and a member
             // that calls `list.cons` has no other way to reach it, now that
@@ -499,7 +507,7 @@ let expand_items owner cfg items = {
             // selected member could be the name of a field, and a `let` and an
             // import of one name is an error (`report_clashes` in scope.dr).
             [:record, kind, name, fields, members, bases, span] =>
-                [syntax.record_derived owner kind name fields members (inherited + bases) span],
+                syntax.record_parts owner kind name fields members (inherited + bases) span,
             // A union is a module and, in the parent, a global of the same
             // name holding its description -- see `syntax.union_decl`.
             [:union_decl, name, params, variants, members, kind, span] =>
@@ -841,7 +849,7 @@ let rec hoist_mod! l parent source m =
                 let index = module_count recorded;
                 [mark_visited full
                     (put :by_name (((by_name recorded)).[full => index])
-                        (add_module (loaded full full source inner_items) recorded)),
+                        (add_module ((loaded full full source inner_items).[:within => parent]) recorded)),
                  stand_in]
             }
         },

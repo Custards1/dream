@@ -46,11 +46,8 @@ struct Period {
 /// `[day, seconds]`: a day rule (`[:m, month, week, weekday]`, `[:j, n]` or
 /// `[:n, n]`) and the local time of day the change happens at.
 struct Rule {
-    // A `Period`, which a field cannot yet name: a record's field types are
-    // resolved inside the module the record becomes, where its siblings are
-    // not visible.
-    !standard : :any
-    !daylight : :any
+    !standard : Period
+    !daylight : Period | :unit     // `()` for a rule with no daylight time
     !start : :any
     !end : :any
 }
@@ -61,8 +58,8 @@ struct Rule {
 struct Zone {
     !name : :string
     !transitions : :array
-    !initial : :any        // a `Period`; see `Rule.standard`
-    !rule : :any
+    !initial : Period
+    !rule : Rule | :unit
 }
 
 let utc : Zone;

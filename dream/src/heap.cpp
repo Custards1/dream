@@ -516,12 +516,11 @@ Value Heap::make_array(uint32_t len) {
     return from_obj(o);
 }
 
-Value Heap::make_record(Value id, uint32_t flags, uint32_t len) {
+Value Heap::make_record(uint32_t tag, uint32_t len) {
     auto* o = static_cast<RecordObj*>(
-        alloc(ObjType::Record, 16 + size_t(len) * sizeof(Value)));
+        alloc(ObjType::Record, 8 + size_t(len) * sizeof(Value)));
     o->len = len;
-    o->flags = flags;
-    o->id = id;
+    o->tag = tag;
     return from_obj(o);
 }
 
@@ -2713,13 +2712,13 @@ struct VerifyWalk {
                 }
                 case ObjType::Record: {
                     auto* r = static_cast<RecordObj*>(o);
-                    size_t need = sizeof(Obj) + 16 + size_t(r->len) * sizeof(Value);
+                    size_t need = sizeof(Obj) + 8 + size_t(r->len) * sizeof(Value);
                     if (r->bytes < need) {
                         problem("record at " + addr(o) + " says it holds " +
                                 std::to_string(r->len) + " fields but is too small");
                         return;
                     }
-                    if (!is_atom(r->id)) {
+                    if (!is_atom(r->id())) {
                         problem("record at " + addr(o) + " has an id that is not an atom");
                         return;
                     }
@@ -3131,7 +3130,7 @@ Value copy_object(Dest& dest, Value v, CopySeen& seen) {
         case ObjType::Record: {
             // The id is an atom of this runtime, as the copy is.
             auto* src = static_cast<RecordObj*>(o);
-            Value rec = dest.make_record(src->id, src->flags, src->len);
+            Value rec = dest.make_record(src->tag, src->len);
             seen.emplace(v, rec);
             for (uint32_t i = 0; i < src->len; ++i) {
                 Value item = copy_value(dest, static_cast<RecordObj*>(o)->items()[i], seen);
@@ -3582,12 +3581,11 @@ Value SharedArea::make_array(uint32_t len) {
     return from_obj(o);
 }
 
-Value SharedArea::make_record(Value id, uint32_t flags, uint32_t len) {
+Value SharedArea::make_record(uint32_t tag, uint32_t len) {
     auto* o = static_cast<RecordObj*>(
-        alloc(ObjType::Record, 16 + size_t(len) * sizeof(Value)));
+        alloc(ObjType::Record, 8 + size_t(len) * sizeof(Value)));
     o->len = len;
-    o->flags = flags;
-    o->id = id;
+    o->tag = tag;
     return from_obj(o);
 }
 

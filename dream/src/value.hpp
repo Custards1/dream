@@ -211,15 +211,21 @@ struct ArrayObj : Obj {
 /// A value of a declared `group`, `struct` or `union`: its fields, lazy as an
 /// array's items are, and the one thing an array does not have -- what it is.
 ///
-/// `id` is an atom naming the declaration, qualified by the module it was
-/// declared in so that two packages' `union Item` are two types:
+/// What it is, is an atom naming the declaration, qualified by the module it
+/// was declared in so that two packages' `union Item` are two types:
 /// `ship.item.Item` for a record, and `ship.item.Item.file` for a union's
-/// variant, which `RECORD_VARIANT` in `flags` marks. Everything a program can
-/// ask of a record's kind -- `type_of`, how it prints, what a constructor
-/// pattern tests -- is read from that one atom, and since an atom is an
-/// immediate, it costs the collector nothing. Two records are equal when their
-/// ids are and their fields are; a record and the list or array it used to be
-/// are never equal, which is the point of having it.
+/// variant. Everything a program can ask of a record's kind -- `type_of`, how
+/// it prints, what a constructor pattern tests -- is read from that one atom.
+/// Two records are equal when their ids are and their fields are; a record and
+/// the list or array it used to be are never equal, which is the point of
+/// having it.
+///
+/// The atom is kept as its index, not as a `Value`, in the word beside the
+/// length, with `RECORD_VARIANT` in the top bit -- the same packing a
+/// `RecordMake` node's `c` operand uses. Holding the whole `Value` cost a word
+/// per record: a two-field record was forty bytes against an array's thirty-two,
+/// and a record-heavy loop allocated a fifth more for it. Packed, the header is
+/// an array's, sixteen bytes, and the fields start where an array's items do.
 ///
 /// Fields are read and changed by position through `get` and `set`, the same
 /// opcodes an array's are, so a record's generated accessors are exactly what
@@ -227,18 +233,25 @@ struct ArrayObj : Obj {
 /// in docs/notes/static-types.md.
 struct RecordObj : Obj {
     uint32_t len;
-    uint32_t flags;
-    Value id;
+    uint32_t tag;
+    Value id() const { return make_atom(tag & ~(1u << 31)); }
+    bool variant() const { return (tag >> 31) != 0; }
     Value* items() { return reinterpret_cast<Value*>(this + 1); }
 };
 
-static_assert(sizeof(ArrayObj) == 16 && sizeof(RecordObj) == 24,
-              "compiled code reads an array's items 16 bytes in and a record's 24 "
-              "(`Emitter::get` in jit.cpp), each after a length at 8");
+static_assert(sizeof(ArrayObj) == 16 && sizeof(RecordObj) == 16,
+              "compiled code reads an array's items and a record's fields 16 bytes "
+              "in (`Emitter::get` in jit.cpp), each after a length at 8");
 
-/// `RecordObj::flags`: the id names a union's variant, `Type.tag`, rather than
-/// a record type.
-inline constexpr uint32_t RECORD_VARIANT = 1u << 0;
+/// `RecordObj::tag`'s top bit: the id names a union's variant, `Type.tag`,
+/// rather than a record type. Equal to `RECORD_MAKE_VARIANT`, so a node's
+/// operand is a header word as it stands.
+inline constexpr uint32_t RECORD_VARIANT = 1u << 31;
+
+/// The header word for the atom `id`, a union's variant when `variant`.
+inline uint32_t record_tag(Value id, bool variant) {
+    return uint32_t(imm_payload(id)) | (variant ? RECORD_VARIANT : 0);
+}
 
 /// A persistent map: a hash array mapped trie. Keys are forced (we have to hash
 /// them); values stay lazy.

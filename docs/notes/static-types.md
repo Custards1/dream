@@ -351,8 +351,8 @@ that macros build and read, and an IR node is read by position in C++ by
   not know, which would have given every record of a type the same key. A
   record now encodes as its id and its fields.
 
-**What it costs.** A record is one word bigger than the array it replaced,
-for its id. A loop that makes a `struct`, reads both fields and sets one,
+**What it costs.** A record was first one word bigger than the array it
+replaced, for its id. A loop that makes a `struct`, reads both fields and sets one,
 three million times, same VM, compiled by the compiler before and after:
 
 | | before (array) | after (record) | |
@@ -365,17 +365,64 @@ three million times, same VM, compiled by the compiler before and after:
 The interpreter is faster because a constructor call is now the
 `record_make` itself rather than a call of `make`. The compiled loop was 20%
 *slower* until `Emitter::get` learnt to read a record's field inline, as it
-read an array's -- 24 bytes in rather than 16, which a `static_assert` beside
-`RecordObj` holds it to; before that every accessor in compiled code was a
-call of `dream_rt_get`. The self-compile, whose tokens and contexts are
+read an array's; before that every accessor in compiled code was a call of
+`dream_rt_get`.
+
+The id was an atom, and an atom is an immediate, so it cost the collector
+nothing -- but it was a whole `Value` in the header, beside a length and a
+flags word that between them filled a word of their own. An atom's index is
+32 bits, and so is a `RecordMake` node's operand, which already packed the
+variant bit in its top bit. So the header now holds the index and that bit in
+the word beside the length (`RecordObj::tag`), and is an array's sixteen
+bytes; the fields start where an array's items do, and `Emitter::get` reads
+both the same way. A loop making a two-field `struct`, setting it and reading
+both fields three million times, one image, the VM before and after:
+
+| | 24-byte header | 16-byte header | |
+|---|---|---|---|
+| bytes allocated | 577 MB | 529 MB | -8% (records: -20%) |
+| interpreted | 941-960 ms | 955-969 ms | level |
+| compiled | 303-319 ms | 303-315 ms | level |
+
+Records are 36% of what that loop allocates; frames are most of the rest. The self-compile, whose tokens and contexts are
 records now, is 2.59 s against 2.36-2.44 s before, with 3% more reductions and
 allocation -- over a compiler that also grew 3% in nodes in the same change,
 so the two are not separated here.
 
-**What is not done.** A record's field types cannot name another record
-declared beside it, because they are resolved inside the record's own module
-(`std.time.zone` writes `:any` where it means `Period`). `mapping` is still
-nominal only in name. And the dispatch on `type_of` that generic code does
--- `match type_of v { :list => .. }` -- now sees `:Point` and falls to its
-default arm, which is right for a record and is the thing to check first when
-a walker that used to handle records stops.
+**A record sees the file it is written in.** A record is a `mod` once the
+loader has read it, and a module sees only what it declares and imports --
+so a field could not be typed with the record declared beside it, and a
+member could not call the function declared above it. It cannot import its
+parent instead, since the parent imports it and imports form a tree. So a
+module hoisted out of another (`modules.module_within`) is lent its parent's
+names once every module has declared its own (`scope.inherit_enclosing`):
+each global, import and selected member the parent binds and it does not, as
+import entries, so they resolve to the parent's globals and the unit cache's
+key -- the declared state -- already covers them. It may read the parent's
+`priv` names too. This holds for every `mod`, not only records.
+
+A field's type is also a *value*: it goes into the record's description.
+Inside one, `Period` named a module, which is not a value, so a record could
+not be named in any description -- `type Ps = [Period]` failed as well. A
+record now leaves a global of its own name in its parent holding its
+description, as a union always did (`syntax.record_parts`). A signature never
+reads it, since `type_ref` asks for the module first.
+
+**Walkers that switch on `type_of`.** A record's `type_of` is its own name,
+so `match type_of v { :list => .., :array => .., _ => .. }` sends it to the
+default arm. Every such switch in the repository was read for whether a
+record could reach it. Four could, and did the wrong thing quietly:
+
+- `std.codec`'s walk (JSON and TOML) wrote a record as the string it prints
+  as. It writes what the record was built as before: a `struct`'s fields, a
+  variant's `[tag, ..fields]` or its tag (`codec.as_written`). `std.wire` is
+  native and keeps records as records.
+- `std.ml.tree` took a record for a leaf, so parameters held in a `struct`
+  were never trained. A record is a branch again, rebuilt as the record it was.
+- `std.build.run`'s `forced!` forced only a record's outside, so its fields
+  crossed into a step's process suspended, frames and all. Arrays had the same
+  gap.
+- `std.log` writes a record as its printed form, which is the readable choice
+  and was left as it is.
+
+**What is not done.** `mapping` is still nominal only in name.

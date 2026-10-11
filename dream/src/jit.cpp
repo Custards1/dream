@@ -3319,37 +3319,22 @@ Emitter::JV Emitter::get(const Node& n) {
 
     // An array at a fixnum inside it. The index is signed, so one unsigned
     // compare against the length rules out both ends. A record is read the
-    // same way: its length is where an array's is, and its fields start one
-    // word later, after the atom naming it (`RecordObj`) -- so a record's
-    // accessor is an inline load, as a `struct`'s was when it was an array.
-    auto* not_arr = bb("get.notarray");
-    auto* is_rec = bb("get.record");
+    // same way: its header is an array's, a length at 8 and the fields from 16
+    // (`RecordObj`), so a record's accessor is the same inline load a
+    // `struct`'s was when it was an array.
     b_.SetInsertPoint(not_cell);
-    b_.CreateCondBr(b_.CreateAnd(b_.CreateICmpEQ(type, llvm::ConstantInt::get(
-                                                           i8_, uint8_t(ObjType::Array))),
-                                 is_fixnum(k)),
-                    is_arr, not_arr);
-    b_.SetInsertPoint(not_arr);
-    b_.CreateCondBr(b_.CreateAnd(b_.CreateICmpEQ(type, llvm::ConstantInt::get(
-                                                           i8_, uint8_t(ObjType::Record))),
-                                 is_fixnum(k)),
-                    is_rec, slow);
+    llvm::Value* indexed = b_.CreateOr(
+        b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Array))),
+        b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Record))));
+    b_.CreateCondBr(b_.CreateAnd(indexed, is_fixnum(k)), is_arr, slow);
     b_.SetInsertPoint(is_arr);
-    auto* checked = bb("get.checked");
-    b_.CreateBr(checked);
-    b_.SetInsertPoint(is_rec);
-    b_.CreateBr(checked);
-    b_.SetInsertPoint(checked);
-    auto* first = b_.CreatePHI(i64_, 2, "get.first");
-    first->addIncoming(i64(16), is_arr);
-    first->addIncoming(i64(24), is_rec);
     llvm::Value* len = b_.CreateZExt(
         b_.CreateLoad(i32_, b_.CreateIntToPtr(b_.CreateAdd(c, i64(8)), ptr_)), i64_);
     llvm::Value* at = b_.CreateAShr(k, 1);
     b_.CreateCondBr(b_.CreateICmpULT(at, len), in_arr, slow);
     b_.SetInsertPoint(in_arr);
     llvm::Value* item = b_.CreateLoad(
-        i64_, b_.CreateIntToPtr(b_.CreateAdd(b_.CreateAdd(c, first), b_.CreateShl(at, 3)), ptr_));
+        i64_, b_.CreateIntToPtr(b_.CreateAdd(b_.CreateAdd(c, i64(16)), b_.CreateShl(at, 3)), ptr_));
     auto* item_bb = b_.GetInsertBlock();
     b_.CreateBr(found);
 

@@ -151,7 +151,7 @@ public:
     Value make_cons(Value head, Value tail);
     Value make_array(uint32_t len);
     /// A record of `len` fields, left for the caller to fill; see RecordObj.
-    Value make_record(Value id, uint32_t flags, uint32_t len);
+    Value make_record(uint32_t tag, uint32_t len);
     /// An empty map: a branch with no children. The capacity argument is a
     /// leftover of the open-addressed table and is ignored -- a trie sizes
     /// itself -- but it is kept so that callers with a sensible hint need not
@@ -1009,7 +1009,7 @@ public:
     Value make_cons(Value head, Value tail);
     Value make_array(uint32_t len);
     /// A record of `len` fields, left for the caller to fill; see RecordObj.
-    Value make_record(Value id, uint32_t flags, uint32_t len);
+    Value make_record(uint32_t tag, uint32_t len);
     Value make_map_branch(uint32_t nslots);
     Value make_map_leaf(uint64_t hash, Value key, Value value, Value next);
     Value make_error(Value kind, Value payload, Value where = UNIT);

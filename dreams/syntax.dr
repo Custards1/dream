@@ -118,7 +118,16 @@ let qualified owner name = if owner == "" { name } else { owner + "." + name };
 /// cannot be written, so it can name nothing else.
 let dispatch_table_name = "<dispatch>";
 
-let record_derived owner kind name fields members bases span = {
+let record_derived owner kind name fields members bases span =
+    list.head (record_parts owner kind name fields members bases span);
+
+/// A record as the items that replace it in its parent: its module, and a
+/// global of its own name holding its description, as a union leaves (see
+/// `union_decl`). The global is what makes `Period` a type in a description
+/// -- `type Ps = [Period]`, a field's `: Period`, `types.check Period v` --
+/// where a name has to be a value and the module is not one. A signature
+/// never reads it: the checker asks for the module first (`typecheck.type_ref`).
+let record_parts owner kind name fields members bases span = {
     let named f = ast.name_e (ast.field_name f) (ast.field_span f);
     // `derive dyn`: every value carries its record's dispatch table in slot 0
     // -- the first position of a list or an array, the key `0` of a map, so
@@ -200,13 +209,18 @@ let record_derived owner kind name fields members bases span = {
         :map => [],
         _ => [ast.let_d "record_id" [ast.param () span] (ast.atom_e id span) false span],
     };
-    let generated = list.head (fresh ([constructor, from_default] + helpers + identity)
-                                     (2147483648 + ast.span_start span * 128));
+    // What the parent sees under the record's own name, freshened with the
+    // rest so that no two generated nodes share an offset.
+    let alias = ast.let_d name [] (ast.field_e (ast.name_e name span) "type" span) false span;
+    let made = list.head (fresh ([constructor, from_default] + helpers + identity + [alias])
+                                (2147483648 + ast.span_start span * 128));
+    let generated = list.take (list.length made - 1) made;
     let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
                                               (own_names name (ast.member_body m)) true (ast.member_span m))
                            members;
     // Each field type occurs once, so retain its written spans for diagnostics.
-    ast.mod_d name (bases + generated + [description] + record_sigs kind name fields span + written) span
+    [ast.mod_d name (bases + generated + [description] + record_sigs kind name fields span + written) span,
+     list.last made]
 };
 
 /// What every generated function of a record promises, for the type checker.

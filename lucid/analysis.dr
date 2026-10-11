@@ -1650,7 +1650,12 @@ let symbols a =
                  detailed (declaration_words a mi name)
                      %{ "name" => name, "kind" => symbol_variable,
                         "range" => at span, "selectionRange" => at span }]
-            }) (list.filter (fn d -> list.nth 1 d == own) (scope.module_defs (resolved a) mi));
+            // A global the loader made up -- the one a record or a union
+            // leaves under its own name, holding its description -- has a
+            // generated span, past 2^31, and is in no file: the declaration
+            // it came from is in the outline already, as a record.
+            }) (list.filter (fn d -> list.nth 1 d == own && ast.span_start (list.nth 3 d) < 2147483648)
+                            (scope.module_defs (resolved a) mi));
             let mine = modules.module_name (modules.module_at (loader a) mi);
             let records = list.map (fn r -> {
                 let span = record_span r;

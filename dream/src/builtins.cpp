@@ -65,7 +65,7 @@ uint64_t key_hash(Value v) {
         } else if (o->type == ObjType::Record && static_cast<RecordObj*>(o)->len == 0) {
             // A variant with no fields -- `Shape.empty` -- is what an atom
             // was before it was a record, and is a key the way an atom is.
-            h = static_cast<RecordObj*>(o)->id;
+            h = static_cast<RecordObj*>(o)->id();
         } else {
             h = identity_hash(o);
         }
@@ -100,7 +100,7 @@ bool key_equal(Value a, Value b) {
     if (x->type == ObjType::Record) {
         auto* rx = static_cast<RecordObj*>(x);
         auto* ry = static_cast<RecordObj*>(y);
-        return rx->len == 0 && ry->len == 0 && rx->id == ry->id;
+        return rx->len == 0 && ry->len == 0 && rx->tag == ry->tag;
     }
     if (x->type == ObjType::BigInt) {
         return bigint::equal(static_cast<BigIntObj*>(x), static_cast<BigIntObj*>(y));
@@ -509,7 +509,7 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
             // declared. A variant with no fields is the name alone.
             out->append(record_shown_name(p, w));
             uint32_t len = static_cast<RecordObj*>(as_obj(w))->len;
-            if (len == 0 && (static_cast<RecordObj*>(as_obj(w))->flags & RECORD_VARIANT)) return true;
+            if (len == 0 && (static_cast<RecordObj*>(as_obj(w))->variant())) return true;
             out->push_back('(');
             p.stack.push_back(w);
             for (uint32_t i = 0; i < len; ++i) {
@@ -1856,9 +1856,9 @@ bool import_across(Process& dest, Runtime& src_rt, Value v, Value* out, int dept
             // again in this one.
             auto* src = static_cast<RecordObj*>(as_obj(v));
             Value id = make_atom(dest.runtime().intern_atom(
-                src_rt.atom_name(uint32_t(imm_payload(src->id)))));
+                src_rt.atom_name(uint32_t(imm_payload(src->id())))));
             uint32_t n = src->len;
-            Value rec = dest.heap().make_record(id, src->flags, n);
+            Value rec = dest.heap().make_record(record_tag(id, src->variant()), n);
             for (uint32_t i = 0; i < n; ++i) {
                 Value item;
                 if (!import_across(dest, src_rt, static_cast<RecordObj*>(as_obj(v))->items()[i],
@@ -2755,14 +2755,14 @@ NativeResult core_record_is(Process&, Value, Value* args, uint32_t) {
     Value id = resolve(args[0]);
     Value v = resolve(args[1]);
     return NativeResult::ok(make_bool(is_obj(v, ObjType::Record) &&
-                                      static_cast<RecordObj*>(as_obj(v))->id == id));
+                                      static_cast<RecordObj*>(as_obj(v))->id() == id));
 }
 
 /// `_record_id x`: the atom naming what `x` is, or `()` when it is no record.
 NativeResult core_record_id(Process&, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     if (!is_obj(v, ObjType::Record)) return NativeResult::ok(UNIT);
-    return NativeResult::ok(static_cast<RecordObj*>(as_obj(v))->id);
+    return NativeResult::ok(static_cast<RecordObj*>(as_obj(v))->id());
 }
 
 /// `_record_fields x`: the fields, in order, as an array -- unforced, as they
@@ -2794,7 +2794,7 @@ NativeResult core_record_of(Process& p, Value, Value* args, uint32_t) {
     if (!is_obj(items, ObjType::Array)) return type_fail(p, "_record_of needs an array of fields");
     uint32_t n = static_cast<ArrayObj*>(as_obj(items))->len;
     p.stack.push_back(items);
-    Value rec = p.heap().make_record(id, truthy(variant) ? RECORD_VARIANT : 0, n);
+    Value rec = p.heap().make_record(record_tag(id, truthy(variant)), n);
     auto* src = static_cast<ArrayObj*>(as_obj(p.stack.back()));
     auto* dst = static_cast<RecordObj*>(as_obj(rec));
     for (uint32_t i = 0; i < n; ++i) {
@@ -3337,9 +3337,9 @@ bool compare_values(Process& p, Value a, Value b, int depth, int* out) {
             // list of them by `compare` wants.
             auto* x = static_cast<RecordObj*>(as_obj(a));
             auto* y = static_cast<RecordObj*>(as_obj(b));
-            if (x->id != y->id) {
-                *out = order(p.runtime().atom_name(uint32_t(imm_payload(x->id))),
-                             p.runtime().atom_name(uint32_t(imm_payload(y->id))));
+            if (x->id() != y->id()) {
+                *out = order(p.runtime().atom_name(uint32_t(imm_payload(x->id()))),
+                             p.runtime().atom_name(uint32_t(imm_payload(y->id()))));
                 return true;
             }
             uint32_t n = std::min(x->len, y->len);
@@ -3525,9 +3525,9 @@ bool wire_write(Process& p, Value v, std::string* out, int depth) {
             }
             case ObjType::Record: {
                 auto* r = static_cast<RecordObj*>(as_obj(v));
-                const std::string& name = p.runtime().atom_name(uint32_t(imm_payload(r->id)));
+                const std::string& name = p.runtime().atom_name(uint32_t(imm_payload(r->id())));
                 wire_bytes(out, WIRE_RECORD, name.data(), name.size());
-                out->push_back(char(r->flags & 0xff));
+                out->push_back(char(r->variant() ? 1 : 0));
                 wire_le(out, r->len, 4);
                 for (uint32_t i = 0; i < r->len; ++i) {
                     if (!wire_write(p, static_cast<RecordObj*>(as_obj(v))->items()[i], out, depth + 1)) return false;
@@ -3722,7 +3722,7 @@ struct WireReader {
                 }
                 at += name_len;
                 if (!has(5)) return false;
-                uint32_t flags = data[at] & RECORD_VARIANT;
+                const bool variant = (data[at] & 1) != 0;
                 at += 1;
                 uint64_t n = le(4);
                 if (n > len) return false;
@@ -3733,7 +3733,7 @@ struct WireReader {
                     if (!read(&item, depth + 1)) return false;
                     items.push_back(item);
                 }
-                Value rec = p.heap().make_record(make_atom(id), flags, uint32_t(n));
+                Value rec = p.heap().make_record(record_tag(make_atom(id), variant), uint32_t(n));
                 for (uint64_t i = 0; i < n; ++i) static_cast<RecordObj*>(as_obj(rec))->items()[i] = items[i];
                 *out = rec;
                 return true;

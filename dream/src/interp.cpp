@@ -264,7 +264,7 @@ bool values_equal(Process& p, Value a, Value b, bool* raised, int depth) {
             // variant's names its union as well as itself.
             auto* x = static_cast<RecordObj*>(oa);
             auto* y = static_cast<RecordObj*>(ob);
-            if (x->id != y->id || x->len != y->len) return false;
+            if (x->tag != y->tag || x->len != y->len) return false;
             return equal_children(p, x->items(), y->items(), x->len, raised, depth);
         }
         case ObjType::Pid:
@@ -1612,7 +1612,7 @@ void container_set(Process& p, uint32_t at, Value container, Value key, Value fr
         // A copy, with the id it had: changing a field of a `Point` answers
         // a `Point`.
         Value value = thunk_for(p, value_node, frame);
-        Value out = p.heap().make_record(src->id, src->flags, n);
+        Value out = p.heap().make_record(src->tag, n);
         src = static_cast<RecordObj*>(as_obj(container));
         auto* dst = static_cast<RecordObj*>(as_obj(out));
         for (uint32_t i = 0; i < n; ++i) {
@@ -2219,9 +2219,8 @@ void step_eval(Process& p) {
         }
         case Op::RecordMake: {
             const uint32_t* kids = img.kids_at(n.a);
-            Value id = make_atom(p.runtime().image_atom(n.c & RECORD_MAKE_ATOM));
             Value rec = p.heap().make_record(
-                id, (n.c & RECORD_MAKE_VARIANT) ? RECORD_VARIANT : 0, n.b);
+                p.runtime().image_atom(n.c & RECORD_MAKE_ATOM) | (n.c & RECORD_MAKE_VARIANT), n.b);
             for (uint32_t i = 0; i < n.b; ++i) {
                 Value item = thunk_for(p, kids[i], frame);
                 static_cast<RecordObj*>(as_obj(rec))->items()[i] = item;
@@ -3434,9 +3433,9 @@ bool jit_compare(Process& p, Op op, Value a, Value b, Value* out) {
 /// and `ship.item.Point` a `Point`.
 std::string record_type_name(Process& p, Value v) {
     auto* r = static_cast<RecordObj*>(as_obj(resolve(v)));
-    const std::string& id = p.runtime().atom_name(uint32_t(imm_payload(r->id)));
+    const std::string& id = p.runtime().atom_name(uint32_t(imm_payload(r->id())));
     size_t end = id.size();
-    if (r->flags & RECORD_VARIANT) {
+    if (r->variant()) {
         size_t dot = id.rfind('.');
         if (dot != std::string::npos) end = dot;
     }
@@ -3449,8 +3448,8 @@ std::string record_type_name(Process& p, Value v) {
 std::string record_shown_name(Process& p, Value v) {
     auto* r = static_cast<RecordObj*>(as_obj(resolve(v)));
     std::string type = record_type_name(p, v);
-    if (!(r->flags & RECORD_VARIANT)) return type;
-    const std::string& id = p.runtime().atom_name(uint32_t(imm_payload(r->id)));
+    if (!r->variant()) return type;
+    const std::string& id = p.runtime().atom_name(uint32_t(imm_payload(r->id())));
     return type + id.substr(id.rfind('.'));
 }
 
