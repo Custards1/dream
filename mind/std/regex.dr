@@ -111,6 +111,7 @@ let problem source = match parse source { [:ok, _] => (), [:error, why] => why }
 let compile : Pattern -> Regex;
 let compile source = compile_with [] source;
 
+/// Parse and compile a regular expression using explicit matching flags.
 let compile_with : [Flag] -> Pattern -> Regex;
 let compile_with flags source = match parse_with flags source {
     [:ok, re] => re,
@@ -122,6 +123,7 @@ let compile_with flags source = match parse_with flags source {
 let parse : :string -> result.Of Regex :string;
 let parse source = parse_with [] source;
 
+/// Parse regular-expression syntax and apply explicit flags, returning a result.
 let parse_with : [Flag] -> :string -> result.Of Regex :string;
 let parse_with flags source = match p.run regex_syntax source {
     [:error, e] => result.error ("column " + to_string (p.Error.column e) + ": " + p.Error.message e),
@@ -167,13 +169,16 @@ let escape text = str.concat_all (list.map (fn c -> if str.contains c "\\.+*?()|
 // Groups are numbered afterwards, in the order their `(` appears, by
 // `number_groups`, which turns a capturing group into `[:cap, n, name, node]`.
 
+/// Parse an entire regular expression and require the end of input.
 priv let regex_syntax : p.Parser :any;
 priv let regex_syntax s at = alternation s at;
 
+/// Parse branches separated by the alternation operator.
 priv let alternation : p.Parser :any;
 priv let alternation s at = p.map (fn alts -> match alts { [one] => one, _ => [:alt, alts] })
                                   (p.sep_by1 (p.text "|") (p.quiet sequence)) s at;
 
+/// Parse consecutive regex atoms into a sequence.
 priv let sequence : p.Parser :any;
 priv let sequence s at = p.map (fn items -> apply_flags items) (p.many quantified) s at;
 
@@ -191,15 +196,18 @@ priv let apply_flags items = match items {
     },
 };
 
+/// Parse an atom and its optional repetition quantifier.
 priv let quantified : p.Parser :any;
 priv let quantified s at = p.map2 (fn node q -> match q { () => node, [lo, hi, greedy] => [:repeat, node, lo, hi, greedy] })
                                   atom (p.optional quantifier) s at;
 
+/// Parse a repetition operator and its greediness modifier.
 priv let quantifier : p.Parser :any;
 priv let quantifier s at = p.map2 (fn [lo, hi] lazy -> [lo, hi, lazy == ()])
     (p.choice [p.to [0, ()] (p.text "*"), p.to [1, ()] (p.text "+"), p.to [0, 1] (p.text "?"), counted])
     (p.optional (p.text "?")) s at;
 
+/// Parse a bounded repetition of the form {n} or {n,m}.
 priv let counted : p.Parser :any;
 priv let counted s at = p.choice [
     p.succeed (fn lo hi -> [lo, hi]) |> p.skip (p.text "{") |> p.keep p.natural |> p.skip (p.text ",")
@@ -208,6 +216,7 @@ priv let counted s at = p.choice [
     p.succeed (fn n -> [n, n]) |> p.skip (p.text "{") |> p.keep p.natural |> p.skip (p.text "}"),
 ] s at;
 
+/// Parse a regex literal, group, character class or assertion.
 priv let atom : p.Parser :any;
 priv let atom s at = p.choice [
     group_syntax,
@@ -219,6 +228,7 @@ priv let atom s at = p.choice [
     p.map (fn c -> [:char, char.code c]) (p.char_not_in "()[]|*+?.^$\\"),
 ] s at;
 
+/// Parse a capture, noncapturing group or flag group.
 priv let group_syntax : p.Parser :any;
 priv let group_syntax s at = p.choice [
     p.choice [p.text "(?=", p.text "(?!", p.text "(?<=", p.text "(?<!"]
@@ -234,13 +244,16 @@ priv let group_syntax s at = p.choice [
         |> p.keep (p.lazy (fn () -> alternation)) |> p.skip (p.label "\")\"" (p.text ")")),
 ] s at;
 
+/// Parse inline matching flags into an option map.
 priv let flag_letters : p.Parser :map;
 priv let flag_letters s at = p.map (fn letters -> list.fold (fn m c -> m.[flag_key c => true]) %{} (str.chars letters))
                                    (p.span1 "a flag (i, m or s)" "ims") s at;
 
+/// Map an inline flag letter to its option key.
 priv let flag_key : :char -> :atom;
 priv let flag_key c = match c { 'i' => :i, 'm' => :m, _ => :s };
 
+/// Parse a bracketed character class and its optional negation.
 priv let class : p.Parser :any;
 priv let class s at = p.choice [
     p.succeed (fn neg first items -> [:class, neg != (), first :: items])
@@ -249,6 +262,7 @@ priv let class s at = p.choice [
         |> p.keep (p.many class_item) |> p.skip (p.label "\"]\"" (p.text "]")),
 ] s at;
 
+/// Parse one character or range inside a character class.
 priv let class_item : p.Parser :any;
 priv let class_item s at = p.choice [
     p.and_then (fn e -> match e {
@@ -268,6 +282,7 @@ priv let range_from : :integer -> p.Parser :any;
 priv let range_from lo s at = p.and_then (fn dash -> if dash == () { p.succeed [:range, lo, lo] } else { range_end lo })
     (p.optional (p.lookahead (p.skip (p.not_followed_by (p.text "]")) (p.text "-")))) s at;
 
+/// Parse the end of a character range starting at the given code point.
 priv let range_end : :integer -> p.Parser :any;
 priv let range_end lo s at = (p.succeed (fn hi -> [:range, lo, hi])
     |> p.skip (p.text "-")
@@ -275,9 +290,11 @@ priv let range_end lo s at = (p.succeed (fn hi -> [:range, lo, hi])
                     (p.map char.code (p.char_not_in "]\\")))
     |> p.where_ok (fn r -> r.[2] >= lo) "a range that does not run backwards") s at;
 
+/// Parse a backslash escape used as a regex atom.
 priv let escape_atom : p.Parser :any;
 priv let escape_atom s at = p.then escaped (p.text "\\") s at;
 
+/// Parse a backslash escape into its syntax representation.
 priv let escaped : p.Parser :any;
 priv let escaped s at = match p.char_at s at {
     () => p.fail "an escape after the backslash" s at,
@@ -311,6 +328,7 @@ priv let escaped s at = match p.char_at s at {
     },
 };
 
+/// Convert hexadecimal source text to an integer code point.
 priv let hex : :string -> :integer;
 priv let hex h = list.fold (fn acc c -> acc * 16 + (if c >= '0' && c <= '9' { char.code c - 48 }
                                                     else if c >= 'a' && c <= 'f' { char.code c - 87 }
@@ -336,12 +354,14 @@ priv let rec number_groups node n = match node {
     other => [other, n],
 };
 
+/// Assign capture indices to syntax nodes, returning the next unused index.
 priv let number_all : [:any] -> :integer -> [[:any], :integer];
 priv let rec number_all nodes n = match nodes {
     [] => [[], n],
     [x, ..rest] => { let [t, n2] = number_groups x n; let [ts, n3] = number_all rest n2; [t :: ts, n3] },
 };
 
+/// Collect named capture groups into a name-to-index map.
 priv let group_names : :any -> :map -> :map;
 priv let rec group_names node m = match node {
     [:cap, n, name, inner] => group_names inner (if name == () { m } else { m.[name => n] }),
@@ -367,6 +387,7 @@ priv let rec check_sizes node = match node {
     _ => (),
 };
 
+/// Return the first syntax problem in a list, or `()` if none exists.
 priv let first_problem : [:any] -> (:string | :unit);
 priv let rec first_problem nodes = match nodes {
     [] => (),
@@ -377,6 +398,7 @@ priv let rec first_problem nodes = match nodes {
 priv let literal_prefix : :any -> :string;
 priv let literal_prefix node = str.of_chars (list.map char.of_code (prefix_codes node));
 
+/// Extract the literal code-point prefix that every match must begin with.
 priv let prefix_codes : :any -> [:integer];
 priv let rec prefix_codes node = match node {
     [:char, c] => [c],
@@ -386,6 +408,7 @@ priv let rec prefix_codes node = match node {
     _ => [],
 };
 
+/// Extract the mandatory literal prefix of a sequence of regex nodes.
 priv let seq_prefix : [:any] -> [:integer];
 priv let rec seq_prefix nodes = match nodes {
     [] => [],
@@ -425,6 +448,7 @@ priv let rec firsts node flags = match node {
     [:flags, f, inner] => firsts inner (map.merge flags f),
 };
 
+/// Compute possible initial characters and nullability for a sequence.
 priv let seq_firsts : [:any] -> :map -> [:any, :bool];
 priv let rec seq_firsts nodes flags = match nodes {
     [] => [[], true],
@@ -434,6 +458,7 @@ priv let rec seq_firsts nodes flags = match nodes {
     },
 };
 
+/// Combine possible initial characters and nullability across alternatives.
 priv let union_firsts : [:any, :bool] -> [:any, :bool] -> [:any, :bool];
 priv let union_firsts [a, na] [b, nb] = [if a == :any || b == :any { :any } else { a + b }, na || nb];
 
@@ -454,6 +479,7 @@ priv let item_codes items = {
 //     #[:class, negated, items, ignore_case]  #[:assert, kind]
 //     #[:split, preferred, other]  #[:jmp, to]  #[:save, slot]  #[:match]
 
+/// Compile a syntax node into regex instructions with a continuation target.
 priv let emit : :any -> :integer -> :map -> [:any];
 priv let rec emit node pc flags = match node {
     [:char, c] => if flags.[:i] && is_letter_code c { [#[:char_ci, fold c]] } else { [#[:char, c]] },
@@ -472,6 +498,7 @@ priv let rec emit node pc flags = match node {
     [:repeat, inner, lo, hi, greedy] => emit_repeat inner lo hi greedy pc flags,
 };
 
+/// Compile a sequence of syntax nodes into regex instructions.
 priv let emit_seq : [:any] -> :integer -> :map -> [:any];
 priv let rec emit_seq nodes pc flags = match nodes {
     [] => [],
@@ -490,6 +517,7 @@ priv let rec emit_alt nodes pc flags = match nodes {
     },
 };
 
+/// Compile bounded or unbounded repetition with the requested greediness.
 priv let emit_repeat : :any -> :integer -> :any -> :bool -> :integer -> :map -> [:any];
 priv let rec emit_repeat inner lo hi greedy pc flags =
     if lo > 0 {
@@ -509,9 +537,11 @@ priv let rec emit_repeat inner lo hi greedy pc flags =
         [fork greedy (pc + 1) out] + body + rest
     };
 
+/// Construct an ordered branching instruction for the regex machine.
 priv let fork : :bool -> :integer -> :integer -> :array;
 priv let fork greedy body out = if greedy { #[:split, body, out] } else { #[:split, out, body] };
 
+/// Test whether an integer code point is an ASCII letter.
 priv let is_letter_code : :integer -> :bool;
 priv let is_letter_code c = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 
@@ -528,6 +558,7 @@ priv let fold c = if c >= 65 && c <= 90 { c + 32 } else { c };
 // sorted list of disjoint ranges, with case folding already applied, so the
 // machine tests a character with a bitmap or by halving.
 
+/// Encode regex instructions and metadata into the runtime's binary representation.
 priv let encode : [:any] -> :integer -> :string -> :any -> :string -> :string;
 priv let encode program groups prefix starts backwards = {
     let step = fn [pieces, classes, n] instr -> match instr {
@@ -568,12 +599,15 @@ priv let rec reversed node = match node {
     other => other,
 };
 
+/// Encode one instruction and its operands.
 priv let inst : :integer -> :integer -> :integer -> :string;
 priv let inst op a b = str.of_bytes [op] + str.of_int_le 4 a + str.of_int_le 4 b;
 
+/// Encode an integer as an unsigned 32-bit instruction field.
 priv let u32 : :integer -> :string;
 priv let u32 n = str.of_int_le 4 n;
 
+/// Return the instruction code for a regex assertion.
 priv let assert_code : :atom -> :integer;
 priv let assert_code kind = match kind {
     :text_start => 0, :text_end => 1, :line_start => 2, :line_end => 3, :word => 4, :not_word => 5,
@@ -587,6 +621,7 @@ priv let bitmap set = {
                            (list.range 0 32))
 };
 
+/// Compute two raised to a nonnegative exponent.
 priv let pow2 : :integer -> :integer;
 priv let rec pow2 n = if n <= 0 { 1 } else { 2 * pow2 (n - 1) };
 
@@ -634,6 +669,7 @@ priv let fold_ranges ranges = list.flat_map (fn [lo, hi] -> {
 priv let run : :string -> :string -> :integer -> :integer -> :any;
 priv let run code s from mode = vm.regex_run code s from mode;
 
+/// Convert runtime capture offsets into a match object for the original string.
 priv let match_of : Regex -> :string -> :array -> Match;
 priv let match_of re s caps = {
     let spans = array.of_list (list.map (fn g -> { let a = caps.[2 * g]; let b = caps.[2 * g + 1];
@@ -756,6 +792,7 @@ let replace_all_with re f s = {
 priv let fill : :string -> Match -> :string;
 priv let fill template m = str.concat_all (template_pieces template 0 m);
 
+/// Expand replacement-template references using the given match.
 priv let template_pieces : :string -> :integer -> Match -> [:string];
 priv let rec template_pieces t i m =
     if i >= len t { [] }
@@ -782,9 +819,11 @@ priv let rec template_pieces t i m =
         }
     };
 
+/// Replace an absent string with an empty string.
 priv let or_empty : (:string | :unit) -> :string;
 priv let or_empty v = match v { () => "", text => text };
 
+/// Read a decimal capture reference from replacement text.
 priv let num_value : :string -> :integer;
 priv let num_value digits = match num.parse_int digits { () => 0, n => n };
 

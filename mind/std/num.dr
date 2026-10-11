@@ -16,10 +16,28 @@ let to_int : (:integer | :float) -> :integer;
 let to_int x = _to_int x;
 
 /// The integer a decimal numeral writes, or `()` for text that is not one.
+///
+/// ```dream
+/// import std.num;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (num.parse_int "42")
+/// };
+/// ```
 let parse_int : :string -> (:integer | :unit);
 let parse_int s = _parse_int s;
 
 /// The float a numeral writes, or `()` for text that is not one.
+///
+/// ```dream
+/// import std.num;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (num.parse_float "3.5")
+/// };
+/// ```
 let parse_float : :string -> (:float | :unit);
 let parse_float s = _parse_float s;
 

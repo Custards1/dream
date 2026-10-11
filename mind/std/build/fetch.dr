@@ -13,6 +13,7 @@
 
 import std.build;
 
+/// Describe a URL download whose contents must match the supplied digest.
 let url : :string -> :string -> :string -> :any;
 let url name address digest =
     // The key is the digest and the name, and not the address: a mirror that

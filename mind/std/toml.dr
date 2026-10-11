@@ -36,15 +36,19 @@ import std.str;
 
 // --- characters -------------------------------------------------------------
 
+/// Test whether a character is whitespace recognized by this format.
 let is_ws : :char -> :bool;
 let is_ws c = c == ' ' || c == '\t';
+/// Test whether a character is an ASCII decimal digit.
 let is_digit : :char -> :bool;
 let is_digit c = c >= '0' && c <= '9';
 
+/// Test whether a character is allowed in a bare TOML key.
 let is_bare : :char -> :bool;
 let is_bare c =
     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit c || c == '_' || c == '-';
 
+/// Drop leading whitespace characters from the parser input.
 let skip_ws : [:char] -> [:char];
 let rec skip_ws cs = match cs {
     [c, ..rest] if is_ws c => skip_ws rest,
@@ -61,6 +65,7 @@ let rec skip_blank cs = match skip_ws cs {
     s => s,
 };
 
+/// Skip characters through the end of the current line.
 let drop_line : [:char] -> [:char];
 let rec drop_line cs = match cs {
     [] => cs,
@@ -78,15 +83,19 @@ let rec end_of_line cs = match skip_ws cs {
     _ => (),             // something else on the line: not valid
 };
 
+/// Pair a parsed value with the remaining input.
 let step : a -> [:char] -> [a, [:char]];
 let step value rest = [value, rest];
+/// Extract the parsed value from a parser step.
 let step_value : :list -> :any;
 let step_value s = list.head s;
+/// Extract the unconsumed input from a parser step.
 let step_rest : :list -> [:char];
 let step_rest s = list.head (list.tail s);
 
 // --- scalars ----------------------------------------------------------------
 
+/// Parse a quoted string body while accumulating decoded characters.
 let quoted_body : [:char] -> [:char] -> :any;
 let rec quoted_body cs acc = match cs {
     [] => (),
@@ -119,6 +128,7 @@ let escaped_scalar cs digits acc = match hex_n cs digits 0 {
         else { quoted_body rest (list.cons (_char_of_code code) acc) },
 };
 
+/// Return a hexadecimal digit's value, or -1 for an invalid character.
 let hex_value : :char -> :integer;
 let hex_value c = match c {
     _ if c >= '0' && c <= '9' => _char_code c - 48,
@@ -145,6 +155,7 @@ let rec literal_body cs acc = match cs {
     [c, ..rest] => literal_body rest (list.cons c acc),
 };
 
+/// Collect a numeric token and record whether it contains floating-point syntax.
 let number_chars : [:char] -> [:char] -> :bool -> [[:char], :bool, [:char]];
 let rec number_chars cs acc floaty = match cs {
     [c, ..rest] if is_digit c || c == '-' || c == '+' => number_chars rest (list.cons c acc) floaty,
@@ -153,6 +164,7 @@ let rec number_chars cs acc floaty = match cs {
     _ => [list.reverse acc, floaty, cs],
 };
 
+/// Parse a numeric token, returning its value and unconsumed input or an error.
 let parse_number : [:char] -> :any;
 let parse_number cs = {
     let taken = number_chars cs [] false;
@@ -166,6 +178,7 @@ let parse_number cs = {
     }
 };
 
+/// Test whether an input character list starts with the supplied text.
 let starts : [:char] -> [:char] -> :bool;
 let rec starts cs word = match [cs, word] {
     [_, []] => true,
@@ -173,11 +186,13 @@ let rec starts cs word = match [cs, word] {
     _ => false,
 };
 
+/// Drop `n` characters from the parser input.
 let drop_n : :integer -> [:char] -> [:char];
 let rec drop_n n cs = if n <= 0 { cs } else { drop_n (n - 1) (list.tail cs) };
 
 // --- values -----------------------------------------------------------------
 
+/// Parse the next value, returning its value and unconsumed input or an error.
 let parse_value : [:char] -> :any;
 let rec parse_value cs = match skip_ws cs {
     [] => (),
@@ -212,6 +227,7 @@ let rec parse_array cs acc = match skip_blank cs {
     },
 };
 
+/// Parse inline-table key/value entries into a map.
 let parse_inline : [:char] -> %{ :string => Value } -> :bool -> :any;
 let rec parse_inline cs acc first = match skip_blank cs {
     [] => (),
@@ -296,14 +312,26 @@ let rec parse_items cs table section current = match skip_blank cs {
 };
 
 /// `[:ok, table]`, or `[:error, message]`.
+///
+/// ```dream
+/// import std.toml;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (toml.parse "[package]\nname = \"hello\"\n")
+/// };
+/// ```
 let parse : :string -> result.Of Document :string;
 let parse text = parse_items (str.chars text) (%{}) "" (%{});
 
+/// Test whether a parse result has the success tag.
 let ok : result.Of a e -> :bool;
 let ok r = list.head r == :ok;
+/// Extract the payload from a parse result.
 let value : result.Of a e -> :any;
 let value r = list.nth 1 r;
 
+/// Parse a document, returning `default` if parsing fails.
 let parse_or : :any -> :string -> :any;
 let parse_or default text = {
     let r = parse text;
@@ -347,6 +375,7 @@ let entries table name = _map_pairs (section table name);
 //   not a table is written before the first header, and so comes back inside
 //   `""`.
 
+/// Encode a hexadecimal digit using lowercase letters.
 priv let hex_digit : :integer -> :string;
 priv let hex_digit n = str.slice n 1 "0123456789abcdef";
 
@@ -366,9 +395,11 @@ let escape_char c = match c {
     },
 };
 
+/// Escape a string and surround it with double quotes for this format.
 let quote : :string -> :string;
 let quote s = "\"" + str.join_str "" (list.map escape_char (str.chars s)) + "\"";
 
+/// Return an atom's name without its leading colon.
 priv let atom_name : :atom -> :string;
 priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a);
 
@@ -392,12 +423,15 @@ let write_key k = {
 
 // --- the holes std.codec declares --------------------------------------------
 
+/// Encode `()` as an empty TOML string.
 let write_unit : :unit -> :string;
 let write_unit u = "\"\"";
 
+/// Encode a boolean using the format's true and false literals.
 let write_bool : :bool -> :string;
 let write_bool b = if b { "true" } else { "false" };
 
+/// Encode an integer in decimal notation.
 let write_int : :integer -> :string;
 let write_int n = to_string n;
 
@@ -411,12 +445,15 @@ let write_float x = {
     else { t + ".0" }
 };
 
+/// Encode a string with the format's quoting and escaping rules.
 let write_string : :string -> :string;
 let write_string s = quote s;
 
+/// Encode an atom's name as a quoted string.
 let write_atom : :atom -> :string;
 let write_atom a = quote (atom_name a);
 
+/// Join already encoded elements into the format's array syntax.
 let write_list : [:string] -> :string;
 let write_list parts = "[" + str.join_str ", " parts + "]";
 
@@ -429,9 +466,11 @@ let write_map pairs = {
     if list.is_empty kept { "{}" } else { "{ " + str.join_str ", " (list.map entry kept) + " }" }
 };
 
+/// Return the format name used by the codec protocol.
 let format_name : :any -> :string;
 let format_name u = "toml";
 
+/// Decode a TOML document; equivalent to `parse` for the codec protocol.
 let decode : :string -> result.Of Document :string;
 let decode text = parse text;
 
@@ -589,5 +628,6 @@ when test {
 type Value = :string | :integer | :float | :bool
            | [Value] | %{ :string => Value };
 type Document = %{ :string => %{ :string => Value } };
+/// Parse text and validate a successful value against `description`.
 let parse_as : :any -> :string -> result.Of Document :any;
 let parse_as description text = decode_as description text;

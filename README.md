@@ -148,3 +148,6 @@ running server has mapped, and the server dies of `SIGBUS`.
 Linux, macOS, Windows and Android, 64-bit little-endian. Linux is where it is developed
 and where every suite runs; [docs/platforms.md](docs/platforms.md) says what is
 portable, what is not, and how it is checked on each platform.
+
+Build release packages with `mind pack` ([formats and configuration](mind/tool/PACKAGING.md)).
+Build guides and source API documentation with `mind docs` ([authoring docs and runnable examples](mind/tool/DOCUMENTATION.md)).

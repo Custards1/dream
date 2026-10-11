@@ -19,6 +19,7 @@ struct Reader {
     !at : :integer
 }
 
+/// Create a buffered reader for a socket with no buffered bytes.
 let reader : :any -> Reader;
 let reader socket = Reader.make socket "" 0;
 

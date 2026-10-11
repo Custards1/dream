@@ -1,0 +1,68 @@
+// Execute fenced Dream examples and retain both successful and failing runs.
+import std.file;
+import std.io;
+import std.list;
+import std.map;
+import std.os;
+import std.str;
+import build;
+import manifest;
+import util;
+import documentation.markdown;
+
+let context m compiler timeout scratch = %{ :manifest => m, :compiler => compiler, :timeout => timeout, :scratch => scratch };
+let output r = r.[:out else ""] + r.[:err else ""];
+let report phase r = {
+    let label = if r.[:timed_out else false] { phase + " timed out" }
+        else { phase + " · exit " + to_string r.[:code else (0 - 1)] };
+    let text = output r;
+    let shown = if len text > 32768 { str.slice 0 32768 text + "\n[output truncated]" } else if text == "" { "(no output)" } else { text };
+    "<div class=\"example-result\"><p><strong>" + markdown.escape label + "</strong></p><pre><code>" + markdown.escape shown + "</code></pre></div>"
+};
+let run! ctx code = try! {
+    let dir = util.join ctx.[:scratch] (io.digest code);
+    file.mkdir_all! dir
+    let entry = util.join dir "example.dr";
+    let image = util.join dir "example.dream";
+    file.write! entry code
+    let m = ctx.[:manifest];
+    let opts = map.merge build.options (%{ :entry => entry, :output => image, :compiler => ctx.[:compiler] });
+    match build.compile_args! m opts {
+        [:error, why] => report "Build setup" (%{ :code => 1, :err => why }),
+        [:ok, args] => {
+            let cmd = build.compiler_command! (build.choose_compiler! m ctx.[:compiler]);
+            let compiled = os.exec_for! (list.head cmd) (list.append (list.nth 1 cmd) args) 60000;
+            if compiled.[:code else 1] != 0 || compiled.[:timed_out else false] { report "Compile" compiled }
+            else {
+                let vm = build.vm_command! ();
+                let program = if str.contains_str "/" vm { util.absolute! vm } else { vm };
+                let ran = os.exec_in! dir program [image] ctx.[:timeout];
+                // Successful compiler chatter only repeats temporary paths.
+                // Warnings are kept when present; execution always has a result.
+                (if compiled.[:err else ""] == "" { "" } else { report "Compile" compiled }) + report "Run" ran
+            }
+        },
+    }
+} catch e { report "Example" (%{ :code => 1, :err => to_string e }) };
+let rec collect! ctx lines results = match lines {
+    [] => results,
+    [line, ..rest] => {
+        let s = str.trim line;
+        if str.starts_with "```" s || str.starts_with "~~~" s {
+            match markdown.fenced (str.slice 0 3 s) rest [] {
+                [code, more] => {
+                    let language = str.trim (markdown.tail 3 s);
+                    if language == "dream" || language == "dr" {
+                        let result = run! ctx code;
+                        collect! ctx more (map.put code result results)
+                    } else { collect! ctx more results }
+                },
+            }
+        } else { collect! ctx rest results }
+    },
+};
+let render! ctx text = {
+    let results = collect! ctx (str.split "\n" text) (%{});
+    markdown.render_with (fn language code -> markdown.code_html language code
+        + (if language == "dream" || language == "dr" { map.get "" code results } else { "" })) text
+};

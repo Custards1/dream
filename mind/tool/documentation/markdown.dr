@@ -1,0 +1,144 @@
+// Small, safe Markdown renderer shared by guides and API comments.
+import std.list;
+import std.str;
+import std.map;
+
+let replace old new text = str.join_str new (str.split old text);
+let escape text = text |> replace "&" "&amp;" |> replace "<" "&lt;" |> replace ">" "&gt;" |> replace "\"" "&quot;" |> replace "'" "&#39;";
+let tail n s = str.slice n (len s - n) s;
+let slug s = {
+    let chars = str.chars (str.lower s);
+    let clean = str.of_chars (list.map (fn c -> if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' { c } else { '-' }) chars);
+    str.join_str "-" (list.filter (fn x -> x != "") (str.split "-" clean))
+};
+let safe_url url = {
+    let u = str.lower (str.trim url);
+    not (str.contains_str "\\" u) && not (str.starts_with "//" u)
+    && not (list.any (fn c -> c <= ' ') (str.chars u))
+    && (not (str.contains_str ":" u) || str.starts_with "https://" u || str.starts_with "http://" u || str.starts_with "mailto:" u)
+};
+let href url = {
+    let parts = str.split "#" url;
+    let path = list.head parts;
+    let suffix = if list.length parts > 1 { "#" + str.join_str "#" (list.tail parts) } else { "" };
+    if not (str.contains_str ":" path) && str.ends_with ".md" path { str.slice 0 (len path - 3) path + ".html" + suffix } else { url }
+};
+let rec inline s = {
+    if s == "" { "" }
+    else if str.starts_with "`" s {
+        let end = str.find_from 1 "`" s;
+        if end < 0 { "`" + inline (tail 1 s) }
+        else { "<code>" + escape (str.slice 1 (end - 1) s) + "</code>" + inline (tail (end + 1) s) }
+    }
+    else if str.starts_with "**" s || str.starts_with "*" s {
+        let n = if str.starts_with "**" s { 2 } else { 1 };
+        let end = str.find_from n (str.repeat n "*") s;
+        let tag = if n == 2 { "strong" } else { "em" };
+        if end < 0 { escape (str.slice 0 n s) + inline (tail n s) }
+        else { "<" + tag + ">" + inline (str.slice n (end - n) s) + "</" + tag + ">" + inline (tail (end + n) s) }
+    }
+    else if str.starts_with "[" s || str.starts_with "![" s {
+        let image = str.starts_with "![" s;
+        let start = if image { 2 } else { 1 };
+        let mid = str.find_from start "](" s;
+        let end = if mid < 0 { 0 - 1 } else { str.find_from (mid + 2) ")" s };
+        if end < 0 { escape (str.slice 0 1 s) + inline (tail 1 s) }
+        else {
+            let label = str.slice start (mid - start) s;
+            let url = str.trim (str.slice (mid + 2) (end - mid - 2) s);
+            let link = if not (safe_url url) { escape label }
+                else if image { "<img loading=\"lazy\" alt=\"" + escape label + "\" src=\"" + escape url + "\">" }
+                else { "<a href=\"" + escape (href url) + "\">" + inline label + "</a>" };
+            link + inline (tail (end + 1) s)
+        }
+    }
+    else {
+        // Consume plain runs at once; UTF-8 bytes are never split by markup.
+        let n = str.upto "`*[!" 0 s;
+        let take = if n == 0 { 1 } else { n };
+        escape (str.slice 0 take s) + inline (tail take s)
+    }
+};
+let heading line = {
+    let n = str.span "#" 0 line;
+    if n > 0 && n <= 6 && str.slice n 1 line == " " { [n, str.trim (tail n line)] } else { () }
+};
+let list_item line = {
+    if str.starts_with "- " line || str.starts_with "* " line || str.starts_with "+ " line { ["ul", tail 2 line] }
+    else {
+        let n = str.span "0123456789" 0 line;
+        if n > 0 && str.slice n 2 line == ". " { ["ol", tail (n + 2) line] } else { () }
+    }
+};
+let cells line = {
+    let s = str.trim line;
+    let a = if str.starts_with "|" s { tail 1 s } else { s };
+    let b = if str.ends_with "|" a { str.slice 0 (len a - 1) a } else { a };
+    list.map str.trim (str.split "|" b)
+};
+let separator line = str.contains_str "-" line && list.all (fn c -> c == '-' || c == ':' || c == '|' || c == ' ') (str.chars (str.trim line));
+let row tag line = "<tr>" + str.join_str "" (list.map (fn c -> "<" + tag + ">" + inline c + "</" + tag + ">") (cells line)) + "</tr>";
+let special line = {
+    let s = str.trim line;
+    s == "" || heading s != () || list_item s != () || str.starts_with "```" s || str.starts_with "~~~" s || str.starts_with "> " s || s == "---" || s == "***"
+};
+let rec fenced marker lines acc = match lines {
+    [] => [str.join_str "\n" (list.reverse acc), []],
+    [line, ..rest] => if str.starts_with marker (str.trim line) { [str.join_str "\n" (list.reverse acc), rest] }
+                    else { fenced marker rest (list.cons line acc) },
+};
+let rec items kind lines acc = match lines {
+    [line, ..rest] => match list_item (str.trim line) {
+        [k, text] if k == kind => items kind rest (list.cons ("<li>" + inline text + "</li>") acc),
+        _ => [str.join_str "" (list.reverse acc), lines],
+    },
+    [] => [str.join_str "" (list.reverse acc), []],
+};
+let rec render_lines code_html lines seen = match lines {
+    [] => "",
+    [line, ..rest] => {
+        let s = str.trim line;
+        if s == "" { render_lines code_html rest seen }
+        else if str.starts_with "```" s || str.starts_with "~~~" s {
+            match fenced (str.slice 0 3 s) rest [] {
+                [code, more] => code_html (str.trim (tail 3 s)) code + render_lines code_html more seen,
+            }
+        }
+        else if heading s != () {
+            let h = heading s;
+            let label = list.nth 1 h;
+            let base = match slug label { "" => "section", x => x };
+            let count = map.get 0 base seen;
+            let id = base + (if count == 0 { "" } else { "-" + to_string count });
+            let tag = "h" + to_string (list.head h);
+            "<" + tag + " id=\"" + id + "\"><a class=\"anchor\" href=\"#" + id + "\">" + inline label + "</a></" + tag + ">"
+                + render_lines code_html rest (map.put base (count + 1) seen)
+        }
+        else if s == "---" || s == "***" { "<hr>" + render_lines code_html rest seen }
+        else if list_item s != () {
+            let kind = list.head (list_item s);
+            match items kind lines [] { [body, more] => "<" + kind + ">" + body + "</" + kind + ">" + render_lines code_html more seen }
+        }
+        else if str.starts_with "> " s {
+            let quote = list.take_while (fn l -> str.starts_with "> " (str.trim l)) lines;
+            "<blockquote>" + render_lines code_html (list.map (fn l -> tail 2 (str.trim l)) quote) (%{}) + "</blockquote>"
+                + render_lines code_html (list.drop (list.length quote) lines) seen
+        }
+        else if str.contains_str "|" s && not (list.is_empty rest) && separator (list.head rest) {
+            let rows = list.take_while (fn l -> str.contains_str "|" l && str.trim l != "") (list.tail rest);
+            "<div class=\"table\"><table><thead>" + row "th" s + "</thead><tbody>" + str.join_str "" (list.map (row "td") rows) + "</tbody></table></div>"
+                + render_lines code_html (list.drop (list.length rows + 1) rest) seen
+        }
+        else {
+            let paragraph = list.cons line (list.take_while (fn l -> not (special l)) rest);
+            "<p>" + inline (str.join_str " " paragraph) + "</p>" + render_lines code_html (list.drop (list.length paragraph) lines) seen
+        }
+    },
+};
+let render_with code_html text = render_lines code_html (str.split "\n" (replace "\r\n" "\n" text)) (%{});
+let title fallback text = match list.first_or () (list.filter (fn l -> str.starts_with "# " l) (str.split "\n" text)) {
+    () => fallback, line => str.trim (tail 2 line),
+};
+
+let code_html language code = "<pre><code class=\"language-" + escape (slug language) + "\">" + escape code + "</code></pre>";
+let render text = render_with code_html text;

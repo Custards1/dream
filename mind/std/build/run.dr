@@ -82,6 +82,7 @@ let rec forced! v = {
 
 // --- the context ---------------------------------------------------------------------
 
+/// Return the current machine's operating system and architecture as a build target.
 let here! : :unit -> :map;
 let here! () = build.Target.make (os.platform ()) (os.arch ());
 
@@ -97,6 +98,7 @@ let rec flag_value flag args = match args {
     [] => (),
 };
 
+/// Read the serialized build context named by the runner's arguments.
 let context! : [:string] -> :map;
 let context! args = match flag_value "--context" args {
     () => host! (os.cwd! ()),
@@ -110,6 +112,7 @@ let context! args = match flag_value "--context" args {
     },
 };
 
+/// Print a build-runner error and terminate with a nonzero status.
 let fail! : :string -> :any;
 let fail! why = {
     console.error! ("build: " + why)
@@ -125,6 +128,7 @@ let rec reach acc i = match build.input i {
     _ => acc,
 };
 
+/// Add a reachable step and its dependencies to the discovered build graph.
 let reach_step : :map -> :map -> :map;
 let reach_step acc s = {
     let shape = build.Step.shape s;
@@ -184,6 +188,7 @@ mapping State {
     reused = 0
 }
 
+/// Resolve a path against the build context's package root.
 let absolute : :map -> :string -> :string;
 let absolute ctx p = match p {
     _ if str.starts_with "/" p => p,
@@ -224,6 +229,7 @@ let tree_files! ctx dir suffix =
 
 // --- keys ------------------------------------------------------------------------------
 
+/// Return a cached step's directory for its content key.
 let dir_of : :map -> :string -> :string;
 let dir_of ctx k = build.Context.cache ctx + "/" + k;
 
@@ -323,6 +329,7 @@ let tail text = {
     str.join_str "\n" (list.drop (list.length lines - 40) lines)
 };
 
+/// Convert a subprocess result into a build result, distinguishing timeouts.
 let exited : :string -> :map -> :string;
 let exited program r = match r.[:timed_out else false] {
     true => program + " ran out of time\n" + tail (r.[:out] + r.[:err]),
@@ -472,9 +479,11 @@ mapping Run {
     keep_going : :bool = false
 }
 
+/// Test whether all dependencies of a scheduled step have completed.
 let ready : :map -> :string -> :bool;
 let ready run shape = list.all (fn d -> _map_has (State.done (Run.state run)) d) ((Run.deps run).[shape else []]);
 
+/// Test whether failures require stopping because keep-going is disabled.
 let stopped : :map -> :bool;
 let stopped run = not (Run.keep_going run) && not (map.is_empty (State.failures (Run.state run)));
 
@@ -699,6 +708,7 @@ let rec goals_named plan name = match (build.Plan.goals plan).[name else ()] {
     g => [[name, g]],
 };
 
+/// Extract the input materialized by a goal.
 let goal_input : :any -> :any;
 let goal_input g = match g {
     [:make, i] => i,
@@ -759,6 +769,7 @@ let outcome ctx plan mods st =
                        (build.Plan.defines plan) (build.Plan.hosts plan) (build.Plan.target plan)
                        (State.reads st) (State.built st) (State.reused st) (%{}) (%{});
 
+/// Return the file storing cached input stamps for the build context.
 let stamps_file : :map -> :string;
 let stamps_file ctx = build.Context.cache ctx + "/stamps";
 

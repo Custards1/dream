@@ -8,6 +8,7 @@ import std.str;
 import std.list;
 import std.streams;
 
+/// Construct an I/O error result with the requested transfer context.
 priv let failure kind offset message = result.error (binary.problem kind (offset * 8) message);
 
 /// Read exactly count bytes. The callback accepts a maximum count and returns
@@ -27,6 +28,7 @@ let read_exact_with! count source! =
         go! 0 []
     };
 
+/// Read exactly `count` bytes using `source!`, then decode them with `codec`.
 let read_with! codec count source! = match read_exact_with! count source! {
     [:error, e] => result.error e,
     [:ok, data] => binary.decode codec data,
@@ -43,5 +45,7 @@ let write_with! codec value sink! = match binary.encode codec value {
     } catch e { failure :io_error 0 (to_string e) },
 };
 
+/// Read exactly `count` bytes from a handle and decode them with `codec`.
 let read! codec count handle = read_with! codec count (io.read! handle);
+/// Encode a value with `codec` and write all its bytes to a handle.
 let write! codec value handle = write_with! codec value (io.write! handle);

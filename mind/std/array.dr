@@ -26,6 +26,7 @@ let fold f init xs = {
     if n == 0 { init } else { go 1 (f init (xs.[0])) }
 };
 
+/// Return the sequence type name, `array`.
 let name : :any -> :string;
 let name xs = "array";
 
@@ -35,6 +36,7 @@ let name xs = "array";
 let length : #[a] -> :integer;
 let length xs = len xs;
 
+/// Test whether the array has no elements.
 let is_empty : #[a] -> :bool;
 let is_empty xs = len xs == 0;
 
@@ -45,12 +47,24 @@ let is_empty xs = len xs == 0;
 let get : #[a] -> :integer -> :any;
 let get xs i = xs.[i];
 
+/// Return the element at zero-based index `i`, or `default` when out of bounds.
+///
+/// ```dream
+/// import std.array;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (array.get_or "missing" #[10, 20] 4)
+/// };
+/// ```
 let get_or : a -> #[a] -> :integer -> a;
 let get_or default xs i = if i < 0 || i >= len xs { default } else { xs.[i] };
 
+/// Return the first element, or `default` when the array is empty.
 let first_or : a -> #[a] -> a;
 let first_or default xs = get_or default xs 0;
 
+/// Return the last element, or `default` when the array is empty.
 let last_or : a -> #[a] -> a;
 let last_or default xs = get_or default xs (len xs - 1);
 
@@ -60,6 +74,16 @@ let last_or default xs = get_or default xs (len xs - 1);
 let new : :integer -> a -> #[a];
 let new n fill = _array_new n fill;
 
+/// Materialize a list as an array, preserving order.
+///
+/// ```dream
+/// import std.array;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (array.of_list [1, 2, 3])
+/// };
+/// ```
 let of_list : [a] -> #[a];
 let of_list xs = _array_of_list xs;
 
@@ -83,21 +107,36 @@ let set xs i v = xs.[i => v];
 // These go through lists because that is where `std.list` already has them,
 // and an array is finite so the round trip terminates.
 
+/// Apply `f` to every element and return the results as an array.
+///
+/// ```dream
+/// import std.array;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (array.map (fn x -> x + 1) #[1, 2, 3])
+/// };
+/// ```
 let map : (a -> b) -> #[a] -> #[b];
 let map f xs = _array_of_list (list.map f (_array_to_list xs));
 
+/// Return an array of elements satisfying `keep`, preserving order.
 let filter : (a -> :bool) -> #[a] -> #[a];
 let filter keep xs = _array_of_list (list.filter keep (_array_to_list xs));
 
+/// Return an array with the elements in reverse order.
 let reverse : #[a] -> #[a];
 let reverse xs = _array_of_list (list.reverse (_array_to_list xs));
 
+/// Return the elements sorted in ascending order.
 let sort : #[a] -> #[a];
 let sort xs = _array_of_list (list.sort (_array_to_list xs));
 
+/// Stable-sort the elements using `before a b` as the ordering predicate.
 let sort_by : (a -> a -> :bool) -> #[a] -> #[a];
 let sort_by before xs = _array_of_list (list.sort_by before (_array_to_list xs));
 
+/// Concatenate two arrays, with `xs` before `ys`.
 let append : #[a] -> #[a] -> #[a];
 let append xs ys =
     _array_of_list (list.append (_array_to_list xs) (_array_to_list ys));
@@ -167,5 +206,6 @@ when test {
 
 import std.types;
 type Of element = #[element];
+/// Validate every element against `element`; return the array or raise a type error.
 let check : :any -> #[a] -> #[a];
 let check element values = types.check (Of element) values;

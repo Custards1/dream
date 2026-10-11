@@ -120,6 +120,7 @@ let render q = {
     number flat 1 [] []
 };
 
+/// Flatten SQL fragments into PostgreSQL text and positional parameter values.
 priv let flatten : [Part] -> [:any] -> [:any];
 priv let rec flatten ps !acc = match ps {
     [] => acc,
@@ -135,6 +136,7 @@ priv let rec flatten ps !acc = match ps {
 priv let spliced : :any -> Fragment;
 priv let spliced f = type_assert (is_fragment f) "a fragment (build text with sql.raw)" f;
 
+/// Test whether a value is a tagged SQL fragment.
 let is_fragment : :any -> :bool;
 let is_fragment f = type_of f == :list && not (list.is_empty f) && f.[0] == :sql;
 
@@ -148,6 +150,7 @@ priv let number flat start text values = {
     number_from flat (count + start - 1) text values
 };
 
+/// Number bind parameters starting at the supplied position.
 priv let number_from : [:any] -> :integer -> [:string] -> [:any] -> [:string, [:any]];
 priv let rec number_from flat !n text values = match flat {
     [] => [str.concat_all text, values],
@@ -184,6 +187,7 @@ let ident name = raw (quote_ident name);
 let qualified : [:any] -> Fragment;
 let qualified names = raw (str.join_str "." (list.map quote_ident names));
 
+/// Quote an identifier, doubling embedded double quotes.
 let quote_ident : :any -> :string;
 let quote_ident name = {
     let text = if type_of name == :atom { value.atom_name name } else { to_string name };
@@ -225,9 +229,11 @@ let or conditions = match conditions {
     many => join " OR " (list.map parenthesised many),
 };
 
+/// Wrap a condition in SQL NOT.
 let negate : Fragment -> Fragment;
 let negate condition = concat [raw "NOT ", parenthesised condition];
 
+/// Surround a SQL fragment with parentheses.
 priv let parenthesised : Fragment -> Fragment;
 priv let parenthesised f = concat [raw "(", f, raw ")"];
 
@@ -235,6 +241,7 @@ priv let parenthesised f = concat [raw "(", f, raw ")"];
 /// equality; one fragment; or a list of fragments, all of which must hold.
 type Conditions = :map | Fragment | [Fragment];
 
+/// Normalize a value to a SQL condition fragment.
 let condition : Conditions -> Fragment;
 let condition c = match type_of c {
     :map => and (list.map (fn [k, v] -> eq k v) (map.pairs c)),
@@ -273,6 +280,7 @@ let insert_all table rows = {
                                 rows)]
 };
 
+/// Refer to a column of the row proposed by an INSERT.
 priv let inserted : :any -> Fragment;
 priv let inserted v = match v {
     () => raw "DEFAULT",
@@ -312,16 +320,22 @@ let text_with sql vs = [:sql, list.map (fn t -> match t {
 }) (scan sql false)];
 
 // Shared lexical checks; keep these names for existing std.sql.pg.sql callers.
+/// Scan SQL text into tokens while respecting strings and comments.
 let scan : :string -> :bool -> [:any];
 let scan text braces = checked.scan text braces;
+/// Return the source text belonging to a scanned token.
 let token_text : :any -> :string;
 let token_text t = checked.token_text t;
+/// Check a SQL statement and return its diagnostics.
 let lint : [:any] -> :bool -> :bool -> :any;
 let lint tokens several positional = checked.lint tokens several positional;
+/// Check SQL under an explicit statement classification.
 let lint_as : :bool -> [:any] -> :bool -> :bool -> :any;
 let lint_as whole tokens several positional = checked.lint_as whole tokens several positional;
+/// Construct a SQL diagnostic with its source location.
 let problem : :string -> :any;
 let problem text = checked.problem text;
+/// Adjust a statement diagnostic to its position in a larger script.
 let script_problem : :string -> :any;
 let script_problem text = checked.script_problem text;
 
@@ -332,18 +346,23 @@ priv type Syntax = :any;
 priv let span : [:integer, :integer];
 priv let span = [0, 0];
 
+/// Expand a string fragment to macro syntax.
 priv let str_s : :string -> Syntax;
 priv let str_s s = [:str, s, span];
 
+/// Expand a list of fragments to macro syntax.
 priv let list_s : [Syntax] -> Syntax;
 priv let list_s items = [:list, items, span];
 
+/// Expand an atom fragment to macro syntax.
 priv let atom_s : :string -> Syntax;
 priv let atom_s name = [:atom, name, span];
 
+/// Build a tagged syntax representation for a SQL fragment.
 priv let tagged : :string -> Syntax -> Syntax;
 priv let tagged tag e = list_s [atom_s tag, e];
 
+/// Return a PostgreSQL SQL macro-expansion error.
 priv let invalid : :string -> [:error, :string];
 priv let invalid message = [:error, "sql.query: " + message];
 
@@ -385,6 +404,7 @@ macro script template = match template {
     _ => invalid "sql.script expects a string literal",
 };
 
+/// Expand a SQL template with its inserted fragments and bound values.
 priv let from_template : :string -> Syntax;
 priv let from_template text = {
     let tokens = scan text true;
@@ -421,9 +441,11 @@ priv let path text = {
     }
 };
 
+/// Test whether a character can begin a SQL identifier.
 priv let is_ident_start : :integer -> :bool;
 priv let is_ident_start b = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128;
 
+/// Test whether text forms a valid identifier for SQL template syntax.
 priv let is_name : :string -> :bool;
 priv let is_name s =
     len s > 0 && is_ident_start (str.byte 0 s) && str.span name_bytes 0 s == len s;
@@ -438,6 +460,7 @@ priv let assemble pieces = match list.filter (fn p -> type_of p == :list && p.[0
     _ => tagged "sql" (list_s (list.map part_syntax (merge_text pieces [] ""))),
 };
 
+/// Combine adjacent SQL text fragments.
 priv let merge_text : [:any] -> [:any] -> :string -> [:any];
 priv let rec merge_text pieces acc pending = match pieces {
     [] => list.reverse (if pending == "" { acc } else { list.cons pending acc }),
@@ -447,6 +470,7 @@ priv let rec merge_text pieces acc pending = match pieces {
     },
 };
 
+/// Expand one SQL template part into macro syntax.
 priv let part_syntax : :any -> Syntax;
 priv let part_syntax p = match p {
     [:param_s, e] => tagged "param" e,

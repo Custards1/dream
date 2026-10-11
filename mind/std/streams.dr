@@ -20,6 +20,7 @@ let write_all_with! writer! text = {
     put! 0
 };
 
+/// Write every byte of a string to a handle, retrying partial writes.
 let write_all! : :any -> :string -> :atom;
 let write_all! handle text = write_all_with! (io.write! handle) text;
 
@@ -28,5 +29,6 @@ let write_all! handle text = write_all_with! (io.write! handle) text;
 import std.types;
 type Text = :string;
 // Preserve the existing write loop; callers opt into validation at entry.
+/// Validate the text against `description` before writing every byte to a handle.
 let write_as! : :any -> :any -> :string -> :atom;
 let write_as! description handle text = write_all! handle (types.check description text);

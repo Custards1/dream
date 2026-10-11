@@ -42,18 +42,23 @@ mod get {
     }
 }
 
+/// Dispatch a left fold to the implementation registered for the value's runtime type.
 let fold : (b -> :any -> b) -> b -> Collection -> b;
 let fold f init xa = (get.fold_from (type_of xa)) f init xa;
 
+/// Dispatch mapping to the runtime type's implementation, passing `f` and `init` through.
 let map : :any -> :any -> Collection -> :any;
 let map f init xa = (get.map_from (type_of xa)) f init xa;
 
+/// Dispatch indexed lookup to the value's runtime type.
 let nth : :integer -> Collection -> :any;
 let nth i l = (get.nth_from (type_of l)) i l;
 
+/// Dispatch reversal to the value's runtime type.
 let reverse : Collection -> Collection;
 let reverse c = (get.reverse_from (type_of c) c);
 
+/// Return the protocol name, `dynamic`.
 let name : :any -> :string;
 let name x = "dynamic"
 

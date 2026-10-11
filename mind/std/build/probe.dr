@@ -88,6 +88,7 @@ let llvm_link program linkage components = {
                    "answer"
 };
 
+/// Probe LLVM components using llvm-config and shared-library link flags.
 let llvm : [:string] -> :any;
 let llvm components = llvm_link "llvm-config" "--link-shared" components;
 

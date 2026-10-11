@@ -28,6 +28,7 @@
 // `fold`, and nothing in the grammar can say "the element type of whatever
 // container derives this". So what a callback is handed is `:any`, and the
 // deriving module's own `fold` signature is where the element is named.
+/// Accumulate over a sequence using its implementation of the fold protocol.
 let fold : (b -> a -> b) -> b -> :any -> b;
 virtual let fold f init xs;
 
@@ -43,14 +44,17 @@ virtual let name xs = "sequence";
 let length : :any -> :integer;
 let length xs = fold (fn n _ -> n + 1) 0 xs;
 
+/// Test whether the sequence has zero elements.
 let is_empty : :any -> :bool;
 let is_empty xs = length xs == 0;
 
 // --- arithmetic -------------------------------------------------------------
 
+/// Add the sequence's elements, returning 0 when empty.
 let sum : :any -> (:integer | :float);
 let sum xs = fold (fn acc x -> acc + x) 0 xs;
 
+/// Multiply the sequence's elements, returning 1 when empty.
 let product : :any -> (:integer | :float);
 let product xs = fold (fn acc x -> acc * x) 1 xs;
 
@@ -65,9 +69,11 @@ let count keep xs = fold (fn n x -> if keep x { n + 1 } else { n }) 0 xs;
 let any : (:any -> :bool) -> :any -> :bool;
 let any keep xs = fold (fn seen x -> seen || keep x) false xs;
 
+/// Test whether every element satisfies `keep`; empty sequences return true.
 let all : (:any -> :bool) -> :any -> :bool;
 let all keep xs = fold (fn ok x -> ok && keep x) true xs;
 
+/// Test whether the sequence contains a value equal to `wanted`.
 let contains : :any -> :any -> :bool;
 let contains wanted xs = any (fn x -> x == wanted) xs;
 
@@ -77,13 +83,16 @@ let contains wanted xs = any (fn x -> x == wanted) xs;
 // out of range: a total function that says "nothing" rather than one that
 // raises.
 
+/// Return the best element under `better`, or `()` for an empty sequence.
 let extreme_by : (:any -> :any -> :bool) -> :any -> :any;
 let extreme_by better xs =
     fold (fn best x -> if best == () { x } else if better x best { x } else { best }) () xs;
 
+/// Return the smallest element, or `()` for an empty sequence.
 let minimum : :any -> :any;
 let minimum xs = extreme_by (fn a b -> a < b) xs;
 
+/// Return the largest element, or `()` for an empty sequence.
 let maximum : :any -> :any;
 let maximum xs = extreme_by (fn a b -> a > b) xs;
 
@@ -92,6 +101,7 @@ let minimum_by : (:any -> :any) -> :any -> :any;
 let minimum_by rank xs =
     fold (fn best x -> if best == () { x } else if rank x < rank best { x } else { best }) () xs;
 
+/// Return the element with the greatest rank, or `()` when empty.
 let maximum_by : (:any -> :any) -> :any -> :any;
 let maximum_by rank xs =
     fold (fn best x -> if best == () { x } else if rank x > rank best { x } else { best }) () xs;
@@ -117,6 +127,7 @@ let join sep xs = {
     if joined == () { "" } else { joined }
 };
 
+/// Return the sequence's type name and element count as readable text.
 let describe : :any -> :string;
 let describe xs = name xs + " of " + to_string (length xs)
 
@@ -125,6 +136,7 @@ let describe xs = name xs + " of " + to_string (length xs)
 // A derived container's actual traversal defines membership. The descriptor
 // contains a closure, so it can check inside comp but is not itself bakeable.
 import std.types;
+/// Describe a sequence whose elements all satisfy the given type description.
 let elements_type : :any -> :any;
 let elements_type element = types.refine :any
     (fn values -> fold (fn valid value -> valid && types.accepts element value) true values);

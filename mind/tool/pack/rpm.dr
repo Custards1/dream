@@ -39,19 +39,19 @@ import std.map;
 import std.result;
 import std.str;
 
-import bytes;
-import compress;
-import cpio;
-import deps;
-import item;
-import item.{Item};
-import layout;
-import layout.Layout;
-import out;
-import platform;
-import scratch;
-import spec;
-import spec.Spec;
+import pack.bytes;
+import pack.compress;
+import pack.cpio;
+import pack.deps;
+import pack.item;
+import pack.item.{Item};
+import pack.layout;
+import pack.layout.Layout;
+import pack.out;
+import pack.platform;
+import pack.scratch;
+import pack.spec;
+import pack.spec.Spec;
 
 // --- tags ---------------------------------------------------------------------------
 
@@ -232,7 +232,7 @@ let package_tags sp lay c payload_digest = {
     [entry 100 (Value.strings ["C"]),
      string 1000 (Spec.name sp), string 1001 (Spec.version sp), string 1002 (to_string (Spec.release sp)),
      entry 1004 (Value.i18n (Spec.summary sp)), entry 1005 (Value.i18n (Spec.description sp)),
-     int32 1006 (Layout.epoch lay), string 1007 "ship",
+     int32 1006 (Layout.epoch lay), string 1007 "mind",
      int32 1009 (layout.installed_size (Layout.items lay)),
      string 1014 (match Spec.license sp { "" => "Unknown", l => l }),
      entry 1016 (Value.i18n (spec.text sp "rpm" "group" "Unspecified")),

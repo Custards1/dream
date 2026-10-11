@@ -92,6 +92,7 @@ let logsumexp x = {
 let stretch : :tensor -> :any -> :any;
 let stretch x r = if type_of r == :tensor { tensor.repeat (last_axis x).[1] r } else { r };
 
+/// Compute a natural logarithm using the value's numeric representation.
 priv let log_of : :any -> :any;
 priv let log_of v = if type_of v == :tensor { tensor.log v } else { math.log v };
 
@@ -110,6 +111,7 @@ let clip lo hi x = tensor.min (tensor.max x lo) hi;
 let like : :tensor -> :tensor -> :tensor;
 let like ref t = if tensor.device ref == :host { tensor.host t } else { on_gpu_as (tensor.dtype ref) t };
 
+/// Move a value to the GPU representation selected by the reference value.
 priv let on_gpu_as : :atom -> :tensor -> :tensor;
 priv let on_gpu_as dtype t = match dtype { :f32 => tensor.gpu t, _ => tensor.gpu64 t };
 

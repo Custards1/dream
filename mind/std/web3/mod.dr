@@ -13,7 +13,9 @@ import std.web3.hex;
 /// http.with_header or http.with_bearer. Each exchange has its own ID space.
 let provider url = http.request "POST" url |> http.with_timeout (time.seconds 30) |> http.with_redirects 0;
 
+/// Construct an error result for an invalid Web3 request argument.
 priv let bad message = result.error (error.new :web3_argument message);
+/// Construct an error result for a malformed JSON-RPC response.
 priv let malformed message = result.error (error.new :web3_response message);
 
 /// Construct a JSON-RPC request. IDs are nonnegative integers or strings.
@@ -41,6 +43,7 @@ let response id value =
         } else { result.error (error.new :web3_rpc e) }
     };
 
+/// Send a JSON-RPC payload through the client's configured transport.
 priv let exchange! client payload = {
     let? received = http.send! (client |> http.Request.set_method "POST" |> http.with_json payload);
     let? good = http.expect_ok received;
@@ -75,6 +78,7 @@ let batch_response count values =
         if list.is_empty invalid { result.ok replies } else { list.head invalid }
     };
 
+/// Match batch responses to request indices, detecting invalid or duplicate IDs.
 priv let rec index_responses values count found = match values {
     [] => result.ok found,
     [v, ..rest] =>
@@ -87,20 +91,26 @@ priv let rec index_responses values count found = match values {
         },
 };
 
+/// Execute a batch of JSON-RPC calls and restore the original request order.
 let batch! client calls = {
     let? payload = batch_request calls;
     let? decoded = exchange! client payload;
     batch_response (list.length calls) decoded
 };
 
+/// Decode a successful JSON-RPC result as an Ethereum quantity.
 priv let quantity_response value = result.map_error (fn e -> error.new :web3_response (error.payload e)) (hex.parse_quantity value);
+/// Validate a successful JSON-RPC result as hexadecimal data.
 priv let data_response value = result.map_error (fn e -> error.new :web3_response (error.payload e)) (hex.data value);
+/// Perform a JSON-RPC call and decode its result as an integer quantity.
 priv let quantity_rpc! client method params = {
     let? value = rpc! client method params;
     quantity_response value
 };
 
+/// Request the connected Ethereum chain's numeric chain ID.
 let chain_id! client = quantity_rpc! client "eth_chainId" [];
+/// Request the latest block number.
 let block_number! client = quantity_rpc! client "eth_blockNumber" [];
 /// Wei per gas, as an integer.
 let gas_price! client = quantity_rpc! client "eth_gasPrice" [];
@@ -112,12 +122,14 @@ let balance! client address block = {
     quantity_rpc! client "eth_getBalance" [a, b]
 };
 
+/// Request an address's transaction count at the selected block.
 let transaction_count! client address block = {
     let? a = hex.address address;
     let? b = hex.block block;
     quantity_rpc! client "eth_getTransactionCount" [a, b]
 };
 
+/// Request the bytecode stored at an address at the selected block.
 let code! client address block = {
     let? a = hex.address address;
     let? b = hex.block block;
@@ -136,6 +148,7 @@ let call! client transaction block = {
     }
 };
 
+/// Request a gas estimate for the supplied transaction.
 let estimate_gas! client transaction =
     if type_of transaction != :map { bad "expected a transaction object" }
     else { quantity_rpc! client "eth_estimateGas" [transaction] };
@@ -145,15 +158,18 @@ let transaction! client hash = {
     let? h = hex.hash hash;
     rpc! client "eth_getTransactionByHash" [h]
 };
+/// Request a transaction receipt by hash; a pending receipt may be absent.
 let receipt! client hash = {
     let? h = hex.hash hash;
     rpc! client "eth_getTransactionReceipt" [h]
 };
+/// Request a block, optionally including complete transaction objects.
 let block! client block full_transactions = {
     let? b = hex.block block;
     if type_of full_transactions != :bool { bad "full_transactions must be a bool" }
     else { rpc! client "eth_getBlockByNumber" [b, full_transactions] }
 };
+/// Request event logs matching the supplied filter.
 let logs! client filter =
     if type_of filter != :map { bad "expected a log filter object" }
     else { rpc! client "eth_getLogs" [filter] };

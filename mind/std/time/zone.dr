@@ -250,6 +250,7 @@ priv let clock_seconds s i = {
     fields i 0 0
 };
 
+/// Parse a fixed numeric component from a time-zone string.
 priv let digits : :string -> :integer -> :any;
 priv let digits s i = {
     let stop = str.span "0123456789" i s;
@@ -301,10 +302,12 @@ let of_tzif name bytes =
 priv let header : :string -> :integer -> [:integer];
 priv let header bytes at = list.map (fn k -> u32 bytes (at + 20 + 4 * k)) [0, 1, 2, 3, 4, 5];
 
+/// Compute a TZif data block's size from its counts and timestamp width.
 priv let block_size : [:integer] -> :integer -> :integer;
 priv let block_size [isut, isstd, leap, times, types, chars] width =
     times * width + times + types * 6 + chars + leap * (width + 4) + isstd + isut;
 
+/// Decode a TZif data block into a time-zone result.
 priv let read_block : :string -> :string -> [:integer] -> :integer -> :integer -> result.Of Zone :string;
 priv let read_block name bytes counts at width = {
     let [isut, isstd, leap, times, types, chars] = counts;
@@ -333,12 +336,15 @@ priv let read_block name bytes counts at width = {
     else { result.ok (Zone.make name transitions initial rule) }
 };
 
+/// Read a big-endian unsigned 32-bit value from TZif data.
 priv let u32 : :string -> :integer -> :integer;
 priv let u32 s at = ((str.byte at s * 256 + str.byte (at + 1) s) * 256 + str.byte (at + 2) s) * 256 + str.byte (at + 3) s;
 
+/// Read a big-endian signed 32-bit value from TZif data.
 priv let i32 : :string -> :integer -> :integer;
 priv let i32 s at = { let u = u32 s at; if u >= 2147483648 { u - 4294967296 } else { u } };
 
+/// Read a big-endian signed 64-bit value from TZif data.
 priv let i64 : :string -> :integer -> :integer;
 priv let i64 s at = {
     let u = u32 s at * 4294967296 + u32 s (at + 4);
@@ -364,6 +370,7 @@ let load! name =
         result.error ("not a zone name: " + name)
     } else { load_from! name (search_dirs! ()) };
 
+/// Search the candidate zoneinfo directories for a named time zone.
 priv let load_from! : :string -> [:string] -> result.Of Zone :string;
 priv let rec load_from! name dirs = match dirs {
     [] => result.error ("no time zone called " + name + " on this machine"),
@@ -394,6 +401,7 @@ let local! () = match os.env! "TZ" {
     },
 };
 
+/// Load the system's local time zone.
 priv let localtime! : :unit -> Zone;
 priv let localtime! () = {
     // The link's target names the zone -- `../usr/share/zoneinfo/America/Denver`
@@ -407,6 +415,7 @@ priv let localtime! () = {
     from_file_or_utc! name path
 };
 
+/// Load a zone file, falling back to UTC when it cannot be read or decoded.
 priv let from_file_or_utc! : :string -> :string -> Zone;
 priv let from_file_or_utc! name path = match file.read! path {
     () => utc,

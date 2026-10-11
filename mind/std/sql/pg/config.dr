@@ -95,6 +95,7 @@ let parse text =
 
 // --- URLs ------------------------------------------------------------------------
 
+/// Parse a PostgreSQL connection URL into connection options.
 priv let parse_url : :string -> [:ok, :map] | [:error, :string];
 priv let parse_url text = {
     let rest = str.slice (str.find_from 0 "://" text + 3) (len text) text;
@@ -133,9 +134,11 @@ priv let split_hostport hp =
         if colon < 0 { [hp, ""] } else { [str.slice 0 colon hp, str.slice (colon + 1) (len hp) hp] }
     };
 
+/// Return the final occurrence of a delimiter, or -1 when absent.
 priv let last_index : :string -> :string -> :integer;
 priv let last_index needle s = last_from needle s (str.find_from 0 needle s) (-1);
 
+/// Search for the last delimiter starting at the supplied offset.
 priv let last_from : :string -> :string -> :integer -> :integer -> :integer;
 priv let rec last_from needle s at found =
     if at < 0 { found } else { last_from needle s (str.find_from (at + 1) needle s) at };
@@ -160,6 +163,7 @@ let decode_percent s = {
 priv let keyword_pairs : :string -> [[:string, :string]];
 priv let keyword_pairs text = keywords_from text 0 [];
 
+/// Parse keyword/value connection options from an offset.
 priv let keywords_from : :string -> :integer -> [[:string, :string]] -> [[:string, :string]];
 priv let rec keywords_from text at acc = {
     let start = str.span " \t\r\n" at text;
@@ -178,6 +182,7 @@ priv let rec keywords_from text at acc = {
     }
 };
 
+/// Parse a quoted connection-option value, including backslash escapes.
 priv let quoted_value : :string -> :integer -> [:string] -> [:any];
 priv let rec quoted_value text at pieces = {
     let stop = str.upto "'\\" at text;
@@ -204,6 +209,7 @@ priv let ignored = map.set_of ["connect_timeout", "client_encoding", "target_ses
                                "sslnegotiation", "ssl_min_protocol_version", "ssl_max_protocol_version",
                                "channel_binding", "fallback_application_name", "keepalives"];
 
+/// Overlay parsed connection options on the configuration defaults.
 priv let apply : :map -> :string -> :string -> [:ok, :map] | [:error, :string];
 priv let apply c k v = match k {
     "host" if str.starts_with "/" v => [:error, "a Unix-domain socket (" + v + ") cannot be opened by this VM; use a TCP host"],

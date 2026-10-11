@@ -27,29 +27,32 @@ import std.list;
 import std.os;
 import std.str;
 import std.toml;
+import manifest;
+import util;
 
-import arch;
-import aur;
-import brew;
-import bytes;
-import compress;
-import deb;
-import installer;
-import layout;
-import layout.Layout;
-import release;
-import rpm;
-import scratch;
-import spec;
-import spec.Spec;
-import sums;
-import tarball;
+import pack.arch;
+import pack.aur;
+import pack.brew;
+import pack.bytes;
+import pack.compress;
+import pack.deb;
+import pack.installer;
+import pack.layout;
+import pack.layout.Layout;
+import pack.release;
+import pack.rpm;
+import pack.scratch;
+import pack.spec;
+import pack.spec.Spec;
+import pack.sums;
+import pack.tarball;
 
 let version : :string = "0.1.0";
 
 let opts = [
     cli.section "what to package",
-    cli.value "m" "manifest" "PATH" "the manifest to read" |> cli.default_to "mind.toml",
+    cli.value "C" "dir" "DIR" "the project to package (default: here, or above)",
+    cli.value "m" "manifest" "PATH" "the manifest to read",
     cli.value "" "package-version" "V" "package this version, whatever the manifest says",
     cli.value "" "release" "N" "the package's own revision (default: [ship] release, or 1)",
     cli.value "" "arch" "ARCH" "the machine it is for: x86_64, aarch64, all, or native",
@@ -61,7 +64,7 @@ let opts = [
         |> cli.choices ["auto", "none", "gzip", "xz", "zstd"] |> cli.default_to "auto",
     cli.flag "q" "quiet" "print only what was made, and what went wrong",
     cli.flag "h" "help" "this message",
-    cli.flag "" "version" "print ship's version",
+    cli.flag "" "version" "print the packager version",
 ];
 
 let command_spec = [
@@ -80,16 +83,16 @@ let command_spec = [
     cli.command "help" "this message" [],
 ];
 
-let usage = "ship -- a program made into what each platform installs
+let usage = "mind pack -- a program made into what each platform installs
 
-usage: ship <command> [options]
+usage: mind pack <command> [options]
 
 commands:
 " + cli.commands_help command_spec + "\n\n" + cli.options_help opts + "\n";
 
 let fail! : :string -> :never;
 let fail! message = {
-    console.error! ("ship: " + message)
+    console.error! ("mind pack: " + message)
     os.exit! 1
 };
 
@@ -102,12 +105,12 @@ let spec! c = {
         "arch" => cli.get "" c "arch",
         "os" => cli.get "" c "os",
     };
-    match spec.load! (cli.get "mind.toml" c "manifest") overrides {
+    match spec.load! (manifest_path! c) overrides {
         [:error, why] => fail! why,
         [:ok, sp] => match spec.problems sp {
             [] => {
                 if not (cli.flag_set c "quiet") {
-                    each! (fn w -> console.error! ("ship: warning: " + w)) (spec.warnings sp)
+                    each! (fn w -> console.error! ("mind pack: warning: " + w)) (spec.warnings sp)
                 }
                 sp
             },
@@ -240,7 +243,7 @@ let report! r = match r {
         true
     },
     [:error, why] => {
-        console.error! ("ship: " + why)
+        console.error! ("mind pack: " + why)
         false
     },
 };
@@ -281,7 +284,7 @@ let git_config! key = try! {
 /// rest left to fill in, each key with the line that says what it is for.
 let skeleton : :string -> :string -> :string -> :string;
 let skeleton name summary maintainer =
-    "\n# What `ship` makes packages from: `ship check`, then `ship all`. Each key is\n"
+    "\n# What `ship` makes packages from: `mind pack check`, then `mind pack all`. Each key is\n"
     + "# described in ship's README.\n[ship]\n"
     + "summary = " + toml.quote summary + "\n"
     + "maintainer = " + toml.quote maintainer + "\n"
@@ -301,7 +304,7 @@ let skeleton name summary maintainer =
     + "[ship.arch]\ndepends = [\"dream\"]\n\n[ship.brew]\ndepends = [\"dream\"]\n";
 
 let cmd_init! c = {
-    let path = cli.get "mind.toml" c "manifest";
+    let path = manifest_path! c;
     let text = match file.read! path { () => "", t => t };
     let doc = match toml.parse text { [:ok, d] => d, [:error, why] => fail! (path + ": " + why) };
     if not (list.is_empty (toml.entries doc "ship")) || str.contains_str "\n[ship]" ("\n" + text) {
@@ -318,19 +321,20 @@ let cmd_init! c = {
         [who, email] => who + " <" + email + ">",
     };
     file.write! path (text + skeleton name summary maintainer)
-    console.print! ("added [ship] to " + path + ": fill it in, then run `ship check`")
+    console.print! ("added [ship] to " + path + ": fill it in, then run `mind pack check`")
 };
 
-let main! = {
-    match cli.commands opts command_spec (os.args! ()) {
+let run! args = {
+    match cli.commands opts command_spec args {
         [:error, why] => fail! (why + "\n\n" + usage),
         [:ok, c] => {
+            if cli.rest c != [] { fail! "unexpected arguments; try `mind pack help`" }
             if cli.flag_set c "help" {
                 console.print! usage
                 os.exit! 0
             }
             if cli.flag_set c "version" {
-                console.print! ("ship " + version)
+                console.print! ("mind pack " + version)
                 os.exit! 0
             }
             match cli.chosen c {
@@ -353,4 +357,14 @@ let main! = {
             }
         },
     }
+};
+
+// Resolve the manifest the same way as the other mind commands. Explicit
+// -m remains relative to the working directory, for release automation.
+let manifest_path! c = match cli.get () c "manifest" {
+    () => match manifest.find! (cli.get (os.cwd! ()) c "dir") {
+        [:ok, m] => util.join (manifest.root m) "mind.toml",
+        [:error, why] => fail! why,
+    },
+    p => p,
 };

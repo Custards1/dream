@@ -33,3 +33,6 @@ and are the first thing to read before working on what they describe.
 measured, what was kept, what was tried and thrown away, and why. Comments in
 the code point into it by section title (`see "Some title"`), and it is where
 the traps are written down.
+
+[Generating documentation with `mind docs`](../mind/tool/DOCUMENTATION.md) covers
+Markdown guides, source comments and examples with captured output.

@@ -175,6 +175,7 @@ let with_headers pairs msg = {
 priv let header_value : :any -> :string;
 priv let header_value v = str.filter (fn c -> c != '\r' && c != '\n') (text_of v);
 
+/// Convert a body or header value to its string representation.
 priv let text_of : :any -> :string;
 priv let text_of v = match type_of v { :string => v, :atom => str.slice 1 (len (to_string v)) (to_string v), _ => to_string v };
 
@@ -188,9 +189,11 @@ let content_type msg = match header "content-type" msg {
 
 // --- reading messages ---------------------------------------------------------------
 
+/// Return an HTTP response's numeric status code.
 let status : :map -> :integer;
 let status resp = Response.status resp;
 
+/// Return a message's body, defaulting to an empty string.
 let body : :map -> :string;
 let body msg = msg.[:body else ""];
 
@@ -257,6 +260,7 @@ let not_found = status_only 404;
 let no_content : :map;
 let no_content = respond 204 "";
 
+/// Build a plain-text response with status 400 and the supplied explanation.
 let bad_request : :string -> :map;
 let bad_request why = text why |> Response.set_status 400;
 
@@ -343,6 +347,7 @@ let with_tls options req = Request.set_options ((Request.options req).[:tls => o
 
 type Reader = rd.Reader.type;
 
+/// Wrap a socket in a buffered HTTP reader.
 let reader : :any -> Reader;
 let reader socket = rd.reader socket;
 
@@ -359,7 +364,9 @@ let read_exact! r n = rd.read_exact! r n;
 let read_to_end! : Reader -> :integer -> [:string, Reader];
 let read_to_end! r limit = read_body! r [] true limit;
 
+/// Test whether a header name contains only permitted token characters.
 priv let valid_header_name name = name != "" && str.span "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" 0 name == len name;
+/// Test whether a header value excludes prohibited control characters.
 priv let valid_header_value value = str.all (fn c -> { let n = _char_code c; n == 9 || (n >= 32 && n != 127) }) value;
 
 /// The start line and the headers up to the blank line: `[start, headers,
@@ -511,11 +518,13 @@ let read_body! r headers until_close limit = {
     [str.concat_all (list.reverse pieces), r2]
 };
 
+/// Decode a hexadecimal chunk-size field.
 priv let hex_number : :string -> :integer;
 priv let hex_number t =
     if t == "" || str.span "0123456789abcdefABCDEF" 0 t != len t || len t > 15 { 0 - 1 }
     else { list.fold (fn acc c -> acc * 16 + hex_digit c) 0 (str.chars t) };
 
+/// Decode one hexadecimal character to its numeric value.
 priv let hex_digit : :char -> :integer;
 priv let hex_digit c = { let k = _char_code c; if k <= 57 { k - 48 } else if k <= 70 { k - 55 } else { k - 87 } };
 
@@ -711,9 +720,11 @@ let stream! req on_piece! = run! (Client.new ()) req (sink_step! on_piece!);
 let stream_with! : :map -> :map -> (:string -> :any) -> result.Of :map :error;
 let stream_with! c req on_piece! = run! c req (sink_step! on_piece!);
 
+/// Deliver a response-body chunk to the supplied sink.
 priv let sink_step! : (:string -> :any) -> :unit -> :string -> :unit;
 priv let sink_step! on_piece! acc piece = { on_piece! piece; () };
 
+/// Execute a configured HTTP exchange with connection and body handling.
 priv let run! : :map -> :map -> :any -> result.Of :map :error;
 priv let run! c req0 sink = {
     let req = with_client_defaults c req0;
@@ -750,12 +761,15 @@ priv let with_client_defaults c req = {
     with_headers_set |> Request.set_url address |> Request.set_options (map.merge (Client.options c) (Request.options req))
 };
 
+/// Send an HTTP GET request to an address.
 let get! : :string -> result.Of :map :error;
 let get! address = send! (request "GET" address);
 
+/// Send an HTTP HEAD request to an address.
 let head! : :string -> result.Of :map :error;
 let head! address = send! (request "HEAD" address);
 
+/// Send an HTTP DELETE request to an address.
 let delete! : :string -> result.Of :map :error;
 let delete! address = send! (request "DELETE" address);
 
@@ -764,12 +778,15 @@ let delete! address = send! (request "DELETE" address);
 let post! : :string -> :string -> result.Of :map :error;
 let post! address text_body = send! (request "POST" address |> with_body text_body);
 
+/// Encode a value as JSON and send it in an HTTP POST request.
 let post_json! : :string -> :any -> result.Of :map :error;
 let post_json! address value = send! (request "POST" address |> with_json value);
 
+/// Form-encode name/value pairs and send them in an HTTP POST request.
 let post_form! : :string -> :any -> result.Of :map :error;
 let post_form! address pairs = send! (request "POST" address |> with_form pairs);
 
+/// Encode a value as JSON and send it in an HTTP PUT request.
 let put_json! : :string -> :any -> result.Of :map :error;
 let put_json! address value = send! (request "PUT" address |> with_json value);
 
@@ -809,6 +826,7 @@ let download! address path = {
     }
 };
 
+/// Write all bytes of one outgoing HTTP body piece.
 priv let write_piece! : :any -> :string -> :unit;
 priv let write_piece! h piece = { streams.write_all! h piece; () };
 
@@ -835,6 +853,7 @@ priv let rec follow! c req left sink = {
     }
 };
 
+/// Test whether a status code triggers supported redirect handling.
 priv let is_redirect : :integer -> :bool;
 priv let is_redirect code = code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
 
@@ -870,6 +889,7 @@ priv let connect! u req = {
     else { [:h1, sock] }
 };
 
+/// Derive a connection-pool key from the request's destination and transport options.
 priv let pool_key : :map -> :string;
 priv let pool_key u = url.Url.scheme u + "://" + url.Url.host u + ":" + to_string (url.port_of u);
 
@@ -922,9 +942,11 @@ priv let over! c key conn is_new req u sink following = {
     }
 };
 
+/// Test whether a failure permits retrying the exchange.
 priv let retryable : :any -> :bool;
 priv let retryable e = list.contains (error.kind e) [:bad_response, :connection_lost, :connection_reset, :io_closed, :io_error, :broken_pipe, :stream_reset];
 
+/// Close an I/O handle while suppressing cleanup errors.
 priv let close_quietly! : :any -> :unit;
 priv let close_quietly! sock = connections.close_quietly! sock;
 
@@ -942,6 +964,7 @@ priv let exchange_on! sock u req sink keep following = {
     [Response.set_url (Request.url req) resp, reusable && keep]
 };
 
+/// Ignore a value when no response-body sink is required.
 priv let nothing : :unit -> :unit;
 priv let nothing u = ();
 

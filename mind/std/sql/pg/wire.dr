@@ -126,9 +126,11 @@ let status_of b = match b {
     _ => :unknown,
 };
 
+/// Decode a RowDescription message into column metadata.
 priv let columns_of : :string -> [:any];
 priv let columns_of body = columns_from body 2 (bytes.u16_at body 0) [];
 
+/// Decode remaining column descriptions from a wire offset.
 priv let columns_from : :string -> :integer -> :integer -> [:any] -> [:any];
 priv let rec columns_from body at n acc =
     if n <= 0 { list.reverse acc }
@@ -145,6 +147,7 @@ priv let rec columns_from body at n acc =
 priv let fields_of : :string -> [:any];
 priv let fields_of body = fields_from body 2 (bytes.u16_at body 0) [];
 
+/// Decode remaining row fields from a wire offset.
 priv let fields_from : :string -> :integer -> :integer -> [:any] -> [:any];
 priv let rec fields_from body !at n acc =
     if n <= 0 { list.reverse acc }
@@ -154,6 +157,7 @@ priv let rec fields_from body !at n acc =
         else { fields_from body (at + 4 + size) (n - 1) (list.cons (str.slice (at + 4) size body) acc) }
     };
 
+/// Decode the column formats of a COPY response.
 priv let copy_formats : :string -> [:integer];
 priv let copy_formats body =
     list.map (fn i -> bytes.i16_at body (3 + 2 * i)) (list.range 0 (bytes.u16_at body 1));
@@ -182,9 +186,11 @@ priv let field_names = %{
     82 => :routine,            // R
 };
 
+/// Decode an ErrorResponse or NoticeResponse into diagnostic fields.
 priv let notice_fields : :string -> :map;
 priv let notice_fields body = notice_from body 0 %{};
 
+/// Decode diagnostic fields from a wire offset.
 priv let notice_from : :string -> :integer -> :map -> :map;
 priv let rec notice_from body at acc = {
     let code = str.byte at body;
@@ -196,6 +202,7 @@ priv let rec notice_from body at acc = {
     }
 };
 
+/// Insert a fully evaluated field into a map.
 priv let strict_put : :map -> :any -> :string -> :map;
 priv let strict_put !m k !v = m.[k => v];
 
@@ -224,12 +231,15 @@ let cancel_request : :integer -> :integer -> :string;
 let cancel_request pid secret =
     bytes.be32 16 + bytes.be32 80877102 + bytes.be32 pid + bytes.be32 secret;
 
+/// Encode a cleartext or already-hashed password response message.
 let password : :string -> :string;
 let password text = frame "p" (bytes.cstr text);
 
+/// Encode the initial SASL mechanism and response message.
 let sasl_initial : :string -> :string -> :string;
 let sasl_initial mechanism data = frame "p" (bytes.cstr mechanism + bytes.be32 (len data) + data);
 
+/// Encode a subsequent SASL response message.
 let sasl_response : :string -> :string;
 let sasl_response data = frame "p" data;
 
@@ -253,6 +263,7 @@ let bind portal stmt values =
     frame "B" (bytes.cstr portal + bytes.cstr stmt + bytes.be16 0 + bytes.be16 (len values)
                + str.concat_all (list.map bound values) + bytes.be16 0);
 
+/// Encode a Bind message for a prepared statement and its parameters.
 priv let bound : :any -> :string;
 priv let bound v = match v {
     () => bytes.be32 (-1),
@@ -280,12 +291,14 @@ let flush = frame "H" "";
 let terminate : :string;
 let terminate = frame "X" "";
 
+/// Encode a COPY data message.
 let copy_data : :string -> :string;
 let copy_data data = frame "d" data;
 
 let copy_done : :string;
 let copy_done = frame "c" "";
 
+/// Encode a COPY failure message containing the reason.
 let copy_fail : :string -> :string;
 let copy_fail reason = frame "f" (bytes.cstr reason);
 

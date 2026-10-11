@@ -212,5 +212,6 @@ import std.types;
 // Field metadata and named record data can be checked before conversion.
 type Fields = [:atom];
 type Backing = types.enum [:list, :array, :map];
+/// Convert a map to a record and validate it against the supplied description.
 let of_map_as : :any -> :map -> :any;
 let of_map_as description value = types.check description (of_map value);

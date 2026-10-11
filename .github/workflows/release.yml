@@ -3,8 +3,8 @@ name: Release
 # A tag `vX.Y.Z` makes Dream's packages and publishes them as that tag's
 # release: a .deb, an RPM and an Arch package for Linux x86_64, a tarball for
 # it and for macOS arm64, and from the tarballs a Homebrew formula, a PKGBUILD
-# for the AUR, install.sh and SHA256SUMS. `ship` makes all of it from the
-# `[ship]` sections of mind.toml (ship/README.md, "A release on several
+# for the AUR, install.sh and SHA256SUMS. `mind pack` makes all of it from the
+# `[ship]` sections of mind.toml (mind/tool/PACKAGING.md, "A release on several
 # machines"); each machine makes what only it can, and the Linux job, which
 # has every source, makes the rest once the macOS tarball has reached it.
 #
@@ -41,8 +41,7 @@ jobs:
           build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/main.dr
           build-dream/bin/dream build/dreams.dream -L mind/std mind/tool/main.dr --shebang -o build/mind
           build-dream/bin/dream build/dreams.dream lucid/main.dr -L mind -L . -o build/lucid.dream
-          build-dream/bin/dream build/dreams.dream -L mind ship/main.dr --shebang -o build/ship
-      - run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) build-dream/bin/dream build/ship tarball --package-version "${VERSION#v}"
+      - run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) build-dream/bin/dream build/mind pack tarball --package-version "${VERSION#v}"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -63,13 +62,12 @@ jobs:
           build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/main.dr
           build-dream/bin/dream build/dreams.dream -L mind/std mind/tool/main.dr --shebang -o build/mind
           build-dream/bin/dream build/dreams.dream lucid/main.dr -L mind -L . -o build/lucid.dream
-          build-dream/bin/dream build/dreams.dream -L mind ship/main.dr --shebang -o build/ship
       - uses: actions/download-artifact@v4
         with:
           name: macos
           path: dist
       - name: every package, then what is made from the tarballs
-        run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) build-dream/bin/dream build/ship all --package-version "${VERSION#v}"
+        run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) build-dream/bin/dream build/mind pack all --package-version "${VERSION#v}"
       - name: the packages install
         run: |
           sudo apt-get install -y ./dist/dream_*_amd64.deb
@@ -82,6 +80,6 @@ jobs:
         run: |
           cp dist/aur/PKGBUILD dist/PKGBUILD
           cp dist/aur/.SRCINFO dist/SRCINFO
-          build-dream/bin/dream build/ship sums
+          build-dream/bin/dream build/mind pack sums
           find dist -maxdepth 1 -type f -print0 | sort -z \
             | xargs -0 gh release create "v${VERSION#v}" --title "Dream ${VERSION#v}" --generate-notes

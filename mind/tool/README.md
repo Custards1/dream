@@ -57,6 +57,8 @@ another.
 | `mind deps`, `mind tree` | every package the project resolves to, as a list or as who needs what |
 | `mind info` | what this build would run, without running it |
 | `mind options` | every package's options, and what this build sets them to |
+| `mind pack FORMAT` | create release packages ([Packaging](PACKAGING.md)) |
+| `mind docs` | compile guides and API comments, including example output ([Documentation](DOCUMENTATION.md)) |
 | `mind clean` | remove `target/` |
 
 `mind help` lists the flags. The ones a build takes are the compiler's
@@ -326,3 +328,13 @@ on.
 just test-mind          # the units, and the graph, options and script suites in tests/
 mind test mind          # the same
 ```
+
+## Packaging and documentation
+
+`mind pack` contains the former standalone Ship packager. Existing `[ship]`
+manifest sections keep working; replace `ship FORMAT` with `mind pack FORMAT`.
+There is no separate Ship executable or package.
+
+`mind docs` builds an offline documentation site from Markdown guides and
+`///` source comments. Fenced Dream examples in comments are compiled and run;
+the pages show their output, including intentional failures.

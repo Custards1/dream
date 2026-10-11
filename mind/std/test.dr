@@ -19,6 +19,7 @@ import std.io;
 import std.os;
 import std.vm;
 
+/// Write test-runner output to standard output.
 let write! : :string -> :unit;
 let write! text = {
     let handle = io.stdout! ();
@@ -39,8 +40,10 @@ let write! text = {
 let case : :string -> :any -> Case;
 let case name body = [name, body];
 
+/// Return a test case's display name.
 let case_name : Case -> :string;
 let case_name c = c.[0];
+/// Return the suspended body of a test case.
 let case_body : Case -> :any;
 let case_body c = ((_list_tail c)).[0];
 
@@ -76,6 +79,7 @@ let patience = 10000;
 // Each raises a message describing the difference. Raising is what ends a case
 // at its first failure, and what the runner catches.
 
+/// Assert that `actual` equals `expected`; raise with both values on failure.
 let eq! : :any -> :any -> :ok;
 let eq! expected actual = {
     if expected == actual { :ok }
@@ -84,18 +88,21 @@ let eq! expected actual = {
     }
 };
 
+/// Assert that `actual` differs from `unexpected`.
 let ne! : :any -> :any -> :ok;
 let ne! unexpected actual = {
     if unexpected != actual { :ok }
     else { raise! ("expected anything but " + to_string unexpected) }
 };
 
+/// Assert that the value is true.
 let true! : :any -> :ok;
 let true! actual = {
     if actual == true { :ok }
     else { raise! ("expected true, got " + to_string actual) }
 };
 
+/// Assert that the value is false.
 let false! : :any -> :ok;
 let false! actual = {
     if actual == false { :ok }
@@ -114,18 +121,21 @@ let near! tolerance expected actual = {
     }
 };
 
+/// Test whether a list contains an equal element.
 let has_element : a -> [a] -> :bool;
 let rec has_element x xs =
     if _list_is_empty xs { false }
     else if xs.[0] == x { true }
     else { has_element x (_list_tail xs) };
 
+/// Assert that a list contains `x`.
 let contains! : a -> [a] -> :ok;
 let contains! x xs = {
     if has_element x xs { :ok }
     else { raise! (to_string xs + " does not contain " + to_string x) }
 };
 
+/// Assert that a list has no elements.
 let empty! : [a] -> :ok;
 let empty! xs = {
     if _list_is_empty xs { :ok }
@@ -163,6 +173,7 @@ priv let raised_where! e = {
     lines (_error_trace! e) 6
 };
 
+/// Execute cases in order, carrying the passed and failed counts into the final report.
 let run_cases! : :integer -> :integer -> [Case] -> [:integer, :integer];
 let rec run_cases! passed failed cases = {
     if _list_is_empty cases { [passed, failed] }

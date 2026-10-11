@@ -62,6 +62,7 @@ let defaults = Options.new ();
 let check : :string -> random.Gen :any -> (:any -> :any) -> test.Case;
 let check name gen holds = check_with defaults name gen holds;
 
+/// Create a named property test using explicit generation and shrinking options.
 let check_with : :map -> :string -> random.Gen :any -> (:any -> :any) -> test.Case;
 let check_with options name gen holds = test.case name $( for_all_with! options gen holds );
 
@@ -78,6 +79,7 @@ let seeded s = Options.set_seed s defaults;
 let for_all! : random.Gen :any -> (:any -> :any) -> :ok;
 let for_all! gen holds = for_all_with! defaults gen holds;
 
+/// Run a generated property with explicit options, shrinking and reporting a failing case.
 let for_all_with! : :map -> random.Gen :any -> (:any -> :any) -> :ok;
 let for_all_with! options gen holds = {
     let base = match Options.seed options {
@@ -90,6 +92,7 @@ let for_all_with! options gen holds = {
     run_cases! options gen holds base 0
 };
 
+/// Generate and check cases, carrying the random state and remaining test count.
 priv let run_cases! : :map -> random.Gen :any -> (:any -> :any) -> :any -> :integer -> :ok;
 priv let rec run_cases! options gen holds base i =
     if i >= Options.runs options { :ok }
@@ -191,6 +194,7 @@ priv let rec bisect! gen holds with_word lo hi found !budget =
         }
     };
 
+/// Search shrink candidates for a smaller input that still fails the property.
 priv let first_failing! : random.Gen :any -> (:any -> :any) -> [:integer] -> [[:integer]] -> :integer -> :any;
 priv let rec first_failing! gen holds tape cands !budget =
     if budget <= 0 { [:none, 0] }

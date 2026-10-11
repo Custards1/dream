@@ -46,6 +46,7 @@ priv let huffman_codes = [[8184, 13], [8388568, 23], [268435426, 28], [268435427
 priv let tree : :array;
 priv let tree = comp build_tree huffman_codes;
 
+/// Build the decoding tree for the HPACK Huffman code table.
 priv let build_tree : [[:integer]] -> :array;
 priv let build_tree codes = {
     // Built in a map, a node per index, then frozen into an array.
@@ -67,6 +68,7 @@ priv let build_tree codes = {
     array.of_list (list.map (fn i -> array.of_list (nodes.[i])) (list.range 0 count))
 };
 
+/// Compute two raised to a nonnegative exponent.
 priv let pow2 : :integer -> :integer;
 priv let rec pow2 k = if k <= 0 { 1 } else { 2 * pow2 (k - 1) };
 
@@ -175,6 +177,7 @@ struct Decoder {
     !max : :integer
 }
 
+/// Construct an HPACK decoder with an empty dynamic table and a maximum table size.
 let decoder : :integer -> Decoder;
 let decoder max = Decoder.make [] 0 max max;
 
@@ -184,6 +187,7 @@ let decoder max = Decoder.make [] 0 max max;
 let decode : Decoder -> :string -> result.Of :any :string;
 let decode d block = decode_from d block 0 [];
 
+/// Decode header representations from an offset, updating the dynamic table.
 priv let decode_from : Decoder -> :string -> :integer -> [[:string]] -> result.Of :any :string;
 priv let rec decode_from d s at acc =
     if at >= len s { result.ok [list.reverse acc, d] }
@@ -236,6 +240,7 @@ priv let entry d i =
     if i <= 61 { static_entries.[i - 1] }
     else { (Decoder.table d).[i - 62 else ()] };
 
+/// Add a header to the dynamic table, evicting older entries to stay within its limit.
 priv let add : Decoder -> :string -> :string -> Decoder;
 priv let add d name value = {
     let cost = len name + len value + 32;
@@ -243,6 +248,7 @@ priv let add d name value = {
     else { evict (Decoder.make ([name, value] :: Decoder.table d) (Decoder.size d + cost) (Decoder.limit d) (Decoder.max d)) }
 };
 
+/// Set the dynamic table's size limit and evict entries as needed.
 priv let resize : Decoder -> :integer -> Decoder;
 priv let resize d n = evict (Decoder.make (Decoder.table d) (Decoder.size d) n (Decoder.max d));
 
@@ -264,6 +270,7 @@ priv let evict d =
 let encode : [[:string]] -> :string;
 let encode headers = str.concat_all (list.map encode_one headers);
 
+/// Encode one name/value header pair as HPACK bytes.
 priv let encode_one : [:string] -> :string;
 priv let encode_one [name, value] = match static_pairs.[name + "\u{0}" + value else ()] {
     () => match static_names.[name else ()] {

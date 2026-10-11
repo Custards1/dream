@@ -18,8 +18,10 @@ let dir_of path = {
     if cut < 0 { "." } else { str.slice 0 cut path }
 };
 
+/// Format a preprocessor value; an absent value becomes an empty string.
 let value_text v = match v { () => "", s if type_of s == :string => s, x => to_string x };
 
+/// Return a sanitizer atom's spelling for compiler flags.
 let sanitizer k = str.slice 1 (str.byte_length (to_string k) - 1) (to_string k);
 
 /// The flags one setting adds when compiling a source in `lang`.

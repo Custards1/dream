@@ -60,10 +60,13 @@ let child_with name start restart = %{ :name => name, :start => start, :restart 
 let child : :string -> :any -> Child;
 let child name start = child_with name start :permanent;
 
+/// Return a child specification's name.
 let child_name : Child -> :any;
 let child_name c = map.get "" :name c;
+/// Return the function that starts the child.
 let child_start : Child -> :any;
 let child_start c = map.get () :start c;
+/// Return the child's restart policy, defaulting to permanent.
 let child_restart : Child -> :any;
 let child_restart c = map.get :permanent :restart c;
 
@@ -125,6 +128,7 @@ let affected strategy names name =
 // window: more than `limit` of them within `window_ms` and the supervisor gives
 // up and stops, which is the same thing a person would do.
 
+/// Set the maximum restart count and the time window in milliseconds.
 let limits : :integer -> :integer -> Limits;
 let limits limit window_ms = %{ :limit => limit, :window => window_ms };
 
@@ -133,6 +137,7 @@ let limits limit window_ms = %{ :limit => limit, :window => window_ms };
 let with_shutdown : :integer -> Limits -> Limits;
 let with_shutdown ms lim = map.put :shutdown ms lim;
 
+/// Return the shutdown grace period in milliseconds, defaulting to 5000.
 let shutdown_after : Limits -> :integer;
 let shutdown_after lim = map.get 5000 :shutdown lim;
 
@@ -148,6 +153,7 @@ let recent window now times =
 
 // --- the supervisor's own state -------------------------------------------------
 
+/// Construct the initial supervisor state from its strategy, children and limits.
 let state : Strategy -> [Child] -> Limits -> State;
 let state strategy children lim =
     %{ :strategy => strategy, :children => children, :lim => lim,
@@ -157,27 +163,38 @@ let state strategy children lim =
        :watchers => [],
        :restarts => [], :stopping => false };
 
+/// Read the restart strategy from supervisor state.
 let s_strategy : State -> :any;
 let s_strategy s = map.get :one_for_one :strategy s;
+/// Read the child specifications from supervisor state.
 let s_children : State -> :any;
 let s_children s = map.get [] :children s;
+/// Read the restart and shutdown limits from supervisor state.
 let s_limits : State -> :any;
 let s_limits s   = map.get default_limits :lim s;
+/// Read the map of currently running child processes.
 let s_running : State -> :any;
 let s_running s  = map.get map.empty :running s;
+/// Read the recorded restart timestamps.
 let s_restarts : State -> :any;
 let s_restarts s = map.get [] :restarts s;
+/// Read the processes waiting for supervisor notifications.
 let s_watchers : State -> :any;
 let s_watchers s = map.get [] :watchers s;
+/// Test whether shutdown is in progress.
 let s_stopping : State -> :any;
 let s_stopping s = map.get false :stopping s;
 
+/// Replace the running-child map in supervisor state.
 let with_running : %{ :string => :process } -> State -> State;
 let with_running r s = map.put :running r s;
+/// Replace the restart history in supervisor state.
 let with_restarts : [:integer] -> State -> State;
 let with_restarts r s = map.put :restarts r s;
+/// Append a watcher to the supervisor state.
 let with_watcher : :process -> State -> State;
 let with_watcher w s = map.put :watchers (list.append (s_watchers s) [w]) s;
+/// Mark the supervisor as stopping so children are no longer restarted.
 let stopping : State -> State;
 let stopping s = map.put :stopping true s;
 
@@ -186,6 +203,7 @@ let stopping s = map.put :stopping true s;
 let names_of : State -> [:string];
 let names_of s = list.map (fn c -> child_name c) (s_children s);
 
+/// Find a child specification by name, returning `()` when absent.
 let child_named : State -> :string -> :any;
 let child_named s name = {
     let hit = list.filter (fn c -> child_name c == name) (s_children s);
@@ -255,6 +273,7 @@ let stop_child! s name =
         },
     };
 
+/// Stop the named children and return the updated supervisor state.
 let stop_all! : State -> [:string] -> State;
 let stop_all! s names = list.fold (fn acc n -> stop_child! acc n) s names |> strict!;
 
@@ -345,6 +364,7 @@ let handle! s m =
         _ => [:go, s],
     };
 
+/// Enter the supervisor's message-handling loop.
 let serve! : State -> :any;
 let serve! s = proc.serve! s (fn st m -> handle! st m);
 
@@ -361,6 +381,7 @@ let start_with! strategy children lim = {
     } )
 };
 
+/// Start a supervisor with the default restart and shutdown limits.
 let start! : Strategy -> [Child] -> :process;
 let start! strategy children = start_with! strategy children default_limits;
 
@@ -370,9 +391,11 @@ let start! strategy children = start_with! strategy children default_limits;
 // of the mailbox by that tag, so a process can ask a supervisor something while
 // other messages -- reports from `notify!` among them -- are waiting for it.
 
+/// Send a supervisor control response to the requesting process.
 priv let answer! : :process -> :any -> :any;
 priv let answer! to value = strict! (send! to [:supervisor, self! (), value]);
 
+/// Send a supervisor control request and wait for its response.
 priv let ask! : :process -> :any -> :any;
 priv let ask! sup request = {
     strict! (send! sup request)
@@ -381,6 +404,7 @@ priv let ask! sup request = {
     }
 };
 
+/// Test whether a message is a control response from the given supervisor.
 priv let is_answer_from : :process -> :any -> :bool;
 priv let is_answer_from sup m = match m {
     [:supervisor, from, _] => from == sup,
@@ -585,11 +609,13 @@ type Strategy = :one_for_one | :one_for_all | :rest_for_one;
 type Restart = :permanent | :transient | :temporary;
 type Child = %{ :name => :string, :start => :pure_fn | :impure_fn,
                 :restart => Restart };
+/// Construct and validate a child specification.
 let checked_child : :string -> :any -> Restart -> Child;
 let checked_child name start restart = types.check Child (child_with name start restart);
 
 type Limits = %{ :limit => :integer where fn n -> n >= 0,
                  :window => :integer where fn n -> n >= 1 };
+/// Validate the supervisor configuration before starting its children.
 let start_checked! : :any -> :any -> :any -> :process;
 let start_checked! strategy children lim = {
     let checked_strategy = strict! (types.check Strategy strategy);

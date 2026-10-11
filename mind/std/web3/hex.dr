@@ -5,18 +5,22 @@ import std.list;
 import std.result;
 import std.str;
 
+/// Construct an invalid-Web3-argument error result.
 priv let bad message = result.error (error.new :web3_argument message);
 priv let digits = "0123456789abcdef";
+/// Decode one hexadecimal character to its four-bit value.
 priv let nibble c =
     if c >= 48 && c <= 57 { c - 48 }
     else if c >= 65 && c <= 70 { c - 55 }
     else if c >= 97 && c <= 102 { c - 87 }
     else { -1 };
 
+/// Test whether every character from an offset is hexadecimal.
 priv let rec valid_from s i =
     if i == len s { true }
     else { nibble (str.byte i s) >= 0 && valid_from s (i + 1) };
 
+/// Test whether a hexadecimal string starts with the required 0x prefix.
 priv let prefixed s = type_of s == :string && len s >= 2 && str.slice 0 2 s == "0x";
 
 /// True for 0x-prefixed, whole bytes; "0x" is empty data.
@@ -36,6 +40,7 @@ let decode_data s = {
         (list.map (fn i -> 2 + i * 2) (list.range 0 ((len checked - 2) / 2)))))
 };
 
+/// Format a nonnegative integer using hexadecimal digits.
 priv let rec spell n acc =
     if n == 0 { acc }
     else { spell (n / 16) (str.slice (n % 16) 1 digits + acc) };
@@ -45,10 +50,21 @@ let quantity n =
     if type_of n != :integer || n < 0 { bad "expected a nonnegative integer quantity" }
     else { result.ok (if n == 0 { "0x0" } else { "0x" + spell n "" }) };
 
+/// Accumulate hexadecimal quantity digits into an integer.
 priv let rec read_quantity s i !acc =
     if i == len s { acc }
     else { read_quantity s (i + 1) (acc * 16 + nibble (str.byte i s)) };
 
+/// Decode a canonical Ethereum hexadecimal quantity or return an argument error.
+///
+/// ```dream
+/// import std.web3.hex;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (hex.parse_quantity "0x2a")
+/// };
+/// ```
 let parse_quantity s =
     if not (prefixed s) || len s < 3 || (len s > 3 && str.byte 2 s == 48) || not (valid_from s 2) {
         bad "expected a canonical hex quantity (zero is 0x0; no leading zeroes)"
@@ -59,6 +75,7 @@ let address s =
     if is_data s && len s == 42 { result.ok s }
     else { bad "expected a 20-byte 0x-prefixed address" };
 
+/// Validate a 32-byte hexadecimal hash and return a result.
 let hash s =
     if is_data s && len s == 66 { result.ok s }
     else { bad "expected a 32-byte 0x-prefixed hash" };

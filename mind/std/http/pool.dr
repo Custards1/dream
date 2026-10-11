@@ -57,6 +57,7 @@ let close! pool = {
 let close_quietly! : :any -> :unit;
 let close_quietly! sock = { try! { io.close! sock } catch e { () }; () };
 
+/// Process connection-pool requests while tracking idle and checked-out connections.
 priv let loop! : :integer -> :map -> :map -> :unit;
 priv let rec loop! idle_ms idle shared = {
     let now = time.monotonic! () / 1000000;
@@ -89,6 +90,7 @@ priv let rec loop! idle_ms idle shared = {
     }
 };
 
+/// Close idle connections whose expiration deadline has passed.
 priv let reap! : :integer -> :integer -> :map -> :map;
 priv let reap! idle_ms now idle = {
     let all = list.flat_map (fn k -> idle.[k]) (map.keys idle);
@@ -96,9 +98,11 @@ priv let reap! idle_ms now idle = {
     map.from_pairs (list.map (fn k -> [k, list.filter (fn [_, stamp] -> now - stamp < idle_ms) (idle.[k])]) (map.keys idle))
 };
 
+/// Shut down every connection-owning process in the list.
 priv let shutdown_all! : [:process] -> :unit;
 priv let rec shutdown_all! cs = match cs { [] => (), [c, ..rest] => { send! c [:h2_shutdown]; shutdown_all! rest } };
 
+/// Close all retained idle connection handles.
 priv let close_all! : [[:any]] -> :unit;
 priv let rec close_all! entries = match entries {
     [] => (),

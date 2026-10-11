@@ -86,21 +86,38 @@ let week = 604800000000000;
 /// nanosecond, so `seconds 1.5` is a second and a half.
 let nanoseconds : (:integer | :float) -> Duration;
 let nanoseconds n = whole n;
+/// Convert a number of microseconds to an integral nanosecond duration.
 let microseconds : (:integer | :float) -> Duration;
 let microseconds n = whole (n * microsecond);
+/// Convert a number of milliseconds to an integral nanosecond duration.
 let milliseconds : (:integer | :float) -> Duration;
 let milliseconds n = whole (n * millisecond);
+/// Convert a number of seconds to an integral nanosecond duration.
+///
+/// ```dream
+/// import std.time;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (time.to_milliseconds (time.seconds 2))
+/// };
+/// ```
 let seconds : (:integer | :float) -> Duration;
 let seconds n = whole (n * second);
+/// Convert a number of minutes to an integral nanosecond duration.
 let minutes : (:integer | :float) -> Duration;
 let minutes n = whole (n * minute);
+/// Convert a number of hours to an integral nanosecond duration.
 let hours : (:integer | :float) -> Duration;
 let hours n = whole (n * hour);
+/// Convert a number of 24-hour days to an integral nanosecond duration.
 let days : (:integer | :float) -> Duration;
 let days n = whole (n * day);
+/// Convert a number of seven-day weeks to an integral nanosecond duration.
 let weeks : (:integer | :float) -> Duration;
 let weeks n = whole (n * week);
 
+/// Convert a duration calculation to an integer number of nanoseconds.
 priv let whole : (:integer | :float) -> :integer;
 priv let whole x = if type_of x == :float { num.to_int (if x < 0.0 { x - 0.5 } else { x + 0.5 }) } else { x };
 
@@ -108,22 +125,29 @@ priv let whole x = if type_of x == :float { num.to_int (if x < 0.0 { x - 0.5 } e
 /// many complete milliseconds it holds.
 let to_microseconds : Duration -> :integer;
 let to_microseconds d = d / microsecond;
+/// Return the whole milliseconds in a nanosecond duration.
 let to_milliseconds : Duration -> :integer;
 let to_milliseconds d = d / millisecond;
+/// Return the whole seconds in a nanosecond duration.
 let to_whole_seconds : Duration -> :integer;
 let to_whole_seconds d = d / second;
+/// Return the whole minutes in a nanosecond duration.
 let to_whole_minutes : Duration -> :integer;
 let to_whole_minutes d = d / minute;
+/// Return the whole hours in a nanosecond duration.
 let to_whole_hours : Duration -> :integer;
 let to_whole_hours d = d / hour;
+/// Return the whole 24-hour days in a nanosecond duration.
 let to_whole_days : Duration -> :integer;
 let to_whole_days d = d / day;
 
 /// A duration in seconds, with the fraction: `to_seconds (time.ms 1500)` is 1.5.
 let to_seconds : Duration -> :float;
 let to_seconds d = num.to_float d / 1000000000.0;
+/// Convert a nanosecond duration to fractional minutes.
 let to_minutes : Duration -> :float;
 let to_minutes d = num.to_float d / 60000000000.0;
+/// Convert a nanosecond duration to fractional hours.
 let to_hours : Duration -> :float;
 let to_hours d = num.to_float d / 3600000000000.0;
 
@@ -225,10 +249,13 @@ struct DateTime {
     !abbrev : :string
 }
 
+/// Test whether a year is a Gregorian leap year.
 let is_leap_year : :integer -> :bool;
 let is_leap_year y = calendar.is_leap_year y;
+/// Return the number of days in a Gregorian year and month.
 let days_in_month : :integer -> :integer -> :integer;
 let days_in_month y m = calendar.days_in_month y m;
+/// Return 365 or 366 according to the Gregorian leap-year rule.
 let days_in_year : :integer -> :integer;
 let days_in_year y = calendar.days_in_year y;
 
@@ -291,6 +318,7 @@ let in_zone zone t = {
 /// The same instant, read at another offset or in another zone.
 let to_offset : :integer -> DateTime -> DateTime;
 let to_offset offset dt = at_offset offset "" (to_instant dt);
+/// Represent the same instant in another time zone.
 let to_zone : Zone -> DateTime -> DateTime;
 let to_zone zone dt = in_zone zone (to_instant dt);
 
@@ -361,6 +389,7 @@ let is_dst zone t = tz.Period.dst (tz.period_at zone (calendar.floor_div t secon
 let weekday_number : DateTime -> :integer;
 let weekday_number dt = calendar.weekday_of_days (day_number dt);
 
+/// Return the weekday atom for a date-time.
 let weekday : DateTime -> Weekday;
 let weekday dt = weekday_atoms.[weekday_number dt - 1];
 
@@ -384,6 +413,7 @@ priv let weekday_atoms = #[:monday, :tuesday, :wednesday, :thursday, :friday, :s
 /// zones compare by when they happened, not by what their clocks said.
 let before : DateTime -> DateTime -> :bool;
 let before a b = to_instant a < to_instant b;
+/// Test whether one date-time represents a later instant than another.
 let after : DateTime -> DateTime -> :bool;
 let after a b = to_instant a > to_instant b;
 /// The duration from `a` to `b`.
@@ -401,6 +431,7 @@ let between a b = to_instant b - to_instant a;
 let add_days : :integer -> DateTime -> DateTime;
 let add_days n dt = with_date (calendar.civil_from_days (day_number dt + n)) dt;
 
+/// Add calendar weeks, retaining the local clock time.
 let add_weeks : :integer -> DateTime -> DateTime;
 let add_weeks n dt = add_days (7 * n) dt;
 
@@ -415,6 +446,7 @@ let add_months n dt = {
     with_date [y, m, d] dt
 };
 
+/// Add calendar years using the month-arithmetic rules.
 let add_years : :integer -> DateTime -> DateTime;
 let add_years n dt = add_months (12 * n) dt;
 
@@ -437,10 +469,12 @@ let months_between a b = {
     else { raw }
 };
 
+/// Extract local clock fields for ordered comparison.
 priv let clock_key : DateTime -> [:integer];
 priv let clock_key dt = [DateTime.year dt, DateTime.month dt, DateTime.day dt, DateTime.hour dt,
                          DateTime.minute dt, DateTime.second dt, DateTime.nano dt];
 
+/// Replace the date fields while retaining the remaining date-time fields.
 priv let with_date : [:integer, :integer, :integer] -> DateTime -> DateTime;
 priv let with_date [y, m, d] dt = DateTime.make y m d (DateTime.hour dt) (DateTime.minute dt) (DateTime.second dt)
                                                 (DateTime.nano dt) (DateTime.offset dt) (DateTime.abbrev dt);
@@ -506,6 +540,7 @@ let clock_text dt = pad 2 (DateTime.hour dt) + ":" + pad 2 (DateTime.minute dt) 
 let http_date : Instant -> :string;
 let http_date t = format "%a, %d %b %Y %H:%M:%S GMT" (to_utc t);
 
+/// Format the fractional-second component for textual output.
 priv let fraction : :integer -> :string;
 priv let fraction nano =
     if nano == 0 { "" }
@@ -525,6 +560,7 @@ let pad width n =
         str.repeat (width - len digits) "0" + digits
     };
 
+/// Format a year for date-time output.
 priv let year_text : :integer -> :string;
 priv let year_text y = if y > 9999 { "+" + to_string y } else { pad 4 y };
 
@@ -543,6 +579,7 @@ priv let month_names = #["January", "February", "March", "April", "May", "June",
 priv let day_names : #[:string];
 priv let day_names = #["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
+/// Return the abbreviated form of a date-name string.
 priv let short : :string -> :string;
 priv let short name = str.slice 0 3 name;
 
@@ -561,6 +598,7 @@ priv let short name = str.slice 0 3 name;
 let format : :string -> DateTime -> :string;
 let format pattern dt = str.concat_all (format_pieces (expand_pattern pattern) 0 dt);
 
+/// Scan a format string and expand directives using a date-time.
 priv let format_pieces : :string -> :integer -> DateTime -> [:string];
 priv let rec format_pieces p i dt =
     if i >= len p { [] }
@@ -575,6 +613,7 @@ priv let rec format_pieces p i dt =
         }
     };
 
+/// Format one date-time directive.
 priv let directive : :integer -> DateTime -> :string;
 priv let directive code dt = match char.of_code (if code < 0 { 37 } else { code }) {
     'Y' => year_text (DateTime.year dt),
@@ -612,6 +651,7 @@ priv let directive code dt = match char.of_code (if code < 0 { 37 } else { code 
     other => "%" + str.of_chars [other],
 };
 
+/// Convert a 24-hour clock hour to its 12-hour representation.
 priv let twelve : :integer -> :integer;
 priv let twelve h = { let r = h % 12; if r == 0 { 12 } else { r } };
 
@@ -649,6 +689,7 @@ let parse pattern text = {
 let parse_instant : :string -> :string -> result.Of Instant :string;
 let parse_instant pattern text = result.map to_instant (parse pattern text);
 
+/// Parse formatted date-time fields into an accumulator map.
 priv let read_fields : :string -> :integer -> :string -> :integer -> :map -> result.Of :map :string;
 priv let rec read_fields p pi s si fields =
     if pi >= len p {
@@ -676,6 +717,7 @@ priv let rec read_fields p pi s si fields =
         }
     };
 
+/// Return a directive's name for parse diagnostics.
 priv let directive_name : :integer -> :string;
 priv let directive_name code = match char.of_code code {
     'Y' => "a year", 'm' => "a month", 'd' => "a day", 'e' => "a day", 'H' => "an hour",
@@ -729,6 +771,7 @@ priv let read_directive code s i = match char.of_code code {
     _ => (),
 };
 
+/// Pair a parsed field with the tag identifying it.
 priv let tagged : :any -> :any -> :any;
 priv let tagged key found = match found { () => (), [v, next] => [key, v, next] };
 
@@ -739,6 +782,7 @@ priv let number s i least most = {
     if stop - i < least { () } else { [num.parse_int (str.slice i (stop - i) s), stop] }
 };
 
+/// Parse a signed numeric field within the supplied width bounds.
 priv let signed_number : :string -> :integer -> :integer -> :integer -> :any;
 priv let signed_number s i least most = {
     let b = str.byte i s;
@@ -796,6 +840,7 @@ priv let name_at names s i = {
     try_from 0
 };
 
+/// Validate parsed date-time fields and construct a date-time result.
 priv let build : :map -> result.Of DateTime :string;
 priv let build f = {
     let offset = f.[:offset else 0];
@@ -869,6 +914,7 @@ let parse_iso text = {
     }
 };
 
+/// Test whether text matches one of the accepted local ISO date-time formats.
 priv let parse_local_ok : :string -> :bool;
 priv let parse_local_ok s = list.any (fn p -> result.is_ok (parse p s)) ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S.%N"];
 
@@ -964,6 +1010,7 @@ let parse_duration text = {
     else { result.map (fn d -> if negative { 0 - d } else { d }) (parts 0 0) }
 };
 
+/// Resolve a duration unit name to its size in nanoseconds.
 priv let unit_size : :string -> :any;
 priv let unit_size u = match u {
     "ns" => nanosecond, "us" => microsecond, "µs" => microsecond, "μs" => microsecond,
@@ -975,6 +1022,7 @@ priv let unit_size u = match u {
 priv let digits_value : :string -> :integer;
 priv let digits_value s = match num.parse_int s { () => 0, n => n };
 
+/// Compute ten raised to a nonnegative exponent.
 priv let pow10 : :integer -> :integer;
 priv let rec pow10 n = if n <= 0 { 1 } else { 10 * pow10 (n - 1) };
 

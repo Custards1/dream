@@ -126,6 +126,7 @@ priv let next! sock = {
     }
 };
 
+/// Send a response to a local process on behalf of the remote request handler.
 priv let send! : :any -> :any -> :atom;
 priv let send! sock value = streams.write_all! sock (wire.frame value);
 
@@ -136,6 +137,7 @@ priv let send! sock value = streams.write_all! sock (wire.frame value);
 let listen! : :integer -> :any;
 let listen! port = net.listen! port;
 
+/// Return the actual port bound by a network listener.
 let port_of! : :any -> :integer;
 let port_of! listener = net.port! listener;
 
@@ -271,9 +273,11 @@ let serve! port pid = serve_via! port (fixed pid);
 
 // --- calling ---------------------------------------------------------------------
 
+/// Open a connection to a remote host and port.
 let connect! : :string -> :integer -> :any;
 let connect! host port = net.connect! host port;
 
+/// Close a remote connection's I/O handle.
 let close! : :any -> :any;
 let close! conn = io.close! conn;
 
@@ -530,5 +534,6 @@ when test {
 import std.types;
 type Request body = [:call, body] | [:cast, body];
 type Response value = [:ok, value] | [:error, :string];
+/// Perform a remote call and validate the returned value against `description`.
 let call_as! : :any -> :any -> :any -> :any;
 let call_as! description connection request = types.check description (call! connection request);

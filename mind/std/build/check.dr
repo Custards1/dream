@@ -25,6 +25,7 @@ import std.str;
 let reads : :any -> :any;
 let reads i = [:reads, build.input i];
 
+/// Test whether an argument denotes a file, tree or build artifact input.
 let is_input : :any -> :bool;
 let is_input a = match a { [:file, _] => true, [:tree, _, _] => true, [:artifact, _, _] => true, _ => false };
 
@@ -46,9 +47,11 @@ let resolved job argv = list.flat_map (fn a -> match a {
     s => [s],
 }) argv;
 
+/// Resolve build inputs used as values in a check's environment.
 let env_resolved : :map -> %{:string => :any} -> %{:string => :string};
 let env_resolved job env = map.map_values (fn v -> if is_input v { build.path job v } else { v }) env;
 
+/// Resolve a check's executable and argument list against its inputs.
 let program_and : :map -> %{:string => :any} -> [:any] -> [:any];
 let program_and job env argv = {
     let line = resolved job argv;
@@ -73,6 +76,7 @@ let succeeds_with name env argv =
 let output : :string -> [:any] -> :string -> :map;
 let output name argv expected = output_with name (%{}) argv expected;
 
+/// Construct a check that captures output under the given execution environment.
 let output_with : :string -> %{:string => :any} -> [:any] -> :string -> :map;
 let output_with name env argv expected =
     build.step "check.output" name (list.cons (build.file expected) (inputs_of env argv))

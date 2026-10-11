@@ -34,6 +34,7 @@ let is_branch x = branch_kind (type_of x) x;
 // the tier only takes a strict binding of a parameter), so a computed
 // subject is handed to a helper and matched there. These run once per leaf
 // per training step.
+/// Test whether a value's kind is a supported parameter-tree branch.
 priv let branch_kind : :atom -> :any -> :bool;
 priv let branch_kind kind x = match kind {
     :list => true,
@@ -46,6 +47,7 @@ priv let branch_kind kind x = match kind {
 let is_numeric : :any -> :bool;
 let is_numeric x = numeric_kind (type_of x);
 
+/// Test whether a runtime kind is a numeric leaf kind.
 priv let numeric_kind : :atom -> :bool;
 priv let numeric_kind kind = match kind { :tensor => true, :float => true, :integer => true, _ => false };
 
@@ -58,6 +60,7 @@ priv let numeric_kind kind = match kind { :tensor => true, :float => true, :inte
 let map : (:any -> :any) -> :any -> :any;
 let map f t = if is_branch t { map_branch (type_of t) f t } else { f t };
 
+/// Map a function over a branch while preserving its container kind.
 priv let map_branch : :atom -> (:any -> :any) -> :any -> :any;
 priv let map_branch kind f t = match kind {
     :list => map_list f t,
@@ -65,9 +68,11 @@ priv let map_branch kind f t = match kind {
     _ => map_entries f (maps.pairs t) %{},
 };
 
+/// Map a function over a list branch.
 priv let map_list : (:any -> :any) -> [:any] -> [:any];
 priv let map_list f xs = match xs { [] => [], [x, ..rest] => map f x :: map_list f rest };
 
+/// Map values of a map branch, preserving its keys.
 priv let map_entries : (:any -> :any) -> [:any] -> %{:any => :any} -> %{:any => :any};
 priv let map_entries f pairs !acc = match pairs {
     [] => acc,
@@ -78,6 +83,7 @@ priv let map_entries f pairs !acc = match pairs {
 let map_numeric : (:any -> :any) -> :any -> :any;
 let map_numeric f t = map (numeric_only f) t;
 
+/// Apply a transformation to numeric leaves and retain nonnumeric metadata.
 priv let numeric_only : (:any -> :any) -> :any -> :any;
 priv let numeric_only f x = if is_numeric x { f x } else { x };
 
@@ -88,6 +94,7 @@ let map2 f a b =
     if is_branch a { map2_branch (type_of a) f a b }
     else if is_numeric a { f a b } else { a };
 
+/// Combine corresponding leaves of two branches of the same kind.
 priv let map2_branch : :atom -> (:any -> :any -> :any) -> :any -> :any -> :any;
 priv let map2_branch kind f a b = match kind {
     :list => map2_list f a b,
@@ -95,12 +102,14 @@ priv let map2_branch kind f a b = match kind {
     _ => map2_entries f (maps.pairs a) b %{},
 };
 
+/// Combine corresponding leaves of two list branches.
 priv let map2_list : (:any -> :any -> :any) -> [:any] -> [:any] -> [:any];
 priv let map2_list f xs ys = match xs {
     [] => [],
     [x, ..rest] => map2 f x (list.head ys) :: map2_list f rest (list.tail ys),
 };
 
+/// Combine corresponding map values under matching keys.
 priv let map2_entries : (:any -> :any -> :any) -> [:any] -> :any -> %{:any => :any} -> %{:any => :any};
 priv let map2_entries f pairs other !acc = match pairs {
     [] => acc,
@@ -114,6 +123,7 @@ let map3 f a b c =
     if is_branch a { map3_branch (type_of a) f a b c }
     else if is_numeric a { f a b c } else { a };
 
+/// Combine corresponding leaves of three branches of the same kind.
 priv let map3_branch : :atom -> (:any -> :any -> :any -> :any) -> :any -> :any -> :any -> :any;
 priv let map3_branch kind f a b c = match kind {
     :list => map3_list f a b c,
@@ -121,12 +131,14 @@ priv let map3_branch kind f a b c = match kind {
     _ => map3_entries f (maps.pairs a) b c %{},
 };
 
+/// Combine corresponding leaves of three list branches.
 priv let map3_list : (:any -> :any -> :any -> :any) -> [:any] -> [:any] -> [:any] -> [:any];
 priv let map3_list f xs ys zs = match xs {
     [] => [],
     [x, ..rest] => map3 f x (list.head ys) (list.head zs) :: map3_list f rest (list.tail ys) (list.tail zs),
 };
 
+/// Combine corresponding map values from three trees.
 priv let map3_entries : (:any -> :any -> :any -> :any) -> [:any] -> :any -> :any -> %{:any => :any} -> %{:any => :any};
 priv let map3_entries f pairs b c !acc = match pairs {
     [] => acc,
@@ -138,6 +150,7 @@ priv let map3_entries f pairs b c !acc = match pairs {
 let leaves : :any -> [:any];
 let leaves t = list.reverse (gather [] t);
 
+/// Accumulate the leaves of a parameter tree.
 priv let gather : [:any] -> :any -> [:any];
 priv let gather acc t =
     if not (is_branch t) { t :: acc }
@@ -152,6 +165,7 @@ priv let gather acc t =
 let paths : :any -> [[[:any], :any]];
 let paths t = list.reverse (walk [] [] t);
 
+/// Traverse a parameter tree, collecting paths paired with their leaf values.
 priv let walk : [:any] -> [:any] -> :any -> [[[:any], :any]];
 priv let walk acc at t =
     if not (is_branch t) { if is_numeric t { [list.reverse at, t] :: acc } else { acc } }
@@ -177,6 +191,7 @@ let at path t = match path {
 let size : :any -> :integer;
 let size t = list.fold_strict (fn !n x -> n + count x) 0 (leaves t);
 
+/// Count the scalar elements of one numeric leaf; nonnumeric metadata counts as zero.
 priv let count : :any -> :integer;
 priv let count x = match type_of x { :tensor => tensor.size x, :float => 1, :integer => 1, _ => 0 };
 

@@ -61,9 +61,11 @@ import std.time;
 type Level = :trace | :debug | :info | :warn | :error | :off;
 type Format = :text | :json | :logfmt;
 
+/// Return the numeric severity used for filtering, including the off level.
 let rank : Level -> :integer;
 let rank level = match level { :trace => 0, :debug => 1, :info => 2, :warn => 3, :error => 4, :off => 5 };
 
+/// Return a severity's uppercase display name.
 let level_name : Level -> :string;
 let level_name level = match level { :trace => "TRACE", :debug => "DEBUG", :info => "INFO", :warn => "WARN",
                                      :error => "ERROR", :off => "OFF" };
@@ -181,6 +183,7 @@ let threshold lg = {
     if name == "" || map.is_empty filters { Logger.minimum lg } else { walk name }
 };
 
+/// Find the final dot in a logger name, or -1 when absent.
 priv let last_dot : :string -> :integer;
 priv let last_dot s = {
     let rec go from best = { let at = str.find_from from "." s; if at < 0 { best } else { go (at + 1) at } };
@@ -211,14 +214,19 @@ let at! lg l message fields =
         emit! lg event
     };
 
+/// Emit a trace message and structured fields through the default logger.
 let trace! : :string -> :map -> :unit;
 let trace! message fields = at! (default! ()) :trace message fields;
+/// Emit a debug message and structured fields through the default logger.
 let debug! : :string -> :map -> :unit;
 let debug! message fields = at! (default! ()) :debug message fields;
+/// Emit an informational message and structured fields through the default logger.
 let info! : :string -> :map -> :unit;
 let info! message fields = at! (default! ()) :info message fields;
+/// Emit a warning and structured fields through the default logger.
 let warn! : :string -> :map -> :unit;
 let warn! message fields = at! (default! ()) :warn message fields;
+/// Emit an error message and structured fields through the default logger.
 let error! : :string -> :map -> :unit;
 let error! message fields = at! (default! ()) :error message fields;
 
@@ -240,6 +248,7 @@ let timed! lg l message fields value = {
     }
 };
 
+/// Format and write a structured log event using the logger's configuration.
 priv let emit! : Logger -> :map -> :unit;
 priv let emit! lg event = match Logger.sink lg {
     [:agent, pid] => { agent.update! pid (fn events -> event :: events); () },
@@ -255,9 +264,11 @@ priv let emit! lg event = match Logger.sink lg {
     },
 };
 
+/// Write all log text to the selected output handle.
 priv let write! : :any -> :string -> :unit;
 priv let write! handle line = { streams.write_all! handle line; () };
 
+/// Decide whether the logger should emit terminal colors for this handle.
 priv let wants_color! : Logger -> :any -> :bool;
 priv let wants_color! lg sink = Logger.format lg == :text && match sink {
     :stderr => console.color_enabled! (Logger.color lg) (io.stderr! ()),
@@ -294,6 +305,7 @@ priv let text_line stamp event color = {
     str.join_str " " ([stamp, painted, name + Event.message event] + pairs)
 };
 
+/// Return the terminal styles for a severity.
 priv let level_style : Level -> [console.Style];
 priv let level_style l = match l { :trace => [:dim], :debug => [:dim], :info => [:cyan], :warn => [:yellow],
                                    :error => [:red, :bold], :off => [] };
@@ -331,9 +343,11 @@ let jsonable v = match type_of v {
     _ => to_string v,
 };
 
+/// Return an atom's spelling without its leading colon.
 priv let atom_name : :atom -> :string;
 priv let atom_name a = { let t = to_string a; if str.starts_with ":" t { str.slice 1 (len t) t } else { t } };
 
+/// Format a structured field's key as text.
 priv let key_text : :any -> :string;
 priv let key_text k = match type_of k { :atom => atom_name k, :string => k, _ => to_string k };
 
@@ -350,6 +364,7 @@ priv let value_text v = {
     if t != "" && str.upto " \"=\n\t" 0 t >= len t { t } else { quote_always t }
 };
 
+/// Escape and quote a structured field value, including whitespace and control characters.
 priv let quote_always : :string -> :string;
 priv let quote_always t = "\"" + str.concat_all (list.map (fn c -> match c { '"' => "\\\"", '\\' => "\\\\", '\n' => "\\n", '\t' => "\\t",
                                                                              other => str.of_chars [other] }) (str.chars t)) + "\"";

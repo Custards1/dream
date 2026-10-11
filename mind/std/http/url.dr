@@ -79,6 +79,7 @@ let parse_or_raise text = match parse text {
     [:error, why] => type_assert false ("not a URL: " + why) (Url.new ()),
 };
 
+/// Test whether text is a valid URI scheme.
 priv let is_scheme : :string -> :bool;
 priv let is_scheme s = {
     let c = str.byte 0 s;
@@ -114,6 +115,7 @@ priv let parse_authority a = {
     }
 };
 
+/// Find the final occurrence of a substring, or -1 when absent.
 priv let last_index : :string -> :string -> :integer;
 priv let last_index needle s = {
     let rec go from best = { let at = str.find_from from needle s; if at < 0 { best } else { go (at + 1) at } };
@@ -184,6 +186,7 @@ let resolve base reference = match parse reference {
     },
 };
 
+/// Combine a base URI path with a relative reference path.
 priv let merge_paths : Url -> :string -> :string;
 priv let merge_paths base path =
     if Url.has_authority base && Url.path base == "" { "/" + path }
@@ -209,6 +212,15 @@ let remove_dots path = {
 
 /// Every byte outside RFC 3986's unreserved set (`A-Z a-z 0-9 - . _ ~`) as
 /// `%XX`: for a path segment or a query value.
+///
+/// ```dream
+/// import std.http.url;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (url.encode "hello world")
+/// };
+/// ```
 let encode : :string -> :string;
 let encode s = encode_except "" s;
 
@@ -223,6 +235,7 @@ let encode_form s = str.join_str "+" (list.map encode (str.split " " s));
 priv let unreserved : :string;
 priv let unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
 
+/// Percent-encode bytes except those explicitly allowed.
 priv let encode_except : :string -> :string -> :string;
 priv let encode_except keep s = {
     let allowed = unreserved + keep;
@@ -236,6 +249,7 @@ priv let encode_except keep s = {
     pieces 0 []
 };
 
+/// Format a byte as a percent escape with two hexadecimal digits.
 priv let percent : :integer -> :string;
 priv let percent b = "%" + str.slice (b / 16) 1 "0123456789ABCDEF" + str.slice (b % 16) 1 "0123456789ABCDEF";
 
@@ -247,6 +261,7 @@ let decode s = decode_with false s;
 let decode_form : :string -> :string;
 let decode_form s = decode_with true s;
 
+/// Decode percent escapes, optionally treating plus as a space.
 priv let decode_with : :bool -> :string -> :string;
 priv let decode_with plus s = {
     let stops = if plus { "%+" } else { "%" };
@@ -266,9 +281,11 @@ priv let decode_with plus s = {
     pieces 0 []
 };
 
+/// Decode two hexadecimal characters into a byte.
 priv let hex2 : :string -> :integer;
 priv let hex2 h = if len h == 2 && str.span "0123456789abcdefABCDEF" 0 h == 2 { hexd (str.byte 0 h) * 16 + hexd (str.byte 1 h) } else { 0 - 1 };
 
+/// Decode a hexadecimal character code into its value.
 priv let hexd : :integer -> :integer;
 priv let hexd b = if b <= 57 { b - 48 } else if b <= 70 { b - 55 } else { b - 87 };
 
@@ -291,6 +308,7 @@ let encode_query pairs = {
     str.join_str "&" (list.map (fn [k, v] -> encode_form (text_of k) + "=" + encode_form (text_of v)) ps)
 };
 
+/// Convert a query-field value to its string representation.
 priv let text_of : :any -> :string;
 priv let text_of v = match type_of v { :string => v, :atom => str.slice 1 (len (to_string v)) (to_string v), _ => to_string v };
 

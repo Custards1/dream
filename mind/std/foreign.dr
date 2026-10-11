@@ -107,18 +107,23 @@ type Buffer = Handle "buffer";
 
 // Spelled as functions too, for a signature built rather than written.
 
+/// Describe an owned foreign handle with a tag and destructor.
 let own : :string -> :string -> Result;
 let own tag destructor = [:own, tag, destructor];
 
+/// Describe a borrowed foreign handle with the given tag.
 let borrow : :string -> Result;
 let borrow tag = [:borrow, tag];
 
+/// Describe a foreign handle accepted under the given tag.
 let handle : :string -> Arg;
 let handle tag = [:handle, tag];
 
+/// Describe an output parameter whose pointee has type `t`.
 let out : Result -> Arg;
 let out t = [:out, t];
 
+/// Describe a callback's argument and result types.
 let callback : [CallbackArg] -> CallbackResult -> Arg;
 let callback args result = [:callback, args, result];
 
@@ -128,6 +133,7 @@ let taken destructor = [:cstr, destructor];
 
 // --- libraries and functions -------------------------------------------------------
 
+/// Return a library path for use in a foreign-function declaration.
 let library : :string -> Library;
 let library path = path;
 
@@ -301,9 +307,11 @@ let buffer_of! s = {
     b
 };
 
+/// Read a typed value from a foreign buffer at byte offset `at`.
 let peek! : Buffer -> :integer -> Scalar | :ptr -> :any;
 let peek! b at t = ffi.peek! b at t;
 
+/// Write a typed value into a foreign buffer at byte offset `at`.
 let poke! : Buffer -> :integer -> Scalar | :ptr -> :any -> :unit;
 let poke! b at t v = ffi.poke! b at t v;
 
@@ -316,12 +324,15 @@ let read! b at n = ffi.read! b at n;
 let read_string! : Buffer -> :integer -> :string;
 let read_string! b at = ffi.read_string! b at;
 
+/// Copy a string's bytes into a foreign buffer at byte offset `at`.
 let write! : Buffer -> :integer -> :string -> :unit;
 let write! b at s = ffi.write! b at s;
 
+/// Return the native size in bytes of a foreign type.
 let sizeof : Scalar | :ptr -> :integer;
 let sizeof t = ffi.sizeof t;
 
+/// Return the native alignment in bytes of a foreign type.
 let alignof : Scalar | :ptr -> :integer;
 let alignof t = ffi.alignof t;
 
@@ -333,6 +344,7 @@ let array_of! t xs = {
     b
 };
 
+/// Write list elements consecutively using the native size of type `t`.
 let write_array! : Buffer -> :integer -> Scalar | :ptr -> [:any] -> :unit;
 let rec write_array! b at t xs = match xs {
     [] => (),
@@ -342,9 +354,11 @@ let rec write_array! b at t xs = match xs {
     },
 };
 
+/// Read `n` consecutive native values from a foreign buffer into a list.
 let read_array! : Buffer -> :integer -> Scalar | :ptr -> :integer -> [:any];
 let read_array! b at t n = read_array_into! b at t n [];
 
+/// Read remaining native values, accumulating them before restoring input order.
 priv let read_array_into! : Buffer -> :integer -> Scalar | :ptr -> :integer -> [:any] -> [:any];
 priv let rec read_array_into! b at t n acc =
     // Read from the end, so consing puts the elements in order.
@@ -368,12 +382,14 @@ priv let rec read_array_into! b at t n acc =
 
 type Layout = %{ :size => :integer, :align => :integer, :fields => :map, :order => [:atom] };
 
+/// Compute aligned offsets, total size and alignment for named foreign fields.
 let layout : [[:atom, Scalar | :ptr]] -> Layout;
 let layout fields = {
     let raw = list.fold place_field %{ :size => 0, :align => 1, :fields => %{}, :order => [] } fields;
     raw.[:size => round_up raw.[:size] raw.[:align]]
 };
 
+/// Append one aligned field to a foreign-record layout.
 priv let place_field : Layout -> [:atom, Scalar | :ptr] -> Layout;
 priv let place_field acc [name, t] = {
     let a = ffi.alignof t;
@@ -386,6 +402,7 @@ priv let place_field acc [name, t] = {
     }
 };
 
+/// Round an offset up to the next multiple of the required alignment.
 priv let round_up : :integer -> :integer -> :integer;
 priv let round_up n a = (n + a - 1) / a * a;
 
@@ -401,6 +418,7 @@ let struct_buffer! shape = ffi.buffer! shape.[:size];
 let read_struct! : Buffer -> :integer -> Layout -> :map;
 let read_struct! b at shape = read_fields! b at shape shape.[:order] %{};
 
+/// Read the named fields of a foreign-record layout into a map.
 priv let read_fields! : Buffer -> :integer -> Layout -> [:atom] -> :map -> :map;
 priv let rec read_fields! b at shape names acc = match names {
     [] => acc,
@@ -415,6 +433,7 @@ priv let rec read_fields! b at shape names acc = match names {
 let write_struct! : Buffer -> :integer -> Layout -> :map -> :unit;
 let write_struct! b at shape values = write_fields! b at shape shape.[:order] values;
 
+/// Write values from a map into the named fields of a foreign-record layout.
 priv let write_fields! : Buffer -> :integer -> Layout -> [:atom] -> :map -> :unit;
 priv let rec write_fields! b at shape names values = match names {
     [] => (),

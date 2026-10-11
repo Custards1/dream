@@ -27,6 +27,7 @@ import std.list;
 let fold : (a -> :any -> a) -> a -> :string -> a;
 let fold f init s = list.fold_strict f init (_str_chars s);
 
+/// Return the sequence type name, `string`.
 let name : :any -> :string;
 let name s = "string";
 
@@ -42,17 +43,30 @@ let length s = list.length (_str_chars s);
 let byte_length : (:string | :bigstr) -> :integer;
 let byte_length s = len s;
 
+/// Test whether the string contains no bytes.
 let is_empty : (:string | :bigstr) -> :bool;
 let is_empty s = len s == 0;
 
 // --- characters -------------------------------------------------------------
 
+/// Decode the string into a list of Unicode characters.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.chars "café")
+/// };
+/// ```
 let chars : :string -> [:char];
 let chars s = _str_chars s;
 
+/// Encode a list of Unicode characters as a string.
 let of_chars : [:char] -> :string;
 let of_chars cs = _str_of_chars cs;
 
+/// Return the first Unicode character, or `default` for an empty string.
 let first_or : a -> :string -> (a | :char);
 let first_or default s = list.first_or default (_str_chars s);
 
@@ -110,21 +124,35 @@ let upto set from s = _str_upto s from set;
 let find_from : :integer -> :string -> :string -> :integer;
 let find_from from needle s = _str_find s needle from;
 
+/// Return the byte offset of the first occurrence of `needle`, or -1 if absent.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.find "world" "hello world")
+/// };
+/// ```
 let find : :string -> :string -> :integer;
 let find needle s = _str_find s needle 0;
 
+/// Test whether `needle` occurs anywhere in the string.
 let contains_str : :string -> :string -> :bool;
 let contains_str needle s = _str_find s needle 0 >= 0;
 
+/// Test whether the string begins with the given prefix.
 let starts_with : :string -> (:string | :bigstr) -> :bool;
 let starts_with prefix s = _str_slice s 0 (len prefix) == prefix;
 
+/// Test whether the string ends with the given suffix.
 let ends_with : :string -> (:string | :bigstr) -> :bool;
 let ends_with suffix s =
     _str_slice s (len s - len suffix) (len suffix) == suffix;
 
 // --- building ---------------------------------------------------------------
 
+/// Join two strings in order.
 let concat : :string -> :string -> :string;
 let concat a b = a + b;
 
@@ -141,6 +169,15 @@ let concat_all parts = _str_concat parts;
 /// The strings in `parts` with `sep` between them. `std.seq` supplies `join`,
 /// which renders each element with `to_string`; this one is for strings that
 /// are already strings and should not gain quotes.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.join_str ", " ["red", "green", "blue"])
+/// };
+/// ```
 let join_str : :string -> [:string] -> :string;
 let join_str sep parts =
     match parts {
@@ -155,6 +192,15 @@ let repeat n s = if n <= 0 { "" } else { _str_concat (list.replicate n s) };
 
 /// The parts of `s` between each occurrence of `sep`, as a list of strings.
 /// An empty separator would not make progress, so it yields the whole string.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.split "," "red,green,blue")
+/// };
+/// ```
 let split : :string -> :string -> [:string];
 let split sep s = {
     let seplen = len sep;
@@ -170,12 +216,15 @@ let split sep s = {
 
 // --- transforming -----------------------------------------------------------
 
+/// Apply `f` to each Unicode character and join the resulting characters.
 let map : (:char -> :char) -> :string -> :string;
 let map f s = _str_of_chars (list.map f (_str_chars s));
 
+/// Keep the Unicode characters for which `keep` returns true.
 let filter : (:char -> :bool) -> :string -> :string;
 let filter keep s = _str_of_chars (list.filter keep (_str_chars s));
 
+/// Reverse the order of Unicode characters, preserving their UTF-8 encoding.
 let reverse : :string -> :string;
 let reverse s = _str_of_chars (list.reverse (_str_chars s));
 
@@ -184,32 +233,58 @@ let reverse s = _str_of_chars (list.reverse (_str_chars s));
 // Only the ASCII range. Real Unicode case folding is a table this library does
 // not carry, and pretending otherwise would be worse than saying so.
 
+/// Convert an ASCII lowercase character to uppercase; leave other characters unchanged.
 let upper_char : :char -> :char;
 let upper_char c =
     if c >= 'a' && c <= 'z' { _char_of_code (_char_code c - 32) } else { c };
 
+/// Convert an ASCII uppercase character to lowercase; leave other characters unchanged.
 let lower_char : :char -> :char;
 let lower_char c =
     if c >= 'A' && c <= 'Z' { _char_of_code (_char_code c + 32) } else { c };
 
+/// Convert ASCII lowercase letters to uppercase throughout the string.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.upper "hello")
+/// };
+/// ```
 let upper : :string -> :string;
 let upper s = map upper_char s;
 
+/// Convert ASCII uppercase letters to lowercase throughout the string.
 let lower : :string -> :string;
 let lower s = map lower_char s;
 
 // --- trimming ---------------------------------------------------------------
 
+/// Test for a space, tab, newline or carriage return.
 let is_space : :char -> :bool;
 let is_space c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
 
+/// Remove spaces, tabs and line endings from the start of the string.
 let trim_start : :string -> :string;
 let trim_start s = _str_of_chars (list.drop_while is_space (_str_chars s));
 
+/// Remove spaces, tabs and line endings from the end of the string.
 let trim_end : :string -> :string;
 let trim_end s =
     _str_of_chars (list.reverse (list.drop_while is_space (list.reverse (_str_chars s))));
 
+/// Remove spaces, tabs and line endings from both ends of the string.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.trim "  hello  ")
+/// };
+/// ```
 let trim : :string -> :string;
 let trim s = trim_end (trim_start s);
 

@@ -20,4 +20,4 @@ let suite ctx name = {
 };
 
 let plan : :map -> :map;
-let plan ctx = list.fold (fn p name -> p |> build.check name (suite ctx name)) build.empty ["graph", "options", "scripts"];
+let plan ctx = list.fold (fn p name -> p |> build.check name (suite ctx name)) build.empty ["graph", "options", "scripts", "docs"];

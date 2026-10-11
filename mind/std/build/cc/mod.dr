@@ -59,10 +59,13 @@ mapping Target {
     uses = []           // [Target]
 }
 
+/// Describe an executable target built from the supplied source files.
 let executable : :string -> [:string] -> Target;
 let executable name sources = Target.make :executable name (list.map (fn s -> [s, []]) sources) [] [] [];
+/// Describe a shared-library target built from the supplied source files.
 let shared : :string -> [:string] -> Target;
 let shared name sources = Target.make :shared name (list.map (fn s -> [s, []]) sources) [] [] [];
+/// Describe a static-library target built from the supplied source files.
 let static : :string -> [:string] -> Target;
 let static name sources = Target.make :static name (list.map (fn s -> [s, []]) sources) [] [] [];
 
@@ -71,41 +74,70 @@ let static name sources = Target.make :static name (list.map (fn s -> [s, []]) s
 let external : :string -> [Setting] -> Target;
 let external name public = Target.make :external name [] [] public [];
 
+/// Return the target kind: executable, shared library or static library.
 let kind t = Target.kind t;
+/// Return the target's logical name.
 let name t = Target.name t;
+/// Return the target's source files and per-source settings.
 let sources t = Target.sources t;
+/// Return settings applied when building this target.
 let settings t = Target.settings t;
+/// Return settings propagated to targets that use this target.
 let public t = Target.public t;
+/// Return the targets and libraries this target depends on.
 let uses t = Target.uses t;
 
 // --- modifiers -------------------------------------------------------------------
 //
 // Each takes the target last, so a description reads as a pipeline.
 
+/// Append a private build setting to the target.
 let set s t = Target.set_settings (list.append (settings t) [s]) t;
+/// Append a setting propagated to users of the target.
 let set_public s t = Target.set_public (list.append (public t) [s]) t;
 
+/// Select a C or C++ language standard for the target.
 let standard language t = set (Setting.standard language) t;
+/// Set the target's optimization level.
 let optimize level t = set (Setting.optimize level) t;
+/// Enable or disable generation of debugging information.
 let debug_info on t = set (Setting.debug_info on) t;
+/// Select the target's compiler warning level.
 let warnings level t = set (Setting.warnings level) t;
+/// Enable or disable treating compiler warnings as errors.
 let warnings_as_errors on t = set (Setting.warnings_as_errors on) t;
+/// Define a preprocessor symbol without an explicit value.
 let define name t = set (Setting.define name ()) t;
+/// Define a preprocessor symbol with the supplied value.
 let define_value name value t = set (Setting.define name value) t;
+/// Add a private header search directory.
 let include dir t = set (Setting.include dir) t;
+/// Enable or disable C++ runtime type information.
 let rtti on t = set (Setting.rtti on) t;
+/// Enable the selected compiler sanitizer.
 let sanitize kind t = set (Setting.sanitize kind) t;
+/// Enable or disable position-independent code.
 let pic on t = set (Setting.pic on) t;
+/// Add thread support to this target and propagate its linkage requirements.
 let threads t = set_public Setting.threads t;
+/// Add compiler flags under a toolchain or platform selector.
 let flags_for selector flags t = set (Setting.flags_for selector flags) t;
+/// Add linker flags under a toolchain or platform selector.
 let link_flags_for selector flags t = set (Setting.link_flags_for selector flags) t;
+/// Add a preprocessor definition under a selector.
 let define_for selector name t = set (Setting.define_for selector name) t;
+/// Link a system library and propagate it to users of the target.
 let system library t = set_public (Setting.system library) t;
+/// Link a system library only on the selected operating system.
 let system_for os library t = set_public (Setting.system_for os library) t;
+/// Request exporting all symbols where the toolchain supports it.
 let export_all t = set Setting.export_all t;
+/// Add a runtime library search path.
 let runtime_path dir t = set (Setting.runtime_path dir) t;
 
+/// Add a header directory propagated to users of the target.
 let public_include dir t = set_public (Setting.include dir) t;
+/// Add a preprocessor symbol propagated to users of the target.
 let public_define name t = set_public (Setting.define name ()) t;
 
 /// Another source file, with no settings of its own.
@@ -134,7 +166,9 @@ mapping Toolchain {
     includes = ""       // what `cl /showIncludes` begins a header's line with
 }
 
+/// Describe the GCC toolchain for a target operating system.
 let gcc os = Toolchain.make :gcc :gnu os "gcc" "g++" "ar" "" "" "";
+/// Describe the Clang toolchain for a target operating system.
 let clang os = Toolchain.make :clang :gnu os "clang" "clang++" "ar" "" "" "";
 let msvc = Toolchain.make :msvc :msvc :windows "cl.exe" "cl.exe" "lib.exe" "link.exe" "" "Note: including file:";
 

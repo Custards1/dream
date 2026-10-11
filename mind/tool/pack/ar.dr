@@ -11,8 +11,8 @@ import std.io;
 import std.list;
 import std.str;
 
-import bytes;
-import out;
+import pack.bytes;
+import pack.out;
 
 let magic : :string = "!<arch>\n";
 

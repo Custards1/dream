@@ -139,6 +139,7 @@ priv let metric_fn loss_name m = match m {
     _ => metrics.of m,
 };
 
+/// Return a metric's display name.
 priv let metric_name : :any -> :string;
 priv let metric_name m = match type_of m {
     :atom => atom_text m,
@@ -146,6 +147,7 @@ priv let metric_name m = match type_of m {
     _ => "metric",
 };
 
+/// Return an atom's spelling without its leading colon.
 priv let atom_text : :atom -> :string;
 priv let atom_text a = str.slice 1 (str.length (to_string a) - 1) (to_string a);
 
@@ -188,6 +190,7 @@ let fit! model ds opts = join! (spawn! (training! model ds opts));
 priv let training! : nn.Layer -> data.Dataset -> %{:atom => :any} -> :any;
 priv let training! model ds opts = $( guarded_train! model ds opts );
 
+/// Run training with cleanup and error handling around the training loop.
 priv let guarded_train! : nn.Layer -> data.Dataset -> %{:atom => :any} -> Fitted;
 priv let guarded_train! model ds opts = try! { train! model ds opts } catch e {
     // A model too large for the process's heap fails deep inside a step,
@@ -201,6 +204,7 @@ priv let guarded_train! model ds opts = try! { train! model ds opts } catch e {
     } else { error.rethrow! e }
 };
 
+/// Fit a layer to a dataset using the configured optimization and reporting options.
 priv let train! : nn.Layer -> data.Dataset -> %{:atom => :any} -> Fitted;
 priv let train! model ds opts = {
     let n = data.size ds;
@@ -422,6 +426,7 @@ let save! path t = {
     file.write! path ("dream-ml 1\n" + str.concat_all (list.map piece (tree.paths t)))
 };
 
+/// Convert a serialization key to text.
 priv let key_text : :any -> :string;
 priv let key_text k = match type_of k {
     :integer => "#" + to_string k,
@@ -429,6 +434,7 @@ priv let key_text k = match type_of k {
     _ => "=" + k,
 };
 
+/// Reconstruct a serialization key from text.
 priv let key_of : :string -> :any;
 priv let key_of text = {
     let body = str.slice 1 (str.length text - 1) text;

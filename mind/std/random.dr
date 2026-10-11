@@ -90,6 +90,7 @@ let next rng = match rng {
     },
 };
 
+/// Return a nonnegative modular remainder.
 priv let mod_pos : :integer -> :integer -> :integer;
 priv let mod_pos x m = { let r = x % m; if r < 0 { r + m } else { r } };
 
@@ -114,6 +115,7 @@ priv let of_bytes b = {
     Rng.mrg a0 a1 a2 b0 b1 b2
 };
 
+/// Restrict an integer to its low 32 bits.
 priv let u32 : :string -> :integer -> :integer;
 priv let u32 s at = ((str.byte at s * 256 + str.byte (at + 1) s) * 256 + str.byte (at + 2) s) * 256 + str.byte (at + 3) s;
 
@@ -201,9 +203,11 @@ priv let rec below range rng = {
     if acc < per * range { [acc / per, rng2] } else { below range rng2 }
 };
 
+/// Determine how many random words and bits are needed for a bound.
 priv let words_for : :integer -> :integer -> :integer -> [:integer, :integer];
 priv let rec words_for range k bound = if bound >= range { [k, bound] } else { words_for range (k + 1) (bound * word_range) };
 
+/// Assemble the requested number of random words into an integer.
 priv let accumulate : :integer -> :integer -> Gen :integer;
 priv let rec accumulate k !acc rng =
     if k <= 0 { [acc, rng] }
@@ -291,6 +295,7 @@ let weighted pairs rng = {
     [choose_weighted pairs r, rng2]
 };
 
+/// Select the entry whose cumulative weight contains the sampled position.
 priv let choose_weighted : [[:any]] -> :any -> :any;
 priv let rec choose_weighted pairs r = match pairs {
     [[w, v]] => v,
@@ -318,6 +323,7 @@ let sample_of k xs rng = {
     [list.map (fn i -> m.[i]) (list.reverse (list.range (n - take) n)), rng2]
 };
 
+/// Shuffle indexed elements using Fisher-Yates, threading the generator state.
 priv let fisher_yates : :integer -> :integer -> :map -> Gen :map;
 priv let rec fisher_yates i stop !m rng =
     if i < 1 || i < stop { [m, rng] }
@@ -328,9 +334,11 @@ priv let rec fisher_yates i stop !m rng =
         fisher_yates (i - 1) stop (map.put_strict j (m.[i]) (map.put_strict i (m.[j]) m)) rng2
     };
 
+/// Convert an array to a map keyed by its indices.
 priv let indexed : :array -> :map;
 priv let indexed items = map.from_pairs (list.map (fn i -> [i, items.[i]]) (list.range 0 (array.length items)));
 
+/// Normalize a supported collection to an array.
 priv let as_array : :any -> :array;
 priv let as_array xs = match type_of xs {
     :array => xs,
@@ -353,6 +361,7 @@ let bytes n rng = {
     go n [] rng
 };
 
+/// Compute 256 raised to the given nonnegative exponent.
 priv let pow256 : :integer -> :integer;
 priv let rec pow256 n = if n <= 0 { 1 } else { 256 * pow256 (n - 1) };
 
@@ -374,6 +383,7 @@ let char_in lo hi rng = {
 let uuid : Gen :string;
 let uuid rng = { let [b, rng2] = bytes 16 rng; [uuid_text b, rng2] };
 
+/// Format UUID bytes using hexadecimal groups separated by hyphens.
 priv let uuid_text : :string -> :string;
 priv let uuid_text b = {
     // Version 4 in the high nibble of byte 6, and the RFC 9562 variant (10xx)
@@ -390,9 +400,11 @@ priv let uuid_text b = {
 let constant : a -> Gen a;
 let constant v rng = [v, rng];
 
+/// Transform a generator's result without changing its state transition.
 let map : (a -> b) -> Gen a -> Gen b;
 let map f g rng = { let [v, rng2] = g rng; [f v, rng2] };
 
+/// Run two generators in order and combine their values with `f`.
 let map2 : (a -> b -> c) -> Gen a -> Gen b -> Gen c;
 let map2 f ga gb rng = {
     let [a, r1] = ga rng;
@@ -400,6 +412,7 @@ let map2 f ga gb rng = {
     [f a b, r2]
 };
 
+/// Run three generators in order and combine their values with `f`.
 let map3 : (a -> b -> c -> d) -> Gen a -> Gen b -> Gen c -> Gen d;
 let map3 f ga gb gc rng = {
     let [a, r1] = ga rng;
@@ -509,6 +522,7 @@ let bytes! n = crypto.random_bytes! n;
 let int! : :integer -> :integer -> :integer;
 let int! lo hi = if hi <= lo { lo } else { lo + secure_below! (hi - lo + 1) };
 
+/// Sample a cryptographically secure integer below a positive bound without modulo bias.
 priv let secure_below! : :integer -> :integer;
 priv let rec secure_below! range = {
     let [k, bound] = bytes_for range 1 256;
@@ -518,6 +532,7 @@ priv let rec secure_below! range = {
     if n < limit { n % range } else { secure_below! range }
 };
 
+/// Compute the number of bytes needed to represent a sampling bound.
 priv let bytes_for : :integer -> :integer -> :integer -> [:integer, :integer];
 priv let rec bytes_for range k bound = if bound >= range { [k, bound] } else { bytes_for range (k + 1) (bound * 256) };
 
@@ -525,6 +540,7 @@ priv let rec bytes_for range k bound = if bound >= range { [k, bound] } else { b
 let float! : :unit -> :float;
 let float! () = num.to_float (secure_below! 9007199254740992) / 9007199254740992.0;
 
+/// Sample a cryptographically secure boolean with equal probabilities.
 let bool! : :unit -> :bool;
 let bool! () = secure_below! 2 == 1;
 

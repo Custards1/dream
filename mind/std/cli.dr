@@ -61,14 +61,19 @@ let opt : :string -> :string -> Kind -> :string -> :string -> Option;
 let opt short long kind meta help =
     %{ :short => short, :long => long, :kind => kind, :meta => meta, :help => help };
 
+/// Return an option's short spelling, or an empty string when absent.
 let short : Option -> :string;
 let short o = o.[:short else ""];
+/// Return an option's long spelling, or an empty string when absent.
 let long : Option -> :string;
 let long o  = o.[:long else ""];
+/// Return an option's parsing kind, defaulting to a flag.
 let kind : Option -> Kind;
 let kind o  = o.[:kind else :flag];
+/// Return the placeholder used for an option's value in help text.
 let meta : Option -> :string;
 let meta o  = o.[:meta else ""];
+/// Return an option's help description.
 let help : Option -> :string;
 let help o  = o.[:help else ""];
 
@@ -103,6 +108,7 @@ let count short long help = opt short long :count "" help;
 let section : :string -> Option;
 let section title = opt "" "" :section "" title;
 
+/// Test whether an entry is an option rather than a help-section heading.
 let is_option : Option -> :bool;
 let is_option o = kind o != :section;
 
@@ -127,9 +133,11 @@ let default_to v o = o.[:default => v];
 
 // --- what parsing produced ---------------------------------------------------
 
+/// Construct parsed arguments from option values and positional arguments.
 let parsed : %{ :string => :any } -> Arguments -> Parsed;
 let parsed values rest = %{ :values => values, :rest => rest };
 
+/// Return the map of parsed option values.
 let values : Parsed -> %{ :string => :any };
 let values c = c.[:values else (%{})];
 /// The arguments that were not options, in order.
@@ -155,10 +163,13 @@ let all c name = get [] c name;
 let command : :string -> :string -> [Option] -> Command;
 let command name help opts = %{ :name => name, :help => help, :opts => opts };
 
+/// Return a command's name.
 let command_name : Command -> :string;
 let command_name cm = cm.[:name else ""];
+/// Return a command's help description.
 let command_help : Command -> :string;
 let command_help cm = cm.[:help else ""];
+/// Return the options specific to a command.
 let command_opts : Command -> [Option];
 let command_opts cm = cm.[:opts else []];
 
@@ -168,24 +179,28 @@ let chosen c = c.[:command else ()];
 
 // --- parsing -----------------------------------------------------------------
 
+/// Find an option by its long name, or return `()` when absent.
 let by_long : [Option] -> :string -> :any;
 let by_long os name = {
     let hit = list.filter (fn o -> is_option o && long o == name) os;
     if list.is_empty hit { () } else { list.head hit }
 };
 
+/// Find an option by its short spelling, or return `()` when absent.
 let by_short : [Option] -> :string -> :any;
 let by_short os c = {
     let hit = list.filter (fn o -> is_option o && short o == c) os;
     if list.is_empty hit { () } else { list.head hit }
 };
 
+/// Find a command by name, or return `()` when absent.
 let by_command : [Command] -> :string -> :any;
 let by_command cmds name = {
     let hit = list.filter (fn cm -> command_name cm == name) cmds;
     if list.is_empty hit { () } else { list.head hit }
 };
 
+/// Increment a counted option in the parsed values.
 let add_count : Parsed -> Option -> :integer -> Parsed;
 let add_count c o n =
     c.[:values => (((values c)).[(long o) => ((((values c)).[(long o) else 0]) + n)])];
@@ -197,9 +212,11 @@ let record c o v =
     c.[:values => (((values c)).[(long o) => (if kind o == :list { list.append (((values c)).[(long o) else []]) [v] }
               else { v })])];
 
+/// Append a positional argument to the parsed result.
 let add_rest : Parsed -> :string -> Parsed;
 let add_rest c a = c.[:rest => (list.append (rest c) [a])];
 
+/// Construct the diagnostic for an option whose value was omitted.
 let missing : Option -> :string -> [:error, :string];
 let missing o spelling =
     [:error, spelling + " needs " + (if str.is_empty (meta o) { "a value" } else { meta o })];
@@ -311,6 +328,7 @@ let step os c a rest = {
     }
 };
 
+/// Consume options and positional arguments, stopping with a diagnostic on malformed input.
 let walk : [Option] -> Parsed -> Arguments -> Outcome;
 let rec walk os c args =
     match args {
@@ -378,6 +396,7 @@ let parse os args =
         [:ok, c] => finalize os c,
     };
 
+/// Parse a selected command using both its own options and the global options.
 let finish_command : [Option] -> [Command] -> Parsed -> :string -> Arguments -> Outcome;
 let finish_command globals cmds c cmd args = {
     match by_command cmds cmd {
@@ -424,11 +443,13 @@ let rec scan globals cmds c args =
             else { finish_command globals cmds c a more },
     };
 
+/// Parse a command line using global options and a table of subcommands.
 let commands : [Option] -> [Command] -> Arguments -> Outcome;
 let commands globals cmds args = scan globals cmds (parsed (%{}) []) args;
 
 // --- the usage message -------------------------------------------------------
 
+/// Right-pad a string with spaces to at least `n` bytes.
 let pad_to : :integer -> :string -> :string;
 let rec pad_to n s = if str.byte_length s >= n { s } else { pad_to n (s + " ") };
 
@@ -466,6 +487,7 @@ let suffixed_help o = {
     help o + choices_text + default_text + required_text
 };
 
+/// Format one option's spelling, placeholder and help text.
 let line : Option -> :string;
 let line o =
     if kind o == :section { "\n" + help o + ":" }
@@ -479,6 +501,7 @@ let options_help os = str.join_str "\n" (list.map line os);
 let command_line : Command -> :string;
 let command_line cm = "  " + pad_to 22 (command_name cm) + command_help cm;
 
+/// Format a command table as newline-separated help text.
 let commands_help : [Command] -> :string;
 let commands_help cmds = str.join_str "\n" (list.map command_line cmds);
 
@@ -678,6 +701,7 @@ type Command = %{ :name => :string, :help => :string, :opts => [Option] };
 type Outcome = [:ok, Parsed] | [:error, :string];
 type Step = [:ok, Parsed, Arguments] | [:error, :string];
 // The caller describes the values table after options and defaults are read.
+/// Parse arguments, then validate the parsed values against `description`.
 let parse_as : :any -> [Option] -> Arguments -> ([:ok, Parsed] | [:error, :any]);
 let parse_as description options args = match parse options args {
     [:ok, parsed] => match types.validate description (values parsed) {
@@ -704,6 +728,7 @@ let option_type option = {
     }
 };
 
+/// Derive a record description for the values produced by an option table.
 let values_type : [Option] -> :any;
 let values_type options = {
     let [required_fields, optional_fields] = list.fold (fn [required_fields, optional_fields] o -> {

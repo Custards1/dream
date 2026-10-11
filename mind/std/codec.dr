@@ -58,12 +58,15 @@ import std.str;
 let write_unit : :unit -> :string;
 virtual let write_unit u;
 
+/// Encode a boolean with the selected format's boolean writer.
 let write_bool : :bool -> :string;
 virtual let write_bool b;
 
+/// Encode an integer with the selected format's integer writer.
 let write_int : :integer -> :string;
 virtual let write_int n;
 
+/// Encode a float with the selected format's float writer.
 let write_float : :float -> :string;
 virtual let write_float x;
 
@@ -284,6 +287,7 @@ let next_frame buf = {
     }
 };
 
+/// Decode complete length-prefixed frames and return any unfinished input suffix.
 priv let frames_from : [Decoded :any] -> :string -> [[Decoded :any], :string];
 priv let rec frames_from acc buf = match next_frame buf {
     ()        => [list.reverse acc, buf],
@@ -304,10 +308,13 @@ import std.types;
 type Decoded value = result.Of value :any;
 // Syntax errors stay in the codec's error channel; a schema mismatch is a
 // :type_error value in that same channel. No exception is needed by a parser.
+/// Decode a value and validate a successful payload against `description`.
 let decode_as : :any -> :string -> Decoded :any;
 let decode_as description text = result.validate_ok description (decode text);
+/// Validate a value against `description` before encoding it.
 let encode_as : :any -> :any -> :string;
 let encode_as description value = encode (types.check description value);
 
+/// Validate a value before encoding it as a length-prefixed frame.
 let frame_as : :any -> :any -> :string;
 let frame_as description value = frame (types.check description value);

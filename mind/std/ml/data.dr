@@ -51,9 +51,11 @@ let make x y = Dataset.make x y;
 let of_lists : [:any] -> [:any] -> Dataset;
 let of_lists xs ys = make (tensor.of_list xs) (tensor.of_list ys);
 
+/// Return a dataset's input values.
 let x : Dataset -> :tensor;
 let x ds = Dataset.x ds;
 
+/// Return a dataset's target values.
 let y : Dataset -> :tensor;
 let y ds = Dataset.y ds;
 
@@ -202,6 +204,7 @@ let parse_csv text = {
     }
 };
 
+/// Treat a CSV line as a header when at least one field is not numeric.
 priv let is_header : :string -> :bool;
 priv let is_header line = list.any (fn f -> num.parse_float (str.trim f) == () && num.parse_int (str.trim f) == ()) (str.split "," line);
 

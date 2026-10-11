@@ -171,18 +171,23 @@ let condition e = field :condition e;
 let is : :atom -> :any -> :bool;
 let is c e = condition e == c;
 
+/// Extract the PostgreSQL SQLSTATE code from an error.
 let code : :any -> :any;
 let code e = field :code e;
 
+/// Extract the primary human-readable message from a PostgreSQL error.
 let message : :any -> :any;
 let message e = field :message e;
 
+/// Extract optional diagnostic detail from a PostgreSQL error.
 let detail : :any -> :any;
 let detail e = field :detail e;
 
+/// Extract an optional recovery hint from a PostgreSQL error.
 let hint : :any -> :any;
 let hint e = field :hint e;
 
+/// Extract the constraint name reported by PostgreSQL.
 let constraint : :any -> :any;
 let constraint e = field :constraint e;
 
@@ -214,9 +219,11 @@ let describe e =
         str.join_str "\n  " (list.cons (head + " " + p.[:message else ""]) tail)
     };
 
+/// Map a PostgreSQL diagnostic field tag to its readable name.
 priv let name_of : :atom -> :string;
 priv let name_of a = { let t = to_string a; str.slice 1 (len t - 1) t };
 
+/// Format a diagnostic field with its label when the field is present.
 priv let labelled : :string -> :any -> :string;
 priv let labelled label v = match v { () => "", text => label + ": " + to_string text };
 

@@ -35,7 +35,7 @@ import std.num;
 import std.str;
 import std.toml;
 
-import platform;
+import pack.platform;
 
 mapping Spec {
     // The directory the manifest is in: every source is relative to it.

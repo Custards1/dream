@@ -64,10 +64,13 @@ priv let members xs = match xs {
 priv let fields_of : :any -> :any;
 priv let fields_of m = match m { [:record, fields] => fields, _ => m };
 
+/// Describe a list whose elements all satisfy `element`.
 let list_of : Description -> Description;
 let list_of element = [:list_of, element];
+/// Describe an array whose elements all satisfy `element`.
 let array_of : Description -> Description;
 let array_of element = [:array_of, element];
+/// Describe a map whose keys satisfy `key` and values satisfy `value`.
 let map_of : Description -> Description -> Description;
 let map_of key value = [:map_of, key, value];
 /// A list of exactly these, in this order: `tuple [:ok, value]`.
@@ -76,10 +79,13 @@ let tuple elements = [:tuple, members elements];
 /// An array of exactly these, which is to `tuple` what an array is to a list.
 let array : :any -> Description;
 let array elements = [:array, members elements];
+/// Describe a value accepted by at least one of the supplied descriptions.
 let one_of : :any -> Description;
 let one_of choices = [:union, members choices];
+/// Describe a value accepted by every supplied description.
 let all_of : :any -> Description;
 let all_of requirements = [:intersection, members requirements];
+/// Describe either `()` or a value satisfying `element`.
 let optional : Description -> Description;
 let optional element = one_of [:unit, element];
 /// Accepts one value and nothing else. A non-primitive atom, a string, a
@@ -93,6 +99,7 @@ let literal value = [:literal, value];
 /// what it lacks.
 let record : :any -> Description;
 let record fields = [:record, fields_of fields];
+/// Add a predicate to a base description; both checks must succeed.
 let refine : Description -> (:any -> :bool) -> Description;
 let refine base predicate = [:refine, base, predicate];
 /// A function. What membership can ask of one is that it is a function --
@@ -104,14 +111,19 @@ let fn_of input output = [:fn, input, output];
 
 // These return only data, including their constraints, so `comp` can bake the
 // result. A refinement holding a closure is what cannot make that promise.
+/// Describe exactly one of the supplied literal values.
 let enum : :any -> Description;
 let enum values = one_of (list.map literal (members values));
+/// Describe a tagged list with `tag` first and the supplied field descriptions after it.
 let variant : :atom -> :any -> Description;
 let variant tag fields = tuple (_list_cons (literal tag) (members fields));
+/// Describe a numeric value between the inclusive lower and upper bounds.
 let range : (:integer | :float) -> (:integer | :float) -> Description;
 let range lower upper = [:range, lower, upper];
+/// Add inclusive size bounds to a base description.
 let sized : :integer -> :integer -> Description -> Description;
 let sized lower upper base = [:sized, base, lower, upper];
+/// Describe a record with required and optional fields.
 let record_with : :any -> :any -> Description;
 let record_with required optional_fields =
     [:fields, fields_of required, fields_of optional_fields];
@@ -134,6 +146,15 @@ let primitive kind = list.contains kind
 /// at all, a union stops at its first match, and a list type walks the spine
 /// it is asked about and no further. A description nothing here recognises is
 /// a literal, and a literal is compared with `==`.
+///
+/// ```dream
+/// import std.types;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (types.accepts (types.list_of :integer) [1, 2, 3])
+/// };
+/// ```
 let accepts : Description -> :any -> :bool;
 let rec accepts description value = match description {
     :any => true,
@@ -224,6 +245,7 @@ let rec exactly elements values = match elements {
 
 // Generated records carry a key, a description, and zero or one default.
 // Missing defaulted fields have the same meaning here as in their accessors.
+/// Normalize one field description for a required or optional record field.
 let shape_field : :atom -> :any -> :any -> :bool;
 let shape_field kind field value = match field {
     [key, description, defaults] => {
@@ -240,6 +262,15 @@ let shape_field kind field value = match field {
 /// expected. Like a failed pattern or an index out of range, this is a
 /// partial operation in pure code: it happens when the result is demanded,
 /// and not at all if it never is.
+///
+/// ```dream
+/// import std.types;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (types.check :integer "this intentionally fails")
+/// };
+/// ```
 let check : Description -> a -> a;
 let check description value = type_assert (accepts description value) description value;
 

@@ -37,6 +37,7 @@ let kind e = _error_kind e;
 let payload : :any -> :any;
 let payload e = _error_payload e;
 
+/// Test whether a value is a runtime error object.
 let is_error : :any -> :bool;
 let is_error e = type_of e == :error;
 

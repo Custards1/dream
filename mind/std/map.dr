@@ -42,30 +42,66 @@ let merge a b = list.fold_strict (fn m p -> m.[(list.nth 0 p) => (list.nth 1 p)]
 
 // --- looking ----------------------------------------------------------------
 
+/// Look up `k`, returning `default` when the key is absent.
+///
+/// ```dream
+/// import std.map;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (map.get "missing" "name" (%{ "name" => "Ada" }))
+/// };
+/// ```
 let get : v -> k -> %{ k => v } -> v;
 let get default k m = m.[k else default];
+/// Test whether the map contains key `k`.
 let has : k -> %{ k => v } -> :bool;
 let has k m = _map_has m k;
+/// Return the entries as `[key, value]` pairs; their order is unspecified.
 let pairs : %{ k => v } -> [[k, v]];
 let pairs m = _map_pairs m;
+/// Return all keys; their order is unspecified. Use `sorted_keys` for ordered output.
 let keys : %{ k => v } -> [k];
 let keys m = list.map (fn p -> list.nth 0 p) (_map_pairs m);
+/// Return all values; their order is unspecified.
 let values : %{ k => v } -> [v];
 let values m = list.map (fn p -> list.nth 1 p) (_map_pairs m);
+/// Count the entries in the map.
 let size : %{ k => v } -> :integer;
 let size m = list.length (_map_pairs m);
+/// Test whether the map contains no entries.
 let is_empty : %{ k => v } -> :bool;
 let is_empty m = list.is_empty (_map_pairs m);
 
 /// The keys in order. The only operation here that imposes one, and it costs a
 /// sort every time it is asked -- a map does not remember it.
+///
+/// ```dream
+/// import std.map;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (map.sorted_keys (%{ "b" => 2, "a" => 1 }))
+/// };
+/// ```
 let sorted_keys : %{ k => v } -> [k];
 let sorted_keys m = list.sort (keys m);
 
 // --- changing ---------------------------------------------------------------
 
+/// Return a map with `k` set to `v`, replacing any previous value.
+///
+/// ```dream
+/// import std.map;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (map.put "count" 2 (%{ "count" => 1 }))
+/// };
+/// ```
 let put : k -> v -> %{ k => v } -> %{ k => v };
 let put k v m = m.[k => v];
+/// Return a map without `k`; an absent key leaves the contents unchanged.
 let remove : k -> %{ k => v } -> %{ k => v };
 let remove k m = _map_remove m k;
 
@@ -87,6 +123,7 @@ let update default f k m = m.[k => (f (m.[k else default]))];
 /// it.
 let put_strict : k -> v -> %{ k => v } -> %{ k => v };
 let put_strict k !v m = m.[k => v];
+/// Apply `f` to the existing value or `default`, force the result, and store it at `k`.
 let update_strict : v -> (v -> v) -> k -> %{ k => v } -> %{ k => v };
 let update_strict default f k m = put_strict k (f (m.[k else default])) m;
 
@@ -94,6 +131,7 @@ let update_strict default f k m = put_strict k (f (m.[k else default])) m;
 let put_new : k -> v -> %{ k => v } -> %{ k => v };
 let put_new k v m = if _map_has m k { m } else { m.[k => v] };
 
+/// Transform each value with `f`, preserving its key.
 let map_values : (v -> w) -> %{ k => v } -> %{ k => w };
 let map_values f m =
     list.fold_strict (fn acc p -> acc.[(list.nth 0 p) => (f (list.nth 1 p))]) empty (_map_pairs m);
@@ -127,12 +165,16 @@ let without other m = filter (fn k _ -> not (_map_has other k)) m;
 // this is a hash -- and because a set written as a list of members reads
 // better at the definition than a map literal does.
 
+/// Build a map-backed set from a list, discarding duplicate elements.
 let set_of : [a] -> %{ a => :bool };
 let set_of xs = list.fold_strict (fn m x -> m.[x => true]) empty xs;
+/// Test whether a map-backed set contains an element.
 let member : a -> %{ a => :bool } -> :bool;
 let member x s = _map_has s x;
+/// Return a map-backed set containing the given element.
 let add : a -> %{ a => :bool } -> %{ a => :bool };
 let add x s = s.[x => true];
+/// Return the elements of a map-backed set, in unspecified order.
 let members : %{ a => :bool } -> [a];
 let members s = keys s;
 
@@ -191,5 +233,6 @@ when test {
 import std.types;
 type Of key value = %{ key => value };
 type Entry key value = [key, value];
+/// Validate the map's keys and values against their descriptions; raise on a mismatch.
 let check : :any -> :any -> %{ k => v } -> %{ k => v };
 let check key value entries = types.check (Of key value) entries;

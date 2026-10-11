@@ -35,6 +35,7 @@ let place root p =
     if str.starts_with "/" p || (str.byte_length p > 1 && str.slice 1 1 p == ":") || root == "" { p }
     else { root + "/" + p };
 
+/// Format a CMake command and its escaped arguments.
 let command : :string -> [:string] -> :string;
 let command name args = match args {
     [] => "",
@@ -50,6 +51,7 @@ let compilers = [
     [["MSVC"], cc.msvc],
 ];
 
+/// Map a source-language atom to CMake's language identifier.
 let lang_id lang = match lang { :c => "C", _ => "CXX" };
 
 /// One generator expression per compiler, for the flags `translate` gives it.
@@ -71,6 +73,7 @@ let per_compiler translate condition = {
              grouped
 };
 
+/// Resolve a selector to its compiler-family condition.
 let family_of sel = match sel {
     :gnu => ["GNU", "Clang", "AppleClang"],
     :gcc => ["GNU"],
@@ -78,6 +81,7 @@ let family_of sel = match sel {
     _ => ["MSVC"],
 };
 
+/// Map a target OS to CMake's platform identifier.
 let platform_id os = match os { :linux => "Linux", :macos => "Darwin", :windows => "Windows", :android => "Android", _ => to_string os };
 
 // --- which settings go where ---------------------------------------------------------
@@ -93,9 +97,11 @@ let native s = match s {
     _ => false,
 };
 
+/// Translate settings into toolchain-specific CMake compiler flags.
 let flags_of translate tc lang settings =
     list.flat_map (fn s -> if native s { [] } else { translate tc lang s }) settings;
 
+/// Render compile options with language and toolchain conditions.
 let compile_options lang settings =
     list.append (per_compiler (fn tc -> match cc.Toolchain.family tc {
                                    :msvc => flags_of msvc.compile_flags tc lang settings,
@@ -104,6 +110,7 @@ let compile_options lang settings =
                               (fn ids -> "COMPILE_LANG_AND_ID:" + lang_id lang + "," + ids))
                 [];
 
+/// Render target link options as CMake expressions.
 let link_options settings =
     per_compiler (fn tc -> list.flat_map (fn s -> if native s { [] } else {
         match cc.Toolchain.family tc {
@@ -113,6 +120,7 @@ let link_options settings =
     }) settings)
                  (fn ids -> "CXX_COMPILER_ID:" + ids);
 
+/// Extract preprocessor definitions from build settings.
 let definitions settings = list.flat_map (fn s -> match s {
     [:define, n, ()] => [quoted n],
     [:define, n, v] => [quoted (n + "=" + gnu.value_text v)],
@@ -120,11 +128,13 @@ let definitions settings = list.flat_map (fn s -> match s {
     _ => [],
 }) settings;
 
+/// Resolve include directories from build settings against the source root.
 let includes root settings = list.flat_map (fn s -> match s {
     [:include, d] => [quoted (place root d)],
     _ => [],
 }) settings;
 
+/// Resolve linked libraries from build settings.
 let libraries root settings = list.flat_map (fn s -> match s {
     :threads => ["Threads::Threads"],
     [:system, l] => [l],
@@ -133,6 +143,7 @@ let libraries root settings = list.flat_map (fn s -> match s {
     _ => [],
 }) settings;
 
+/// Extract language-standard requirements from build settings.
 let standards settings = list.flat_map (fn s -> match s {
     [:standard, l] => {
         let lang = if cc.standard_is_for :cxx l { "CXX" } else { "C" };
@@ -152,8 +163,10 @@ let target_id all t = match cc.kind t {
     _ => cc.name t,
 };
 
+/// Return the C/C++ languages used by a target's source files.
 let languages t = list.unique (list.filter (fn l -> l != :other) (list.map (fn [p, _] -> cc.language p) (cc.sources t)));
 
+/// Render one target and its dependency relationships as CMake source.
 let target_text : :string -> [cc.Target] -> cc.Target -> :string;
 let target_text root all t = {
     let id = target_id all t;
