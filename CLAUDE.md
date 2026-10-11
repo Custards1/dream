@@ -348,17 +348,25 @@ The lessons that keep coming back:
   resolution; [dreams/expand.dr](dreams/expand.dr) and [docs/notes/macro-expansion.md](docs/notes/macro-expansion.md) says what
   that costs.
 - `group P { x, y }`, `struct P { x, y }` and `mapping P { x, y }` declare a
-  record: a module of generated functions — `P.make`, `P.new`, `P.x`, `P.set_x`
-  — over a list, an array and a map respectively. The *loader* rewrites them
-  (`syntax.record`), so nothing downstream knows a record from a `mod`; "A
-  record is a declaration before it is a module" is what that costs a tool.
-  A field may be given a default (`x = 0`), which is the `else` of the read its
-  accessor compiles to; `new` is the constructor that takes only the fields
-  without one. An entry *with parameters* is a **member** — `say_hi self = ..`
+  record: a module of generated functions — `P.make`, `P.new`, `P.x`, `P.set_x`.
+  A `group` or `struct` value is a **record of its own** (`RecordObj`): it
+  carries the atom naming its declaration (`app.P`), prints as `P(1, 2)`,
+  `type_of` answers `:P`, it equals no list or array, and `P(x, y)` takes it
+  apart; a `mapping` is a map. The *loader* rewrites them (`syntax.record`),
+  so nothing downstream knows a record from a `mod`; "A record is a
+  declaration before it is a module" is what that costs a tool, and "Records
+  are values of their own" in docs/notes/static-types.md is the design.
+  A field may be given a default (`x = 0`); `new` is the constructor that
+  takes only the fields without one. An entry *with parameters* is a **member** — `say_hi self = ..`
   — an ordinary function compiled inside the generated module, where the
   accessors are globals. Having parameters is the whole of what tells the two
   apart, and entries are separated by `,` or by a line break, as a block's
-  statements are by `;`.
+  statements are by `;`. Like every `mod`, the generated module sees the
+  names of the file it is written in (`scope.inherit_enclosing`), so a field
+  can be typed `: Period` and a member can call its neighbours; and the
+  parent gets a global `P` holding `P.type`, so `P` is a type in a
+  description too. A record's header is an array's 16 bytes: the id is an
+  atom index packed beside the length (`RecordObj::tag`).
 - `type Name params = description` names an **optional type**: a description
   that is an ordinary value, checked only where a program asks. Its
   right-hand side, and a record field's `: annotation`, are read in a grammar
@@ -379,12 +387,13 @@ The lessons that keep coming back:
   never rejected. [docs/notes/static-types.md](docs/notes/static-types.md)
   is the design.
 - `union Shape { circle(radius : :float), empty }` declares a **discriminated
-  union**: a module of constructors whose values are `[:circle, r]` and
-  `:empty` -- the tagged lists Dream already writes by hand -- plus a global
-  `Shape` holding its description. A `match` on one must handle every
-  variant. Lists back it; `union struct Shape { .. }` makes the variants
-  with fields arrays (`#[:circle, r]`) instead, as `struct` is to `group`,
-  and `switch_head` dispatches on either.
+  union**: a module of constructors whose values are records --
+  `Shape.circle 1.0`, `Shape.empty`, each carrying `app.Shape.circle` -- plus
+  a global `Shape` holding its description. They are matched with
+  constructor patterns, `Shape.circle(r)` and `Shape.empty`, and are equal
+  to no tagged list or atom: `[:circle, r]` against a `Shape` never matches,
+  and the checker says so. A `match` on one must handle every variant.
+  `union struct` still parses and means the same thing.
 - `import std.tensor` gives **tensors**: packed numbers with a shape
   (`TensorObj`), on which `+ - * / %` are elementwise and `a @ b` is the
   matrix product (the parser writes it as the builtin `_tensor_matmul`).
@@ -464,6 +473,29 @@ The lessons that keep coming back:
 
 In Dream, write `match` rather than a long `if`/`else if` chain, and convert
 such a chain to a `match` when you come across one. There are plenty left.
+
+The compiler's private alternatives are unions: resolution meanings, fusion
+plans, checker types and formulas, and session outcomes. A failed `comp` and
+an unrun contract batch use private records, so a program cannot return a list
+or atom that looks like the compiler's own failure. Source files are always
+`diag.Source` records.
+
+Compiler state has declared fields: `modules.Loader` and `Module`,
+`package.Packages`, `scope.State`, `Resolution` and `Function`,
+`lower.Lowering`, `opt.State`, and `ir.Program` and `Image` are mappings.
+Use their accessors and setters. Keep the scope state and resolver as maps:
+the unit cache computes and reapplies their diffs. `scope.Function.recursive`
+is the function's recursion flag; the surface AST still uses its original
+list representation.
+
+Four list protocols must stay lists: the AST that macros receive,
+`[:ok, ..]`/`[:error, ..]` results consumed by `let?`, `[:crashed, e]` around
+compiler-owned results, and placeholder holes inside syntax trees. Signatures
+use `ast.Expr`, `Pattern`, `Decl`, `Param` and `Span` without changing those
+representations. Optional lookups may remain unsigned where their truthful
+unit alternative would require unrelated caller changes. Force finite loop
+accumulators with `!acc`; forcing a list's spine does not force its elements.
+See [Static types](docs/notes/static-types.md) for the migration and measurements.
 
 Comments in this codebase explain *why a thing is the way it is*, usually in
 full sentences, often several lines at the head of a section. Match that. The

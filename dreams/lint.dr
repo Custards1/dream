@@ -22,6 +22,7 @@
 // the chain; it only misses the ones it cannot see.
 
 import std.list;
+import std.map;
 import dreams.ast;
 
 /// What a walk over one parameter's uses has found: whether a call grows it,
@@ -169,11 +170,20 @@ let rec forces_in e acc =
 
 // --- local, syntax-proven pitfalls -------------------------------------------
 
+/// One warning a pass found: where, what is wrong, and what to do about it.
+group Hit { span, message, note }
+
 /// Keep the literal kind: map keys need not share numeric equality semantics.
 /// Unknown expressions and floats are deliberately left to runtime.
+///
+/// The key is a string because the walks below keep what they have seen in a
+/// map, and a map finds a list key by identity: two `[:int, 1]` built apart
+/// are two keys. The kind is spelled first, so `1` and `"1"` stay apart.
+let literal_key : :any -> :any;
 let literal_key e = match e {
-    [kind, value, _] if list.contains kind [:int, :str, :char, :atom, :bool] => [kind, value],
-    [:unit, _] => [:unit],
+    [kind, value, _] if list.contains kind [:int, :str, :char, :atom, :bool] =>
+        to_string kind + " " + to_string value,
+    [:unit, _] => ":unit",
     _ => (),
 };
 
@@ -189,15 +199,17 @@ let pattern_key p = match p {
     _ => (),
 };
 
+/// `seen` is a map, not a list: a generated map literal or `match` can run to
+/// thousands of entries, and a list searched once per entry is quadratic.
 let rec duplicate_keys pairs seen acc = match pairs {
     [] => acc,
     [[k, _], ..rest] => {
         let key = literal_key k;
-        let next = if key != () && list.contains key seen {
-            list.cons [ast.span k, "duplicate literal map key: the earlier value is overwritten",
-                       "remove the duplicate key or give this entry a different key"] acc
+        let next = if key != () && map.has key seen {
+            list.cons (Hit.make (ast.span k) "duplicate literal map key: the earlier value is overwritten"
+                                "remove the duplicate key or give this entry a different key") acc
         } else { acc };
-        duplicate_keys rest (if key == () { seen } else { list.cons key seen }) next
+        duplicate_keys rest (if key == () { seen } else { seen.[key => true] }) next
     },
     _ => acc,
 };
@@ -206,13 +218,13 @@ let rec unreachable_arms arms covered seen acc = match arms {
     [] => acc,
     [[p, guard, _, span], ..rest] => {
         let key = pattern_key p;
-        let unreachable = covered || (key != () && list.contains key seen);
+        let unreachable = covered || (key != () && map.has key seen);
         let next = if unreachable {
-            list.cons [span, "unreachable match arm: an earlier unguarded arm already matches it",
-                       "remove this arm, move it before the earlier arm, or guard the earlier arm"] acc
+            list.cons (Hit.make span "unreachable match arm: an earlier unguarded arm already matches it"
+                                "remove this arm, move it before the earlier arm, or guard the earlier arm") acc
         } else { acc };
         unreachable_arms rest (covered || (guard == () && catches_all p))
-            (if guard == () && key != () { list.cons key seen } else { seen }) next
+            (if guard == () && key != () { seen.[key => true] } else { seen }) next
     },
     _ => acc,
 };
@@ -224,20 +236,21 @@ let rec literal_zero e = match e {
     _ => false,
 };
 
-/// `[span, message, note]` in source traversal order. Walk each body once so
+/// A `Hit` for each, in source traversal order. Walk each body once so
 /// nested functions and literals are checked without duplicate diagnostics.
+let pitfalls : :any -> [:any];
 let pitfalls e = list.reverse (pitfalls_in e []);
 
 let rec pitfalls_in e acc =
     if type_of e != :list { acc }
     else {
         let here = match e {
-            [:map, pairs, _] => duplicate_keys pairs [] acc,
-            [:match, _, arms, _] => unreachable_arms arms false [] acc,
+            [:map, pairs, _] => duplicate_keys pairs %{} acc,
+            [:match, _, arms, _] => unreachable_arms arms false %{} acc,
             [:binary, op, _, divisor, _] if (op == :div || op == :mod) && literal_zero divisor =>
-                list.cons [ast.span divisor,
-                           (if op == :div { "division" } else { "remainder" }) + " by a literal zero",
-                           "check the divisor: zero can raise an error or produce a non-finite result"] acc,
+                list.cons (Hit.make (ast.span divisor)
+                                    ((if op == :div { "division" } else { "remainder" }) + " by a literal zero")
+                                    "check the divisor: zero can raise an error or produce a non-finite result") acc,
             _ => acc,
         };
         list.fold (fn a x -> pitfalls_in x a) here e
@@ -260,7 +273,25 @@ when test {
         other => other,
     };
 
+    /// The messages `pitfalls` reports for the first declaration of `src`.
+    let pitfalls_of src = match parser.parse_module src {
+        [:ok, [[:let, _, _, body, _, _], .._], _] => list.map Hit.message (pitfalls body),
+        other => other,
+    };
+
+    let duplicate = "duplicate literal map key: the earlier value is overwritten";
+    let unreachable = "unreachable match arm: an earlier unguarded arm already matches it";
+
     let tests = [
+        test.case "a repeated literal key is found, built apart or not"
+            $( test.eq! [duplicate, duplicate] (pitfalls_of "let f = %{ :a => 1, \"a\" => 2, :a => 3, :a => 4 };") ),
+        test.case "the same spelling in another kind is another key"
+            $( test.eq! [] (pitfalls_of "let f = %{ 1 => 1, \"1\" => 2, :unit => 3, () => 4 };") ),
+        test.case "an arm after a catch-all, or after the same unguarded literal"
+            $( test.eq! [unreachable, unreachable]
+                        (pitfalls_of "let f x = match x { 1 => 0, 1 => 1, y => y, :b => 2 };") ),
+        test.case "a guarded arm hides nothing"
+            $( test.eq! [] (pitfalls_of "let f x = match x { 1 if x > 0 => 0, 1 => 1, _ => 2 };") ),
         test.case "a force in a list is suspended"
             $( test.eq! 1 (forces "let f! x = [:ok, strict! x];") ),
         test.case "in an array and a map, key or value"

@@ -249,20 +249,21 @@ let main! = console.print! [a 1, a 0, b 2, c 3, d 4, e, f, h, i];
     failure(prelude + 'let g : :integer | :unit;\nlet g = 3;\nlet main! = console.print! (g + 1);',
             'but this is `:integer | :unit` and `1`')
 
-    # A union is taken apart by its values and its tags as well as by its
-    # kinds. `x == :atom` picks out one value -- a `union` variant with no
-    # fields is one -- and `list.head x`, `x.[0]` or `x.[:kind]` compared with
-    # an atom picks out the tagged lists or records that could carry it. A
-    # `match` arm sees the scrutinee cut down to what its pattern could match,
-    # and a `match` on a probe narrows the name it probes. Only atoms, booleans
-    # and `()` narrow: `3 == 3.0`, and a `bigstr` is `==` its string.
+    # A union of tagged lists is taken apart by its values and its tags as
+    # well as by its kinds. `x == :atom` picks out one value, and
+    # `list.head x`, `x.[0]` or `x.[:kind]` compared with an atom picks out
+    # the tagged lists or maps that could carry it. A `match` arm sees the
+    # scrutinee cut down to what its pattern could match, and a `match` on a
+    # probe narrows the name it probes. Only atoms, booleans and `()`
+    # narrow: `3 == 3.0`, and a `bigstr` is `==` its string. (A declared
+    # `union` is records, not tagged lists, and is the block after this.)
     tagged = prelude + '''
 import std.list;
-union Shape { circle(radius : :float), square(side : :float), empty }
+type Shape = [:circle, :float] | [:square, :float] | :empty;
 let radius : [:circle, :float] -> :float;
 let radius c = list.nth 1 c;
 let pick : :integer -> Shape;
-let pick n = match n { 0 => Shape.empty, 1 => Shape.circle 1.5, _ => Shape.square 2.0 };
+let pick n = match n { 0 => :empty, 1 => [:circle, 1.5], _ => [:square, 2.0] };
 let status : :integer -> :ok | :error | :pending;
 let status n = match n { 0 => :ok, 1 => :error, _ => :pending };
 let only_ok : :ok -> :integer;
@@ -311,6 +312,35 @@ let main! = console.print! [a 0, a 1, b 0, c 0, c 1, d 1, d 2, e 1, f 1, g 3, h 
     # `list.head` of a union with an atom in it is itself the mistake.
     failure(tagged + 'let main! = { let s = pick 1; console.print! (list.head s == :circle) };',
             'argument 1 of `list.head` should be `[a]`, but this is `Shape`')
+
+    # A declared union's variants are records of their own: a constructor
+    # pattern takes one apart and gives its fields their declared types, a
+    # `match` must handle every variant, a list pattern can never match one,
+    # and a list is not one wherever one is expected.
+    nominal = prelude + '''
+import std.list;
+union Shape { circle(radius : :float), square(side : :float), empty }
+let pick : :integer -> Shape;
+let pick n = match n { 0 => Shape.empty, 1 => Shape.circle 1.5, _ => Shape.square 2.0 };
+let half : :float -> :float;
+let half x = x / 2.0;
+let area : Shape -> :float;
+let area s = 1.0;
+'''
+    success(nominal + '''
+let size s = match s { Shape.circle(r) => half r, Shape.square(side) => side, Shape.empty => 0.0 };
+let main! = console.print! [list.map (fn n -> size (pick n)) [0, 1, 2], type_of (pick 1), pick 1 == Shape.circle 1.5];
+''', '[[0, 0.75, 2], :Shape, true]\n')
+    failure(nominal + 'let main! = console.print! (match pick 1 { Shape.circle(r) => r + "x", _ => "" });',
+            'but this is `:float` and `"x"`')
+    failure(nominal + 'let main! = console.print! (match pick 1 { Shape.circle(r) => r });',
+            'does not handle `Shape.square(_)` or `Shape.empty`')
+    failure(nominal + 'let main! = console.print! (match pick 1 { [:circle, r] => r, _ => 0.0 });',
+            'this arm can never match: a `Shape` is not a list')
+    failure(nominal + 'let main! = console.print! (area [:circle, 1.0]);',
+            'argument 1 of `area` should be `Shape`, but this is')
+    failure(nominal + 'let main! = console.print! (match pick 1 { Shape.circle(r, extra) => r, _ => 0.0 });',
+            '`Shape.circle` makes 1 field, and this pattern has 2')
 
     # --- what is not ----------------------------------------------------------------
     #
@@ -394,51 +424,52 @@ union Shape {
     empty
 
     area self = match self {
-        [:circle, r] => 3.0 * r * r,
-        [:rect, w, h] => w * h,
-        :empty => 0.0,
+        Shape.circle(r) => 3.0 * r * r,
+        Shape.rect(w, h) => w * h,
+        Shape.empty => 0.0,
     }
 }
 '''
-    # A variant is the tagged list programs already write, and one with no
-    # fields is its atom. The union's own name is its description, and the
-    # module of constructors beside it.
+    # A variant is a record of its own: it prints as the constructor that made
+    # it, and a tagged list or an atom that looks like it is not one. The
+    # union's own name is its description, and the module of constructors
+    # beside it.
     success(prelude + shapes + '''
 union Option a { some(value : a), none }
 let main! = {
     console.print! [Shape.circle 1.0, Shape.rect 2.0 3.0, Shape.empty]
     console.print! [Shape.area (Shape.circle 1.0), Shape.area (Shape.rect 2.0 3.0), Shape.area Shape.empty]
-    console.print! [types.accepts Shape [:rect, 1.0, 2.0], types.accepts Shape [:rect, 1],
-                    types.accepts Shape :empty, types.accepts Shape :full]
-    console.print! [Option.some 3, Option.none, types.accepts (Option :integer) [:some, 1],
-                    types.accepts (Option :integer) [:some, "x"]]
+    console.print! [types.accepts Shape (Shape.rect 1.0 2.0), types.accepts Shape [:rect, 1.0, 2.0],
+                    types.accepts Shape Shape.empty, types.accepts Shape :empty]
+    console.print! [Option.some 3, Option.none, types.accepts (Option :integer) (Option.some 1),
+                    types.accepts (Option :integer) (Option.some "x")]
 };
-''', '[[:circle, 1], [:rect, 2, 3], :empty]\n[3, 6, 0]\n[true, false, true, false]\n'
-     '[[:some, 3], :none, true, false]\n')
+''', '[Shape.circle(1), Shape.rect(2, 3), Shape.empty]\n[3, 6, 0]\n[true, false, true, false]\n'
+     '[Option.some(3), Option.none, true, false]\n')
 
     # The check that makes declaring one worth it.
     failure(prelude + shapes + '''
 let perimeter : Shape -> :float;
 let perimeter s = match s {
-    [:circle, r] => 6.0 * r,
-    [:rect, w, h] => 2.0 * (w + h),
+    Shape.circle(r) => 6.0 * r,
+    Shape.rect(w, h) => 2.0 * (w + h),
 };
 let main! = console.print! (perimeter Shape.empty);
-''', 'this `match` on `Shape` does not handle `:empty`')
+''', 'this `match` on `Shape` does not handle `Shape.empty`')
     failure(prelude + shapes + '''
 let label : Shape -> :string;
-let label s = match s { :empty => "nothing" };
+let label s = match s { Shape.empty => "nothing" };
 let main! = console.print! (label Shape.empty);
-''', '`[:circle, _]` or `[:rect, _, _]`')
+''', '`Shape.circle(_)` or `Shape.rect(_, _)`')
     # A wildcard, a binder, or a guard all count as handling.
     success(prelude + shapes + '''
 let label : Shape -> :string;
-let label s = match s { :empty => "nothing", _ => "something" };
+let label s = match s { Shape.empty => "nothing", _ => "something" };
 let big : Shape -> :bool;
 let big s = match s {
-    [:circle, r] if r > 10.0 => true,
-    [:circle, _] => false,
-    [:rect, _, _] => false,
+    Shape.circle(r) if r > 10.0 => true,
+    Shape.circle(_) => false,
+    Shape.rect(_, _) => false,
     other => false,
 };
 let main! = console.print! [label Shape.empty, label (Shape.circle 1.0), big (Shape.circle 20.0)];
@@ -446,7 +477,7 @@ let main! = console.print! [label Shape.empty, label (Shape.circle 1.0), big (Sh
     # A pattern takes the variant it matched apart: `r` is the radius.
     failure(prelude + shapes + '''
 let bad : Shape -> :string;
-let bad s = match s { [:circle, r] => r + "cm", _ => "" };
+let bad s = match s { Shape.circle(r) => r + "cm", _ => "" };
 let main! = console.print! (bad Shape.empty);
 ''', '`+` adds two numbers')
     failure(prelude + shapes + 'let main! = console.print! (Shape.circle 2);',
@@ -454,27 +485,32 @@ let main! = console.print! (bad Shape.empty);
     failure(prelude + shapes + 'let s : Shape = [:square, 1.0]; let main! = console.print! s;',
             '`s` should be `Shape`')
 
-    # The idiom every result in the language already uses, declared: the
-    # variants are `[:ok, v]` and `[:error, e]` exactly as written by hand, so
-    # old code and new agree about them.
+    # The idiom every result in the language uses, declared -- and declared,
+    # it is a type of its own: `Outcome.ok 1` is not the `[:ok, 1]` a function
+    # wrote by hand, so the two cannot be mixed up, and a mix is reported.
     success(prelude + '''
 union Outcome v { ok(value : v), error(reason : :string) }
 let parse : :string -> Outcome :integer;
-let parse s = if s == "1" { Outcome.ok 1 } else { [:error, "not one: " + s] };
+let parse s = if s == "1" { Outcome.ok 1 } else { Outcome.error ("not one: " + s) };
 let show : Outcome :integer -> :string;
-let show r = match r { [:ok, n] => to_string (n + 1), [:error, why] => why };
-let main! = console.print! [show (parse "1"), show (parse "2")];
-''', '["2", "not one: 2"]\n')
+let show r = match r { Outcome.ok(n) => to_string (n + 1), Outcome.error(why) => why };
+let main! = console.print! [show (parse "1"), show (parse "2"), Outcome.ok 1 == [:ok, 1]];
+''', '["2", "not one: 2", false]\n')
+    failure(prelude + '''
+union Outcome v { ok(value : v), error(reason : :string) }
+let parse : :string -> Outcome :integer;
+let parse s = if s == "1" { Outcome.ok 1 } else { [:error, "not one: " + s] };
+let main! = console.print! (parse "2");
+''', 'should be `Outcome :integer`')
 
     # A union declared in another module is a type there too, by its dotted
-    # name. The global the union leaves beside its module holds a run-time
-    # description and is not a declaration, so the module has to be asked first.
+    # name, and its constructors are matched by theirs.
     success(prelude + '''
 mod shapes {
     union Shape { circle(radius : :float), empty }
 }
 let area : shapes.Shape -> :float;
-let area s = match s { [:circle, r] => 3.0 * r * r, :empty => 0.0 };
+let area s = match s { shapes.Shape.circle(r) => 3.0 * r * r, shapes.Shape.empty => 0.0 };
 let main! = console.print! (area (shapes.Shape.circle 2.0));
 ''', '12\n')
 
@@ -519,8 +555,8 @@ let main! = console.print! (try! { half (label 3) } catch e { 0 });
     warns(prelude + '''
 union Shape { circle(radius : :float), empty }
 let pick n = if n > 0 { Shape.circle 1.0 } else { Shape.empty };
-let main! = console.print! (match pick 1 { [:circle, r] => r });
-''', '1\n', 'warning:', '`:empty`')
+let main! = console.print! (match pick 1 { Shape.circle(r) => r });
+''', '1\n', 'warning:', '`Shape.empty`')
 
     # `()` on some path is "nothing there", not a union every caller must
     # take apart, and a program that agrees with itself says nothing.

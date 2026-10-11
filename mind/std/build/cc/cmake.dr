@@ -85,11 +85,11 @@ let platform_id os = match os { :linux => "Linux", :macos => "Darwin", :windows 
 /// Settings CMake has a word of its own for, and so are not written as flags.
 let native : cc.Setting -> :bool;
 let native s = match s {
-    [:standard, _] => true, [:optimize, _] => true, [:debug_info, _] => true,
-    [:define, _, _] => true, [:define_for, _, _] => true, [:include, _] => true,
-    [:pic, _] => true, :threads => true, :export_all => true,
-    [:system, _] => true, [:system_for, _, _] => true, [:library_dir, _] => true,
-    [:link_file, _] => true, [:runtime_path, _] => true,
+    cc.Setting.standard(_) => true, cc.Setting.optimize(_) => true, cc.Setting.debug_info(_) => true,
+    cc.Setting.define(_, _) => true, cc.Setting.define_for(_, _) => true, cc.Setting.include(_) => true,
+    cc.Setting.pic(_) => true, cc.Setting.threads => true, cc.Setting.export_all => true,
+    cc.Setting.system(_) => true, cc.Setting.system_for(_, _) => true, cc.Setting.library_dir(_) => true,
+    cc.Setting.link_file(_) => true, cc.Setting.runtime_path(_) => true,
     _ => false,
 };
 
@@ -114,27 +114,27 @@ let link_options settings =
                  (fn ids -> "CXX_COMPILER_ID:" + ids);
 
 let definitions settings = list.flat_map (fn s -> match s {
-    [:define, n, ()] => [quoted n],
-    [:define, n, v] => [quoted (n + "=" + gnu.value_text v)],
-    [:define_for, sel, n] => [quoted ("$<$<CXX_COMPILER_ID:" + str.join_str "," (family_of sel) + ">:" + n + ">")],
+    cc.Setting.define(n, ()) => [quoted n],
+    cc.Setting.define(n, v) => [quoted (n + "=" + gnu.value_text v)],
+    cc.Setting.define_for(sel, n) => [quoted ("$<$<CXX_COMPILER_ID:" + str.join_str "," (family_of sel) + ">:" + n + ">")],
     _ => [],
 }) settings;
 
 let includes root settings = list.flat_map (fn s -> match s {
-    [:include, d] => [quoted (place root d)],
+    cc.Setting.include(d) => [quoted (place root d)],
     _ => [],
 }) settings;
 
 let libraries root settings = list.flat_map (fn s -> match s {
-    :threads => ["Threads::Threads"],
-    [:system, l] => [l],
-    [:system_for, os, l] => [quoted ("$<$<PLATFORM_ID:" + platform_id os + ">:" + l + ">")],
-    [:link_file, p] => [quoted (place root p)],
+    cc.Setting.threads => ["Threads::Threads"],
+    cc.Setting.system(l) => [l],
+    cc.Setting.system_for(os, l) => [quoted ("$<$<PLATFORM_ID:" + platform_id os + ">:" + l + ">")],
+    cc.Setting.link_file(p) => [quoted (place root p)],
     _ => [],
 }) settings;
 
 let standards settings = list.flat_map (fn s -> match s {
-    [:standard, l] => {
+    cc.Setting.standard(l) => {
         let lang = if cc.standard_is_for :cxx l { "CXX" } else { "C" };
         [lang + "_STANDARD " + cc.standard_version l, lang + "_STANDARD_REQUIRED ON", lang + "_EXTENSIONS OFF"]
     },

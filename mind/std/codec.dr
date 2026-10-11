@@ -164,7 +164,32 @@ let rec encode_value v = match type_of v {
     :array   => write_array (list.map encode_value (_array_to_list v)),
     :map     => write_map (map_entries v),
     :tensor  => write_tensor v,
+    _ if types.record_id v != () => encode_value (as_written v),
     _        => write_opaque v,
+};
+
+/// A record as what it was before it was a value of its own: a `group` or a
+/// `struct` as its fields, a union's variant as `[tag, ..fields]`, or its
+/// tag alone when it has none -- the list, array or atom it used to be
+/// built as. Its `type_of` is its own name (`:Point`), which no arm above
+/// can name, so without this it fell to `write_opaque` and a JSON document
+/// that had held `[1, 2]` held `"Point(1, 2)"`. A record does not carry its
+/// field names, so this is the most a walk that knows only the value can
+/// say; `std.record` is the way to write one by name.
+///
+/// The tag is the variant's name as a string. The formats this walk spells
+/// -- JSON and TOML; `std.wire` writes records natively -- spell an atom as
+/// its name, so `"circle"` is what `:circle` wrote, and there is then no
+/// atom to look up for it.
+priv let as_written : :any -> :any;
+priv let as_written v = {
+    let fields = types.record_fields v;
+    if not (types.is_variant v) { fields }
+    else {
+        let id = to_string (types.record_id v);
+        let tag = list.last (str.split "." (str.slice 1 (str.byte_length id - 1) id));
+        if list.is_empty fields { tag } else { list.cons tag fields }
+    }
 };
 
 /// The value as one whole message: what `decode` reads back, and what `frame`

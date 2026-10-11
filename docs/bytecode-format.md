@@ -201,6 +201,14 @@ lazy VM cannot work out for itself:
 | 78 | `bnot` | operand node | — | — |
 | 79 | `shl` | left node | count node | — |
 | 80 | `shr` | left node | count node | — |
+| 81 | `record_make` | kids offset | field count | atom index, top bit set for a variant |
+
+`record_make` builds a value of a declared `group`, `struct` or union variant
+(`RecordObj`): the fields in a lazy position, as `array`'s items are, and the
+atom naming the declaration -- `app.Point`, or `app.Shape.circle` with
+`c`'s top bit set. Validation checks the kids and that the atom index is in
+the atom table. A part of a parallel build numbers atoms for itself, so the
+merge renumbers this operand as it does `atom`'s.
 
 
 `type_is` forces its subject to WHNF and compares its runtime type, answering a
@@ -506,6 +514,8 @@ Later appends: `_sort_keyed` (50), `_tensor_matmul` (51) and `_str_interp`
 (52), the last the builtin behind opcode 74, which an interpolated string
 `$"..{x}.."` lowers to directly: one kid, the list of its pieces. Then `_mailbox_peek!`,
 `_mailbox_take!`, `_await_message!`, `_deadline_in!` (53-56), `_match_fail`
-(57) and `_error_trace!` (58).
+(57) and `_error_trace!` (58). Then `_tensor_of_bytes` (59), and the record
+primitives `_record_is` (60), `_record_id` (61), `_record_fields` (62) and
+`_record_of` (63).
 
 Images importing the removed `std.core` or `std.native` modules must be recompiled.

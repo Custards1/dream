@@ -114,11 +114,11 @@ when test {
 
     let here = build.Target.make :linux :x86_64;
     let ctx = build.Context.new "p" "1" "/p" here here;
-    let step_of a = list.nth 1 a;
+    let step_of a = a.[0];
 
     let tests = [
         test.case "a probe asks one question and never fails"
-            $( test.eq! [[:find, "git", "answer"]]
+            $( test.eq! [build.Op.find "git" "answer"]
                         (build.Step.action (step_of (program ctx "git")) (build.Job.make "/d" ctx (%{}))) ),
         test.case "llvm's answers are one record, or none"
             $( test.eq! [(), %{ :version => "21.1.8", :includes => "/i", :libdir => "/l",

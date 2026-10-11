@@ -381,7 +381,7 @@ let build! l out shebang depfile specs said o = {
         // Set here, on the image this command writes, and never in
         // `compile.image`: a `comp` runs an image of the same program on the
         // compiler's own VM, and a cross-build's target is not that machine.
-        let img = (compile.image b).[:target_flags => target.flags aimed];
+        let img = ir.Image.set_target_flags (target.flags aimed) (compile.image b);
         let payload_bytes = list.sum sizes;
         // The shebang goes in front of the image rather than into it: the VM
         // skips a leading `#!` line when it loads a file, which is what makes
@@ -417,8 +417,8 @@ let build! l out shebang depfile specs said o = {
                     console.error! ("compiled -> " + out + " ("
                                 + to_string (str.byte_length bytes + payload_bytes)
                                 + " bytes, " + to_string (modules.module_count l)
-                                + " modules, " + to_string (list.length (img.[:nodes else []]))
-                                + " nodes, " + to_string (list.length (img.[:funcs else []]))
+                                + " modules, " + to_string (list.length (ir.Image.nodes img))
+                                + " nodes, " + to_string (list.length (ir.Image.funcs img))
                                 + " functions"
                                 + (if target.is_any aimed { "" }
                                    else { ", for " + target.describe aimed })
@@ -448,12 +448,12 @@ let show_stats! l = {
     // Both counts, because the interesting number about the arena is how much
     // of it was the same node written again: `nodes` is what the image carries
     // and `lowered` is what lowering emitted to get there.
-    count! "nodes" (list.length (img.[:nodes else []]))
+    count! "nodes" (list.length (ir.Image.nodes img))
     count! "lowered" (list.length (lowered.[:nodes else []]))
-    count! "constants" (list.length (img.[:ints else []])
-                       + list.length (img.[:floats else []])
-                       + list.length (img.[:strs else []])
-                       + list.length (img.[:atoms else []]))
+    count! "constants" (list.length (ir.Image.ints img)
+                       + list.length (ir.Image.floats img)
+                       + list.length (ir.Image.strs img)
+                       + list.length (ir.Image.atoms img))
     count! "reductions" (vm.reductions! ())
     print_diags! (modules.files l) (list.append (modules.diags l) (scope.r_diags r))
 };
@@ -572,7 +572,7 @@ let show_time! o file = {
     line! "total" total ()
     console.print! ("image     " + to_string (str.byte_length bytes) + " bytes, "
                     + to_string (modules.module_count l) + " modules, "
-                    + to_string (list.length (img.[:nodes else []])) + " nodes"
+                    + to_string (list.length (ir.Image.nodes img)) + " nodes"
                     + " (from " + to_string (list.length (lowered.[:nodes else []])) + ")")
     show_macros! l
     print_diags! (modules.files l) (list.append (list.append (modules.diags l) (lower.all_diags r low))
@@ -762,20 +762,20 @@ let show_at! l file line col = {
 /// One resolution, in the terms a person reading it would use.
 let describe_resolution l r found =
     match found {
-        [:local, slot, span] => "local, slot " + to_string slot
+        scope.Meaning.local(slot, span) => "local, slot " + to_string slot
                                 + ", bound at byte " + to_string (ast.span_start span),
-        [:capture, idx, _] => "captured from an enclosing function, capture " + to_string idx,
-        [:global, mi, name, g] =>
+        scope.Meaning.capture(idx, _) => "captured from an enclosing function, capture " + to_string idx,
+        scope.Meaning.global(mi, name, g) =>
             "global `" + name + "` of module " + modules.module_name (modules.module_at l mi)
             + ", index " + to_string g,
-        [:builtin, name] => "builtin `" + name + "`",
-        [:member, [:dream, target], field, g] =>
+        scope.Meaning.builtin(name) => "builtin `" + name + "`",
+        scope.Meaning.member(scope.Ref.dream(target), field, g) =>
             "`" + field + "` of module " + modules.module_name (modules.module_at l target)
             + ", global " + to_string g,
-        [:member, [:native, p, _], field, _] => "`" + field + "` of the host module `" + p + "`",
-        [:closure, fi] => "a closure over function " + to_string fi,
-        [:thunk, fi] => "a thunk over function " + to_string fi,
-        [:match, slot] => "the subject of a match, held in slot " + to_string slot,
+        scope.Meaning.member(scope.Ref.native(p, _), field, _) => "`" + field + "` of the host module `" + p + "`",
+        scope.Meaning.closure(fi) => "a closure over function " + to_string fi,
+        scope.Meaning.thunk(fi) => "a thunk over function " + to_string fi,
+        scope.Meaning.subject(slot) => "the subject of a match, held in slot " + to_string slot,
         other => to_string other,
     };
 

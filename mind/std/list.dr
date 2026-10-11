@@ -390,7 +390,7 @@ when test {
         // The right side is never walked, which is what lets `concat` run
         // down a list of lists that has no end.
         test.case "append keeps the right lazy"
-            $( test.eq! 1 (head (append [1] (map (fn x -> x / 0) (range 0 3)))) ),
+            $( test.eq! 1 (head (append [1] (map (fn _ -> test.boom) (range 0 3)))) ),
         test.case "reverse"             $( test.eq! [3, 2, 1] (reverse [1, 2, 3]) ),
         test.case "reverse of empty"    $( test.empty! (reverse []) ),
         test.case "range"               $( test.eq! [1, 2, 3] (range 1 4) ),

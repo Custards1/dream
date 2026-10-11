@@ -94,7 +94,7 @@ priv let episodes : [Stage] -> :integer -> :integer -> :integer -> :integer;
 priv let episodes stages gap !n !since = match stages {
     [] => n,
     [s, ..rest] => match s {
-        :rem => episodes rest gap (if since > gap { n + 1 } else { n }) 0,
+        Stage.rem => episodes rest gap (if since > gap { n + 1 } else { n }) 0,
         _ => episodes rest gap n (since + 1),
     },
 };
@@ -154,7 +154,7 @@ priv let pad : :string -> :string;
 priv let pad name = str.repeat (4 - str.length name) " " + name;
 
 priv let mark : Stage -> :string;
-priv let mark s = match s { :wake => "^", :rem => "=", :n1 => "-", :n2 => "_", :n3 => "#" };
+priv let mark s = match s { Stage.wake => "^", Stage.rem => "=", Stage.n1 => "-", Stage.n2 => "_", Stage.n3 => "#" };
 
 /// The stage most of `stages` are; the earlier in class order on a tie.
 let commonest : [Stage] -> Stage;

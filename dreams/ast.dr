@@ -19,45 +19,94 @@ import std.list;
 
 // --- spans ------------------------------------------------------------------
 
-group Span derive dreams.source_range { span_start, span_end }
+// A span is `[start, end]`: a pair, not a record. It is syntax, and syntax is
+// ordinary lists -- a macro builds and reads it as freely as the parser does,
+// and a `group` is a value of its own now, which a macro's `[0, 3]` is not
+// (see "Records are values of their own" in docs/notes/static-types.md).
+mod Span {
+    derive dreams.source_range;
 
-let span_of = Span.make;
-let span_start s = Span.span_start s;
-let span_end s = Span.span_end s;
+    let span_start self = self.[0];
+    let span_end self = self.[1];
+}
+
+/// `[start, end]` in bytes.
+type Span = [:integer, :integer];
+
+// --- what the tree is made of -------------------------------------------------
+//
+// Names for the kinds of node, so that a signature can say which it takes. A
+// node is a list and that is all these promise: what a node holds is the
+// business of the `match` that takes it apart, and a union of every form,
+// checked at every constructor, would cost the checker more than it found.
+
+/// An expression: `[form, .., span]`.
+type Expr = [:any];
+/// A pattern, of the forms below `--- patterns`.
+type Pattern = [:any];
+/// A module's item, or a block's statement.
+type Decl = [:any];
+/// `[name, span]`; `[(), span, pattern]` for one written as a pattern; and
+/// `[name, span, (), :strict]` for one forced on entry.
+type Param = [:any];
+/// `[pattern, guard, body, span]`, the guard `()` when there is none.
+type Arm = [:any];
+
+let span_of : :integer -> :integer -> Span;
+let span_of a b = [a, b];
+let span_start : Span -> :integer;
+let span_start s = s.[0];
+let span_end : Span -> :integer;
+let span_end s = s.[1];
 
 /// The span covering both, for a node built out of two others.
+let span_to : Span -> Span -> Span;
 let span_to a b = [span_start a, span_end b];
 
-let no_span = Span.make 0 0;
+let no_span : Span;
+let no_span = [0, 0];
 
 // --- expressions ------------------------------------------------------------
 //
 // The constructors exist so that the shape is written down once. A pass that
 // reads the tree matches on it directly rather than going through accessors.
 
+let int_e : :integer -> Span -> Expr;
 let int_e v span        = [:int, v, span];
+let float_e : :float -> Span -> Expr;
 let float_e v span      = [:float, v, span];
+let char_e : :char -> Span -> Expr;
 let char_e c span       = [:char, c, span];
+let bool_e : :bool -> Span -> Expr;
 let bool_e b span       = [:bool, b, span];
+let str_e : :string -> Span -> Expr;
 let str_e s span        = [:str, s, span];
+let atom_e : :string -> Span -> Expr;
 let atom_e name span    = [:atom, name, span];
+let unit_e : Span -> Expr;
 let unit_e span         = [:unit, span];
 
 /// A bare name. A trailing `!` is part of `name` and is what marks it impure.
+let name_e : :string -> Span -> Expr;
 let name_e name span    = [:name, name, span];
 
 /// `obj.field` -- module member access, and nothing else.
+let field_e : Expr -> :string -> Span -> Expr;
 let field_e obj name span = [:field, obj, name, span];
 
 /// Curried application: `f a b` is one node with two arguments.
+let apply_e : Expr -> [Expr] -> Span -> Expr;
 let apply_e callee args span = [:apply, callee, args, span];
 
 /// `lhs |> f a`. Kept as its own node rather than desugared here, because
 /// lowering folds it into a *single* application -- which is what lets a
 /// variadic native take everything at the call site.
+let pipe_e : Expr -> Expr -> Span -> Expr;
 let pipe_e lhs rhs span = [:pipe, lhs, rhs, span];
 
+let unary_e : :atom -> Expr -> Span -> Expr;
 let unary_e op e span      = [:unary, op, e, span];
+let binary_e : :atom -> Expr -> Expr -> Span -> Expr;
 let binary_e op l r span   = [:binary, op, l, r, span];
 
 /// `a @ b` -- the matrix product, or the dot product of two vectors. Not a
@@ -72,6 +121,7 @@ let binary_e op l r span   = [:binary, op, l, r, span];
 /// A name is known by where it is written -- resolution and the language
 /// server both key on it -- and the whole expression starts where `l` does,
 /// so a name given that span was resolved as `l`.
+let matmul_e : Expr -> Expr -> Span -> Span -> Expr;
 let matmul_e l r at span = apply_e (name_e "_tensor_matmul" at) [l, r] span;
 
 /// `$"a {x} b"`: the pieces in order -- the literal text as strings, the
@@ -79,44 +129,60 @@ let matmul_e l r at span = apply_e (name_e "_tensor_matmul" at) [l, r] span;
 /// unary operator over the list of pieces, as `::` is a binary one, so every
 /// pass that walks expressions already walks into the pieces; only the
 /// lowering knows it is the `str_interp` opcode.
+let interp_e : [Expr] -> Span -> Expr;
 let interp_e pieces span = unary_e :interp (list_e pieces span) span;
 
 /// `else` is optional; a missing one is `()`.
+let if_e : Expr -> Expr -> Expr | :unit -> Span -> Expr;
 let if_e cond then_e else_e span = [:if, cond, then_e, else_e, span];
 
 /// `{ stmt* }` -- the value is the last statement, or `()` when empty.
+let block_e : [Decl] -> Span -> Expr;
 let block_e stmts span  = [:block, stmts, span];
 
 /// `$( e )` -- suspended, and a value in its own right.
+let thunk_e : Expr -> Span -> Expr;
 let thunk_e e span      = [:thunk, e, span];
 
+let try_e : Expr -> :string -> Expr -> Span -> Expr;
 let try_e body binder handler span = [:try, body, binder, handler, span];
+let lambda_e : [Param] -> Expr -> Span -> Expr;
 let lambda_e params body span      = [:lambda, params, body, span];
 
 /// `comp e` is evaluated by the compiler; `comp! e` by running it on a VM.
+let comp_e : :bool -> Expr -> Span -> Expr;
 let comp_e impure e span = [:comp, impure, e, span];
+let expand_e : Expr -> Span -> Expr;
 let expand_e e span = [:expand, e, span];
 
+let list_e : [Expr] -> Span -> Expr;
 let list_e items span   = [:list, items, span];
+let array_e : [Expr] -> Span -> Expr;
 let array_e items span  = [:array, items, span];
+let map_e : [[Expr]] -> Span -> Expr;
 let map_e pairs span    = [:map, pairs, span];
 
+let match_e : Expr -> :list -> Span -> Expr;
 let match_e scrutinee arms span = [:match, scrutinee, arms, span];
 
 /// `c.[k]`, and `c.[k else d]` with something to answer when nothing is at the
 /// key -- `()` when there is not. A map is read by key, an array or a list by
 /// position.
+let get_e : Expr -> Expr -> Expr | :unit -> Span -> Expr;
 let get_e container key fallback span = [:get, container, key, fallback, span];
 
 /// `c.[k => v]` -- the container changed at `k`. The one it was given is left
 /// alone, as every value is.
+let set_e : Expr -> Expr -> Expr -> Span -> Expr;
 let set_e container key value span = [:set, container, key, value, span];
 
 // --- reading a node ---------------------------------------------------------
 
+let kind : [:any] -> :atom;
 let kind e = e.[0];
 
 /// Every node keeps its span last, however many fields it has.
+let span : [:any] -> Span;
 let span e = list.last e;
 
 // --- operators --------------------------------------------------------------
@@ -139,6 +205,7 @@ let binops = [
 /// The bitwise operators sit where Python puts them, between the comparisons
 /// and arithmetic, so `x & 1 == 0` tests the low bit and `1 << n - 1` shifts by
 /// `n - 1`; and above `::`, so `n & 1 :: bits` puts the bit on the front.
+let precedence : :atom -> :integer;
 let precedence op =
     match op {
         :or  => 0,
@@ -159,6 +226,7 @@ let precedence op =
 /// reading would cons a list onto a number. It sits below `+` so that
 /// `n - 1 :: rest` puts the difference at the front, and above the comparisons
 /// so that `x :: xs == ys` compares the lists.
+let right_assoc : :atom -> :bool;
 let right_assoc op = op == :cons;
 
 /// The operator a token kind stands for, or `()` when it is not one.
@@ -168,6 +236,7 @@ let right_assoc op = op == :cons;
 /// cons cells and two calls per candidate to answer a question about one atom:
 /// it was seven percent of everything the compiler did. The table stays as the
 /// documentation of what an operator is; this is how it is looked up.
+let infix_of : :atom -> :atom | :unit;
 let infix_of token_kind =
     match token_kind {
         :or_or   => :or,  :and_and => :and,
@@ -188,12 +257,14 @@ let infix_of token_kind =
 
 /// A parameter is a name, or `()` -- a slot that binds nothing, which is what
 /// `let now! () = ..` uses.
+let param : :string | :unit -> Span -> Param;
 let param name span = [name, span];
 let param_name p = list.nth 0 p;
 
 /// A parameter written as a pattern: `let f [a, b] = ..`. It is a slot like any
 /// other -- the argument arrives in it -- and its name is `()`, because nothing
 /// is bound to the argument whole; the body sees what the pattern binds.
+let pattern_param : Pattern -> Span -> Param;
 let pattern_param pattern span = [(), span, pattern];
 
 /// A parameter forced when the function is entered: `!acc`, or `(strict acc)`.
@@ -207,17 +278,23 @@ let pattern_param pattern span = [(), span, pattern];
 /// a value by the time the next suspension is made of it. Only a name may be
 /// strict; the marker rides in a fourth element that every reader of a plain
 /// name parameter ignores.
+let strict_param : :string -> Span -> Param;
 let strict_param name span = [name, span, (), :strict];
+let param_strict : Param -> :bool;
 let param_strict p = match p { [_, _, _, :strict] => true, _ => false };
 
 /// The pattern a parameter takes apart, or `()` for one that is a name.
+let param_pattern : Param -> Pattern | :unit;
 let param_pattern p = match p { [_, _, pattern] => pattern, _ => () };
 
 /// `let name params = body`. `rec` is recorded even though a top-level `let`
 /// is always visible to itself, because it documents intent where it is used.
+let priv_d : Decl -> Span -> Decl;
 let priv_d declaration span = [:priv, declaration, span];
 
+let let_d : :string -> [Param] -> Expr -> :bool -> Span -> Decl;
 let let_d name params body is_rec span = [:let, name, params, body, is_rec, span];
+let macro_d : :string -> [Param] -> Expr -> Span -> Decl;
 let macro_d name params body span = [:macro, name, params, body, span];
 /// The backing kind is `:list`, `:array` or `:map`.
 /// One field of a record: the parameter its constructor takes, and what an
@@ -228,14 +305,21 @@ let macro_d name params body span = [:macro, name, params, body, span];
 /// so a field's default is spliced straight into the read. A default of `()`
 /// *written by the author* is `[:unit, span]` and not this, so the two do not
 /// collide.
-group RecordField { param, default }
-
-let record_field = RecordField.make;
-let field_param f = RecordField.param f;
-let field_default f = RecordField.default f;
+///
+/// `[param, default]`, or `[param, default, type]` once a type is written --
+/// a list, as every piece of syntax is, so that a macro can make one.
+let record_field : Param -> Expr | :unit -> [:any];
+let record_field param default = [param, default];
+let field_param : [:any] -> Param;
+let field_param f = f.[0];
+let field_default : [:any] -> Expr | :unit;
+let field_default f = f.[1];
 // Older syntax and macros keep their two-element fields.
+let field_type : [:any] -> Expr | :unit;
 let field_type f = f.[2 else ()];
+let field_name : [:any] -> :string;
 let field_name f    = param_name (list.nth 0 f);
+let field_span : [:any] -> Span;
 let field_span f    = list.nth 1 (list.nth 0 f);
 
 /// A member of a record: `say_hi self = "hi " + name self`. It is an ordinary
@@ -254,14 +338,20 @@ let field_span f    = list.nth 1 (list.nth 0 f);
 /// Having parameters is also what tells a member from a field: `x = 0` is a
 /// field with a default and `f self = 0` is a member, and nothing else has to
 /// be written to say which was meant.
-group RecordMember { name, params, body, span }
+///
+/// `[name, params, body, span]`, a list for the reason a field is.
+let record_member : :string -> [Param] -> Expr -> Span -> [:any];
+let record_member name params body span = [name, params, body, span];
+let member_name : [:any] -> :string;
+let member_name m = m.[0];
+let member_params : [:any] -> [Param];
+let member_params m = m.[1];
+let member_body : [:any] -> Expr;
+let member_body m = m.[2];
+let member_span : [:any] -> Span;
+let member_span m = m.[3];
 
-let record_member = RecordMember.make;
-let member_name m = RecordMember.name m;
-let member_params m = RecordMember.params m;
-let member_body m = RecordMember.body m;
-let member_span m = RecordMember.span m;
-
+let record_d : :atom -> :string -> [[:any]] -> [[:any]] -> Span -> Decl;
 let record_d kind name fields members span = [:record, kind, name, fields, members, [], span];
 
 /// `let name : type` -- a signature: what `name` promises to be, written in the
@@ -270,6 +360,7 @@ let record_d kind name fields members span = [:record, kind, name, fields, membe
 /// lowering and every pass after them walk past it, so a signature costs the
 /// compiled program nothing and changes no image. `let f x : t = ..` is read as
 /// a signature and a `let` side by side -- see `parse_let`.
+let sig_d : :string -> Expr -> Span -> Decl;
 let sig_d name t span = [:sig, name, t, span];
 
 /// `union Name params { variant(field : t, ..), .., member self = .. }`: a
@@ -278,9 +369,11 @@ let sig_d name t span = [:sig, name, t, span];
 ///
 /// A variant is `[name, span, fields]` and a field `[name, span, type]`, with
 /// `()` for a field written without a type.
+let union_d : :string -> [Param] -> [[:any]] -> [[:any]] -> Span -> Decl;
 let union_d name params variants members span = [:union_decl, name, params, variants, members, :list, span];
 /// `union struct Shape { .. }`: the same union, its variants with fields
 /// arrays rather than lists -- what `struct` is to `group`.
+let array_union_d : :string -> [Param] -> [[:any]] -> [[:any]] -> Span -> Decl;
 let array_union_d name params variants members span = [:union_decl, name, params, variants, members, :array, span];
 /// `foreign name from lib { .. }`: a C library, which the loader rewrites into
 /// a module of bound functions, resource types and struct layouts
@@ -294,6 +387,7 @@ let array_union_d name params variants members span = [:union_decl, name, params
 ///     [:c_function, name, c type, symbol, span]
 ///
 /// where a C type is written in the type grammar and read by `syntax`.
+let foreign_d : :string -> Expr | :unit -> [[:any]] -> Span -> Decl;
 let foreign_d name library entries span = [:foreign_decl, name, library, entries, span];
 /// `image name from source { .. }`: another Dream image, which the loader
 /// rewrites into a module of functions bound in it (`syntax.image_decl`).
@@ -303,35 +397,48 @@ let foreign_d name library entries span = [:foreign_decl, name, library, entries
 ///
 /// where `target` is `module.member` in the image, or a bare member of its
 /// top-level module.
+let image_d : :string -> Expr -> [[:any]] -> Span -> Decl;
 let image_d name source entries span = [:image_decl, name, source, entries, span];
 
+let variant : :string -> Span -> [[:any]] -> [:any];
 let variant name span fields = [name, span, fields];
+let variant_name : [:any] -> :string;
 let variant_name v = list.nth 0 v;
+let variant_span : [:any] -> Span;
 let variant_span v = list.nth 1 v;
+let variant_fields : [:any] -> [[:any]];
 let variant_fields v = list.nth 2 v;
 
 /// `let [a, b] = pair` -- a `let` that binds what a pattern names. A node of
 /// its own rather than a `let` whose name is a pattern, because everything
 /// that reads a `let` reads its name as a string.
+let let_pattern_d : Pattern -> Expr -> Span -> Decl;
 let let_pattern_d pattern body span = [:let_p, pattern, body, span];
 
+let import_d : [:string] -> :string | :unit -> [[:any]] | :unit -> Span -> Decl;
 let import_d path alias names span = [:import, path, alias, names, span];
+let mod_d : :string -> [Decl] -> Span -> Decl;
 let mod_d name items span          = [:mod, name, items, span];
+let derive_d : [:string] -> Span -> Decl;
 let derive_d path span             = [:derive, path, span];
 
 /// `derive dyn path` in a record's header: its values carry the record's
 /// implementations of the base's `dyn` virtuals. Written beside the plain
 /// `derive` it comes with, so everything that only follows a derive -- the
 /// dependency walk, the inherited items -- needs to know nothing about it.
+let dispatch_d : [:string] -> Span -> Decl;
 let dispatch_d path span           = [:dispatch, path, span];
 
 /// `dyn` is true for `virtual dyn let`: called in the module that declares
 /// it, the virtual dispatches on its last argument (see "Dispatch" in
 /// docs/language-spec.md).
+let virtual_d : :string -> [Param] -> Expr | :unit -> :bool -> Span -> Decl;
 let virtual_d name params body dyn span = [:virtual, name, params, body, dyn, span];
+let when_d : [:any] -> [Decl] -> Span -> Decl;
 let when_d cond items span         = [:when, cond, items, span];
 
 /// The root returned by the parser for one source file.
+let module : [Decl] -> [:any];
 let module items = [:module, items];
 
 // --- patterns ---------------------------------------------------------------
@@ -340,8 +447,11 @@ let module items = [:module, items];
 // what keeps `match` usable on a lazy structure. That is lowering's business;
 // here they are only recorded.
 
+let wildcard_p : Span -> Pattern;
 let wildcard_p span     = [:wildcard, span];
+let bind_p : :string -> Span -> Pattern;
 let bind_p name span    = [:bind, name, span];
+let literal_p : Expr -> Span -> Pattern;
 let literal_p e span    = [:literal, e, span];
 /// `rest` is `()` for a fixed-length pattern, `[name, name_span]` for
 /// `[a, ..rest]`, and `[()]` for a `..` that matches the rest without naming it.
@@ -352,17 +462,37 @@ let literal_p e span    = [:literal, e, span];
 /// `[x, ..rest] as whole` the list, its rest and the whole `as` all begin at
 /// the `[`, so `rest` and `whole` were given one slot, and `whole` came out
 /// holding the rest.
+let cons_p : Pattern -> Pattern -> Span -> Span -> Pattern;
 let cons_p head tail operator_span span = [:cons_p, head, tail, operator_span, span];
+let list_p : [Pattern] -> [:any] | :unit -> Span -> Pattern;
 let list_p items rest span  = [:list_p, items, rest, span];
+let array_p : [Pattern] -> [:any] | :unit -> Span -> Pattern;
 let array_p items rest span = [:array_p, items, rest, span];
+let map_p : [[:any]] -> Span -> Pattern;
 let map_p pairs span        = [:map_p, pairs, span];
+let as_p : Pattern -> :string -> Span -> Span -> Pattern;
 let as_p inner name name_span span = [:as_p, inner, name, name_span, span];
+/// `Shape.circle(r)`, `Shape.empty`, `Point(x, y)`: a value made by one
+/// constructor, with its fields taken apart by position. `ctor` is the
+/// constructor as an expression -- a name or a dotted member, resolved the
+/// way any name is -- and `fields` the patterns for its fields, empty for a
+/// variant that has none. What makes it a test is the id the constructor
+/// stamps on what it makes (`scope.wrapper_of`), so it matches values of
+/// that constructor and nothing else: never a list or an array, however
+/// alike they look. See "Records are values of their own" in
+/// docs/notes/static-types.md.
+let record_p : Expr -> [Pattern] -> Span -> Pattern;
+let record_p ctor fields span = [:record_p, ctor, fields, span];
 
 /// One `pattern => body`, with an optional guard checked after the pattern
 /// matched, so it can use what the pattern bound.
+let arm : Pattern -> Expr | :unit -> Expr -> Span -> Arm;
 let arm pattern guard body span = [pattern, guard, body, span];
+let arm_pattern : Arm -> Pattern;
 let arm_pattern a = list.nth 0 a;
+let arm_guard : Arm -> Expr | :unit;
 let arm_guard a   = list.nth 1 a;
+let arm_body : Arm -> Expr;
 let arm_body a    = list.nth 2 a;
 
 // --- tests -------------------------------------------------------------------
@@ -430,18 +560,22 @@ import std.str;
 /// A string as it would be written in source. `to_string` is the identity on
 /// a plain string, which in a dump loses the very thing that tells a string
 /// from a name -- `(str hi)` and `(name hi)` should not look alike.
+let quote_str : :string -> :string;
 let quote_str s =
-    "\"" + str.join_str "" (list.map (fn ch ->
-        if ch == '"' { "\\\"" }
-        else if ch == '\\' { "\\\\" }
-        else if ch == '\n' { "\\n" }
-        else if ch == '\t' { "\\t" }
-        else { str.of_chars [ch] }) (str.chars s)) + "\"";
+    "\"" + str.join_str "" (list.map (fn ch -> match ch {
+        '"' => "\\\"",
+        '\\' => "\\\\",
+        '\n' => "\\n",
+        '\t' => "\\t",
+        _ => str.of_chars [ch],
+    }) (str.chars s)) + "\"";
 
 /// An atom's name, without the leading `:`. Operators are atoms, and a tree
 /// reads better with `(binary add ..)` than `(binary :add ..)`.
+let atom_name : :atom -> :string;
 let atom_name a = { let s = to_string a; str.slice 1 (str.byte_length s - 1) s };
 
+let show : [:any] -> :string;
 let rec show e =
     match e {
         [:int, v, _]        => "(int " + to_string v + ")",
@@ -536,9 +670,11 @@ let rec show e =
     }
 ;
 
+let show_all : [[:any]] -> :string;
 let show_all xs = str.join_str " " (list.map (fn x -> show x) xs)
 ;
 
+let show_params : [Param] -> :string;
 let show_params ps =
     str.join_str " " (list.map (fn p ->
         match param_pattern p {
@@ -563,6 +699,7 @@ let show_arm a =
         + " " + show (arm_body a) + "]"
 ;
 
+let show_pattern : Pattern -> :string;
 let rec show_pattern p =
     match p {
         [:wildcard, _]      => "_",
@@ -575,6 +712,9 @@ let rec show_pattern p =
             "%{" + str.join_str " " (list.map (fn kv -> show (list.nth 0 kv) + " => "
                                                         + show_pattern (list.nth 1 kv)) pairs) + "}",
         [:as_p, inner, n, _, _] => "(" + show_pattern inner + " as " + n + ")",
+        [:record_p, ctor, fields, _] =>
+            show ctor + (if list.is_empty fields { "" }
+                         else { "(" + str.join_str ", " (list.map show_pattern fields) + ")" }),
         other => "?" + to_string (other.[0]),
     }
 ;
@@ -599,6 +739,7 @@ let show_import_names ns =
 
 /// A `when` condition. The vocabulary is the language's own, so it renders
 /// the same way the rest of the tree does.
+let show_cfg : [:any] -> :string;
 let rec show_cfg c =
     match c {
         [:const, b]        => "(const " + to_string b + ")",

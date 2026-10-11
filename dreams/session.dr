@@ -146,23 +146,30 @@ let carried_ok slice =
 
 let ast_record item = match item { [:record, _, _, _, _, _, _] => true, _ => false };
 
-/// Which way to compile an entry, decided before anything is loaded:
-/// `:reboot` -- nothing carried, or the prefix the engine stands for no longer
-/// starts the new program. The engine's `base_text` is the whole of what the
-/// session was *before* this entry's transient `main!`, so appending a `let`
-/// keeps the prefix and proceeds, while adding an import -- which is inserted
-/// before the definitions rather than after them -- breaks it and reboots.
-/// `[:proceed, items]` is the prefix holding and the entry only adding `let`s;
-/// `:fresh` is a text that will not parse, or a slice that needs a full build.
+/// Which way to compile an entry, decided before anything is loaded.
+union Route {
+    // Nothing carried, or the prefix the engine stands for no longer starts
+    // the new program. The engine's `base_text` is the whole of what the
+    // session was *before* this entry's transient `main!`, so appending a
+    // `let` keeps the prefix and proceeds, while adding an import -- which is
+    // inserted before the definitions rather than after them -- breaks it and
+    // reboots.
+    reboot
+    // The prefix holding, and the entry only adding `let`s.
+    proceed(items)
+    // A text that will not parse, or a slice that needs a full build.
+    fresh
+}
+
 let route text base_text engine base =
     match parser.parse_module text {
-        [:error, _, _] => :fresh,
+        [:error, _, _] => Route.fresh,
         [:ok, items, _] => match true {
-            _ if expansion.has_expansion items || list.any ast_record items => :fresh,
-            _ if engine == () => :reboot,
-            _ if not (str.starts_with (engine_base_text engine) text) => :reboot,
-            _ if carried_ok (list.head (entry_partition items base)) => [:proceed, items],
-            _ => :fresh,
+            _ if expansion.has_expansion items || list.any ast_record items => Route.fresh,
+            _ if engine == () => Route.reboot,
+            _ if not (str.starts_with (engine_base_text engine) text) => Route.reboot,
+            _ if carried_ok (list.head (entry_partition items base)) => Route.proceed items,
+            _ => Route.fresh,
         },
     };
 
@@ -211,11 +218,12 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
 
     // The linked lists go into the program only long enough for the compile-time
     // expressions to be evaluated against a complete image.
-    let stuffed = ((((((lower.prog (list.head li))).[:funcs => funcs1])).[:globals => globals1])).[:imports => imports1];
+    let stuffed = lower.prog (list.head li)
+        |> ir.Program.set_funcs funcs1 |> ir.Program.set_globals globals1 |> ir.Program.set_imports imports1;
     let settled = lower.settle_comps! (lower.set_prog stuffed (list.head li));
     // Nothing may re-evaluate these: the values are nodes in the arena now, and
     // re-running a `comp!` would be an effect happening a second time.
-    let low1 = settled.[:pending_comp => []];
+    let low1 = (settled |> lower.Lowering.set_pending_comp ([]));
 
     let ds = list.append (list.append (modules.diags l) (scope.diags state1))
                          (list.append (scope.r_diags r1) (lower.l_diags low1));
@@ -250,7 +258,7 @@ let rec main_step! l mi main_item en source image = {
     let lg = lower.link_globals_from r2 (list.head lm) (list.length (engine_globals en));
     let funcs2 = list.append (engine_funcs en) (list.nth 1 lm);
     let globals2 = list.append (engine_globals en) (list.nth 1 lg);
-    let p2 = ((((lower.prog (list.head lg))).[:funcs => funcs2])).[:globals => globals2];
+    let p2 = lower.prog (list.head lg) |> ir.Program.set_funcs funcs2 |> ir.Program.set_globals globals2;
     let low2 = lower.settle_comps! (lower.set_prog p2 (list.head lg));
 
     let ds = list.append (list.append (modules.diags l) (scope.diags state2))
@@ -278,7 +286,11 @@ let finalize! l mi en low2 r2 funcs2 globals2 source image = {
            :globals_count => list.length globals2 - engine_root_from en,
            :flags => 0, :derives => ir.no_node };
     let p =
-        ((((((((lower.prog (list.head sourced))).[:modules => (list.append (engine_modules en) [root_rec])])).[:entry => (lower.find_entry l r2)])).[:module_name => (list.nth 1 named)])).[:source_name => (list.nth 1 sourced)];
+        lower.prog (list.head sourced)
+            |> ir.Program.set_modules (list.append (engine_modules en) [root_rec])
+            |> ir.Program.set_entry (lower.find_entry l r2)
+            |> ir.Program.set_module_name (list.nth 1 named)
+            |> ir.Program.set_source_name (list.nth 1 sourced);
     if write_file! image (emit.to_binary (ir.finish p)) { [:ok, image] }
     else { [:error, "dreams: cannot write " + image] }
 };
@@ -301,7 +313,10 @@ let boot! roots cfg source image text base_text engine base = {
     // diagnostics: those are checked from the scope state itself, which is how
     // a carried entry sees its own declaration errors too.
     let r0 =
-        ((((((scope.resolver (scope.envs state1))).[:imports => (scope.s_imports state1)])).[:module_recs => (scope.s_module_recs state1)])).[:diags => []];
+        ((scope.resolver (scope.envs state1))
+            |> scope.Resolution.set_imports (scope.s_imports state1)
+            |> scope.Resolution.set_module_recs (scope.s_module_recs state1)
+            |> scope.Resolution.set_diags ([]));
     let low0 = lower.lowering r0 ir.program 0;
     let pre_ = pre scope.state r0 low0 (scope.next_global state_deps) [] [] [] [] true;
     match compile_slice! l mi state1 pre_ (list.length slice)
@@ -359,9 +374,9 @@ let compile! roots cfg source image text base_text engine base =
         false => [[:error, "dreams: cannot write " + source], engine, base],
         true =>
             match route text base_text engine base {
-                :reboot => boot! roots cfg source image text base_text engine base,
-                [:proceed, items] => proceed! source image items engine base_text base,
-                :fresh => fresh_build! roots cfg source image text engine base,
+                Route.reboot => boot! roots cfg source image text base_text engine base,
+                Route.proceed(items) => proceed! source image items engine base_text base,
+                Route.fresh => fresh_build! roots cfg source image text engine base,
             },
     };
 
@@ -387,9 +402,9 @@ when test {
 
         // --- routing ---
         test.case "no carried engine re-boots"
-            $( test.eq! :reboot (route "let main! = ();" "let main! = ();" () 0) ),
+            $( test.eq! Route.reboot (route "let main! = ();" "let main! = ();" () 0) ),
         test.case "an import inserted before the definitions re-boots"
-            $( test.eq! :reboot
+            $( test.eq! Route.reboot
                         (route "import std.console;\nimport std.io;\nlet a = 1;\nlet main! = ();"
                                "import std.console;\nimport std.io;\nlet a = 1;"
                                (engine () () () () 2 0 [] [] [] []
@@ -399,15 +414,15 @@ when test {
                            "import std.console;\nlet a = 1;\nlet b = 2;"
                            (engine () () () () 2 0 [] [] [] []
                                    "import std.console;\nlet a = 1;") 2 {
-                   [:proceed, _] => true,
+                   Route.proceed(_) => true,
                    _ => false,
                } ),
         test.case "a text that does not parse is a fresh build"
-            $( test.eq! :fresh
+            $( test.eq! Route.fresh
                         (route "let main! = let x" "let a = 1;"
                                (engine () () () () 1 0 [] [] [] [] "let a = 1;") 1) ),
         test.case "a slice that is not lets is a fresh build"
-            $( test.eq! :fresh
+            $( test.eq! Route.fresh
                         (route "mod m {\n    let x = 1;\n}\nlet main! = ();" ""
                                (engine () () () () 0 0 [] [] [] [] "") 0) ),
 

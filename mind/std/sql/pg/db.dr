@@ -272,18 +272,18 @@ let config_of conn = Conn.config conn;
 /// Answer whatever the server asks until it says the login succeeded.
 priv let authenticate! : Conn -> :unit;
 priv let rec authenticate! conn = match receive! conn {
-    [:authentication, 0, _] => (),
-    [:authentication, 3, _] => {
+    wire.Message.authentication(0, _) => (),
+    wire.Message.authentication(3, _) => {
         write! conn (wire.password (password! conn))
         authenticate! conn
     },
-    [:authentication, 5, salt] => {
+    wire.Message.authentication(5, salt) => {
         let c = Conn.config conn;
         let inner = crypto.md5_hex (password! conn + config.Config.user c);
         write! conn (wire.password ("md5" + crypto.md5_hex (inner + salt)))
         authenticate! conn
     },
-    [:authentication, 10, data] => {
+    wire.Message.authentication(10, data) => {
         let mechanisms = list.filter (fn m -> m != "") (str.split "\0" data);
         if list.contains "SCRAM-SHA-256" mechanisms { scram! conn }
         else {
@@ -292,13 +292,13 @@ priv let rec authenticate! conn = match receive! conn {
         }
         authenticate! conn
     },
-    [:authentication, code, _] =>
+    wire.Message.authentication(code, _) =>
         errors.fail! :unsupported_authentication
             ("the server asks for authentication method " + to_string code
              + " (Kerberos, GSSAPI or SSPI), which this client does not speak"),
-    [:error_response, fields] => raise! (errors.server fields),
-    [:negotiate_version, _, _] => authenticate! conn,
-    [:notice_response, _] => authenticate! conn,
+    wire.Message.error_response(fields) => raise! (errors.server fields),
+    wire.Message.negotiate_version(_, _) => authenticate! conn,
+    wire.Message.notice_response(_) => authenticate! conn,
     other => unexpected! "logging in" other,
 };
 
@@ -328,8 +328,8 @@ priv let scram! conn = {
 
 priv let sasl_step! : Conn -> :integer -> :string;
 priv let sasl_step! conn code = match receive! conn {
-    [:authentication, c, data] if c == code => data,
-    [:error_response, fields] => raise! (errors.server fields),
+    wire.Message.authentication(c, data) if c == code => data,
+    wire.Message.error_response(fields) => raise! (errors.server fields),
     other => unexpected! "during SCRAM" other,
 };
 
@@ -337,11 +337,11 @@ priv let sasl_step! conn code = match receive! conn {
 /// the first time it says it is ready.
 priv let settle! : Conn -> :map -> :integer -> :integer -> Conn;
 priv let rec settle! conn params pid secret = match receive! conn {
-    [:parameter_status, name, v] => settle! conn (params.[name => v]) pid secret,
-    [:backend_key, p, s] => settle! conn params p s,
-    [:notice_response, _] => settle! conn params pid secret,
-    [:error_response, fields] => raise! (errors.server fields),
-    [:ready, _] => Conn.make (Conn.socket conn) pid secret params (Conn.config conn),
+    wire.Message.parameter_status(name, v) => settle! conn (params.[name => v]) pid secret,
+    wire.Message.backend_key(p, s) => settle! conn params p s,
+    wire.Message.notice_response(_) => settle! conn params pid secret,
+    wire.Message.error_response(fields) => raise! (errors.server fields),
+    wire.Message.ready(_) => Conn.make (Conn.socket conn) pid secret params (Conn.config conn),
     other => unexpected! "starting up" other,
 };
 
@@ -417,22 +417,22 @@ priv let pending columns = Pending.make columns [] [] [] [] () [];
 
 priv let collect! : Conn -> Pending -> [:map];
 priv let rec collect! conn !p = match receive! conn {
-    [:row_description, cols] => collect! conn (Pending.set_columns cols p),
-    [:data_row, fields] => collect! conn (with_row p fields),
-    [:command_complete, tag] => collect! conn (closed conn p tag),
-    :empty_query => collect! conn (closed conn p ""),
-    [:copy_data, data] => collect! conn (with_copy p data),
-    [:copy_out_response, _, _] => collect! conn p,
-    :copy_done => collect! conn p,
-    [:copy_in_response, _, _] => {
+    wire.Message.row_description(cols) => collect! conn (Pending.set_columns cols p),
+    wire.Message.data_row(fields) => collect! conn (with_row p fields),
+    wire.Message.command_complete(tag) => collect! conn (closed conn p tag),
+    wire.Message.empty_query => collect! conn (closed conn p ""),
+    wire.Message.copy_data(data) => collect! conn (with_copy p data),
+    wire.Message.copy_out_response(_, _) => collect! conn p,
+    wire.Message.copy_done => collect! conn p,
+    wire.Message.copy_in_response(_, _) => {
         write! conn (wire.copy_fail "COPY FROM STDIN goes through db.copy_in!, which has rows to send")
         collect! conn p
     },
-    [:error_response, fields] => collect! conn (with_failure p (errors.server fields)),
-    [:notice_response, fields] => collect! conn (with_notice p fields),
-    [:notification, pid, channel, payload] =>
+    wire.Message.error_response(fields) => collect! conn (with_failure p (errors.server fields)),
+    wire.Message.notice_response(fields) => collect! conn (with_notice p fields),
+    wire.Message.notification(pid, channel, payload) =>
         collect! conn (with_notification p (Notification.make channel payload pid)),
-    [:ready, status] => finish! conn p status,
+    wire.Message.ready(status) => finish! conn p status,
     _ => collect! conn p,
 };
 
@@ -452,8 +452,13 @@ priv let with_notification p n = forced Pending.set_notifications (strict_cons n
 /// it is given, so without this a list grown a row at a time is a chain of
 /// suspended conses, each holding the one before, that only unwinds -- one
 /// frame per row -- when the result is finally read.
-priv let forced : (Pending -> :any -> Pending) -> Pending -> :any -> Pending;
-priv let forced set p !v = set p v;
+///
+/// The value is the second argument and the record the third, as the setter
+/// takes them. It was written the other way round, so `!v` forced the record
+/// and the list it was there for was stored suspended after all -- invisible
+/// while a `Pending` was a list too, and a type error once it was a record.
+priv let forced : (:any -> Pending -> Pending) -> :any -> Pending -> Pending;
+priv let forced set !v p = set v p;
 
 /// The first failure is the one that is raised; a later one is about the
 /// first.
@@ -653,23 +658,23 @@ priv let portal! : Conn -> :integer -> (a -> [:any] -> [[:any]] -> a) -> a -> [:
 priv let rec portal! conn batch step! !acc columns raw failure = {
     let message = try! { receive! conn } catch e { raise! (lost e) };
     match message {
-        [:row_description, cols] => portal! conn batch step! acc cols raw failure,
-        [:data_row, fields] => portal! conn batch step! acc columns (strict_cons fields raw) failure,
-        :portal_suspended => {
+        wire.Message.row_description(cols) => portal! conn batch step! acc cols raw failure,
+        wire.Message.data_row(fields) => portal! conn batch step! acc columns (strict_cons fields raw) failure,
+        wire.Message.portal_suspended => {
             let next = portal_step! conn step! acc columns raw;
             try! { write! conn (wire.execute "" batch + wire.flush) } catch e { raise! (lost e) }
             portal! conn batch step! next columns [] failure
         },
-        [:command_complete, _] => {
+        wire.Message.command_complete(_) => {
             let next = portal_step! conn step! acc columns raw;
             try! { write! conn wire.sync } catch e { raise! (lost e) }
             portal! conn batch step! next columns [] failure
         },
-        [:error_response, fields] => {
+        wire.Message.error_response(fields) => {
             try! { write! conn wire.sync } catch e { raise! (lost e) }
             portal! conn batch step! acc columns [] (errors.server fields)
         },
-        [:ready, _] => if failure == () { acc } else { raise! failure },
+        wire.Message.ready(_) => if failure == () { acc } else { raise! failure },
         _ => portal! conn batch step! acc columns raw failure,
     }
 };
@@ -806,10 +811,10 @@ let prepare_types! conn name text oids = {
 
 priv let described! : Conn -> Prepared -> :any -> Prepared;
 priv let rec described! conn p failure = match receive! conn {
-    [:parameter_description, oids] => described! conn (Prepared.set_parameters oids p) failure,
-    [:row_description, cols] => described! conn (Prepared.set_columns cols p) failure,
-    [:error_response, fields] => described! conn p (if failure == () { errors.server fields } else { failure }),
-    [:ready, _] => if failure == () { p } else { raise! failure },
+    wire.Message.parameter_description(oids) => described! conn (Prepared.set_parameters oids p) failure,
+    wire.Message.row_description(cols) => described! conn (Prepared.set_columns cols p) failure,
+    wire.Message.error_response(fields) => described! conn p (if failure == () { errors.server fields } else { failure }),
+    wire.Message.ready(_) => if failure == () { p } else { raise! failure },
     _ => described! conn p failure,
 };
 
@@ -871,9 +876,9 @@ priv let to_string_name t = if type_of t == :atom { value.atom_name t } else { t
 /// -- arrives instead, and is read to the end and answered.
 priv let copy_ready! : Conn -> :any -> :any;
 priv let rec copy_ready! conn failure = match receive! conn {
-    [:copy_in_response, _, _] => (),
-    [:error_response, fields] => copy_ready! conn (errors.server fields),
-    [:ready, _] => if failure == () { errors.client :protocol_violation "the server did not start a COPY" } else { failure },
+    wire.Message.copy_in_response(_, _) => (),
+    wire.Message.error_response(fields) => copy_ready! conn (errors.server fields),
+    wire.Message.ready(_) => if failure == () { errors.client :protocol_violation "the server did not start a COPY" } else { failure },
     _ => copy_ready! conn failure,
 };
 
@@ -955,8 +960,8 @@ let notify! conn channel payload = {
 /// this process, not a worker, until one arrives.
 let next_notification! : Conn -> Notification;
 let rec next_notification! conn = match receive! conn {
-    [:notification, pid, channel, payload] => Notification.make channel payload pid,
-    [:error_response, fields] => raise! (errors.server fields),
+    wire.Message.notification(pid, channel, payload) => Notification.make channel payload pid,
+    wire.Message.error_response(fields) => raise! (errors.server fields),
     _ => next_notification! conn,
 };
 

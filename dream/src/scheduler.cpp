@@ -360,6 +360,15 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
         }
     }
 
+    // The root failing is the end of the program, whoever else is still
+    // alive. Nothing can catch an error the root did not, and waiting for the
+    // rest -- the run's usual end -- reported it only once they had all ended:
+    // a program whose `main!` raised while a registry or a listener it started
+    // was still up printed nothing and never exited (examples/16_registry,
+    // about one run in forty). The deadlock check cannot see that case,
+    // because a listener is parked on IO and not on a message.
+    if (p->failed && p->id() == root_id_.load()) root_failed_.store(true);
+
     // Sent before `live_` drops, so a program whose last two processes are a
     // monitor and what it watches cannot be counted finished in between.
     for (uint64_t id : monitors) deliver(id, down_message(*p));
@@ -680,6 +689,7 @@ void Scheduler::dump(const char* why) const {
 }
 
 bool Scheduler::run(const std::shared_ptr<Process>& root) {
+    root_id_.store(root->id());
     enqueue(root);
     start();
     bool clean = wait_for_all();
@@ -699,7 +709,7 @@ bool Scheduler::wait_for_all() {
     std::unique_lock<std::mutex> lk(idle_mutex_);
     if (stuck_after <= 0.0) {
         done_cv_.wait(lk, [this] {
-            return live_.load() == 0 || deadlocked_.load() || !running_.load();
+            return live_.load() == 0 || deadlocked_.load() || root_failed_.load() || !running_.load();
         });
         return live_.load() == 0;
     }
@@ -709,7 +719,7 @@ bool Scheduler::wait_for_all() {
     for (;;) {
         auto period = std::chrono::duration<double>(stuck_after);
         bool done = done_cv_.wait_for(lk, std::chrono::duration_cast<std::chrono::milliseconds>(period), [this] {
-            return live_.load() == 0 || deadlocked_.load() || !running_.load();
+            return live_.load() == 0 || deadlocked_.load() || root_failed_.load() || !running_.load();
         });
         if (done) break;
         uint64_t now = total_reductions_.load();

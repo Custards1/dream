@@ -26,6 +26,6 @@ let main2! = {
     console.print! "Hello from curseu"
 
     let result = strict! recv! handle
-    console.print! "Hello from curseu, received " + to_string result
+    console.print! ("Hello from curseu, received " + to_string result)
     join! handle;
 };

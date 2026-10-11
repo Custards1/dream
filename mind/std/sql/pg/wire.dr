@@ -297,7 +297,7 @@ when test {
     let unframe f = [str.byte 0 f, str.slice 5 (bytes.u32_at f 1 - 4) f];
 
     let columns_in : Message -> [:any];
-    let columns_in m = match m { [:row_description, cs] => cs, _ => [] };
+    let columns_in m = match m { Message.row_description(cs) => cs, _ => [] };
 
     let tests = [
         test.case "a frame's length counts itself and not its type"
@@ -313,10 +313,10 @@ when test {
             $( test.eq! (str.of_bytes [0, 0, 0, 0, 0, 2, 0, 0, 0, 1] + "7" + bytes.be32 (-1) + bytes.be16 0)
                         (list.nth 1 (unframe (bind "" "" ["7", ()]))) ),
         test.case "ready, by what the status byte says"
-            $( test.eq! [[:ready, :idle], [:ready, :failed]]
+            $( test.eq! [Message.ready :idle, Message.ready :failed]
                         [decode 90 "I", decode 90 "E"] ),
         test.case "a data row keeps NULL apart from the empty string"
-            $( test.eq! [:data_row, ["1", (), ""]]
+            $( test.eq! (Message.data_row ["1", (), ""])
                         (decode 68 (bytes.be16 3 + bytes.be32 1 + "1" + bytes.be32 (-1) + bytes.be32 0)) ),
         test.case "a row description, column by column"
             $( test.eq! [["id", 23, 4, 16384, 1], ["no such atom here", 25, -1, 0, 0]]
@@ -332,13 +332,13 @@ when test {
         test.case "an error's fields, by name"
             $( test.eq! %{ :severity => "ERROR", :code => "42P01", :message => "nope" }
                         (match decode 69 "VERROR\0C42P01\0Mnope\0\0" {
-                             [:error_response, fields] => fields,
+                             Message.error_response(fields) => fields,
                              _ => %{},
                          }) ),
         test.case "a notification"
-            $( test.eq! [:notification, 7, "jobs", "go"]
+            $( test.eq! (Message.notification 7 "jobs" "go")
                         (decode 65 (bytes.be32 7 + "jobs\0go\0")) ),
         test.case "a message nobody knows is kept, not guessed at"
-            $( test.eq! [:unknown, 33, "x"] (decode 33 "x") ),
+            $( test.eq! (Message.unknown 33 "x") (decode 33 "x") ),
     ];
 }

@@ -1379,6 +1379,10 @@ static void test_builtin_table_matches_compiler() {
                               "_match_fail",
                               "_error_trace!",
                               "_tensor_of_bytes",
+                              "_record_is",
+                              "_record_id",
+                              "_record_fields",
+                              "_record_of",
     };
     const uint32_t n = uint32_t(sizeof(expected) / sizeof(expected[0]));
     CHECK_EQ(builtin_count(), n);

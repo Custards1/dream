@@ -36,6 +36,9 @@ end.
 - Reusing the frame of a self tail call: measured, and not built
 - A JIT that can allocate -- the plan, and how it was done instead
 - Spilling compiled frames: measured, and not kept
+- Strict arguments are evaluated where they stand
+- A pinned heap grew past its cap
+- Strict by default: the experiment
 
 The collector has a document of its own, [../gc.md](../gc.md), and "Collecting under compiled code" there is where the JIT and the collector meet.
 
@@ -111,6 +114,7 @@ The checker, compile-time contracts, and what a signature buys the JIT.
 
 - Compile-time contracts: a refinement run against a value the compiler has
 - What a signature buys the compiled code
+- Records are values of their own
 
 ## [The language server](lucid.md)
 

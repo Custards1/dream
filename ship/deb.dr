@@ -57,7 +57,7 @@ let field name value = if str.is_empty value { "" } else { name + ": " + value +
 let installed_kib : Layout -> :integer;
 let installed_kib lay = {
     let items = Layout.items lay;
-    let one = fn i -> match i { [:link, _, _] => 1, _ => (item.size i + 1023) / 1024 };
+    let one = fn i -> match i { item.Item.link(_, _) => 1, _ => (item.size i + 1023) / 1024 };
     list.fold_strict (fn !acc i -> acc + one i) 0 items + list.length (layout.dirs items)
 };
 
@@ -104,7 +104,7 @@ let data_items lay = {
 let md5sums! : Layout -> :string;
 let md5sums! lay = {
     let lines = list.map (fn i -> match i {
-        [:file, path, _, source, _] => crypto.hex (crypto.digest_file! :md5 source) + "  " + path + "\n",
+        item.Item.file(path, _, source, _) => crypto.hex (crypto.digest_file! :md5 source) + "  " + path + "\n",
         _ => "",
     }) (Layout.items lay);
     strict! lines

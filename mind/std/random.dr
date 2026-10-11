@@ -78,13 +78,13 @@ let word_range = 4294967087;
 /// One word, uniform in `[0, word_range)`, and the generator after it.
 let next : Rng -> [:integer, Rng];
 let next rng = match rng {
-    #[:mrg, a0, a1, a2, b0, b1, b2] => {
+    Rng.mrg(a0, a1, a2, b0, b1, b2) => {
         let p1 = mod_pos (1403580 * a1 - 810728 * a0) m1;
         let p2 = mod_pos (527612 * b2 - 1370589 * b0) m2;
         let z = mod_pos (p1 - p2) m1;
         [z, Rng.mrg a1 a2 p1 b1 b2 p2]
     },
-    #[:tape, words, used] => match words {
+    Rng.tape(words, used) => match words {
         [] => [0, Rng.tape [] (used + 1)],
         [w, ..rest] => [w, Rng.tape rest (used + 1)],
     },
@@ -122,7 +122,15 @@ priv let u32 s at = ((str.byte at s * 256 + str.byte (at + 1) s) * 256 + str.byt
 /// computation that should not depend on how much the other one drew.
 let split : Rng -> [Rng, Rng];
 let split rng = {
-    let state = to_string rng;
+    // The text this has always hashed, written out rather than read from
+    // `to_string`: a generator was the array `#[:mrg, ..]` once, and printed
+    // as that, and a split must not change because printing did -- a seed
+    // someone recorded would replay as another program.
+    let words xs = str.join_str ", " (list.map to_string xs);
+    let state = match rng {
+        Rng.mrg(a0, a1, a2, b0, b1, b2) => "#[:mrg, " + words [a0, a1, a2, b0, b1, b2] + "]",
+        Rng.tape(ws, used) => "#[:tape, " + to_string ws + ", " + to_string used + "]",
+    };
     [of_bytes (crypto.sha256 ("L" + state)), of_bytes (crypto.sha256 ("R" + state))]
 };
 
@@ -134,7 +142,7 @@ let of_tape words = Rng.tape words 0;
 
 /// How many words a tape generator has answered.
 let tape_used : Rng -> :integer;
-let tape_used rng = match rng { #[:tape, _, used] => used, _ => 0 };
+let tape_used rng = match rng { Rng.tape(_, used) => used, _ => 0 };
 
 // --- running a generator ----------------------------------------------------------------
 

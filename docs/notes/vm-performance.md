@@ -1450,3 +1450,123 @@ nursery no safepoint can reach -- real, but not visible in any measurement here,
 and not worth 40% of `mapfilter` to have early. Do the site-count work first;
 then this becomes cheap enough to be worth having, and stage three has something
 to stand on.
+
+## Strict arguments are evaluated where they stand
+
+2026-10-09. A saturated call to a native already evaluated its strict arguments
+in the caller (`fill_native_args`); a call to a *closure* suspended every
+argument, including one its function forces on entry. `let rec go i !acc = ..`
+made a thunk for `acc` at every call and forced it one step later.
+
+The loader now records, per function, the parameters its body forces before
+anything else (`Image::strict_args`): the run of strict `local` reads at the
+head of the body, which is exactly the shape `lower_body` emits for `!acc`. A
+saturated closure call with any of them evaluates those arguments in the caller
+through a `ClosureArgs` continuation -- the closure half of `NativeArgs` -- and
+builds the frame when the last is in. Only that prefix counts, because it is
+what makes the change unobservable: nothing of the callee's has run before its
+strict parameters are forced on either path, and they are forced in the same
+order, so the same argument raises first with the same error. Every image is
+byte-identical.
+
+**On today's code it is worth almost nothing**, and that is worth knowing
+before reading anything into it: 0.14% of a self-compile's allocation. The
+compiler's hot `!acc` loops run compiled, and `thunk_for` already computes an
+`acc + x` whose operands are in hand without suspending it -- a three-million
+step `!acc` loop under `--no-jit` allocates the same bytes on both VMs.
+
+**On strict code it is the difference.** The all-strict compiler from the next
+section allocates 4.25 GB on the old VM and 4.00 GB on this one (-5.8%), and
+thunks fall from 23% of allocation to 18%. So it is what a strict parameter
+costs, and it is kept for that.
+
+## A pinned heap grew past its cap
+
+Found 2026-10-09 by the experiment below, and not caused by it. A process's
+heap is capped (`DREAM_MAX_HEAP`, 1 GB), and the cap fires only when the
+*live* data measured by the last collection is past half of it -- deliberately,
+so a process that merely allocates fast is not killed. But under a force
+nobody vouched for (`force_pins`; see "Collecting underneath a native" in
+docs/gc.md) nothing can be collected, so the live figure is never measured
+again. `list.length (list.from 1)` with the list held is a native walking an
+endless list in a nested machine, and it grew until the allocator threw and
+`bad_alloc` took down the VM -- under the JIT and the interpreter alike, on the
+VM before any of this work.
+
+Under a pin, everything allocated since the last collection is held whether or
+not it is reachable, so `check_limits` takes the allocation as the measure
+there. The case now raises a catchable `:out_of_memory` in that process.
+
+## Strict by default: the experiment
+
+2026-10-09. The question: would Dream be better strict by default, with
+laziness written where it is wanted? Half of what CLAUDE.md warns about is the
+cost of laziness -- `fold_strict`, `strict!` inside a list being suspended
+itself, a lint for accumulators nothing forces, a guard written only to make
+the JIT admit a loop. "Strictness analysis" was measured earlier and found
+worthless *for allocation*; a strict semantics is a different claim, and
+nobody had measured it.
+
+**How.** `-D strict_everything` makes the compiler rewrite every named
+parameter of every `let` and `fn` in the program as though it were `!x`
+(`strict_everything` in dreams/modules.dr). It is call-by-value in arguments
+and nothing else: list cells, map values and a block's `let` stay lazy. Two
+exceptions, both to model what a strict-by-default compiler would actually do
+rather than to flatter the result: a pattern parameter, and a `let` whose body
+is one call or one `.[ ]`. The second matters. That is the shape
+`scope.wrapper_of` turns into the primitive it wraps, and it refuses a wrapper
+with a strict parameter -- so without the exception `list.nth`, `list.head`
+and every accessor stopped being an opcode, and the first measurement was 66%
+more reductions, most of them that.
+
+The compiler built with the switch compiles the compiler: **its output is
+byte-identical** to the lazy compiler's. Self-compile, same VM, same source:
+
+| | lazy | all-strict | |
+|---|---|---|---|
+| wall (JIT, best of 3, interleaved) | 2.36 s | 2.84 s | **+20%** |
+| reductions | 254 M | 352 M | +39% |
+| bytes allocated | 4.17 GB | 4.00 GB | -4% |
+| promoted | 643 MB | 521 MB | -19% |
+| live at the largest major | 309 MB | 205 MB | **-34%** |
+| held from the OS at the peak | 1.09 GB | 0.73 GB | **-33%** |
+| frames live at the largest major | 762 K | 221 K | -71% |
+
+**The memory is the finding.** Allocation barely moves, which is what the
+earlier analysis saw. *Retention* is cut by a third, and the by-kind line says
+where: frames live at the largest major fall from 762 thousand to 221 thousand.
+A suspension carries its whole frame, so a lazy argument nobody has forced yet
+keeps everything its caller's frame reached. That is a space leak with a
+specific shape, and it does not need strictness to fix: a thunk that kept only
+the slots it reads would release the rest. That is the next thing to measure.
+
+**The time is real work laziness was skipping**, not overhead. The largest
+single item: the lexer's `char_len` walks a `//` comment to advance the column
+(dreams/lexer.dr, `skip_trivia`), and the column is never read, because the
+newline after the comment resets it. Lazily that walk never happens; strictly
+it is 16.6 M reductions. The rest is spread thin over the folds, the checker
+and the parser -- the same shape many times: an argument computed for a
+branch that does not use it.
+
+**What breaks.** `std --test` built the same way: 14 of roughly a thousand
+cases fail, in three kinds.
+
+- *The callee decides when, or whether, to evaluate.* `time.within! d
+  (list.length (list.from 1))` hands a computation to a worker to run under a
+  deadline; strictly the caller runs it first, forever. `http.get! "not a
+  url"` raises before the callee's own handler is reached. A contract test
+  asserts that an argument nobody uses is never evaluated. A strict Dream
+  writes each of these with `$( )`.
+- *The order of effects in impure code.* The registry, websocket, log and HTTP
+  client cases: an impure call in argument position ran later lazily, after
+  effects the test had arranged, and earlier strictly. Strictly is arguably the
+  order a reader expects -- but every one of these programs was written and
+  tested against the other order.
+- *Nothing breaks, it is only slower:* the `char_len` kind.
+
+**The verdict, for now: do not flip the default.** 20% is too much to pay for
+code that works, and the second kind of break is the expensive one to migrate,
+because nothing reports it. What the experiment did buy is a target: the
+memory win comes from what suspensions *retain*, not from how many are made,
+and that can be had without changing what any program means. The switch stays
+in the compiler so this can be measured again.

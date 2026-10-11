@@ -275,7 +275,7 @@ when test {
         } ),
         test.case "the seed is in the report" $( test.true! (str.contains_str "DREAM_SEED=7" (failure! ints (fn xs -> false))) ),
         test.case "a broken generator is said to be" $( {
-            let broken = random.map (fn n -> n / 0) (random.int 0 9);
+            let broken = random.map (fn _ -> test.boom) (random.int 0 9);
             test.true! (str.starts_with "the generator raised" (failure! broken (fn n -> true)))
         } ),
         test.case "examples" $( test.eq! 5 (list.length (examples! 5 ints)) ),

@@ -96,6 +96,12 @@ let names = [
     "_match_fail",     // what a failed `match` raises with; see `lower.match_failure`
     "_error_trace!",   // where an error was raised; see `error.trace!`
     "_tensor_of_bytes",
+    // Records and unions; see "Records are values of their own" in
+    // docs/notes/static-types.md.
+    "_record_is",      // what a constructor pattern asks
+    "_record_id",      // the atom naming what a record is
+    "_record_fields",  // its fields, as an array
+    "_record_of",      // one, from an id and its fields
 
 ];
 
@@ -185,6 +191,10 @@ let signatures = %{
     "_deadline_in!" => "integer -> integer, the monotonic clock that many milliseconds from now",
     "_match_fail" => "value -> path -> line -> col -> never, raising :match_error with [value, path, line, col]",
     "_error_trace!" => "error -> list of [:in | :made, name, path, line, col], innermost first",
+    "_record_is" => "atom -> value -> bool, true when the value is a record with that id",
+    "_record_id" => "value -> atom, or () when it is no record",
+    "_record_fields" => "record -> array of its fields, unforced",
+    "_record_of" => "atom -> bool -> array -> record; the bool says it is a variant",
 
 };
 
@@ -237,12 +247,15 @@ let wrapper name = wrappers.[name else ()];
 
 /// Primitives the parser writes on the program's behalf: `a @ b` is
 /// `_tensor_matmul a b` (`ast.matmul_e`), and an interpolated string's pieces
-/// are joined by `_str_interp` (`ast.interp_e`). A name the author did not write is
-/// not one to warn them about.
+/// are joined by `_str_interp` (`ast.interp_e`), and a record's or a union's
+/// constructor is a `_record_of` the loader wrote (`syntax.constructed`), and a
+/// `dyn` dispatcher asks `_record_id` of its receiver (`scope.dispatching`). A
+/// name the author did not write is not one to warn them about.
 let written_by_parser : :string -> :bool;
 let written_by_parser name =
     list.contains name ["_tensor_matmul", "_str_interp", "_mailbox_peek!", "_mailbox_take!",
-                        "_await_message!", "_deadline_in!", "_match_fail"];
+                        "_await_message!", "_deadline_in!", "_match_fail", "_record_of",
+                        "_record_id"];
 
 /// A builtin's signature, or its bare name for one that has none.
 let signature : :string -> :string;

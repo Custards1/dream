@@ -6,7 +6,7 @@
 // REM, the dreaming stage, which comes late and in growing stretches. A night
 // is a list of them, a *hypnogram*.
 //
-// A stage is a union value (`:wake`, `:n1`, ..), so a `match` on one must
+// A stage is a union value (`Stage.wake`, `Stage.n1`, ..), so a `match` on one must
 // handle all five, and the model's classes are their positions in `all`.
 
 import std.list;
@@ -25,7 +25,7 @@ let count = 5;
 
 /// A stage's class number.
 let index : Stage -> :integer;
-let index s = match s { :wake => 0, :n1 => 1, :n2 => 2, :n3 => 3, :rem => 4 };
+let index s = match s { Stage.wake => 0, Stage.n1 => 1, Stage.n2 => 2, Stage.n3 => 3, Stage.rem => 4 };
 
 /// The stage with class number `i`.
 let of_index : :integer -> Stage;
@@ -37,7 +37,7 @@ let is_sleep s = s != Stage.wake;
 
 /// The stage's name as a person writes it.
 let name : Stage -> :string;
-let name s = match s { :wake => "Wake", :n1 => "N1", :n2 => "N2", :n3 => "N3", :rem => "REM" };
+let name s = match s { Stage.wake => "Wake", Stage.n1 => "N1", Stage.n2 => "N2", Stage.n3 => "N3", Stage.rem => "REM" };
 
 /// The stage named `text`, in any case (`"rem"`, `"N3"`), or `()`.
 let parse : :string -> (Stage | :unit);

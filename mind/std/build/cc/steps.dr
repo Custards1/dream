@@ -125,7 +125,7 @@ let runtime_dir tc = match os_of tc { :windows => "bin/", _ => "lib/" };
 /// by a run path, unless the target set one.
 let with_run_path : cc.Toolchain -> cc.Target -> cc.Target;
 let with_run_path tc t = {
-    let has = list.any (fn s -> match s { [:runtime_path, _] => true, _ => false }) (cc.settings t);
+    let has = list.any (fn s -> match s { cc.Setting.runtime_path(_) => true, _ => false }) (cc.settings t);
     match cc.kind t == :executable && os_of tc != :windows && not has && not (list.is_empty (shared_used t)) {
         true => cc.runtime_path "../lib" t,
         false => t,
@@ -201,7 +201,7 @@ let rec link_step tc target = {
     // Explicit dependency files participate in the key, so replacing a
     // system archive at the same path relinks its consumers.
     let files = list.flat_map (fn setting -> match setting {
-        [:link_file, path] => [build.file path],
+        cc.Setting.link_file(path) => [build.file path],
         _ => [],
     }) (cc.link_settings t);
     let outputs = list.concat [
@@ -267,8 +267,8 @@ when test {
                          cc.Toolchain.name (parse ctx "clang version 19.1.7\nTarget: x86_64"),
                          cc.Toolchain.version (parse ctx "g++ (GCC) 14.2.1\nCopyright")] ),
         test.case "a GNU compile runs in the package and writes into the step"
-            $( test.eq! [[:run, "/p", %{}, "g++", ["-fPIC", "-O2", "-MD", "-MF", "/d/deps.d", "-c", "src/demo.cpp",
-                                                    "-o", "/d/src#demo.cpp.o"]]]
+            $( test.eq! [build.Op.run "/p" %{} "g++" ["-fPIC", "-O2", "-MD", "-MF", "/d/deps.d", "-c", "src/demo.cpp",
+                                                      "-o", "/d/src#demo.cpp.o"]]
                         (build.Step.action (compile_step linux lib ["src/demo.cpp", []]) (build.Job.make "/d" ctx (%{}))) ),
         test.case "what cl printed becomes a depfile"
             $( test.eq! "a.obj: \\\n  a.cpp \\\n  C:\\inc\\a.h\n"

@@ -56,6 +56,7 @@
 // The fast paths are inline; every slow path calls the interpreter's own
 // helper, so the two tiers cannot drift apart on what an operation means.
 
+#include <functional>
 #include <pthread.h>
 #include <sched.h>
 #include "jit.hpp"
@@ -76,6 +77,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -178,6 +180,12 @@ constexpr uint32_t kMaxBindDuplication = 8;
 /// more than one read. Its *work* is done once whatever this says -- see "A
 /// binding computed once" -- so this bounds the size of the compiled body.
 constexpr uint32_t kMaxMemoCode = 64;
+
+/// The most nodes a switch's targets may come to, together, before it is
+/// written as the chain of arms it jumps into instead (`Emitter::switch_node`).
+/// Each target is a suffix of one chain, so writing them all is quadratic in
+/// the arms; `std.types.check` took nine seconds to compile that way.
+constexpr uint32_t kMaxSwitchCode = 1024;
 
 /// How many cells one compiled call of a list builder makes before it suspends
 /// the rest. See "Building ahead". A bound on work and memory nobody may ever
@@ -455,8 +463,12 @@ int constant_condition(const Image& img, const Node& n) {
     return Op(condition.op) == Op::ConstBool ? int(condition.a != 0) : -1;
 }
 
-/// The ops the emitter can write. `Op::Capture` is deliberately absent:
-/// a capture lives in the frame, beyond the parameters this emitter reads. The
+/// The ops the emitter writes itself. Three more are decided in `check`,
+/// because whether they are written depends on more than the op: a capture
+/// (only a root has a closure to read it from), a map literal (only an empty
+/// one), and a big integer. Anything else pure is the interpreter's to
+/// evaluate -- see "What the interpreter evaluates" -- so this list is no
+/// longer what refuses a function, only what is written inline. The
 /// emitter used to refuse unsupported ops *after* the analysis had said yes, which cost nothing while a
 /// compile was one function -- the emitter gave up and the function was marked
 /// rejected. It is not free now: an emitter that gives up on a peer gives up on
@@ -474,9 +486,9 @@ bool op_is_supported(Op op) {
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
         case Op::And: case Op::Or: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs:
         // Data. See "Lists, arrays and maps" and "Lazy positions" below.
-        case Op::ConstStr: case Op::Global:
+        case Op::ConstStr: case Op::Global: case Op::Builtin:
         case Op::ListIsEmpty: case Op::ListTail: case Op::Cons:
-        case Op::MakeList: case Op::MakeArray: case Op::Get: case Op::Set:
+        case Op::MakeList: case Op::MakeArray: case Op::RecordMake: case Op::Get: case Op::Set:
             return true;
         default:
             return false;
@@ -535,6 +547,7 @@ bool cheap_lazy(const Image& img, const std::vector<uint32_t>& binds, uint32_t a
         case Op::ConstInt:
             return fixnum_fits(img.integer(n.a));
         case Op::ConstBool: case Op::ConstChar: case Op::Unit: case Op::ConstAtom:
+        case Op::Builtin: case Op::Capture:
             return true;
         case Op::Local:
             if (n.a < arity) return true;
@@ -549,6 +562,40 @@ bool cheap_lazy(const Image& img, const std::vector<uint32_t>& binds, uint32_t a
             return false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// What the interpreter evaluates
+//
+// An op this file does not write used to refuse the whole function. Measured on
+// a self-compile run with every hot function compiled before it ran again
+// (`DREAM_JIT_SYNC=1 DREAM_JIT_WHY=1`), that was 612 refusals against 855
+// compiles, and nearly all of them were one node in an otherwise ordinary
+// body: the `%{}` default in every accessor of a `mapping`, which is every
+// accessor of the compiler's own state; a lambda reading what it captured; a
+// lambda being made; a module member passed as a value; a `try`.
+//
+// A suspension already says how to have the interpreter evaluate a node:
+// `suspend` makes a thunk of it against the frame this iteration would have
+// had, and forcing that thunk runs the node exactly where and as the
+// interpreter would have. A node in a *lazy* position has always been written
+// that way. One in an evaluated position can be written the same way and then
+// forced on the spot -- which is what the interpreter does when it reaches it,
+// with one thunk more -- and the rest of the function is compiled around it.
+//
+// What that may not cover is an effect, for the reason everything in this file
+// avoids one: compiled code orders nothing, and a call it makes may be run
+// again from the top. So a node marked impure is refused as before, and the
+// lowerer marks a node impure when anything under it is (`inherit` in
+// dreams/lower.dr), so the mark on the node is the answer for all of it.
+//
+// What the interpreter evaluates is invisible to the analysis: none of it is a
+// self call site, none of it counts as forcing a parameter, and none of it has
+// a definite force order. Each of those walks stops at such a node, which
+// claims less than the truth and is therefore always sound. The cost is the
+// thunk and, where an iteration has none yet, the frame; an op that is hot
+// enough to matter is worth writing out instead, as `Capture`, `Builtin` and
+// the empty map literal are.
+// ---------------------------------------------------------------------------
 
 /// The head and tail of a cell `n` builds: the opcode, or a saturated call of
 /// the builtin it is the opcode of, which is what an image `opt` has not
@@ -644,6 +691,9 @@ struct Analysis {
     /// this function: the list is built ahead of whoever reads it, a run of
     /// cells a call. See "Building ahead".
     std::unordered_set<uint32_t> cons_steps;
+    /// Nodes in evaluated positions that are suspended and forced on the spot
+    /// rather than written out. See "What the interpreter evaluates".
+    std::unordered_set<uint32_t> interpreted;
 };
 
 /// How many arguments a call handed to the machine may have. The helper takes
@@ -776,6 +826,7 @@ public:
             a.let_steps = let_steps_;
         }
         a.calls = calls_;
+        a.interpreted = interp_;
         // A parameter the signature declares `:float` starts the fixpoint as
         // one instead of as nothing. That is a guess about the value the
         // caller hands in, and the entry guards it exactly as it guards a slot
@@ -859,17 +910,31 @@ private:
 
         if (op == Op::Apply || is_primitive(op)) {
             if (check_apply(node, n, depth)) return true;
+            // Only a call refused for what it *is*. One whose argument was
+            // refused has already been offered to the interpreter at that
+            // argument, and what failed there would fail here.
+            if (kind_at(node) == CallKind::Refused && interpret(node, n)) return true;
             why(n, kind_at(node) == CallKind::Refused ? "a call this tier cannot make" : "an argument");
             return false;
         }
+        // A capture is read out of the closure the frame holds, which a root
+        // has and a peer -- a global function, entered with no frame -- does
+        // not; nor would a peer have anything to capture.
+        if (op == Op::Capture) {
+            if (peer_depth_ == 0 && n.a < f_.n_captures) return true;
+            return interpret(node, n);
+        }
+        // `%{}` is built in place; a literal with entries forces its keys, in
+        // order, and is the interpreter's.
+        if (op == Op::MakeMap) return n.b == 0 || interpret(node, n);
+        // An integer too big for a fixnum is a boxed constant the emitter has
+        // no way to name.
+        if (op == Op::ConstInt && !fixnum_fits(img_.integer(n.a))) return interpret(node, n);
         if (!op_is_supported(op)) {
+            if (interpret(node, n)) return true;
             why(n, "an operation this tier does not emit");
             return false;
         }
-        // An integer too big for a fixnum is a boxed constant the emitter has
-        // no way to name, so it is refused here rather than there -- same
-        // reason as the two ops missing from the list above.
-        if (op == Op::ConstInt && !fixnum_fits(img_.integer(n.a))) return false;
         if (op == Op::Local) {
             if (n.a >= f_.slots) return false;
             ++reads_[n.a];
@@ -939,6 +1004,19 @@ private:
                 return true;
         }
     }
+
+    /// Have the interpreter evaluate `node` where it stands: suspended against
+    /// this iteration's frame and forced at once. See "What the interpreter
+    /// evaluates". False for an effect, which compiled code may not perform,
+    /// and for a statement, which is not an expression with a value.
+    bool interpret(uint32_t node, const Node& n) {
+        if (n.flags & F_IMPURE) return false;
+        if (Op(n.op) == Op::Bind || Op(n.op) == Op::Nop) return false;
+        interp_.insert(node);
+        nested_calls_ = true;
+        return true;
+    }
+    bool interpreted(uint32_t node) const { return interp_.count(node) != 0; }
 
     /// `DREAM_JIT_WHY=1` says, for each function refused, the first node that
     /// refused it -- which is what to change in a library that wants a loop
@@ -1103,7 +1181,18 @@ private:
         if (n.a < f_.arity || n.a >= f_.slots) return false;
         // One slot, one binding. Bound twice, a read means whichever came
         // before it, and this has no way to say which that was.
-        if (binds_[n.a] != NO_NODE) return false;
+        //
+        // The same `bind` met again is not a second binding. A `match` that
+        // starts with a switch jumps *into* its chain of arms, so each target
+        // is a suffix of that chain and the walk reaches an arm's binds once
+        // through the chain and once through the switch. Refusing that refused
+        // every function whose `match` had a switch -- a union's, and a list's
+        // tagged by atoms -- and said nothing about why.
+        if (binds_[n.a] != NO_NODE) {
+            if (binds_[n.a] == n.b && strict_binds_[n.a] == ((n.flags & F_STRICT) != 0)) return true;
+            why(n, "a slot bound twice");
+            return false;
+        }
         binds_[n.a] = n.b;
         strict_binds_[n.a] = (n.flags & F_STRICT) != 0;
         // A strict binding runs where it stands, so it is checked here. Any
@@ -1145,6 +1234,12 @@ private:
             // Too deep to measure. Say the one thing that refuses it either way.
             *calls = true;
             return kMaxBindDuplication + 1;
+        }
+        if (interpreted(idx)) {
+            // Run by the machine, so as much a call as any: a binding of one
+            // is remembered rather than run again at every read.
+            *calls = true;
+            return 1;
         }
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
@@ -1195,6 +1290,7 @@ private:
                        expand_cost(n.b, depth + 1, calls) +
                        (n.c == NO_NODE ? 0 : expand_cost(n.c, depth + 1, calls));
             case Op::Set: case Op::Cons: case Op::MakeList: case Op::MakeArray:
+            case Op::RecordMake:
                 // Each builds something, and building it twice is two of it
                 // where the program had one -- sharing lost, not just time.
                 *calls = true;
@@ -1231,6 +1327,9 @@ private:
     /// Slots definitely forced when this node is reduced to WHNF.
     SlotSet strict_of(uint32_t node, int depth) {
         if (depth > 256) return 0;
+        // The interpreter may force anything under it, but nothing it forces
+        // is something compiled code was told it may evaluate early.
+        if (interpreted(node)) return 0;
         const Node& n = img_.node(node);
         switch (Op(n.op)) {
             case Op::Bind:
@@ -1378,8 +1477,14 @@ private:
     /// must stop appending.
     bool force_order(uint32_t idx, int depth, std::vector<uint32_t>& out) {
         if (depth > 128) return false;
+        // Work the interpreter does, which can raise: nothing after it is
+        // definite.
+        if (interpreted(idx)) return false;
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
+            case Op::Capture:
+                // Forcing what was captured is work that can raise.
+                return false;
             case Op::Bind:
                 return !(n.flags & F_STRICT) || force_order(n.b, depth + 1, out);
             case Op::Local:
@@ -1527,6 +1632,9 @@ private:
 
     void collect_calls(uint32_t idx, int depth, bool tail = false) {
         if (depth > 256) return;
+        // A self call the interpreter makes is an ordinary call, entering
+        // this function afresh; it is not a site of this body's.
+        if (interpreted(idx)) return;
         const Node& n = img_.node(idx);
         if (Op(n.op) == Op::Apply || is_primitive(Op(n.op))) {
             const CallKind kind = kind_at(idx);
@@ -1672,6 +1780,8 @@ private:
     /// result position, and a `let` of a self call read as the answer.
     std::unordered_set<uint32_t> steps_;
     std::unordered_set<uint32_t> let_steps_;
+    /// See "What the interpreter evaluates".
+    std::unordered_set<uint32_t> interp_;
     bool nested_calls_ = false;
     bool recurses_ = false;
     bool tail_self_ = false;
@@ -1684,6 +1794,7 @@ public:
     /// carried in one representation and read in the other.
     Ty ty(uint32_t idx, int depth) {
         if (depth > 256) return Ty::Any;
+        if (interpreted(idx)) return Ty::Any;
         const Node& n = img_.node(idx);
         switch (Op(n.op)) {
             case Op::ConstFloat: return Ty::Float;
@@ -1958,7 +2069,7 @@ public:
           ret_dbl_(preset && a.ret_dbl), eager_(a.eager), bind_inline_(a.bind_inline),
           bind_memo_(a.bind_memo), accumulate_(a.accumulate), steps_(a.steps),
           let_steps_(a.let_steps), cons_steps_(a.cons_steps),
-          kinds_(a.kinds), nested_calls_(a.nested_calls), peers_(peers),
+          kinds_(a.kinds), interp_(a.interpreted), nested_calls_(a.nested_calls), peers_(peers),
           preset_(preset), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
@@ -2048,6 +2159,12 @@ private:
     llvm::Value* lazy_array(uint32_t kids_off, uint32_t n);
 
     // --- lazy positions -----------------------------------------------------
+    /// A node the interpreter evaluates, where it stands. See "What the
+    /// interpreter evaluates".
+    JV interpreted(uint32_t idx, bool tail);
+    /// What a lambda captured, as it stands in its closure: unforced.
+    llvm::Value* capture_raw(uint32_t index);
+
     /// The value for an expression in a lazy position: built in place when
     /// that cannot be observed, suspended otherwise. Always tagged. See "Lazy
     /// positions" at the top of this file.
@@ -2221,6 +2338,8 @@ private:
     std::vector<llvm::Value*> memo_;
     /// How each call is made, as the analysis decided it.
     const std::unordered_map<uint32_t, CallKind> kinds_;
+    /// See "What the interpreter evaluates".
+    const std::unordered_set<uint32_t> interp_;
     const bool nested_calls_;
     /// The frame this iteration's suspensions share, or zero until one is
     /// needed. See `snapshot`.
@@ -2284,9 +2403,10 @@ private:
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
         rt_frame_slots_, rt_native_, rt_builtin_, rt_switch_head_,
-        rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_literal_str_,
+        rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_make_record_, rt_make_map_,
+        rt_literal_str_,
         rt_global_, rt_snapshot_, rt_thunk_, rt_apply_, rt_peek_, rt_adopt_, rt_yield_frame_,
-        rt_cons_after_, rt_set_tail_, rt_type_error_got_;
+        rt_cons_after_, rt_set_tail_, rt_type_error_got_, rt_settle_;
     /// The adopt arm of the `snapshot` being written, joined at its end.
     llvm::BasicBlock* pending_adopt_ = nullptr;
 };
@@ -2374,6 +2494,13 @@ void Emitter::declare_helpers() {
         "dream_rt_make_list", llvm::FunctionType::get(i64_, {ptr_, i32_, ptr_}, false));
     rt_make_array_ = mod_.getOrInsertFunction(
         "dream_rt_make_array", llvm::FunctionType::get(i64_, {ptr_, i32_, ptr_}, false));
+    rt_make_record_ = mod_.getOrInsertFunction(
+        "dream_rt_make_record", llvm::FunctionType::get(i64_, {ptr_, i32_, i32_, ptr_}, false));
+    rt_settle_ = mod_.getOrInsertFunction(
+        "dream_rt_settle",
+        llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), {ptr_, i64_, i32_, i64_}, false));
+    rt_make_map_ = mod_.getOrInsertFunction(
+        "dream_rt_make_map", llvm::FunctionType::get(i64_, {ptr_}, false));
     rt_literal_str_ = mod_.getOrInsertFunction(
         "dream_rt_literal_str", llvm::FunctionType::get(i64_, {ptr_, i32_}, false));
     rt_global_ = mod_.getOrInsertFunction(
@@ -2893,9 +3020,20 @@ llvm::Value* Emitter::snapshot() {
 // So such a binding is remembered: an alloca per binding per iteration, zero
 // until the first evaluated read fills it. A lazy read takes the value when it
 // is there and the snapshot's thunk when it is not, and the snapshot takes the
-// value too. The one order left is a snapshot made *before* the first evaluated
-// read: its slot already holds the binding's thunk, and something may hold that
-// thunk, so the evaluated read forces it rather than computing a second copy.
+// value too. A snapshot made *before* the first evaluated read already holds
+// the binding's thunk, and something may hold that thunk, so the evaluated read
+// forces it rather than computing a second copy.
+//
+// And a snapshot made *during* it -- by a lazy position inside the binding's
+// own expression, which is where `let run = match .. { spec => rebuild_run ..
+// }` makes one -- holds a thunk of the binding too, made before there was a
+// value to put there. Whatever reads that slot afterwards forces the thunk and
+// runs the binding a second time. Pure, so no answer changes; but in a function
+// that recursion re-enters through that binding, the work doubles at every
+// level. dreams/opt.dr's `rebuild_node` is that function, and compiled, a
+// four-second compile of a hello-world ran out of memory instead. So the value,
+// once computed, settles that thunk in place (`dream_rt_settle`), as forcing it
+// would have.
 
 void Emitter::make_iteration_state() {
     snap_ = b_.CreateAlloca(i64_, nullptr, "snap");
@@ -2954,6 +3092,16 @@ Emitter::JV Emitter::bound_value(uint32_t slot) {
         return failed_ ? none() : tag(phi);
     }
     llvm::Value* computed = box(v);
+    // A snapshot made while the value was being computed suspended the
+    // binding before it had one; settle that suspension now.
+    auto* settle = bb("bind.settle");
+    auto* settled = bb("bind.settled");
+    llvm::Value* late = b_.CreateLoad(i64_, snap_);
+    b_.CreateCondBr(b_.CreateICmpNE(late, i64(0)), settle, settled);
+    b_.SetInsertPoint(settle);
+    b_.CreateCall(rt_settle_, {proc_, late, i32c(int(slot)), computed});
+    b_.CreateBr(settled);
+    b_.SetInsertPoint(settled);
     auto* compute_end = b_.GetInsertBlock();
     b_.CreateBr(done);
 
@@ -3031,7 +3179,7 @@ void Emitter::mark_refs(uint32_t idx, int depth) {
             mark_refs(n.a, depth + 1);
             run(n.b, n.c);
             return;
-        case Op::Block: case Op::MakeList: case Op::MakeArray:
+        case Op::Block: case Op::MakeList: case Op::MakeArray: case Op::RecordMake:
             run(n.a, n.b);
             return;
         case Op::MakeMap:
@@ -3067,10 +3215,19 @@ Emitter::JV Emitter::lazy(uint32_t idx) {
             if (fixnum_fits(img_.integer(n.a))) return node(idx);
             return tag(suspend(idx));
         case Op::ConstBool: case Op::ConstChar: case Op::Unit: case Op::ConstAtom:
-        case Op::ConstStr:
+        case Op::ConstStr: case Op::Builtin:
             return node(idx);
         case Op::ConstFloat:
             return tag(box(node(idx)));
+        case Op::Capture:
+            // Handed on as it stands, as `thunk_for` hands on a capture.
+            if (preset_) return tag(suspend(idx));
+            return tag(capture_raw(n.a));
+        case Op::MakeMap:
+            // Building an empty map cannot be observed; one with entries
+            // forces its keys, and is suspended.
+            if (n.b == 0) return tag(b_.CreateCall(rt_make_map_, {proc_}));
+            return tag(suspend(idx));
         case Op::Local:
             if (n.a < binds_.size() && binds_[n.a] != NO_NODE) {
                 // A `let`'s name. Its value again when that is cheap, and
@@ -3125,6 +3282,12 @@ Emitter::JV Emitter::lazy(uint32_t idx) {
             if (failed_) return none();
             return tag(b_.CreateCall(Op(n.op) == Op::MakeList ? rt_make_list_ : rt_make_array_,
                                      {proc_, i32c(int(n.b)), items}));
+        }
+        case Op::RecordMake: {
+            llvm::Value* items = lazy_array(n.a, n.b);
+            if (failed_) return none();
+            return tag(b_.CreateCall(rt_make_record_,
+                                     {proc_, i32c(int(n.c)), i32c(int(n.b)), items}));
         }
         case Op::Add: case Op::Sub: case Op::Mul: {
             // `thunk_for`'s arithmetic: two fixnums already in hand, and an
@@ -3234,6 +3397,24 @@ Emitter::JV Emitter::lazy(uint32_t idx) {
     }
 }
 
+Emitter::JV Emitter::interpreted(uint32_t idx, bool tail) {
+    llvm::Value* th = suspend(idx);
+    // The answer of a root loop is forced by `enter_function` once the
+    // compiled call returns, as a parameter that is the answer is; there is
+    // no reason to run the machine underneath this call to do it first.
+    if (tail && root_loop_ && !accumulate_ && !ahead_first_) return tag(th);
+    return tag(force(th));
+}
+
+llvm::Value* Emitter::capture_raw(uint32_t index) {
+    // `frame->closure`, then `closure->caps()[index]`: a frame's closure is
+    // its first word after the header, and a closure's captures follow its
+    // sixteen bytes of header, function and count.
+    llvm::Value* closure = b_.CreateLoad(i64_, b_.CreateIntToPtr(b_.CreateAdd(frame_, i64(8)), ptr_));
+    return b_.CreateLoad(
+        i64_, b_.CreateIntToPtr(b_.CreateAdd(closure, i64(sizeof(ClosureObj) + 8 * uint64_t(index))), ptr_));
+}
+
 llvm::Value* Emitter::lazy_array(uint32_t kids_off, uint32_t n) {
     llvm::Value* items = entry_alloca(i64_, "items", std::max(1u, n));
     for (uint32_t i = 0; i < n; ++i) {
@@ -3309,12 +3490,15 @@ Emitter::JV Emitter::get(const Node& n) {
     b_.CreateCondBr(b_.CreateICmpEQ(k, i64(make_fixnum(0))), found, slow);
 
     // An array at a fixnum inside it. The index is signed, so one unsigned
-    // compare against the length rules out both ends.
+    // compare against the length rules out both ends. A record is read the
+    // same way: its header is an array's, a length at 8 and the fields from 16
+    // (`RecordObj`), so a record's accessor is the same inline load a
+    // `struct`'s was when it was an array.
     b_.SetInsertPoint(not_cell);
-    b_.CreateCondBr(b_.CreateAnd(b_.CreateICmpEQ(type, llvm::ConstantInt::get(
-                                                           i8_, uint8_t(ObjType::Array))),
-                                 is_fixnum(k)),
-                    is_arr, slow);
+    llvm::Value* indexed = b_.CreateOr(
+        b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Array))),
+        b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Record))));
+    b_.CreateCondBr(b_.CreateAnd(indexed, is_fixnum(k)), is_arr, slow);
     b_.SetInsertPoint(is_arr);
     llvm::Value* len = b_.CreateZExt(
         b_.CreateLoad(i32_, b_.CreateIntToPtr(b_.CreateAdd(c, i64(8)), ptr_)), i64_);
@@ -3619,6 +3803,7 @@ Emitter::JV Emitter::float_order(Op op, JV a, JV bv) {
 
 Emitter::JV Emitter::node(uint32_t idx, bool tail) {
     if (failed_) return none();
+    if (interp_.count(idx)) return interpreted(idx, tail);
     if (tail && ahead_first_ && cons_steps_.count(idx)) return cons_step(idx);
     const Node& n = img_.node(idx);
     switch (Op(n.op)) {
@@ -3661,10 +3846,14 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
             if (tail && root_loop_ && !accumulate_) return load_slot_raw(n.a);
             return load_slot(n.a);
         case Op::Capture:
-            // A capture lives in the frame, and a compiled body is a function
-            // of its arguments. Unreachable: op_is_supported refuses it.
-            failed_ = true;
-            return none();
+            // The analysis admits one only in a root, which has a closure.
+            if (preset_) {
+                failed_ = true;
+                return none();
+            }
+            return tag(force(capture_raw(n.a)));
+        case Op::Builtin: return tag(i64(make_builtin(n.a)));
+        case Op::MakeMap: return lazy(idx);
         case Op::Force: return node(n.a);
         case Op::TypeIs: return type_test(n);
         case Op::If: return conditional(n, tail);
@@ -3679,7 +3868,7 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
         case Op::ListTail: return list_tail(n);
         case Op::Get: return get(n);
         case Op::Set: return set(n);
-        case Op::Cons: case Op::MakeList: case Op::MakeArray:
+        case Op::Cons: case Op::MakeList: case Op::MakeArray: case Op::RecordMake:
             // Every part of these is in a lazy position, and so is the whole:
             // building one in place is the one way it is ever written.
             return lazy(idx);
@@ -3745,7 +3934,8 @@ Emitter::JV Emitter::type_test(const Node& n) {
                        n.b == DREAM_TYPE_STRING ? ObjType::Str :
                        n.b == DREAM_TYPE_LIST ? ObjType::Cons :
                        n.b == DREAM_TYPE_ARRAY ? ObjType::Array :
-                       n.b == DREAM_TYPE_TENSOR ? ObjType::Tensor : ObjType::Map;
+                       n.b == DREAM_TYPE_TENSOR ? ObjType::Tensor :
+                       n.b == DREAM_TYPE_RECORD ? ObjType::Record : ObjType::Map;
         llvm::Value* matches = b_.CreateICmpEQ(header, llvm::ConstantInt::get(i8_, uint8_t(kind)));
         if (n.b == DREAM_TYPE_MAP)
             matches = b_.CreateOr(matches, b_.CreateICmpEQ(
@@ -3787,7 +3977,84 @@ Emitter::JV Emitter::block(const Node& n, bool tail) {
     return last;
 }
 
+/// The nodes under `node` as the emitter would write them, a tree and not a
+/// graph, or `limit` once there are that many.
+static uint32_t written_size(const Image& img, uint32_t node, uint32_t limit, int depth = 0) {
+    if (node == NO_NODE || depth > 256) return 0;
+    const Node& n = img.node(node);
+    uint32_t size = 1;
+    auto add = [&](uint32_t k) {
+        if (size < limit) size += written_size(img, k, limit - size, depth + 1);
+    };
+    switch (Op(n.op)) {
+        case Op::If: add(n.a); add(n.b); add(n.c); break;
+        case Op::Block: for (uint32_t i = 0; i < n.b; ++i) add(img.kid(n.a + i)); break;
+        case Op::SwitchAtom: case Op::SwitchHead:
+            add(n.a);
+            for (uint32_t i = 1; i < n.c; i += 2) add(img.kid(n.b + i));
+            add(img.kid(n.b + n.c - 1));
+            break;
+        case Op::Bind: add(n.b); break;
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+        case Op::And: case Op::Or: case Op::Get: case Op::Set:
+            add(n.a); add(n.b); break;
+        case Op::Force: case Op::Neg: case Op::Not: add(n.a); break;
+        case Op::Apply: add(n.a); for (uint32_t i = 0; i < n.c; ++i) add(img.kid(n.b + i)); break;
+        // The rest are leaves, or hold their parts in lazy positions the
+        // emitter writes as a call: one node is near enough.
+        default: break;
+    }
+    return std::min(size, limit);
+}
+
+/// The first arm of the chain a switch jumps into, or `NO_NODE`.
+///
+/// Every target is a suffix of that chain (`dispatch` in dreams/lower.dr): an
+/// arm is an `if` whose `else` is the arm below it. So the head is the one
+/// target no other target reaches down its `else`s. A target that is itself a
+/// switch -- the atom switch under a head switch -- is looked through.
+static uint32_t chain_head(const Image& img, const Node& sw) {
+    std::vector<uint32_t> targets;
+    std::function<void(const Node&)> collect = [&](const Node& s) {
+        for (uint32_t i = 1; i <= s.c; i += 2) {
+            uint32_t t = img.kid(s.b + (i < s.c ? i : s.c - 1));
+            Op op = Op(img.node(t).op);
+            if (op == Op::SwitchAtom || op == Op::SwitchHead) collect(img.node(t));
+            else targets.push_back(t);
+            if (i >= s.c) break;
+        }
+    };
+    collect(sw);
+    std::unordered_set<uint32_t> below;
+    for (uint32_t t : targets) {
+        for (uint32_t at = t; Op(img.node(at).op) == Op::If && img.node(at).c != NO_NODE;) {
+            at = img.node(at).c;
+            if (!below.insert(at).second) break;
+        }
+    }
+    uint32_t head = NO_NODE;
+    for (uint32_t t : targets) {
+        if (below.count(t)) continue;
+        if (head != NO_NODE && head != t) return NO_NODE;
+        head = t;
+    }
+    return head;
+}
+
 Emitter::JV Emitter::switch_node(const Node& n, bool tail) {
+    // Too many arms to write each target out: the chain once, from its head.
+    // That is the program the switch was a shortcut through -- it skips only
+    // arms that cannot match, and forces nothing the chain would not.
+    {
+        uint32_t total = 0;
+        for (uint32_t i = 1; i < n.c && total < kMaxSwitchCode; i += 2)
+            total += written_size(img_, img_.kid(n.b + i), kMaxSwitchCode);
+        if (total >= kMaxSwitchCode) {
+            uint32_t head = chain_head(img_, n);
+            if (head != NO_NODE) return node(head, tail);
+        }
+    }
     JV subject = node(n.a);
     if (failed_ || !subject.v) return none();
     llvm::Value* key = box(subject);
@@ -3801,6 +4068,32 @@ Emitter::JV Emitter::switch_node(const Node& n, bool tail) {
         b_.SetInsertPoint(raised);
         emit_raise(key);
         b_.SetInsertPoint(ready);
+    } else {
+        // A record is keyed by its id, as the interpreter's `take_switch`
+        // keys it: the atom whose index is the header word beside the length,
+        // without the variant bit. Built inline, so a `match` over a union is
+        // one load and a jump table.
+        auto* obj = bb("switch.obj");
+        auto* rec = bb("switch.record");
+        auto* keyed = bb("switch.keyed");
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateCondBr(is_heap_ptr(key), obj, keyed);
+        b_.SetInsertPoint(obj);
+        llvm::Value* type = b_.CreateLoad(i8_, b_.CreateIntToPtr(key, ptr_));
+        b_.CreateCondBr(b_.CreateICmpEQ(type, llvm::ConstantInt::get(i8_, uint8_t(ObjType::Record))),
+                        rec, keyed);
+        b_.SetInsertPoint(rec);
+        llvm::Value* tag = b_.CreateZExt(
+            b_.CreateLoad(i32_, b_.CreateIntToPtr(b_.CreateAdd(key, i64(12)), ptr_)), i64_);
+        llvm::Value* id = b_.CreateOr(b_.CreateShl(b_.CreateAnd(tag, i64(~RECORD_VARIANT & 0xffffffffu)), 8),
+                                      i64(make_atom(0)));
+        b_.CreateBr(keyed);
+        b_.SetInsertPoint(keyed);
+        auto* k = b_.CreatePHI(i64_, 3);
+        k->addIncoming(key, entry);
+        k->addIncoming(key, obj);
+        k->addIncoming(id, rec);
+        key = k;
     }
     auto* fallback = bb("switch.default");
     auto* done = bb("switch.end");
@@ -5130,38 +5423,134 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
 // tests use to make sure a function's *compiled* body is the one they exercise
 // -- and for `DREAM_JIT_SYNC`, when that is wanted anywhere else.
 
+// Several compile threads, not one.
+//
+// A self-compile makes about a thousand functions hot, and compiling all of
+// them costs LLVM a minute of CPU against a program that runs for under three
+// seconds -- so one thread working through the queue reaches the first few
+// dozen before the program is over, and the rest are interpreted to the end.
+// Most machines have cores the program is not using. So there is a pool of
+// compile threads (`DREAM_JIT_THREADS`, `--jit-threads`), each taking the
+// hottest function waiting rather than the oldest (`take_hottest`), and the CPU
+// budget below is shared between them: the pool runs at normal priority while
+// what it has spent together is inside it, and at `SCHED_IDLE` past it, where
+// it gets the idle cores and nothing else.
+//
+// Every compile has a context and a module of its own, and the program's image
+// and runtime are only read, so the threads share nothing while they work but
+// the two tables a finished compile is written into (`mutex`) and LLJIT,
+// which is built to be added to from several threads. Its compiler is the one
+// thing that was not, which is why it is ours (`SizedCompiler`).
+
+/// The code generator: a target machine per module, made fresh for each one,
+/// which is what lets several threads generate code at once -- LLJIT's own
+/// compiler shares one -- and at the level the module's size calls for.
+///
+/// By the time a module reaches code generation, O2 has already done the
+/// optimizing that matters, and what the generator's own optimization buys is
+/// register allocation and instruction selection for tight loops. Measured on
+/// the benchmark loops, that is real: `sum` 43 -> 68 ms and `collatz` 66 -> 107
+/// with the fast generator. But it is paid in proportion to size, and on a
+/// self-compile the 232 modules over `kFastCodegenInsts` were 88% of the 29 s
+/// spent generating code; the fast generator did all of it in 3.6 s. Every
+/// benchmark kernel is under 400 instructions. So a large module is generated
+/// fast and a small one well -- marked by the flag `dream.fast`.
+class SizedCompiler : public llvm::orc::IRCompileLayer::IRCompiler {
+public:
+    explicit SizedCompiler(llvm::orc::JITTargetMachineBuilder jtmb)
+        : IRCompiler(llvm::orc::irManglingOptionsFromTargetOptions(jtmb.getOptions())),
+          jtmb_(std::move(jtmb)) {}
+
+    llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> operator()(llvm::Module& m) override {
+        llvm::orc::JITTargetMachineBuilder b = jtmb_;
+        b.setCodeGenOptLevel(m.getModuleFlag("dream.fast") ? llvm::CodeGenOptLevel::None
+                                                           : llvm::CodeGenOptLevel::Default);
+        auto tm = b.createTargetMachine();
+        if (!tm) return tm.takeError();
+        return llvm::orc::SimpleCompiler(**tm)(m);
+    }
+
+private:
+    const llvm::orc::JITTargetMachineBuilder jtmb_;
+};
+
+/// Instructions, after O2, past which a module's code is generated fast. See
+/// `SizedCompiler`.
+constexpr size_t kFastCodegenInsts = 1000;
+
+/// How many compile threads, unless `--jit-threads` says: `DREAM_JIT_THREADS`,
+/// or two. More is not faster for a program of a few seconds: on a
+/// self-compile (24 threads, 12 cores) one, two and four threads finished
+/// within the noise of each other, eight was 8% slower and sixteen 60% slower
+/// -- they compile more, and what they compile cannot repay itself in a run
+/// that short, while they take cores, cache and the hyperthread beside a
+/// program thread. A run long enough to want everything compiled wants
+/// `--precompile` instead.
+unsigned default_jit_threads() {
+    if (const char* v = std::getenv("DREAM_JIT_THREADS")) {
+        const long n = std::atol(v);
+        if (n > 0) return unsigned(n);
+    }
+    return 2;
+}
+
 struct Jit::Impl {
     explicit Impl(Runtime& r) : rt(r) {}
 
     Runtime& rt;
     std::unique_ptr<llvm::orc::LLJIT> lljit;
+    std::once_flag jit_once;
+    std::string jit_error;
+    /// Guards `compiled` and `rejected`, and nothing that runs long.
     std::mutex mutex;
     std::unordered_map<uint32_t, CompiledFn> compiled;
     std::unordered_set<uint32_t> rejected;
     uint32_t threshold = 32;
     std::atomic<uint64_t> compiled_count{0};
-    bool initialized = false;
+    /// Makes each compile's entry symbol unique, so two compiles of one
+    /// function -- two workers forcing it synchronously at once -- cannot
+    /// define the same name twice.
+    std::atomic<uint64_t> serial{0};
 
-    // The compile thread and its queue, guarded by `queue_mutex` -- a lock of
-    // their own, so an entry that queues a function never waits on a compile.
+    // The compile threads and their queue, guarded by `queue_mutex` -- a lock
+    // of their own, so an entry that queues a function never waits on a
+    // compile.
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     std::deque<uint32_t> queue;
-    std::thread worker;
+    std::vector<std::thread> workers;
+    unsigned threads = default_jit_threads();
     bool stopping = false;
+    /// CPU the compile threads have spent between them. See `jit_within_budget`.
+    std::atomic<int64_t> jit_ns{0};
     const bool force_sync = std::getenv("DREAM_JIT_SYNC") != nullptr;
 
     bool ensure_jit(std::string* error);
+    bool create_jit();
 };
 
 bool Jit::Impl::ensure_jit(std::string* error) {
-    if (lljit) return true;
-    if (!initialized) {
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-        initialized = true;
-    }
-    auto built = llvm::orc::LLJITBuilder().create();
+    std::call_once(jit_once, [this] { create_jit(); });
+    if (!lljit && error) *error = jit_error;
+    return lljit != nullptr;
+}
+
+bool Jit::Impl::create_jit() {
+    std::string* error = &jit_error;
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    // Code generation is ours rather than LLJIT's default, for two reasons:
+    // the default compiler is not safe to call from several threads at once,
+    // and several compile threads is the point (see "Compiling in the
+    // background"); and the level it generates code at is chosen per module,
+    // by size (see `SizedCompiler`).
+    auto built = llvm::orc::LLJITBuilder()
+                     .setCompileFunctionCreator(
+                         [](llvm::orc::JITTargetMachineBuilder jtmb)
+                             -> llvm::Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+                             return std::make_unique<SizedCompiler>(std::move(jtmb));
+                         })
+                     .create();
     if (!built) {
         if (error) *error = llvm::toString(built.takeError());
         return false;
@@ -5201,6 +5590,9 @@ bool Jit::Impl::ensure_jit(std::string* error) {
     add("dream_rt_set_tail", reinterpret_cast<void*>(&dream_rt_set_tail));
     add("dream_rt_make_list", reinterpret_cast<void*>(&dream_rt_make_list));
     add("dream_rt_make_array", reinterpret_cast<void*>(&dream_rt_make_array));
+    add("dream_rt_make_record", reinterpret_cast<void*>(&dream_rt_make_record));
+    add("dream_rt_make_map", reinterpret_cast<void*>(&dream_rt_make_map));
+    add("dream_rt_settle", reinterpret_cast<void*>(&dream_rt_settle));
     add("dream_rt_literal_str", reinterpret_cast<void*>(&dream_rt_literal_str));
     add("dream_rt_global", reinterpret_cast<void*>(&dream_rt_global));
     add("dream_rt_snapshot", reinterpret_cast<void*>(&dream_rt_snapshot));
@@ -5235,7 +5627,9 @@ Jit::~Jit() {
         impl_->queue.clear();
     }
     impl_->queue_cv.notify_all();
-    if (impl_->worker.joinable()) impl_->worker.join();
+    for (std::thread& w : impl_->workers) {
+        if (w.joinable()) w.join();
+    }
     impl_->rt.set_jit(nullptr);
 }
 
@@ -5248,9 +5642,10 @@ int64_t cpu_nanos(clockid_t clock) {
     return int64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec;
 }
 
-/// How much CPU the compile thread may take at normal priority: an allowance
-/// every program gets, plus a share of what the process has spent so far. See
-/// `compile_worker`. `DREAM_JIT_SHARE` is the share as a percentage.
+/// How much CPU the compile threads may take between them at normal priority:
+/// an allowance every program gets, plus a share of what the process has spent
+/// so far. See `compile_worker`. `DREAM_JIT_SHARE` is the share as a
+/// percentage.
 bool jit_within_budget(int64_t jit_ns) {
     static const int64_t share_pct = [] {
         if (const char* v = std::getenv("DREAM_JIT_SHARE")) return int64_t(std::atoll(v));
@@ -5308,24 +5703,48 @@ void Jit::compile_worker() {
             std::unique_lock<std::mutex> g(impl_->queue_mutex);
             impl_->queue_cv.wait(g, [&] { return impl_->stopping || !impl_->queue.empty(); });
             if (impl_->stopping) return;
-            func_index = impl_->queue.front();
-            impl_->queue.pop_front();
+            func_index = take_hottest();
         }
 #if defined(__linux__)
-        set_idle(!jit_within_budget(cpu_nanos(self_clock)));
+        set_idle(!jit_within_budget(impl_->jit_ns.load(std::memory_order_relaxed)));
+        const int64_t spent_before = cpu_nanos(self_clock);
 #endif
-        CompiledFn fn = nullptr;
-        {
+        CompiledFn fn = compile_one(func_index, nullptr);
+        if (!fn) {
             std::lock_guard<std::mutex> g(impl_->mutex);
-            fn = compile_locked(func_index, nullptr);
-            if (!fn) impl_->rejected.insert(func_index);
+            impl_->rejected.insert(func_index);
         }
+#if defined(__linux__)
+        impl_->jit_ns.fetch_add(cpu_nanos(self_clock) - spent_before, std::memory_order_relaxed);
+#endif
         // From "queued" only: nothing else moves a queued function, but a
         // compare-exchange says so rather than relying on it.
         CompiledFn expected = queued();
         cached_[func_index].compare_exchange_strong(expected, fn ? fn : rejected(),
                                                     std::memory_order_acq_rel);
     }
+}
+
+uint32_t Jit::take_hottest() {
+    // The queue is in the order functions *became* hot, which is not the
+    // order they matter in: a function that crossed the threshold early may
+    // be called a handful of times more, and one that crossed it late may
+    // be the loop the rest of the program runs in. `tier` keeps counting a
+    // function while it waits, so the count says which is which. A linear
+    // walk, because it is short beside a compile -- a thousand entries at
+    // the very most, against milliseconds of LLVM.
+    auto best = impl_->queue.begin();
+    uint32_t most = 0;
+    for (auto it = impl_->queue.begin(); it != impl_->queue.end(); ++it) {
+        const uint32_t n = counts_[*it].load(std::memory_order_relaxed);
+        if (n > most) {
+            most = n;
+            best = it;
+        }
+    }
+    const uint32_t func_index = *best;
+    impl_->queue.erase(best);
+    return func_index;
 }
 
 void Jit::set_threshold(uint32_t calls) {
@@ -5353,20 +5772,31 @@ CompiledFn Jit::on_enter(uint32_t func_index) {
             std::lock_guard<std::mutex> g(impl_->queue_mutex);
             if (impl_->stopping) return nullptr;
             impl_->queue.push_back(func_index);
-            if (!impl_->worker.joinable()) impl_->worker = std::thread([this] { compile_worker(); });
+            // The pool is started by the first function to get hot, all of
+            // it at once: a thread waiting on an empty queue costs nothing.
+            if (impl_->workers.empty()) {
+                for (unsigned i = 0; i < impl_->threads; ++i) {
+                    impl_->workers.emplace_back([this] { compile_worker(); });
+                }
+            }
         }
         impl_->queue_cv.notify_one();
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> g(impl_->mutex);
-    auto it = impl_->compiled.find(func_index);
-    if (it != impl_->compiled.end()) return it->second;
-    if (impl_->rejected.count(func_index)) return nullptr;
+    {
+        std::lock_guard<std::mutex> g(impl_->mutex);
+        auto it = impl_->compiled.find(func_index);
+        if (it != impl_->compiled.end()) return it->second;
+        if (impl_->rejected.count(func_index)) return nullptr;
+    }
 
-    CompiledFn fn = compile_locked(func_index, nullptr);
+    CompiledFn fn = compile_one(func_index, nullptr);
     if (!fn) {
-        impl_->rejected.insert(func_index);
+        {
+            std::lock_guard<std::mutex> g(impl_->mutex);
+            impl_->rejected.insert(func_index);
+        }
         cached_[func_index].store(rejected(), std::memory_order_release);
         return nullptr;
     }
@@ -5386,31 +5816,105 @@ void Jit::deoptimize(uint32_t func_index) {
 }
 
 CompiledFn Jit::compile(uint32_t func_index, std::string* error) {
-    std::lock_guard<std::mutex> g(impl_->mutex);
-    return compile_locked(func_index, error);
+    return compile_one(func_index, error);
 }
 
-CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
-    auto it = impl_->compiled.find(func_index);
-    if (it != impl_->compiled.end()) return it->second;
+// Compiling ahead.
+//
+// A function is compiled once it is hot because most functions never are, and
+// compiling one is not cheap: a self-compile's thousand hot functions cost LLVM
+// a minute of CPU, against three seconds of program. But compiled, those
+// functions do the same work in about two thirds of the CPU. So a program that
+// runs long enough to repay the compile -- or a run where only the run's own
+// speed matters -- can have everything compiled first, on every core, while
+// nothing else wants them. That is `--precompile`.
+//
+// Nothing about what is compiled changes. A function the tier refuses is
+// marked so, which is what being refused when hot would have done, and the
+// interpreter runs it.
+Jit::Precompiled Jit::precompile(unsigned threads) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const Image& img = impl_->rt.image();
+    const uint32_t n = uint32_t(img.func_count());
+    std::atomic<uint32_t> next{0};
+    std::atomic<uint32_t> compiled{0};
+    std::atomic<uint32_t> refused{0};
+    auto work = [&] {
+        for (;;) {
+            const uint32_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) return;
+            // A thunk or a parameterless global: the tier never takes one, and
+            // asking costs an analysis.
+            if (img.func(i).arity == 0) continue;
+            CompiledFn fn = compile_one(i, nullptr);
+            if (fn) {
+                compiled.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                refused.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> g(impl_->mutex);
+                impl_->rejected.insert(i);
+            }
+            cached_[i].store(fn ? fn : rejected(), std::memory_order_release);
+        }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned k = 1; k < std::max(1u, threads); ++k) pool.emplace_back(work);
+    work();
+    for (std::thread& t : pool) t.join();
+    Precompiled out;
+    out.compiled = compiled.load();
+    out.refused = refused.load();
+    out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return out;
+}
+
+void Jit::set_threads(unsigned n) {
+    std::lock_guard<std::mutex> g(impl_->queue_mutex);
+    // Only before the pool has started; it is started once, whole.
+    if (impl_->workers.empty() && n > 0) impl_->threads = n;
+}
+
+CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
+    {
+        std::lock_guard<std::mutex> g(impl_->mutex);
+        auto it = impl_->compiled.find(func_index);
+        if (it != impl_->compiled.end()) return it->second;
+    }
     // `DREAM_JIT_TRACE=1` prints every compile, whether it was taken and what
     // LLVM charged for it -- the number that decided compiling in the
     // background, and the one to read before widening the tier again.
     // The function's name is printed beside its index, as `--profile` names
     // it, so that a trace says which of a library's functions the tier took.
+    // With the time split three ways -- writing the IR, optimizing it, and
+    // generating code -- and the module's size before and after O2, which is
+    // what the last two are proportional to.
     struct Trace {
+        using Clock = std::chrono::steady_clock;
         uint32_t fi;
         CompiledFn* result;
         const Image* img;
-        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        Clock::time_point t0 = Clock::now();
+        Clock::time_point emitted{}, optimized{};
+        size_t insts_in = 0, insts_out = 0;
+        static double ms(Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        }
         ~Trace() {
             static const bool on = std::getenv("DREAM_JIT_TRACE") != nullptr;
             if (!on) return;
-            const double ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count();
+            const Clock::time_point t3 = Clock::now();
             StringRef name = img->str(img->func(fi).name);
-            std::fprintf(stderr, "; jit fn#%u %.*s %s %.2f ms\n", fi, int(name.len), name.data,
-                         *result ? "compiled" : "refused", ms);
+            if (!*result) {
+                std::fprintf(stderr, "; jit fn#%u %.*s refused %.2f ms\n", fi, int(name.len),
+                             name.data, ms(t0, t3));
+                return;
+            }
+            std::fprintf(stderr,
+                         "; jit fn#%u %.*s compiled %.2f ms (emit %.2f, opt %.2f, codegen %.2f; "
+                         "%zu -> %zu insts%s)\n",
+                         fi, int(name.len), name.data, ms(t0, t3), ms(t0, emitted),
+                         ms(emitted, optimized), ms(optimized, t3), insts_in, insts_out,
+                         insts_out > kFastCodegenInsts ? ", fast codegen" : "");
         }
     };
     CompiledFn traced = nullptr;
@@ -5422,7 +5926,8 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);
     mod->setDataLayout(impl_->lljit->getDataLayout());
 
-    std::string name = "dream_fn_" + std::to_string(func_index);
+    std::string name = "dream_fn_" + std::to_string(func_index) + "_" +
+                       std::to_string(impl_->serial.fetch_add(1, std::memory_order_relaxed));
     if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index, name)) {
         if (error) *error = "not compilable by this tier";
         return nullptr;
@@ -5431,6 +5936,15 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     // Standard optimization pipeline: without it the tag arithmetic and the
     // repeated slot loads dominate, and the compiled loop is barely faster
     // than the interpreter.
+    auto instructions = [&] {
+        size_t n = 0;
+        for (const llvm::Function& f : *mod) {
+            for (const llvm::BasicBlock& b : f) n += b.size();
+        }
+        return n;
+    };
+    trace.emitted = std::chrono::steady_clock::now();
+    trace.insts_in = instructions();
     llvm::PassBuilder pb;
     llvm::LoopAnalysisManager lam;
     llvm::FunctionAnalysisManager fam;
@@ -5443,6 +5957,11 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
     pb.crossRegisterProxies(lam, fam, cgam, mam);
     auto mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
     mpm.run(*mod, mam);
+    trace.optimized = std::chrono::steady_clock::now();
+    trace.insts_out = instructions();
+    if (trace.insts_out > kFastCodegenInsts) {
+        mod->addModuleFlag(llvm::Module::Warning, "dream.fast", 1);
+    }
 
     if (auto err = impl_->lljit->addIRModule(
             llvm::orc::ThreadSafeModule(std::move(mod), std::move(ctx)))) {
@@ -5455,14 +5974,19 @@ CompiledFn Jit::compile_locked(uint32_t func_index, std::string* error) {
         return nullptr;
     }
     auto fn = sym->toPtr<CompiledFn>();
+    {
+        // Two compiles of one function can race only on the synchronous
+        // path; the first to finish is the one every later caller gets.
+        std::lock_guard<std::mutex> g(impl_->mutex);
+        auto [at, fresh] = impl_->compiled.emplace(func_index, fn);
+        if (fresh) ++impl_->compiled_count;
+        fn = at->second;
+    }
     traced = fn;
-    impl_->compiled[func_index] = fn;
-    ++impl_->compiled_count;
     return fn;
 }
 
 std::string Jit::dump_ir(uint32_t func_index) {
-    std::lock_guard<std::mutex> g(impl_->mutex);
     const Image& img = impl_->rt.image();
     auto ctx = std::make_unique<llvm::LLVMContext>();
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);

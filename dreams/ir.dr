@@ -24,6 +24,8 @@ import std.str;
 import std.dynamic.{fold, map}
 import std.char;
 
+import dreams.ast;
+
 // --- opcodes -------------------------------------------------------------------
 //
 // Named by atom rather than by number, so that a dump reads and a mistake is a
@@ -129,7 +131,15 @@ let ops = [
     [:band, 75, "band"], [:bor, 76, "bor"], [:bxor, 77, "bxor"],
     [:bnot, 78, "bnot"], [:shl, 79, "shl"], [:shr, 80, "shr"],
 
+    /// A value of a declared record or union: `a` = kids offset, `b` = field
+    /// count, `c` = the atom naming it, plus `record_variant` when that is a
+    /// union's variant. See `lower.lower_record`.
+    [:record_make, 81, "record"],
+
 ];
+
+/// `record_make`'s `c`: the top bit says the id names a variant.
+let record_variant = 2147483648;
 
 priv let nth = list.nth;
 
@@ -210,34 +220,95 @@ let add_flag flags f = if has_flag flags f { flags } else { flags + f };
 /// integer would be silent and this is loud.
 let no_node = :none;
 
+let is_node : :any -> :bool;
 let is_node n = n != no_node;
 
 // --- a node --------------------------------------------------------------------
 
 /// The arena as it is built: tables keyed by index, a pool per constant type.
 /// See "the program" below for why a map and not lists.
-type Program = :map;
+mapping Program {
+    // The arena: node index to `Node`, kid index to node index, each with the
+    // count that says what the next index is (see the note on the arena below).
+    nodes = %{}
+    node_count = 0
+    kids = %{}
+    kid_count = 0
+    funcs = []
+    globals = []
+    modules = []
+    imports = []
+    // The constant pools. Each is set by `program`: a default may not name
+    // `pool_new`.
+    ints = ()
+    floats = ()
+    strs = ()
+    atoms = ()
+    // The function `main!` compiles to, and the names an image reports itself
+    // by. All three are filled in when the program is linked.
+    entry = :none
+    module_name = 0
+    source_name = 0
+    // Whether a node emitted since this was last cleared is impure.
+    impure = false
+}
 
 /// The finished program `finish` hands the image writer: every table flattened
-/// into the order the image lays it out in.
-type Image = :map;
+/// into the order the image lays it out in, and what the build adds to it --
+/// the target, the payloads, the parameter hints for the JIT.
+mapping Image {
+    nodes = []
+    kids = []
+    funcs = []
+    globals = []
+    modules = []
+    imports = []
+    ints = []
+    floats = []
+    strs = []
+    atoms = []
+    entry = :none
+    module_name = 0
+    source_name = 0
+    target_flags = 0
+    payloads = []
+    payload_names = []
+    float_params = []
+    integer_params = []
+}
 
-/// `[op, flags, a, b, c]`. The VM's record also carries a 16-bit `aux` field
-/// that nothing generates yet; it is written as zero and left out here rather
-/// than threaded through every constructor unused.
-group Node { op, flags, a, b, c }
+/// `Node(op, flags, a, b, c)`. The VM's record also carries a 16-bit `aux`
+/// field that nothing generates yet; it is written as zero and left out here
+/// rather than threaded through every constructor unused.
+///
+/// A record, read by position: `n.[0]` is the op and `n.[k + 2]` operand `k`,
+/// as when a node was the list `[op, flags, a, b, c]`, and the natives that
+/// walk an arena in C++ (`vm.share_arenas`, `vm.node_section`) read either.
+/// It was a list for their sake, and a list was five cells and a walk to its
+/// last field. A program is tens of thousands of these, built and rebuilt by
+/// every pass, so the record is a third of the bytes and every read one load.
+struct Node { op, flags, a, b, c }
 
+let node : :atom -> :any -> :any -> :any -> Node;
 let node op a b c = Node.make op 0 a b c;
-let node_op = Node.op;
-let node_flags = Node.flags;
-let node_a = Node.a;
-let node_b = Node.b;
-let node_c = Node.c;
+let node_op : Node -> :atom;
+let node_op n = n.[0];
+let node_flags : Node -> :integer;
+let node_flags n = n.[1];
+let node_a : Node -> :any;
+let node_a n = n.[2];
+let node_b : Node -> :any;
+let node_b n = n.[3];
+let node_c : Node -> :any;
+let node_c n = n.[4];
 
+let leaf : :atom -> Node;
 let leaf op = node op no_node no_node no_node;
 
-let with_flags flags n = Node.set_flags flags n;
+let with_flags : :integer -> Node -> Node;
+let with_flags flags n = n.[1 => flags];
 
+let node_is_impure : Node -> :bool;
 let node_is_impure n = has_flag (node_flags n) f_impure;
 
 // --- the constant pools ---------------------------------------------------------
@@ -261,14 +332,20 @@ group Pool {
     }
 }
 
+let pool_new : Pool;
 let pool_new = Pool.new ();
+let pool_values : Pool -> [:any];
 let pool_values = Pool.values;
+let pool_count : Pool -> :integer;
 let pool_count = Pool.count;
+let pool_index : Pool -> :map;
 let pool_index = Pool.index;
 
 /// Intern a value: `[pool, index]`. The index is stable once given.
+let intern : :any -> Pool -> [Pool, :integer];
 let intern v p = Pool.intern v p;
 
+let pool_list : Pool -> [:any];
 let pool_list p = list.reverse (pool_values p);
 
 // --- the program ----------------------------------------------------------------
@@ -284,34 +361,42 @@ let pool_list p = list.reverse (pool_values p);
 // on a node long after it was emitted, and the whole thing is turned into flat
 // lists once, in `finish`, where the cost is paid a single time.
 
-let program = %{
-    :nodes => %{}, :node_count => 0,
-    :kids => %{}, :kid_count => 0,
-    :funcs => [], :globals => [], :modules => [], :imports => [],
-    :ints => pool_new, :floats => pool_new, :strs => pool_new, :atoms => pool_new,
-    // The function `main!` compiles to, and the names an image reports itself
-    // by. All three are filled in when the program is linked.
-    :entry => no_node, :module_name => 0, :source_name => 0,
-};
+let program : Program;
+let program = Program.new ()
+    |> Program.set_ints pool_new |> Program.set_floats pool_new
+    |> Program.set_strs pool_new |> Program.set_atoms pool_new;
 
-let nodes p      = p.[:nodes else (%{})];
+let nodes : Program -> %{:integer => Node};
+let nodes p      = Program.nodes p;
 let node_count : Program -> :integer;
-let node_count p = p.[:node_count else 0];
-let kids p       = p.[:kids else (%{})];
+let node_count p = Program.node_count p;
+let kids : Program -> :map;
+let kids p       = Program.kids p;
 let kid_count : Program -> :integer;
-let kid_count p  = p.[:kid_count else 0];
-let funcs p      = p.[:funcs else []];
-let globals p    = p.[:globals else []];
-let prog_modules p = p.[:modules else []];
-let imports p    = p.[:imports else []];
-let entry p      = p.[:entry else no_node];
-let module_name p = p.[:module_name else 0];
-let source_name p = p.[:source_name else 0];
+let kid_count p  = Program.kid_count p;
+let funcs : Program -> [:map];
+let funcs p      = Program.funcs p;
+let globals : Program -> [:map];
+let globals p    = Program.globals p;
+let prog_modules : Program -> [:map];
+let prog_modules p = Program.modules p;
+let imports : Program -> [:map];
+let imports p    = Program.imports p;
+let entry : Program -> :integer | :atom;
+let entry p      = Program.entry p;
+let module_name : Program -> :integer;
+let module_name p = Program.module_name p;
+let source_name : Program -> :integer;
+let source_name p = Program.source_name p;
 
-let ints p   = p.[:ints else pool_new];
-let floats p = p.[:floats else pool_new];
-let strs p   = p.[:strs else pool_new];
-let atoms p  = p.[:atoms else pool_new];
+let ints : Program -> Pool;
+let ints p   = Program.ints p;
+let floats : Program -> Pool;
+let floats p = Program.floats p;
+let strs : Program -> Pool;
+let strs p   = Program.strs p;
+let atoms : Program -> Pool;
+let atoms p  = Program.atoms p;
 
 /// True, having forced every field of `n` on the way to saying so.
 ///
@@ -341,6 +426,7 @@ let atoms p  = p.[:atoms else pool_new];
 /// without evaluating every part of what it is given: the five questions
 /// written out were a dozen reductions a node, and this is asked of every node
 /// the compiler emits and every flag it sets.
+let settled : :any -> :bool;
 let settled n = type_of (to_string n) == :string;
 
 /// Force the arena's spine.
@@ -356,28 +442,30 @@ let settled n = type_of (to_string n) == :string;
 /// the arena from being a chain of suspended puts, and that keeps it from
 /// being a chain of its own versions, which is a different chain with a
 /// different cause and was worth four hundred megabytes.
+let settle : Program -> Program;
 let settle p = if len (nodes p) >= 0 && len (kids p) >= 0 { p } else { p };
 
 /// The same program with an empty arena: no nodes, no kids. The constant pools
 /// and everything else are kept. A program lowered in parts starts each body
 /// this way, because what a body lowers is shared into its part as soon as the
 /// body is done (`lower.lower_part`) and the pools are all that carries on.
-let cleared p = ((((p.[:nodes => %{}]).[:node_count => 0]).[:kids => %{}]).[:kid_count => 0])
-                    .[:impure => false];
+let cleared : Program -> Program;
+let cleared p = p |> Program.set_nodes %{} |> Program.set_node_count 0
+                  |> Program.set_kids %{} |> Program.set_kid_count 0 |> Program.set_impure false;
 
 /// The node at an index. Every edge in the arena is one of these.
-let node_at : :integer -> Program -> [:any];
+let node_at : :integer -> Program -> Node;
 let node_at i p = ((nodes p)).[i else (leaf :nop)];
 
 let kid_at : :integer -> Program -> :integer | :atom;
 let kid_at i p = ((kids p)).[i else no_node];
 
 /// Append a node: `[program, index]`.
-let push_node : [:any] -> Program -> [Program, :integer];
+let push_node : Node -> Program -> [Program, :integer];
 let push_node n p = {
     let i = node_count p;
     if settled n {
-        [settle (((p.[:nodes => (((nodes p)).[i => n])])).[:node_count => (i + 1)]),
+        [settle (p |> Program.set_nodes ((nodes p).[i => n]) |> Program.set_node_count (i + 1)),
          i]
     } else { [p, i] }
 };
@@ -391,10 +479,11 @@ let push_node n p = {
 /// The fold is strict for the reason `list.fold_strict` gives -- a lazy one
 /// answers a chain of suspended puts, and a run of children is as long as a
 /// call's argument list.
+let push_kids : [:any] -> Program -> [Program, :integer];
 let push_kids xs p = {
     let at = kid_count p;
     let filled = fill_kids (kids p) at xs;
-    [settle (((p.[:kids => filled])).[:kid_count => (at + list.length xs)]), at]
+    [settle (p |> Program.set_kids filled |> Program.set_kid_count (at + list.length xs)), at]
 };
 
 /// Put each child at the next index. The table is a strict parameter for the
@@ -402,22 +491,27 @@ let push_kids xs p = {
 /// fold over the children zipped with their positions: numbering a list this
 /// already walks in order cost a `range` and a `zip` per call, and a call is
 /// made for every argument list the program has.
+let fill_kids : :map -> :integer -> [:any] -> :map;
 let rec fill_kids !m at xs = match xs {
     [] => m,
     [kid, ..rest] => fill_kids (if type_of kid != :nothing { m.[at => kid] } else { m }) (at + 1) rest,
 };
 
-let intern_int v p   = { let got = intern v (ints p);   [p.[:ints => (list.head got)], nth 1 got] };
-let intern_float v p = { let got = intern v (floats p); [p.[:floats => (list.head got)], nth 1 got] };
-let intern_str v p   = { let got = intern v (strs p);   [p.[:strs => (list.head got)], nth 1 got] };
+let intern_int : :integer -> Program -> [Program, :integer];
+let intern_int v p   = { let got = intern v (ints p);   [Program.set_ints (list.head got) p, nth 1 got] };
+let intern_float : :float -> Program -> [Program, :integer];
+let intern_float v p = { let got = intern v (floats p); [Program.set_floats (list.head got) p, nth 1 got] };
+let intern_str : :string -> Program -> [Program, :integer];
+let intern_str v p   = { let got = intern v (strs p);   [Program.set_strs (list.head got) p, nth 1 got] };
 
 /// An atom is stored as the string-table index of its name, because the runtime
 /// interns atoms by name when it loads an image. Interning the name first is
 /// what makes that index exist.
+let intern_atom : :string -> Program -> [Program, :integer];
 let intern_atom v p = {
     let named = intern_str v p;
     let got = intern (nth 1 named) (atoms (list.head named));
-    [((list.head named)).[:atoms => (list.head got)], nth 1 got]
+    [Program.set_atoms (list.head got) (list.head named), nth 1 got]
 };
 
 /// Set a flag on a node already in the arena. Nodes are appended and never
@@ -435,12 +529,13 @@ let intern_atom v p = {
 /// strictness, impurity), so the arena was a chain of tens of thousands of its
 /// own versions, held together by nodes nobody had looked at yet. It was 45% of
 /// a self-compile's live set.
+let set_node_flag : :integer -> :integer -> Program -> Program;
 let set_node_flag i f p = {
     let n = node_at i p;
     let flagged = with_flags (add_flag (node_flags n) f) n;
-    let marked = if f == f_impure { p.[:impure => true] } else { p };
+    let marked = if f == f_impure { Program.set_impure true p } else { p };
     if settled flagged {
-        settle (marked.[:nodes => (((nodes marked)).[i => flagged])])
+        settle (Program.set_nodes ((nodes marked).[i => flagged]) marked)
     } else { p }
 };
 
@@ -450,8 +545,10 @@ let set_node_flag i f p = {
 /// children -- is answered without looking at them. It is false for most of
 /// a program's bodies, which is what makes it worth keeping: a program lowered
 /// in parts gives every body an arena of its own (`cleared`).
-let has_impure p = p.[:impure else false];
+let has_impure : Program -> :bool;
+let has_impure p = Program.impure p;
 
+let node_flags_at : :integer -> Program -> :integer;
 let node_flags_at i p = node_flags (node_at i p);
 
 /// Replace a node already in the arena.
@@ -463,50 +560,43 @@ let node_flags_at i p = node_flags (node_at i p);
 /// Settled like the two writers above, and for the same reason -- there are
 /// only twenty or so of these in a self-compile, so this is consistency rather
 /// than a measurement.
+let set_node : :integer -> Node -> Program -> Program;
 let set_node i n p =
-    if settled n { settle (p.[:nodes => (((nodes p)).[i => n])]) } else { p };
+    if settled n { settle (Program.set_nodes ((nodes p).[i => n]) p) } else { p };
 
 // --- what the arena becomes -------------------------------------------------------
 
 /// Put every pool the right way round. Everything downstream -- the dump, and
 /// eventually the image writer -- reads this rather than the building form.
 let finish : Program -> Image;
-let finish p = (finish_rest p).[:nodes => table_list (nodes p) (node_count p - 1) (leaf :nop) []]
-                              .[:kids => table_list (kids p) (kid_count p - 1) no_node []];
+let finish p = finish_rest p
+    |> Image.set_nodes (table_list (nodes p) (node_count p - 1) (leaf :nop) [])
+    |> Image.set_kids (table_list (kids p) (kid_count p - 1) no_node []);
 
 /// A table keyed `0 .. i` as a list, built from the end so each entry is one
 /// cons and the positions need no list of their own. A hole reads as `fill`,
 /// which is what `node_at` and `kid_at` answer for one.
-let rec table_list m i fill acc =
+let table_list : :map -> :integer -> :any -> [:any] -> [:any];
+let rec table_list m i fill !acc =
     if i < 0 { acc } else { table_list m (i - 1) fill (list.cons (m.[i else fill]) acc) };
 
 /// Everything `finish` makes but the arena itself, for a pass that reads the
 /// arena from its tables and writes a new one.
 let finish_rest : Program -> Image;
-let finish_rest p = %{
-    :funcs => funcs p, :globals => globals p,
-    :modules => prog_modules p, :imports => imports p,
-    :ints => pool_list (ints p), :floats => pool_list (floats p),
-    :strs => pool_list (strs p), :atoms => pool_list (atoms p),
-    :entry => entry p, :module_name => module_name p, :source_name => source_name p,
-};
+let finish_rest p = Image.new ()
+    |> Image.set_funcs (funcs p) |> Image.set_globals (globals p)
+    |> Image.set_modules (prog_modules p) |> Image.set_imports (imports p)
+    |> Image.set_ints (pool_list (ints p)) |> Image.set_floats (pool_list (floats p))
+    |> Image.set_strs (pool_list (strs p)) |> Image.set_atoms (pool_list (atoms p))
+    |> Image.set_entry (entry p) |> Image.set_module_name (module_name p)
+    |> Image.set_source_name (source_name p);
 
 // --- reading it back --------------------------------------------------------------
 
 /// One node, as a line. The operands are shown the way the opcode uses them,
 /// because `a` meaning "a constant index" and `a` meaning "another node" look
 /// identical otherwise, and that is exactly the mistake worth catching.
-/// A string as it would be written in source. `to_string` is the identity on a
-/// plain string, which in a dump loses the one thing that tells a string
-/// constant from a name -- `str hi` and `local hi` should not look alike.
-let quoted s =
-    "\"" + str.join_str "" (list.map (fn ch ->
-        if ch == '"' { "\\\"" }
-        else if ch == '\\' { "\\\\" }
-        else if ch == '\n' { "\\n" }
-        else if ch == '\t' { "\\t" }
-        else { str.of_chars [ch] }) (str.chars s)) + "\"";
-
+let show_node : Image -> :integer -> Node -> :string;
 let show_node img i n = {
     let const_at pool at = {
         let xs = img.[pool else []];
@@ -516,9 +606,9 @@ let show_node img i n = {
         match node_op n {
             :const_int   => const_at :ints (node_a n),
             :const_float => const_at :floats (node_a n),
-            :const_str   => quoted (const_at :strs (node_a n)),
+            :const_str   => ast.quote_str (const_at :strs (node_a n)),
             :const_atom  => {
-                let ats = img.[:atoms else []];
+                let ats = Image.atoms img;
                 let at = node_a n;
                 if at >= list.length ats { ":?" }
                 else { ":" + const_at :strs (nth at ats) }
@@ -537,6 +627,8 @@ let show_node img i n = {
             :make_list   => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
             :make_array  => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
             :make_map    => "kids@" + to_string (node_a n) + "x" + to_string (node_b n),
+            :record_make => "kids@" + to_string (node_a n) + "x" + to_string (node_b n)
+                            + " " + const_at :atoms (node_c n % record_variant),
             :switch_head => to_string (node_a n) + " kids@" + to_string (node_b n)
                             + "x" + to_string (node_c n),
             :switch_atom => to_string (node_a n) + " kids@" + to_string (node_b n)
@@ -564,10 +656,11 @@ let show_node img i n = {
 /// The whole arena, as text. This is what `--dump` prints, and what a test
 /// compares against: a tree written out one node per line is far easier to read
 /// in a failure than a nest of indices.
+let dump : Image -> :string;
 let dump img =
     str.join_str "\n"
-        (list.map (fn i -> show_node img i (nth i (img.[:nodes else []])))
-                  (list.range 0 (list.length (img.[:nodes else []]))));
+        (list.map (fn i -> show_node img i (nth i (Image.nodes img)))
+                  (list.range 0 (list.length (Image.nodes img))));
 
 // --- tests -------------------------------------------------------------------
 
@@ -620,7 +713,7 @@ when test {
         test.case "children come back in the order they went in"
             $( test.eq! [1, 2, 3, 4]
                         { let a = push_kids [1, 2, 3] program;
-                          ((finish (list.head (push_kids [4] (list.head a))))).[:kids else []] } ),
+                          Image.kids (finish (list.head (push_kids [4] (list.head a)))) } ),
 
         test.case "a constant is interned once"
             $( test.eq! [0, 0, 1]
@@ -632,12 +725,12 @@ when test {
             $( test.eq! ["x", "y"]
                         { let a = intern_str "x" program;
                           let b = intern_str "y" (list.head a);
-                          ((finish (list.head b))).[:strs else []] } ),
+                          Image.strs (finish (list.head b)) } ),
         test.case "an atom is stored as the index of its name"
             $( test.eq! [["ok"], [0]]
                         { let got = intern_atom "ok" program;
                           let p = list.head got;
-                          [((finish p)).[:strs else []], ((finish p)).[:atoms else []]] } ),
+                          [Image.strs (finish p), Image.atoms (finish p)] } ),
         test.case "the same atom interns once"
             $( test.eq! [0, 0]
                         { let a = intern_atom "ok" program;
@@ -656,7 +749,7 @@ when test {
                           node_op (node_at (nth 1 a) (list.head b)) } ),
         test.case "the arena comes out in the order it was built"
             $( test.eq! [:unit, :force]
-                        (list.map (fn n -> node_op n) (((finish built)).[:nodes else []])) ),
+                        (list.map (fn n -> node_op n) (Image.nodes (finish built))) ),
         test.case "a dump shows one node per line, with its index"
             $( test.eq! ["  0  unit", "  1  force 0"] (str.split "\n" (dump (finish built))) ),
         test.case "a dump shows a constant's value, not its index"

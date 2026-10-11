@@ -72,10 +72,12 @@ mapping Options {
 }
 
 /// The defaults: checked, shared, no payload.
+let options : Options;
 let options = Options.new ();
 
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
+let scratch : Options;
 let scratch = Options.make false false [] false [] ();
 
 // --- a build --------------------------------------------------------------------
@@ -182,6 +184,7 @@ let share_elsewhere! p = {
 /// against those answers as well -- in parts again, with a checker made from
 /// what all the parts of the first said. See "what an unsigned function
 /// answers" in typecheck.dr.
+let analyze_parallel! : modules.Loader -> scope.Resolution -> :map -> :any -> typecheck.Analysis;
 let analyze_parallel! l r comps cache = {
     let kd = vm.share! (typecheck.prepared l r comps);
     let k = list.head kd;
@@ -200,6 +203,7 @@ let analyze_parallel! l r comps cache = {
 /// asks -- the one, or the first and the one made from what it inferred. Each
 /// kept under a kind of its own, since the two answer different things about
 /// the same walk.
+let checked_in_parts! : :atom -> :any -> [typecheck.Checker] -> scope.Resolution -> [:any];
 let checked_in_parts! how cache ks r = {
     let tables = match cache { () => (), _ => unit.digest (typecheck.tables (list.last ks)) };
     strict! tables
@@ -234,6 +238,7 @@ let check_elsewhere! how !cache !key ks slice = spawn! $( vm.share! (check_unit!
 /// against the same walk and the same tables. Kept with positions counted from
 /// the part's first body, as a walk is, so a body added to an earlier module
 /// does not make every later part's check a stranger.
+let check_unit! : :atom -> :any -> :any -> [typecheck.Checker] -> [[:any]] -> [[:any]];
 let check_unit! how cache key ks slice = match [cache, slice] {
     [(), _] => check_bodies how ks slice,
     [_, []] => check_bodies how ks slice,
@@ -254,6 +259,7 @@ let check_unit! how cache key ks slice = match [cache, slice] {
 /// `[position, answer]` for each body: the first check's answer is
 /// `[diagnostics, inferred]` (`typecheck.check_decl_inferring`), the second's
 /// the diagnostics alone (`typecheck.check_again`).
+let check_bodies : :atom -> [typecheck.Checker] -> [[:any]] -> [[:any]];
 let check_bodies how ks slice = match how {
     :first => list.map (fn nb -> [list.head nb, typecheck.check_decl_inferring (list.head ks) (list.nth 1 nb) []]) slice,
     _ => list.map (fn nb -> [list.head nb, typecheck.check_again (list.head ks) (list.nth 1 ks) (list.nth 1 nb)]) slice,
@@ -323,7 +329,7 @@ let rendered b = diag.render_all (files b) (diags b);
 /// -- an alias of a module -- has no parameters to describe.
 let param_masks : ir.Image -> %{ :integer => :integer } -> [[:integer, :integer]];
 let param_masks img by_global = {
-    let globals = img.[:globals else []];
+    let globals = ir.Image.globals img;
     let found = list.fold (fn acc [gi, mask] -> {
         let g = globals.[gi else ()];
         if g == () || g.[:kind else ir.global_module] != ir.global_function { acc }
@@ -345,10 +351,11 @@ let image b = {
     let built = if not (Options.optimize o) { arena }
                 else { match Build.shared b { () => optimizer.optimize arena, done => done } };
     let hints f = if Options.types o { param_masks built (f (Build.facts b)) } else { [] };
-    built.[:payloads => Options.payloads o]
-         .[:payload_names => Options.payload_names o]
-         .[:float_params => hints typecheck.Analysis.float_params]
-         .[:integer_params => hints typecheck.Analysis.integer_params]
+    built
+        |> ir.Image.set_payloads (Options.payloads o)
+        |> ir.Image.set_payload_names (Options.payload_names o)
+        |> ir.Image.set_float_params (hints typecheck.Analysis.float_params)
+        |> ir.Image.set_integer_params (hints typecheck.Analysis.integer_params)
 };
 
 /// The image as the bytes a `.dream` file holds, payload excepted.

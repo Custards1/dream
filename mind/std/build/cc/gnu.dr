@@ -25,44 +25,44 @@ let sanitizer k = str.slice 1 (str.byte_length (to_string k) - 1) (to_string k);
 /// The flags one setting adds when compiling a source in `lang`.
 let compile_flags : cc.Toolchain -> :atom -> cc.Setting -> [:string];
 let compile_flags tc lang s = match s {
-    [:standard, l] if cc.standard_is_for lang l =>
+    cc.Setting.standard(l) if cc.standard_is_for lang l =>
         [(if lang == :cxx { "-std=c++" } else { "-std=c" }) + cc.standard_version l],
-    [:optimize, :size] => ["-Os"],
-    [:optimize, n] => ["-O" + to_string n],
-    [:debug_info, true] => ["-g"],
-    [:warnings, :none] => ["-w"],
-    [:warnings, :all] => ["-Wall"],
-    [:warnings, :extra] => ["-Wall", "-Wextra"],
-    [:warnings_as_errors, true] => ["-Werror"],
-    [:define, n, ()] => ["-D" + n],
-    [:define, n, v] => ["-D" + n + "=" + value_text v],
-    [:include, d] => ["-I" + d],
-    [:rtti, false] if lang == :cxx => ["-fno-rtti"],
-    [:sanitize, k] if k != :none => ["-fsanitize=" + sanitizer k],
+    cc.Setting.optimize(:size) => ["-Os"],
+    cc.Setting.optimize(n) => ["-O" + to_string n],
+    cc.Setting.debug_info(true) => ["-g"],
+    cc.Setting.warnings(:none) => ["-w"],
+    cc.Setting.warnings(:all) => ["-Wall"],
+    cc.Setting.warnings(:extra) => ["-Wall", "-Wextra"],
+    cc.Setting.warnings_as_errors(true) => ["-Werror"],
+    cc.Setting.define(n, ()) => ["-D" + n],
+    cc.Setting.define(n, v) => ["-D" + n + "=" + value_text v],
+    cc.Setting.include(d) => ["-I" + d],
+    cc.Setting.rtti(false) if lang == :cxx => ["-fno-rtti"],
+    cc.Setting.sanitize(k) if k != :none => ["-fsanitize=" + sanitizer k],
     // Everything is position independent on Windows already, and GCC says so
     // in a warning for every file that asks.
-    [:pic, true] if cc.Toolchain.os tc != :windows => ["-fPIC"],
-    :threads => ["-pthread"],
-    [:flags_for, sel, fs] if cc.applies sel tc => fs,
-    [:define_for, sel, n] if cc.applies sel tc => ["-D" + n],
+    cc.Setting.pic(true) if cc.Toolchain.os tc != :windows => ["-fPIC"],
+    cc.Setting.threads => ["-pthread"],
+    cc.Setting.flags_for(sel, fs) if cc.applies sel tc => fs,
+    cc.Setting.define_for(sel, n) if cc.applies sel tc => ["-D" + n],
     _ => [],
 };
 
 /// The flags one setting adds to a link.
 let link_flags : cc.Toolchain -> cc.Setting -> [:string];
 let link_flags tc s = match s {
-    :threads => ["-pthread"],
-    [:sanitize, k] if k != :none => ["-fsanitize=" + sanitizer k],
-    [:system, l] => ["-l" + l],
-    [:system_for, os, l] if os == cc.Toolchain.os tc => ["-l" + l],
-    [:library_dir, d] => ["-L" + d],
-    [:link_file, p] => [p],
-    [:runtime_path, d] => match cc.Toolchain.os tc {
+    cc.Setting.threads => ["-pthread"],
+    cc.Setting.sanitize(k) if k != :none => ["-fsanitize=" + sanitizer k],
+    cc.Setting.system(l) => ["-l" + l],
+    cc.Setting.system_for(os, l) if os == cc.Toolchain.os tc => ["-l" + l],
+    cc.Setting.library_dir(d) => ["-L" + d],
+    cc.Setting.link_file(p) => [p],
+    cc.Setting.runtime_path(d) => match cc.Toolchain.os tc {
         :linux => ["-Wl,-rpath,$ORIGIN/" + d],
         :macos => ["-Wl,-rpath,@loader_path/" + d],
         _ => [],
     },
-    [:link_flags_for, sel, fs] if cc.applies sel tc => fs,
+    cc.Setting.link_flags_for(sel, fs) if cc.applies sel tc => fs,
     _ => [],
 };
 
@@ -70,7 +70,7 @@ let link_flags tc s = match s {
 let problems : cc.Toolchain -> [cc.Setting] -> [:string];
 let problems tc settings =
     list.flat_map (fn s -> match [s, cc.Toolchain.os tc] {
-        [[:sanitize, k], :windows] if k != :none =>
+        [cc.Setting.sanitize(k), :windows] if k != :none =>
             ["MinGW has no " + sanitizer k + " sanitizer; build with clang-cl or MSVC for :address"],
         _ => [],
     }) settings;

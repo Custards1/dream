@@ -71,12 +71,12 @@ group Entry { tag : :integer, kind : :integer, count : :integer, data : :string,
 
 let entry : :integer -> Value -> Entry;
 let entry tag v = match v {
-    [:int16s, xs] => Entry.make tag 3 (list.length xs) (str.concat_all (list.map (fn n -> bytes.be 2 n) xs)) 2,
-    [:int32s, xs] => Entry.make tag 4 (list.length xs) (str.concat_all (list.map (fn n -> bytes.be 4 n) xs)) 4,
-    [:string, s] => Entry.make tag 6 1 (s + "\0") 1,
-    [:strings, xs] => Entry.make tag 8 (list.length xs) (str.concat_all (list.map (fn s -> s + "\0") xs)) 1,
-    [:i18n, s] => Entry.make tag 9 1 (s + "\0") 1,
-    [:bin, b] => Entry.make tag 7 (str.byte_length b) b 1,
+    Value.int16s(xs) => Entry.make tag 3 (list.length xs) (str.concat_all (list.map (fn n -> bytes.be 2 n) xs)) 2,
+    Value.int32s(xs) => Entry.make tag 4 (list.length xs) (str.concat_all (list.map (fn n -> bytes.be 4 n) xs)) 4,
+    Value.string(s) => Entry.make tag 6 1 (s + "\0") 1,
+    Value.strings(xs) => Entry.make tag 8 (list.length xs) (str.concat_all (list.map (fn s -> s + "\0") xs)) 1,
+    Value.i18n(s) => Entry.make tag 9 1 (s + "\0") 1,
+    Value.bin(b) => Entry.make tag 7 (str.byte_length b) b 1,
 };
 
 let int32 : :integer -> :integer -> Entry;
@@ -144,14 +144,14 @@ let file_tags! lay listed = {
     let dirnames = list.unique (list.map (fn s -> list.head s) split);
     let dir_index = map.from_pairs (list.map (fn [n, d] -> [d, n]) (list.enumerate dirnames));
     let n = list.length items;
-    let digests = list.map (fn i -> match i { [:file, _, _, source, _] => io.digest! source, _ => "" }) items;
+    let digests = list.map (fn i -> match i { item.Item.file(_, _, source, _) => io.digest! source, _ => "" }) items;
     strict! digests
-    [entry 1028 (Value.int32s (list.map (fn i -> match i { [:dir, _, _] => 4096, _ => item.size i }) items)),
+    [entry 1028 (Value.int32s (list.map (fn i -> match i { item.Item.dir(_, _) => 4096, _ => item.size i }) items)),
      entry 1030 (Value.int16s (list.map (fn i -> cpio.type_bits i + item.mode i % 4096) items)),
      entry 1033 (Value.int16s (list.replicate n 0)),
      entry 1034 (Value.int32s (list.replicate n (Layout.epoch lay))),
      entry 1035 (Value.strings digests),
-     entry 1036 (Value.strings (list.map (fn i -> match i { [:link, _, t] => t, _ => "" }) items)),
+     entry 1036 (Value.strings (list.map (fn i -> match i { item.Item.link(_, t) => t, _ => "" }) items)),
      entry 1037 (Value.int32s (list.map (fn i -> if map.member (item.path i) config { 17 } else { 0 }) items)),
      entry 1039 (Value.strings (list.replicate n "root")),
      entry 1040 (Value.strings (list.replicate n "root")),

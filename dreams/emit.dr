@@ -164,14 +164,14 @@ let t_type = tag 84 89 80 69;   // TYPE
 /// far on each one.
 let concat_map f xs = str.concat_all (list.map f xs);
 
-let node_bytes [op, flags, a, b, c] =
+let node_bytes n =
     str.concat_all [
-        u8 (match ir.opcode op { () => 0, code => code }),
-        u8 flags,
+        u8 (match ir.opcode (ir.node_op n) { () => 0, code => code }),
+        u8 (ir.node_flags n),
         u16 0,
-        index a,
-        index b,
-        index c,
+        index (ir.node_a n),
+        index (ir.node_b n),
+        index (ir.node_c n),
     ];
 
 /// The node and kid sections, which are most of an image: the VM writes them
@@ -299,28 +299,28 @@ let type_sections kind hints =
 
 /// Every section, in the order a reader meets them.
 let sections_of img = {
-    let strs = img.[:strs else []];
+    let strs = ir.Image.strs img;
     // The blob is the strings, one after another: nothing has to be done to a
     // string to turn it into its own bytes.
     let blob = str.concat_all strs;
     let base =
-    [section t_kint (concat_map (fn v -> i64 v) (img.[:ints else []])) (list.length (img.[:ints else []])),
-     section t_kflt (concat_map (fn v -> f64 v) (img.[:floats else []])) (list.length (img.[:floats else []])),
+    [section t_kint (concat_map (fn v -> i64 v) (ir.Image.ints img)) (list.length (ir.Image.ints img)),
+     section t_kflt (concat_map (fn v -> f64 v) (ir.Image.floats img)) (list.length (ir.Image.floats img)),
      section t_kstr (string_table strs) (list.length strs),
      section t_sblb blob (str.byte_length blob),
-     section t_katm (concat_map (fn v -> u32 v) (img.[:atoms else []])) (list.length (img.[:atoms else []])),
-     section t_node (node_section (img.[:nodes else []])) (list.length (img.[:nodes else []])),
-     section t_kids (kids_section (img.[:kids else []])) (list.length (img.[:kids else []])),
-     section t_func (concat_map (fn f -> func_bytes f) (img.[:funcs else []])) (list.length (img.[:funcs else []])),
-     section t_glbl (concat_map (fn g -> global_bytes g) (img.[:globals else []])) (list.length (img.[:globals else []])),
-     section t_impt (concat_map (fn i -> import_bytes i) (img.[:imports else []])) (list.length (img.[:imports else []])),
-     section t_mods (concat_map (fn m -> module_bytes m) (img.[:modules else []])) (list.length (img.[:modules else []]))];
+     section t_katm (concat_map (fn v -> u32 v) (ir.Image.atoms img)) (list.length (ir.Image.atoms img)),
+     section t_node (node_section (ir.Image.nodes img)) (list.length (ir.Image.nodes img)),
+     section t_kids (kids_section (ir.Image.kids img)) (list.length (ir.Image.kids img)),
+     section t_func (concat_map (fn f -> func_bytes f) (ir.Image.funcs img)) (list.length (ir.Image.funcs img)),
+     section t_glbl (concat_map (fn g -> global_bytes g) (ir.Image.globals img)) (list.length (ir.Image.globals img)),
+     section t_impt (concat_map (fn i -> import_bytes i) (ir.Image.imports img)) (list.length (ir.Image.imports img)),
+     section t_mods (concat_map (fn m -> module_bytes m) (ir.Image.modules img)) (list.length (ir.Image.modules img))];
     // The payload goes last, and must: its bytes are written after everything
     // the table describes, and they are the one part of the file whose size a
     // `u32` offset could not reach.
-    list.concat [base, type_sections t_type (img.[:float_params else []]),
-                 type_sections t_ityp (img.[:integer_params else []]),
-                 data_sections (img.[:payloads else []]) (img.[:payload_names else []])]
+    list.concat [base, type_sections t_type (ir.Image.float_params img),
+                 type_sections t_ityp (ir.Image.integer_params img),
+                 data_sections (ir.Image.payloads img) (ir.Image.payload_names img)]
 };
 
 /// The image, as bytes.
@@ -349,10 +349,10 @@ let emit img = {
         u16 version_major, u16 version_minor,
         // flags: no span section yet; bits 8-23 are where the image may run
         // (`dreams/target.dr`), zero for anywhere.
-        u32 (img.[:target_flags else 0]),
-        u32 (img.[:module_name else 0]),
-        u32 (img.[:source_name else 0]),
-        index (img.[:entry else ir.no_node]),
+        u32 (ir.Image.target_flags img),
+        u32 (ir.Image.module_name img),
+        u32 (ir.Image.source_name img),
+        index (ir.Image.entry img),
         u32 (list.length secs),
     ];
 

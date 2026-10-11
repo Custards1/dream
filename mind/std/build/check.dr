@@ -26,7 +26,9 @@ let reads : :any -> :any;
 let reads i = [:reads, build.input i];
 
 let is_input : :any -> :bool;
-let is_input a = match a { [:file, _] => true, [:tree, _, _] => true, [:artifact, _, _] => true, _ => false };
+let is_input a = match a {
+    build.Input.file(_) => true, build.Input.tree(_, _) => true, build.Input.artifact(_, _) => true, _ => false,
+};
 
 /// What a check reads: every input on its command line or among its
 /// variables, and what it `reads`.
@@ -102,7 +104,7 @@ when test {
                                                         ["sh", build.file "prog", reads (build.tree "tests" ".dr")]
                                                         "t.expected")) ),
         test.case "it runs from the package, and what it only reads is not an argument"
-            $( test.eq! [[:observe, "/p", %{}, "sh", ["/p/prog"], "output"], [:expect, "output", "/p/t.expected", false]]
+            $( test.eq! [build.Op.observe "/p" %{} "sh" ["/p/prog"] "output", build.Op.expect "output" "/p/t.expected" false]
                         (build.Step.action (output "t" ["sh", build.file "prog", reads "tests"] "t.expected") job) ),
         test.case "the key follows the arguments"
             $( test.ne! (build.Step.shape (succeeds "t" ["sh", build.file "a"]))

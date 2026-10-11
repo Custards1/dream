@@ -422,7 +422,7 @@ when test {
         } ),
         test.case "suppressed fields are never computed" $( {
             let [lg, events!] = capture! ();
-            at! (level :warn lg) :debug "x" %{ :boom => 1 / 0 }
+            at! (level :warn lg) :debug "x" %{ :boom => test.boom }
             test.eq! [] (events! ())
             release! lg
         } ),
@@ -434,7 +434,7 @@ when test {
         } ),
         test.case "timed logs a failure and raises it" $( {
             let [lg, events!] = capture! ();
-            let raised = try! { timed! lg :info "divided" %{} (1 / 0); false } catch e { true };
+            let raised = try! { timed! lg :info "divided" %{} test.boom; false } catch e { true };
             test.eq! [true, :error] [raised, Event.level (list.head (events! ()))]
             release! lg
         } ),

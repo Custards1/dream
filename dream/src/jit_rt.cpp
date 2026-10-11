@@ -4,6 +4,7 @@
 
 #include "jit_rt.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -377,6 +378,17 @@ int dream_rt_get(Process* p, Value c, Value k, int32_t has_default, Value* out) 
                                         std::to_string(tensor_len(c)));
         return 0;
     }
+    if (is_obj(c, ObjType::Record) && is_fixnum(k)) {
+        auto* r = static_cast<RecordObj*>(as_obj(c));
+        const int64_t i = fixnum_value(k);
+        if (i >= 0 && i < int64_t(r->len)) {
+            *out = r->items()[i];
+            return 1;
+        }
+        if (has_default) return 2;
+        *out = rt_out_of_bounds(*p, "field " + std::to_string(i) + " is outside " + describe(*p, c));
+        return 0;
+    }
     if (!is_sequence_value(c)) {
         *out = rt_type_error(*p, "`.[ ]` reads a map, an array or a list, not " +
                                      describe(*p, c));
@@ -437,6 +449,24 @@ int dream_rt_set(Process* p, Value c, Value k, Value v, Value* out) {
     k = resolve(k);
     if (is_obj(c, ObjType::Map)) {
         *out = map_insert(*p, c, k, v);
+        return 1;
+    }
+    if (is_obj(c, ObjType::Record) && is_fixnum(k)) {
+        const uint32_t n = static_cast<RecordObj*>(as_obj(c))->len;
+        const int64_t i = fixnum_value(k);
+        if (i < 0 || i >= int64_t(n)) {
+            *out = rt_out_of_bounds(*p, "field " + std::to_string(i) + " is outside " + describe(*p, c));
+            return 0;
+        }
+        auto* src = static_cast<RecordObj*>(as_obj(c));
+        Value copy = p->heap().make_record(src->tag, n);
+        auto* dst = static_cast<RecordObj*>(as_obj(copy));
+        for (uint32_t j = 0; j < n; ++j) {
+            Value item = uint32_t(i) == j ? v : src->items()[j];
+            dst->items()[j] = item;
+            p->heap().remember_if_old(dst, item);
+        }
+        *out = copy;
         return 1;
     }
     if (!is_sequence_value(c)) {
@@ -536,6 +566,18 @@ Value dream_rt_make_array(Process* p, uint32_t n, const Value* items) {
     return arr;
 }
 
+Value dream_rt_make_record(Process* p, uint32_t id, uint32_t n, const Value* items) {
+    // `id` is the node's `c`: an image atom index, and the variant bit.
+    Value rec = p->heap().make_record(
+        p->runtime().image_atom(id & RECORD_MAKE_ATOM) | (id & RECORD_MAKE_VARIANT), n);
+    auto* r = static_cast<RecordObj*>(as_obj(rec));
+    for (uint32_t i = 0; i < n; ++i) r->items()[i] = items[i];
+    return rec;
+}
+
+/// `%{}`: what `MakeMap` with no entries answers, a fresh empty map.
+Value dream_rt_make_map(Process* p) { return p->heap().make_map(0); }
+
 Value dream_rt_literal_str(Process* p, uint32_t index) { return literal_string_value(*p, index); }
 
 Value dream_rt_global(Process* p, uint32_t index) { return global_value(*p, index); }
@@ -564,6 +606,21 @@ Value dream_rt_yield_frame(Process* p, Value frame, uint32_t n, const Value* val
     auto* fo = static_cast<FrameObj*>(as_obj(fr));
     for (uint32_t i = 0; i < n && i < nslots; ++i) fo->slots()[i] = vals[i];
     return fr;
+}
+
+void dream_rt_settle(Process* p, Value frame, uint32_t slot, Value value) {
+    // The binding was suspended in this frame while compiled code was still
+    // computing it, and the computation has now finished. The thunk is
+    // updated exactly as forcing it would have updated it -- in place, so
+    // whatever already holds it sees the answer -- and is never run. One
+    // already forced, or being forced, is left alone: either it holds this
+    // answer or it is about to.
+    Value v = static_cast<FrameObj*>(as_obj(frame))->slots()[slot];
+    if (!is_obj(v, ObjType::Thunk)) return;
+    Obj* o = as_obj(v);
+    p->heap().remember_if_old(o, value);
+    std::atomic_ref<Value>(static_cast<IndirectObj*>(o)->target).store(value, std::memory_order_relaxed);
+    obj_type_store_release(o, ObjType::Indirect);
 }
 
 void dream_rt_adopt(Process* p, Value frame, uint32_t nslots, const Value* vals,
@@ -673,6 +730,10 @@ extern "C" Value dream_rt_peek(Value c, Value k) {
     if (is_obj(c, ObjType::Array)) {
         auto* a = static_cast<ArrayObj*>(as_obj(c));
         return i < int64_t(a->len) ? a->items()[i] : NIL_SLOT;
+    }
+    if (is_obj(c, ObjType::Record)) {
+        auto* r = static_cast<RecordObj*>(as_obj(c));
+        return i < int64_t(r->len) ? r->items()[i] : NIL_SLOT;
     }
     if (!is_obj(c, ObjType::Cons) || i > 8) return NIL_SLOT;
     Value cur = c;

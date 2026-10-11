@@ -46,7 +46,7 @@ let main! = {
 
     // A process that fails hands the error to whoever joins it, rather than
     // taking the whole program down.
-    let bad = spawn! $( 1 / 0 );
+    let bad = spawn! $( list.head [] );
     console.print! ("failure:     " + to_string (try! { join! bad } catch err { [:caught, err] }))
 
     // ..and its neighbours are unaffected.
