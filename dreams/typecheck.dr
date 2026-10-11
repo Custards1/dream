@@ -1410,8 +1410,8 @@ let statement k h st ds = match st {
     },
     [:let, n, ps, body, is_rec, sp] => match named_body body {
         [_, desc] =>
-            [with_local n :any (Here.set_ltypes ((Here.ltypes h).[n =>
-                [list.map (fn p -> ast.param_name p) ps, desc, [Here.mi h, %{}, Here.ltypes h]]]) h), ds],
+            [with_local n :any (h |> Here.set_ltypes ((Here.ltypes h).[n =>
+                [list.map (fn p -> ast.param_name p) ps, desc, [Here.mi h, %{}, Here.ltypes h]]])), ds],
         () => {
             let sig = match (Here.pending h).[n else ()] { () => (), [t, _] => t };
             let h1 = Here.set_pending (map.remove n (Here.pending h)) h;
@@ -3143,7 +3143,7 @@ let tables k = [Checker.named k, Checker.sigs k, Checker.uses k, Checker.comps k
 /// where a constructor pattern finds the id of a constructor some other part
 /// walked (`constructor_id`), as lowering's parts are given them.
 let with_resolution : Checker -> scope.Resolution -> Checker;
-let with_resolution k r = Checker.set_r (r.[:wrappers => scope.wrappers (Checker.r k)]) k;
+let with_resolution k r = Checker.set_r (r |> scope.Resolution.set_wrappers (scope.wrappers (Checker.r k))) k;
 
 /// The analysis, given what each body said on its own -- `check_decl k b []`,
 /// in the order the resolver queued the bodies -- and what each said in the

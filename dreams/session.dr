@@ -223,7 +223,7 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
     let settled = lower.settle_comps! (lower.set_prog stuffed (list.head li));
     // Nothing may re-evaluate these: the values are nodes in the arena now, and
     // re-running a `comp!` would be an effect happening a second time.
-    let low1 = settled.[:pending_comp => []];
+    let low1 = (settled |> lower.Lowering.set_pending_comp ([]));
 
     let ds = list.append (list.append (modules.diags l) (scope.diags state1))
                          (list.append (scope.r_diags r1) (lower.l_diags low1));
@@ -313,7 +313,10 @@ let boot! roots cfg source image text base_text engine base = {
     // diagnostics: those are checked from the scope state itself, which is how
     // a carried entry sees its own declaration errors too.
     let r0 =
-        ((((((scope.resolver (scope.envs state1))).[:imports => (scope.s_imports state1)])).[:module_recs => (scope.s_module_recs state1)])).[:diags => []];
+        ((scope.resolver (scope.envs state1))
+            |> scope.Resolution.set_imports (scope.s_imports state1)
+            |> scope.Resolution.set_module_recs (scope.s_module_recs state1)
+            |> scope.Resolution.set_diags ([]));
     let low0 = lower.lowering r0 ir.program 0;
     let pre_ = pre scope.state r0 low0 (scope.next_global state_deps) [] [] [] [] true;
     match compile_slice! l mi state1 pre_ (list.length slice)

@@ -140,7 +140,7 @@ let counted s name n = if not (metering s) { s } else {
 /// Several at once. The counts arrive as thunks and a meter that is off never
 /// forces one, so a round pays nothing for being countable.
 let counts s pairs = list.fold (fn acc [name, n] -> counted acc name n) s pairs;
-let tally s name = ((((meter_of s)).[:counts else %{}])).[name else 0];
+let tally s name = ((meter_of s).[:counts else %{}]).[name else 0];
 let vm_starts s = tally s :vm_starts;
 
 /// Two meters added together, which the fallback paths need: a batch that
@@ -179,8 +179,8 @@ let fail s mi sp message =
 /// wrapper is the only thing left saying it was ever anything else.
 let note_macro s mi start reference = {
     let l = loader s;
-    put_loader (modules.Loader.set_expansions (modules.expansions l
-        + [[mi, modules.module_source (modules.module_at l mi), start, scope.Meaning.expanded reference]]) l) s
+    put_loader (l |> modules.Loader.set_expansions (modules.expansions l
+        + [[mi, modules.module_source (modules.module_at l mi), start, scope.Meaning.expanded reference]])) s
 };
 
 /// The module a reference names and the name it names there, or `()`.
@@ -220,7 +220,7 @@ let staged_lowering low = {
         lower.set_prog (ir.set_node placeholder (ir.node :apply closure 0 0)
                                    (lower.prog lowered)) lowered
     }) low (lower.pending_comp low);
-    ready.[:pending_comp => []]
+    (ready |> lower.Lowering.set_pending_comp ([]))
 };
 
 /// The whole program, staged and compiled, for the macro VM to be given calls
@@ -318,7 +318,7 @@ let invocation_image : modules.Loader -> scope.Resolution -> ir.Image;
 let invocation_image ld resolved = {
     let low = staged_lowering (map.remove :image (lower.lower_program resolved));
     let ms = lower.link_modules ld resolved low;
-    ir.finish (ir.Program.set_modules (list.nth 1 ms) (lower.prog (list.head ms)))
+    ir.finish ((lower.prog (list.head ms)) |> ir.Program.set_modules (list.nth 1 ms))
 };
 
 /// The two halves of a call, which is all a session needs of one.

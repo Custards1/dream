@@ -45,51 +45,56 @@ import std.types;
 
 /// The lowering state: the arena being built, and -- once `link!` has run --
 /// the finished image and what each `comp` came to.
-type Lowering = :map;
+mapping Lowering {
+    r = ()
+    prog = ()
+    source = 0
+    ctx = 0
+    diags = []
+    // Function index to its lowered body node, including inline lambdas.
+    func_bodies = %{}
+    // [placeholder node, function, source, span], settled after linking.
+    pending_comp = []
+    // Read-only slots substituted while emitting a fused loop.
+    subst = %{}
+    comp_values = %{}
+    image = ()
+    // Per-part arenas and the values used to patch settled comp placeholders.
+    arenas = ()
+    invented_from = 0
+    filled = %{}
+    sharing = ()
+}
 
 let lowering : scope.Resolution -> ir.Program -> :integer -> Lowering;
 let lowering r p source =
-    %{ :r => r, :prog => p, :source => source, :ctx => 0, :diags => [],
-       // Which node is each function's body. Filled in as the functions are
-       // met, because a lambda's body is lowered where it is written -- into
-       // the same arena as everything else -- and only the entry point differs.
-       :func_bodies => %{},
-       // Compile-time expressions waiting to be evaluated: `[node, function,
-       // source, span]`. The node is a placeholder that whatever the function
-       // comes to will overwrite, once the program has been built and can be
-       // run; the source and span are where it was written, which is where a
-       // failure is reported and what its value is filed under afterwards.
-       :pending_comp => [],
-       // Slots that are read but never written, and the expression each one
-       // stands for. Only ever non-empty while a fused loop's body is being
-       // emitted -- see "deforestation" below.
-       :subst => %{} };
+    Lowering.new () |> Lowering.set_r r |> Lowering.set_prog p |> Lowering.set_source source;
 
 let res : Lowering -> scope.Resolution;
-let res l    = l.[:r else ()];
+let res l    = Lowering.r l;
 let prog : Lowering -> ir.Program;
-let prog l   = l.[:prog else ir.program];
+let prog l   = Lowering.prog l;
 let source : Lowering -> :integer;
-let source l = l.[:source else 0];
+let source l = Lowering.source l;
 /// The module whose names this body was resolved against. Not always the module
 /// it was written in: a body inherited through `derive` is lowered once per
 /// deriving module, and resolves differently each time.
 let ctx : Lowering -> :integer;
-let ctx l = l.[:ctx else 0];
+let ctx l = Lowering.ctx l;
 let l_diags : Lowering -> [:map];
-let l_diags l = l.[:diags else []];
+let l_diags l = Lowering.diags l;
 
 let set_prog : ir.Program -> Lowering -> Lowering;
-let set_prog p l = l.[:prog => p];
+let set_prog p l = (l |> Lowering.set_prog p);
 let set_res : scope.Resolution -> Lowering -> Lowering;
-let set_res r l = l.[:r => r];
+let set_res r l = (l |> Lowering.set_r r);
 let set_source : :integer -> Lowering -> Lowering;
-let set_source i l = l.[:source => i];
+let set_source i l = (l |> Lowering.set_source i);
 let set_ctx : :integer -> Lowering -> Lowering;
-let set_ctx i l = l.[:ctx => i];
+let set_ctx i l = (l |> Lowering.set_ctx i);
 
 let func_bodies : Lowering -> %{:integer => :integer};
-let func_bodies l = l.[:func_bodies else (%{})];
+let func_bodies l = Lowering.func_bodies l;
 /// The node index is forced before it is stored, for the reason `ir.settled`
 /// gives: an unforced one is a thunk holding the frame that would compute it,
 /// and that frame holds this state -- which holds the arena as it stood when
@@ -97,16 +102,16 @@ let func_bodies l = l.[:func_bodies else (%{})];
 /// one *whole arena* apiece.
 let set_func_body fi n l =
     if type_of n != :nothing {
-        l.[:func_bodies => (((func_bodies l)).[fi => n])]
+        (l |> Lowering.set_func_bodies ((func_bodies l).[fi => n]))
     } else { l };
 
-let subst l = l.[:subst else (%{})];
-let set_subst m l = l.[:subst => m];
+let subst l = Lowering.subst l;
+let set_subst m l = (l |> Lowering.set_subst m);
 
 let pending_comp : Lowering -> [[:any]];
-let pending_comp l = l.[:pending_comp else []];
+let pending_comp l = Lowering.pending_comp l;
 let add_comp node fi span l =
-    l.[:pending_comp => (list.append (pending_comp l) [[node, fi, source l, span]])];
+    (l |> Lowering.set_pending_comp (list.append (pending_comp l) [[node, fi, source l, span]]));
 
 /// What each compile-time expression came to, once it has: `[source, start]
 /// => value`, keyed the way the checker names a `comp` it meets.
@@ -117,16 +122,16 @@ let add_comp node fi span l =
 /// run a refinement's predicate over it -- see "compile-time contracts" there.
 /// Nothing in the image depends on it.
 let comp_values : Lowering -> :map;
-let comp_values l = l.[:comp_values else (%{})];
+let comp_values l = Lowering.comp_values l;
 let comp_key : :integer -> ast.Span -> :integer;
 let comp_key source span = source * 4294967296 + ast.span_start span;
 
 let complain span message l =
-    l.[:diags => (list.append (l_diags l) [diag.in_source (source l) (diag.error span message)])];
+    (l |> Lowering.set_diags (list.append (l_diags l) [diag.in_source (source l) (diag.error span message)]));
 
 let warn span message note l =
-    l.[:diags => (list.append (l_diags l)
-                     [diag.in_source (source l) (diag.with_note note (diag.warning span message))])];
+    (l |> Lowering.set_diags (list.append (l_diags l)
+                     [diag.in_source (source l) (diag.with_note note (diag.warning span message))]));
 
 /// Emit a node: `[lowering, index]`.
 let emit : ir.Node -> Lowering -> [Lowering, :integer];
@@ -296,7 +301,7 @@ let constructor_of ctor l =
     };
 
 let constructor_at g l =
-    match ((scope.wrappers (res l))).[g else ()] {
+    match (scope.wrappers (res l)).[g else ()] {
         scope.Wrapper(scope.Inline.record(id, variant, _, fields), _, _) => [id, variant, fields],
         _ => (),
     };
@@ -384,7 +389,7 @@ let rec unwrap found args fuel l =
     };
 
 let unwrap_global found g args fuel l =
-    match ((scope.wrappers (res l))).[g else ()] {
+    match (scope.wrappers (res l)).[g else ()] {
         () => (),
         scope.Wrapper(target, plan, arity) =>
             if list.length args != arity { () }
@@ -431,7 +436,7 @@ let rec builtin_alias found fuel l =
     };
 
 let builtin_alias_global g fuel l =
-    match ((scope.wrappers (res l))).[g else ()] {
+    match (scope.wrappers (res l)).[g else ()] {
         scope.Wrapper(target, plan, arity) =>
             if plan == scope.passed_on arity {
                 builtin_alias target (fuel - 1) l
@@ -503,7 +508,7 @@ let emit_name span l = emit_resolution (lookup span l) l;
 /// stop rather than spin; nothing builds one, and a compiler must terminate on
 /// a program that will not run.
 let emit_local slot l =
-    match ((subst l)).[slot else ()] {
+    match (subst l).[slot else ()] {
         () => emit (ir.node :local slot ir.no_node ir.no_node) l,
         e  => {
             let got = lower_expr e (set_subst (map.remove slot (subst l)) l);
@@ -1300,9 +1305,9 @@ let shown_path ld p = {
 
 /// The resolution, carrying the places table its lowering reports from.
 let with_places : modules.Loader -> scope.Resolution -> scope.Resolution;
-let with_places ld r = r.[:places => places_of ld];
+let with_places ld r = (r |> scope.Resolution.set_places (places_of ld));
 
-let places r = r.[:places else (%{})];
+let places r = scope.Resolution.places r;
 
 /// `[path, line, col]` for a span in the source being lowered.
 let place_of span l = match (places (res l)).[source l else ()] {
@@ -1806,10 +1811,10 @@ let link_funcs r bodies l = link_funcs_from r bodies l 0;
 /// the compiler made up. The image keeps it so that an error can say which
 /// functions it was raised in (`locate_error` in dream/src/interp.cpp).
 let func_place : scope.Resolution -> :map -> [:string, :integer, :integer];
-let func_place r f = match (places r).[f.[:source else ()] else ()] {
+let func_place r f = match (places r).[(scope.Function.source f) else ()] {
     () => ["", 0, 0],
     [path, starts, src] => {
-        let span = f.[:span else ast.no_span];
+        let span = scope.Function.span f;
         let [line, col] = diag.place_in starts (ast.span_start (diag.origin_span src span));
         [path, line, col]
     },
@@ -1833,11 +1838,11 @@ let link_funcs_from r bodies l from = {
         let pathed = if line == 0 { [list.head named, -1] } else { strk path (list.head named) };
         let placed = place_captures (scope.func_captures f) (list.head pathed);
         let flags = (if scope.func_impure f { ir.fn_impure } else { 0 })
-                  + (if f.[:rec else false] { ir.fn_rec } else { 0 })
-                  + (if f.[:thunk else false] { ir.fn_thunk } else { 0 })
+                  + (if scope.Function.recursive f { ir.fn_rec } else { 0 })
+                  + (if (scope.Function.thunk f) { ir.fn_thunk } else { 0 })
                   // A parameterless pure binding is a value the VM forces once
                   // and remembers; an impure one has to run again every time.
-                  + (if f.[:thunk else false] && not (scope.func_impure f) {
+                  + (if (scope.Function.thunk f) && not (scope.func_impure f) {
                          ir.fn_global_value
                      } else { 0 });
         [list.head placed,
@@ -1969,7 +1974,7 @@ let lower_program r = {
     let p = prog linked
         |> ir.Program.set_funcs (list.nth 1 fs) |> ir.Program.set_globals (list.nth 1 gs)
         |> ir.Program.set_imports (list.nth 1 is);
-    ((set_prog p linked)).[:image => (ir.finish p)]
+    ((set_prog p linked) |> Lowering.set_image (ir.finish p))
 };
 
 /// Evaluate every compile-time expression the program contains, and put the
@@ -2172,7 +2177,7 @@ let link_rest! ld r lowered = {
     let p = prog (list.head sourced)
         |> ir.Program.set_modules (list.nth 1 ms) |> ir.Program.set_entry (find_entry ld r)
         |> ir.Program.set_module_name (list.nth 1 named) |> ir.Program.set_source_name (list.nth 1 sourced);
-    ((set_prog p (list.head sourced))).[:image => (ir.finish p)]
+    ((set_prog p (list.head sourced)) |> Lowering.set_image (ir.finish p))
 };
 
 // --- lowering in parts -----------------------------------------------------------
@@ -2236,8 +2241,10 @@ let lower_part r numbered = {
         // A fresh arena for every body: the constant pools are the part's and
         // carry on, and everything else is this body's and is thrown away once
         // it has been shared into the part.
-        let cleared = ((((set_prog (ir.cleared (prog low)) low).[:diags => []]).[:pending_comp => []]))
-                        .[:func_bodies => %{}];
+        let cleared = ((set_prog (ir.cleared (prog low)) low)
+            |> Lowering.set_diags ([])
+            |> Lowering.set_pending_comp ([])
+            |> Lowering.set_func_bodies (%{}));
         let done = lower_from r cleared [list.nth 1 nb];
         let p = prog done;
         // In the table's own order: a part's numbering is its own business,
@@ -2338,7 +2345,9 @@ let link_parallel! ld r cache = {
         walked => {
             let wrappers = vm.share! (scope.wrappers rs);
             let where = vm.share! (places rs);
-            list.map (fn pr -> [pr.[:wrappers => wrappers].[:places => where], scope.part_bodies pr]) walked
+            list.map (fn pr -> [(pr
+                |> scope.Resolution.set_wrappers wrappers
+                |> scope.Resolution.set_places where), scope.part_bodies pr]) walked
         },
     };
     // Dealt before any process starts: a slice left lazy would cross into its
@@ -2367,14 +2376,17 @@ let link_parallel! ld r cache = {
     }) (list.range 0 (list.length parts))));
     let said = list.concat (list.map (fn note -> list.nth 1 note) notes);
     let waiting = list.concat (list.map (fn note -> list.nth 2 note) notes);
-    let lowered = ((((((set_prog (head.[:prog]) (head.[:base])).[:diags => said]).[:pending_comp => waiting])
-                       .[:arenas => head.[:arenas]]).[:invented_from => scope.invented_from rs]));
-    let linked = (link_rest! ld rs lowered).[:sharing => sharing];
+    let lowered = ((set_prog (head.[:prog]) (head.[:base]))
+        |> Lowering.set_diags said
+        |> Lowering.set_pending_comp waiting
+        |> Lowering.set_arenas (head.[:arenas])
+        |> Lowering.set_invented_from (scope.invented_from rs));
+    let linked = ((link_rest! ld rs lowered) |> Lowering.set_sharing sharing);
     // The image, should anything ask for it without the sharing process's --
     // the process failed, or the build did. Lazy, and shared here, in this
     // process: the parts are never laid out any other way.
-    linked.[:image => patched linked (opt.optimize_parts (list.head (for_sharing rs head))
-                                                          (head.[:arenas]) (scope.invented_from rs))]
+    (linked |> Lowering.set_image (patched linked (opt.optimize_parts (list.head (for_sharing rs head))
+                                                          (head.[:arenas]) (scope.invented_from rs))))
 };
 
 /// The wrappers a part's names reach, and the wrappers those stand for, as
@@ -2401,10 +2413,10 @@ let reached_wrappers all r = {
 
 /// Whether this lowering was made in parts, and so has no arena of its own:
 /// only the parts, and a small table of nodes it emitted itself.
-let in_parts l = l.[:arenas else ()] != ();
+let in_parts l = (Lowering.arenas l) != ();
 
 /// The process sharing this lowering's parts, if it was lowered in parts.
-let sharing l = l.[:sharing else ()];
+let sharing l = Lowering.sharing l;
 
 /// What the sharing process is handed: the linked program's records, as an
 /// image whose functions name their bodies where the parts hold them, the
@@ -2507,7 +2519,7 @@ let overlaid xs written n count fill =
 /// The parts, with part 0 as this lowering's own arena now.
 let current_arenas l = {
     let p = prog l;
-    (l.[:arenas]).[0 => ((l.[:arenas]).[0] |> ir.Program.set_nodes (ir.nodes p) |> ir.Program.set_kids (ir.kids p))]
+    (Lowering.arenas l).[0 => ((Lowering.arenas l).[0] |> ir.Program.set_nodes (ir.nodes p) |> ir.Program.set_kids (ir.kids p))]
 };
 
 /// What the functions `todo` start from can reach, walked across the parts:
@@ -2565,13 +2577,13 @@ let parts_image fis l = {
     let reached = list.head (reach_parts (list.map (fn fi -> (funcs.[fi]).[:body]) fis) %{}
                                          (list.fold (fn m fi -> m.[fi => true]) %{} fis) %{}
                                          (current_arenas l3) funcs (array.of_list (ir.globals p))
-                                         (l.[:invented_from else 0]));
+                                         (Lowering.invented_from l));
     let cut = list.map (fn pair -> {
         let [fi, f] = pair;
         if map.has fi reached { f } else { f.[:body => stub] }
     }) (list.zip (list.range 0 (list.length (ir.funcs p))) (ir.funcs p));
     emit.to_binary (opt.optimize_parts_filled (ir.Image.set_funcs cut (ir.finish_rest p)) (current_arenas l3)
-                                              (l.[:invented_from else 0]) (l.[:filled else (%{})]))
+                                              (Lowering.invented_from l) (Lowering.filled l))
 };
 
 /// The `comp` placeholders the function `fi`'s body can reach: the
@@ -2580,7 +2592,7 @@ let parts_dependencies fi l = {
     let p = prog l;
     let funcs = array.of_list (ir.funcs p);
     let met = list.nth 1 (reach_parts [(funcs.[fi]).[:body]] %{} (%{fi => true}) %{} (current_arenas l)
-                                      funcs (array.of_list (ir.globals p)) (l.[:invented_from else 0]));
+                                      funcs (array.of_list (ir.globals p)) (Lowering.invented_from l));
     list.map (fn kv -> list.head kv) (map.pairs met)
 };
 
@@ -2628,9 +2640,9 @@ struct Raised { why }
 /// reported with no span at all, which for a compile-time API is the difference
 /// between "this call is wrong" and "something in the program is".
 let comp_failed src span why l =
-    l.[:diags => (list.append (l_diags l)
+    (l |> Lowering.set_diags (list.append (l_diags l)
                     [diag.in_source src (diag.error span
-                        ("this compile-time expression could not be evaluated: " + to_string why))])];
+                        ("this compile-time expression could not be evaluated: " + to_string why))]));
 
 /// `settle_comp!` for a lowering made in parts: see `settle_parts_comps!`.
 let settle_part_comp! bytes one l = {
@@ -2640,8 +2652,9 @@ let settle_part_comp! bytes one l = {
         Raised(why) => comp_failed src span why l,
         v => {
             let built = emit_const v l;
-            let placed = (list.head built).[:filled => ((list.head built).[:filled else (%{})]).[fi => list.nth 1 built]];
-            placed.[:comp_values => ((comp_values placed)).[comp_key src span => v]]
+            let placed = ((list.head built)
+                |> Lowering.set_filled ((Lowering.filled (list.head built)).[fi => list.nth 1 built]));
+            (placed |> Lowering.set_comp_values ((comp_values placed).[comp_key src span => v]))
         },
     }
 };
@@ -2798,13 +2811,13 @@ let settle_comp! bytes_of one l = {
             let placed = set_prog (ir.set_node node (ir.node_at (list.nth 1 built) (prog (list.head built)))
                                                (prog (list.head built)))
                                   (list.head built);
-            placed.[:comp_values => ((comp_values placed)).[comp_key src span => v]]
+            (placed |> Lowering.set_comp_values ((comp_values placed).[comp_key src span => v]))
         },
     }
 };
 
 let image : Lowering -> ir.Image;
-let image l = l.[:image else (ir.finish ir.program)];
+let image l = match Lowering.image l { () => ir.finish ir.program, img => img };
 
 let diags l = l_diags l;
 
