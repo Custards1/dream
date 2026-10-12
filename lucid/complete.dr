@@ -26,6 +26,7 @@
 
 import std.list;
 import std.map;
+import std.path;
 import std.str;
 import std.vm;
 
@@ -33,6 +34,7 @@ import dreams.ast;
 import dreams.builtins;
 import dreams.modules;
 import dreams.parser;
+import dreams.package;
 import dreams.scope;
 
 import analysis;
@@ -184,13 +186,7 @@ let namespace_of a segs =
 /// The modules directly inside a package, without the ones further down:
 /// `std.list` but not `std.list.something`. The same set `scope.group_contents`
 /// names in a diagnostic, as a list rather than as a sentence.
-let group_names l prefix = {
-    let at = str.byte_length prefix + 1;
-    list.sort (list.unique (list.filter (fn rest -> not (str.contains_str "." rest))
-        (list.map (fn n -> str.slice at (str.byte_length n - at) n)
-                  (list.filter (fn n -> str.starts_with (prefix + ".") n)
-                               (scope.module_names l)))))
-};
+let group_names l prefix = path_children (scope.module_names l) (prefix + ".");
 
 /// A module bound as a global is a module. Anything else is a function when it
 /// was declared with parameters and a value when it was not -- the resolver
@@ -448,6 +444,44 @@ let name_items a offset =
         },
     };
 
+// Import paths exist before a program can be parsed. Ask the compiler's
+// package discovery directly, without loading or checking module bodies.
+let import_prefix : :string -> :integer -> :string | :unit;
+let import_prefix src offset = {
+    let word = analysis.name_start src offset;
+    let start = analysis.chain_start src word;
+    if word_before src start == "import" {
+        str.slice start (word - start) src
+    } else { () }
+};
+
+/// Only the next segment is inserted: `std.http.` offers `url`, while
+/// `std.` offers `http`, even when no file is named `http.dr`.
+let path_children : [:string] -> :string -> [:string];
+let path_children names prefix =
+    list.sort (list.unique (list.map
+        (fn n -> list.head (str.split "." (str.slice (len prefix) (len n - len prefix) n)))
+        (list.filter (fn n -> str.starts_with prefix n && len n > len prefix) names)));
+
+let import_items! : :string -> [:string] -> :string -> [:any];
+let import_items! file roots prefix = {
+    let ps = package.discover! file (list.unique roots);
+    let head = list.head (str.split "." prefix);
+    let pkg = package.find ps head;
+    let names = match pkg {
+        () => list.concat [package.names ps, modules.native_modules,
+                 match package.current ps {
+                     () => [], p => package.modules! p,
+                 },
+                 package.collect_modules! (path.dirname file) (path.dirname file) []],
+        p => list.append modules.native_modules
+                 (list.map (fn n -> head + "." + n) (package.modules! p)),
+    };
+    list.map (fn n -> item n kind_module ("module " + prefix + n)
+                          "An available import." rank_import)
+             (path_children names prefix)
+};
+
 // --- the request ---------------------------------------------------------------------
 
 /// The analysis a completion is answered out of: the buffer as it stands, and
@@ -499,15 +533,20 @@ let completions! path roots docs parsed line character = {
     let offset = pos.offset_of src line character;
     if in_comment src offset { [[], parsed] }
     else {
-        let got = analysed! path roots docs parsed src offset;
-        let a = list.head got;
-        [match context src offset {
-             [:member, segs] => member_items a segs,
-             [:macro_member, segs] => macro_member_items a segs,
-             [:macro_name] => macro_name_items a,
-             _ => name_items a offset,
-         },
-         list.nth 1 got]
+        match import_prefix src offset {
+            prefix if prefix != () => [import_items! path roots prefix, parsed],
+            _ => {
+                let got = analysed! path roots docs parsed src offset;
+                let a = list.head got;
+                [match context src offset {
+                     [:member, segs] => member_items a segs,
+                     [:macro_member, segs] => macro_member_items a segs,
+                     [:macro_name] => macro_name_items a,
+                     _ => name_items a offset,
+                 },
+                 list.nth 1 got]
+            },
+        }
     }
 };
 
@@ -557,6 +596,15 @@ when test {
                  (member_items (of! text) segs);
 
     let tests = [
+        test.case "an unfinished import needs discovery, not resolution"
+            $( test.eq! ["std.", "std.http.", "", ()]
+                [import_prefix "import std." 11,
+                 import_prefix "import std.http.ur" 18,
+                 import_prefix "import hel" 10,
+                 import_prefix "let x = std." 12] ),
+        test.case "package completion includes intermediate directories once"
+            $( test.eq! ["http", "list"]
+                (path_children ["std.http.url", "std.http.h2", "std.list"] "std.") ),
         test.case "member completion omits private bindings"
             $( test.eq! [["shown", "shown"]]
                 (member_details! "mod m { priv let hidden = 1; let shown = hidden; } let main! = 0;" ["m"]) ),

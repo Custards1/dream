@@ -18,6 +18,7 @@
 // a cursor sitting on empty space needs answered.
 
 import std.list;
+import std.http.url;
 import std.map;
 import std.str;
 
@@ -43,13 +44,13 @@ import pos;
 
 let uri_to_path uri =
     if str.starts_with "file://" uri {
-        let rest = str.slice 7 (str.byte_length uri - 7) uri;
+        let rest = url.decode (str.slice 7 (str.byte_length uri - 7) uri);
         // `file://host/path` is not something to guess at, but `file:///path`
         // is the ordinary form and its third slash is the root.
         if str.starts_with "/" rest { rest } else { "/" + rest }
     } else { uri };
 
-let path_to_uri path = if str.starts_with "/" path { "file://" + path } else { "file://" + path };
+let path_to_uri path = "file://" + url.encode_path path;
 
 // --- one analysis --------------------------------------------------------------
 
@@ -1630,7 +1631,8 @@ let symbols a =
         () => [],
         mi => {
             let src = module_text a mi;
-            let at span = pos.range src (ast.span_start span) (ast.span_end span);
+            let starts = diag.line_starts src;
+            let at span = pos.range_in starts src (ast.span_start span) (ast.span_end span);
             // Three sources, not two, once a module can derive: a body
             // inherited through `derive` is a global of *this* module and is
             // written in another file, so its span is an offset into the
@@ -1821,6 +1823,12 @@ when test {
             $( test.eq! "/a/b.dr" (uri_to_path "file:///a/b.dr") ),
         test.case "a path becomes a file URI"
             $( test.eq! "file:///a/b.dr" (path_to_uri "/a/b.dr") ),
+        test.case "file paths decode spaces, UTF-8 and literal percent signs"
+            $( test.eq! "/a b/café%#.dr"
+                (uri_to_path "file:///a%20b/caf%C3%A9%25%23.dr") ),
+        test.case "special file paths round-trip"
+            $( test.eq! "/a b/café%#.dr"
+                (uri_to_path (path_to_uri "/a b/café%#.dr")) ),
         test.case "a URI round-trips"
             $( test.eq! "file:///a/b.dr" (path_to_uri (uri_to_path "file:///a/b.dr")) ),
         test.case "something that is not a file URI is left alone"

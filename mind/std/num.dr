@@ -486,8 +486,15 @@ when test {
         test.case "bit_length"           $( test.eq! [0, 1, 8, 9, 101, 3] [bit_length 0, bit_length 1, bit_length 255,
                                                                           bit_length 256, bit_length (pow 2 100), bit_length (0 - 5)] ),
         test.case "ilog2"                $( test.eq! [0, 0, 1, 7, 8, 100] (list.map ilog2 [1, 1, 2, 255, 256, pow 2 100]) ),
-        test.case "ilog10"               $( test.eq! [0, 0, 1, 2, 2, 3, 99, 100]
+        test.case "ilog10"               $( test.eq! [0, 0, 1, 1, 2, 3, 99, 100]
                                                      (list.map ilog10 [1, 9, 10, 99, 999 - 899, 1000, pow 10 100 - 1, pow 10 100]) ),
+        test.case "ilog10 around powers of ten"
+            $( test.true! (list.all (fn k -> {
+                let power = pow 10 k;
+                [ilog10 (power - 1), ilog10 power, ilog10 (power + 1)] == [k - 1, k, k]
+            }) (list.range 1 101)) ),
+        test.case "ilog10 refuses zero" $( test.raises! $( ilog10 0 ) ),
+        test.case "ilog10 refuses negative integers" $( test.raises! $( ilog10 (0 - 1) ) ),
         test.case "ilog10 at a large size" $( test.eq! [4999, 5000] [ilog10 (pow 10 5000 - 1), ilog10 (pow 10 5000)] ),
         test.case "ilog2 refuses zero"   $( test.raises! $( ilog2 0 ) ),
         test.case "isqrt"                $( test.eq! [0, 1, 1, 2, 3, 3, 4] (list.map isqrt [0, 1, 3, 4, 9, 15, 16]) ),

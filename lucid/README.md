@@ -17,7 +17,7 @@ cannot disagree, because its answers come from the same tables.
 | **Go to definition** | across files and packages, from the resolver's table of what each name means |
 | **Hover** | what a name resolved to, and which module it came from |
 | **Outline** | what a file declares |
-| **Completion** | a module's members after `.`, and the names in scope everywhere else |
+| **Completion** | package and local module paths in imports, a module's members after `.`, and names in scope elsewhere |
 | **Formatting** | the compiler's formatter (`dreams --fmt`) on the buffer, so format-on-save works |
 | **Inlay hints** | the type the checker gave each `let` nobody wrote a signature for, after its name -- or after its parameters, where `let f x : t` would put it -- including what an unsigned function's body answers |
 | **Rename** | a local where it is bound and wherever that binder is the one in scope; a global at its declaration, its signature, every `import m.{name}` and every use, across the program the file is part of |
@@ -64,9 +64,12 @@ the one thing the compiler does not record, so `analysis.dr` reads the binders
 back off the syntax tree -- those scoping rules are written twice, and the
 section that does it says which parts of `dreams/scope.dr` it transcribes.
 
-Parses are kept between requests, since a file either changed or it did not;
-everything derived from them is recomputed, since an analysis that is kept is
-one that can be stale. Editor loads parse on demand: speculative parser workers
+Parses are kept between requests. The latest resolved analysis is also reused
+for an unchanged document, after checking the loaded source texts and package
+discovery again. Edits and filesystem notifications invalidate it. Import-path
+completion asks package discovery directly, so even an unfinished `import std.`
+offers modules without parsing their bodies. Outline ranges share a line index
+rather than scanning the whole file for each symbol. Editor loads parse on demand: speculative parser workers
 would repeat cached work and leave completed process heaps in the VM after each
 request. [docs/notes/lucid.md](../docs/notes/lucid.md) is the
 design: which tree answers which question, and why a record is a declaration
@@ -84,5 +87,6 @@ mind test lucid             # both
 program: that an unsaved buffer is what the compiler sees, that a definition in
 another file is found, and that a diagnostic is withdrawn once its cause is
 fixed.
-It also runs `tests/cache.dr`, which checks that repeated cached loads do not
+It also runs `tests/editor.py` (Python 3), covering import suggestions, escaped
+local paths and dependency changes while a document is unchanged, and `tests/cache.dr`, which checks that repeated cached loads do not
 accumulate parser processes.

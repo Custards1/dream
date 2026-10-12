@@ -26,6 +26,7 @@
 // its cases was transcribed from.
 import std.cli;
 import std.console;
+import std.file;
 
 import std.install;
 import std.io;
@@ -37,6 +38,9 @@ import std.path;
 import std.str;
 
 import dreams.fmt;
+import dreams.diag;
+import dreams.modules;
+import dreams.package;
 
 import analysis;
 import complete;
@@ -49,20 +53,18 @@ let version = "0.1.0";
 
 /// The open documents, where to look for packages, and what has been parsed.
 ///
-/// Everything *derived* is recomputed per request -- an analysis that is kept
-/// is one that can be stale -- but the parses are not derived from anything
-/// this server decides: a file's text either changed or it did not, and the
-/// loader checks which for itself. So the parse map is carried, and it is the
-/// difference between a request costing 793 ms and 127. See `analyse_cached!`.
+/// Parses survive edits; the latest analysis survives only while its sources
+/// and package discovery still agree with the filesystem and open buffers.
 let state docs roots = %{ :docs => docs, :roots => roots, :parsed => %{} };
 
 let docs s  = s.[:docs else (%{})];
 let roots s = s.[:roots else []];
 let parses s = s.[:parsed else (%{})];
 
-let with_doc path text s = s.[:docs => (((docs s)).[path => text])];
-let without_doc path s = s.[:docs => (map.remove path (docs s))];
-let with_roots rs s = s.[:roots => rs];
+let invalidated s = map.remove :analysis s;
+let with_doc path text s = (invalidated s).[:docs => (((docs s)).[path => text])];
+let without_doc path s = (invalidated s).[:docs => (map.remove path (docs s))];
+let with_roots rs s = (invalidated s).[:roots => (list.unique rs)];
 /// Add to what has been parsed. **Merged, never replaced**, and that is not a
 /// detail: a buffer that does not parse names no imports, so the loader for it
 /// never reaches the other modules and its parse map comes back holding only
@@ -81,8 +83,27 @@ let with_parses ps s = s.[:parsed => (map.merge (parses s) ps)];
 /// an analysis made without `analysed!` does not reuse the parses, and one
 /// whose state is not put back through `carrying` throws away the parses it
 /// just did.
-let analysed! s path = analysis.analyse_cached! path (roots s) (docs s) (parses s);
-let carrying a s = with_parses (analysis.parses a) s;
+// Diagnostics, hover and outline commonly ask about the same revision. Keep
+// its resolution, but verify the source files and package discovery before
+// reusing it: a closed dependency can change without a document notification.
+let reusable! : :any -> :string -> :any -> :bool;
+let reusable! s path a =
+    analysis.module_index (analysis.source a) path == analysis.module_of a
+    && analysis.module_of a != ()
+    && not (modules.failed (analysis.source a))
+    && package.discover! path (roots s) == modules.packages (analysis.source a)
+    && list.all (fn f -> {
+        let p = diag.source_path f;
+        let text = ((docs s)).[p else (file.read! p)];
+        text == diag.source_text f
+    }) (modules.files (analysis.source a));
+
+let analysed! s path = match s.[:analysis else ()] {
+    () => analysis.analyse_cached! path (roots s) (docs s) (parses s),
+    a => if reusable! s path a { a }
+         else { analysis.analyse_cached! path (roots s) (docs s) (parses s) },
+};
+let carrying a s = (with_parses (analysis.parses a) s).[:analysis => a];
 
 // --- reading the parts of a request ---------------------------------------------
 
@@ -188,6 +209,7 @@ let handle! out s m = {
             [:go, with_roots (list.append (roots s) (roots_from p)) s]
         },
         "initialized" => [:go, s],
+        "workspace/didChangeWatchedFiles" => [:go, invalidated s],
 
         // The client asks to shut down, then tells us to go. Answering the
         // first and waiting for the second is what the protocol asks for.

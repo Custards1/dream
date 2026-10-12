@@ -16,6 +16,7 @@
 // the sort of bug that is reported as "go to definition is off by a bit".
 
 import std.list;
+import std.num;
 import std.str;
 
 import dreams.diag;
@@ -88,7 +89,8 @@ let position_of text offset = {
 /// start of the file, which for a question asked once is nothing and for a
 /// hint per binding in a long file is a walk of the file per hint. This walks
 /// each offset's own line, found in `starts` -- `diag.line_starts text`.
-let position_in starts text offset = {
+let position_in starts text requested = {
+    let offset = num.clamp 0 (str.byte_length text) requested;
     let [line, col] = diag.place_in starts offset;
     let from = starts.[line - 1];
     let rec walk i !units =
@@ -109,6 +111,16 @@ let range text from until = {
        "end"   => %{ "line" => list.head b, "character" => list.nth 1 b } }
 };
 
+/// Reuse the line index when returning many ranges for the same document.
+/// Walking from byte zero for every outline entry makes a long file quadratic.
+let range_in : :any -> :string -> :integer -> :integer -> :any;
+let range_in starts text from until = {
+    let a = position_in starts text from;
+    let b = position_in starts text until;
+    %{ "start" => %{ "line" => list.head a, "character" => list.nth 1 a },
+       "end" => %{ "line" => list.head b, "character" => list.nth 1 b } }
+};
+
 /// A range covering nothing, at the start of the document. For a diagnostic
 /// that has no span to point at, which is better than pointing somewhere wrong.
 let nowhere = %{ "start" => %{ "line" => 0, "character" => 0 },
@@ -125,6 +137,13 @@ when test {
     let emoji = "a\u{1F600}b";
 
     let tests = [
+        test.case "indexed ranges preserve UTF-16, partial characters and clamping"
+            $( test.true! ({
+                let text = "hé\n" + emoji + "\n";
+                let starts = diag.line_starts text;
+                list.all (fn o -> range text o (o + 1) == range_in starts text o (o + 1))
+                         (list.range (0 - 1) (str.byte_length text + 3))
+            }) ),
         test.case "a position found by its line agrees with one walked from the start"
             $( test.eq! (list.map (fn o -> position_of "ab\ncé\nd" o) [0, 3, 4, 6, 7, 8])
                         (list.map (fn o -> position_in (diag.line_starts "ab\ncé\nd") "ab\ncé\nd" o)

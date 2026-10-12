@@ -64,6 +64,9 @@ function findServer(config, folders) {
     candidates.push(path.join(expandPath(process.env.MINDV2_PATH), 'lucid'));
   }
 
+  const available = candidates.find((c) => fs.existsSync(c));
+  if (available) return available;
+
   // Ask the VM itself. A toolchain wrapper -- the nix flake's `dream` -- sets
   // `$MINDV2_PATH` only inside its own process, so an editor cannot read it
   // from its own environment, and the wrapper is where the installation is
@@ -71,7 +74,7 @@ function findServer(config, folders) {
   // have the flag, or missing entirely, is caught and simply adds nothing.
   const vm = expandPath(config.get('vm.path')) || 'dream';
   try {
-    const out = execFileSync(vm, ['--mindv2-path'], { encoding: 'utf8' });
+    const out = execFileSync(vm, ['--mindv2-path'], { encoding: 'utf8', timeout: 3000 });
     for (const dir of out.trim().split(path.delimiter)) {
       if (!dir) continue;
       const root = expandPath(dir);
@@ -92,12 +95,12 @@ function findServer(config, folders) {
 function packagePaths(config, folders) {
   const roots = [];
   for (const folder of folders || []) roots.push(folder.uri.fsPath);
-  for (const p of config.get('packagePaths') || []) roots.push(p);
+  for (const p of config.get('packagePaths') || []) roots.push(expandPath(p));
 
   const stdlib = config.get('stdlib.path') || process.env.MIND_STDLIB;
-  if (stdlib) roots.push(stdlib);
+  if (stdlib) roots.push(expandPath(stdlib));
 
-  return roots;
+  return [...new Set(roots)];
 }
 
 function activate(context) {

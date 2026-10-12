@@ -227,3 +227,30 @@ is read), so a local's identity is `locals_at`'s innermost binder of the name
 -- the syntax's scoping, which completion already transcribes. Not handled:
 a name inherited through `derive` (renamed in the base only), a record's
 generated members, and modules outside the program rooted at the open file.
+
+## Import discovery and repeated editor requests (2026-10-12)
+
+An unfinished import is answered from `package.discover!` and `package.modules!`,
+without parsing or resolving its module bodies. Local siblings and the current
+package are offered alongside dependencies and host modules. Dotted paths offer
+one segment at a time, including directories containing deeper modules.
+
+The latest resolved analysis is reused after checking its source texts against
+open buffers or disk and comparing fresh package discovery. Document changes,
+closes and filesystem notifications invalidate it; failed loads are retried so
+creating a missing dependency can recover. File URIs now use `std.http.url`'s
+percent encoding, keeping paths containing spaces or Unicode aligned with the
+loader's filesystem paths.
+
+Outline ranges use the existing indexed UTF-16 conversion in `pos`: walking
+from byte zero for each symbol was the larger bottleneck. Three interleaved
+runs against the preceding Lucid sources, with the same VM and dependencies,
+measured repeated requests on `mind/std/str.dr`: median outline latency fell
+from 3296 ms to 19 ms, and unchanged hover from 76 ms to 3.6 ms. Completion at
+an appended unfinished `import std.` fell from 40 ms to 19 ms and now returns
+module candidates. These are request latencies after the document's diagnostic
+notification, not end-to-end typing latency or cold startup measurements.
+
+`tests/editor.py` exercises discovery, local definitions through escaped URIs,
+closed dependency edits/deletion/recreation, manifest dependency changes and
+manifest-less sibling imports against a running server.
