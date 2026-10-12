@@ -30,6 +30,7 @@ import dreams.emit;
 import dreams.ir;
 import dreams.lower;
 import dreams.modules;
+import dreams.package;
 import dreams.opt as optimizer;
 import dreams.scope;
 import dreams.typecheck;
@@ -356,6 +357,19 @@ let image b = {
         |> ir.Image.set_payload_names (Options.payload_names o)
         |> ir.Image.set_float_params (hints typecheck.Analysis.float_params)
         |> ir.Image.set_integer_params (hints typecheck.Analysis.integer_params)
+        |> ir.Image.set_vm_options (vm_options (Build.loader b))
+};
+
+/// The root package's `[vm]` settings, as the image's `VMOP` records. The root
+/// package is the one the program's file is in, and only its settings count:
+/// a library has no say in how the program that uses it is run.
+let vm_options : modules.Loader -> [[:integer]];
+let vm_options l = match package.current (modules.packages l) {
+    () => [],
+    p => match package.Vm.nursery_max (package.vm p) {
+        () => [],
+        n => [[emit.vm_nursery_max, n]],
+    },
 };
 
 /// The image as the bytes a `.dream` file holds, payload excepted.

@@ -13,6 +13,7 @@
 
 import std.list;
 import std.char;
+import std.str;
 
 /// The same number as a float. A float is answered as it is.
 let to_float : (:integer | :float) -> :float;
@@ -47,6 +48,33 @@ let parse_int s = _parse_int s;
 /// ```
 let parse_float : :string -> (:float | :unit);
 let parse_float s = _parse_float s;
+
+/// How far each unit `parse_size` takes shifts a count, by its lower-case spelling.
+priv let size_units : %{:string => :integer};
+priv let size_units = %{ "" => 0, "b" => 0, "k" => 10, "kb" => 10, "m" => 20, "mb" => 20,
+                          "g" => 30, "gb" => 30 };
+
+/// The bytes a size stands for, or `()` for text that is not one: a count of
+/// bytes, or one followed by `K`, `M` or `G` (and an optional `B`), in either
+/// case, each a power of 1024. `parse_size "64M"` is `67108864`.
+///
+/// The spelling is the VM's own, for `dream --max-heap` and the `DREAM_MAX_*`
+/// variables, so a size in a manifest reads the way it does on a command line.
+/// Zero is not a size.
+let parse_size : :string -> (:integer | :unit);
+let parse_size s = {
+    let digits = str.span "0123456789" 0 s;
+    let unit = str.lower (str.slice digits (str.byte_length s - digits) s);
+    let shift = size_units.[unit else ()];
+    match shift {
+        () => (),
+        k => match (if digits == 0 { () } else { _parse_int (str.slice 0 digits s) }) {
+            () => (),
+            0 => (),
+            n => n * pow 2 k,
+        },
+    }
+};
 
 /// The float that is not a number, and the infinities: what `0.0 / 0.0` and
 /// `1.0 / 0.0` make. Named, rather than left to be written as divisions,
@@ -252,6 +280,14 @@ when test {
         test.case "toward zero"          $( test.eq! (0 - 3) (to_int (0.0 - 3.9)) ),
         test.case "a numeral"            $( test.eq! [42, ()] [parse_int "42", parse_int "4x"] ),
         test.case "a float numeral"      $( test.eq! [2.5, ()] [parse_float "2.5", parse_float "x"] ),
+        test.case "a size, as the VM reads one"
+            $( test.eq! [4096, 524288, 67108864, 2147483648, 1024]
+                        [parse_size "4096", parse_size "512K", parse_size "64M", parse_size "2gb",
+                         parse_size "1kB"] ),
+        test.case "not a size"
+            $( test.eq! [(), (), (), (), ()]
+                        [parse_size "", parse_size "M", parse_size "0", parse_size "12T",
+                         parse_size "-1M"] ),
         test.case "eight bytes and back" $( test.eq! [8, 1.5] [len (float_bytes 1.5),
                                                               float_of_bytes (float_bytes 1.5)] ),
 

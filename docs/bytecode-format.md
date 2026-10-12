@@ -101,6 +101,7 @@ Unknown section kinds must be skipped, not treated as an error.
 | `SPAN` | `u32 start, u32 end`                                 | per-node source spans, parallel to `NODE`; reserved, never written |
 | `ITYP` | `u32 func, u32 reserved, u64 integer_params`        | integer signature hints for the JIT |
 | `TYPE` | `u32 func, u32 reserved, u64 float_params`          | what signatures declared, for the JIT (below) |
+| `VMOP` | `u32 key, u32 reserved, u64 value`                  | VM settings from the root package's `[vm]` table; optional (below) |
 | `LDAT` | `u64 offset, u64 length`                            | large-data table, into `PAYL` |
 | `LNAM` | `u32 length`, then the bytes, per datum, unpadded   | payload names; optional |
 | `PAYL` | `u64 byte_length` header, then the bytes            | the payload; last in the file |
@@ -357,6 +358,24 @@ The JIT uses these hints to favor the checked fixnum arithmetic path in code
 layout. Values remain tagged; neither the signature nor propagated arithmetic
 hints prove that a value fits a fixnum. Runtime type checks, overflow handling,
 and slow paths remain active, including for calls from untyped code.
+
+## VM settings (`VMOP`)
+
+The optional `VMOP` section is what the program's root package asked of the VM
+in its manifest's `[vm]` table, one 16-byte record per setting it made: a key,
+a reserved word (zero), and a `u64` value. A program that made none has no
+section, and its image is the bytes it would have been without one. The image
+carries these because it is the one thing every way of running the program has
+in hand; a build tool may not be there at all.
+
+| Key | `[vm]` setting | Value |
+|---|---|---|
+| 1 | `nursery_max` | the most a process's nursery may grow to, in bytes |
+
+The VM reads the section when it loads the image, before the first process, and
+the person running the program overrules it: `dream --nursery-max` first, then
+`DREAM_NURSERY_MAX`, then this. A key the VM does not know is ignored, so a
+setting added later does not stop an older VM from running the image.
 
 ## Large data (`LDAT` and `PAYL`)
 

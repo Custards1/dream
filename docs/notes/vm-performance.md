@@ -1497,6 +1497,49 @@ Under a pin, everything allocated since the last collection is held whether or
 not it is reachable, so `check_limits` takes the allocation as the measure
 there. The case now raises a catchable `:out_of_memory` in that process.
 
+## Strict builtins and pinned forces
+
+Found 2026-10-12, chasing what looked like a cost of `lazy.forced`. Replacing
+`type_of (out s) != :nothing` with `lazy.forced (out s)` in `opt.settle` made a
+self-compile allocate 2.7% more and run 3% slower, with byte-identical output,
+the same reductions, and the same allocation by kind. Under `--no-jit` a compile
+is deterministic, which is what made it findable:
+
+- The "extra allocation" was promotion: allocated and promoted grew by the same
+  126 MB, so the same objects were made and more of them survived a minor.
+- Counting remembered-set entries by kind (`remember_if_old`) put it on
+  `Blackhole`: half a million more thunks were already old when forced, spread
+  over lowering and parsing rather than near `opt.settle` at all.
+- Tagging the GC trace with a per-heap serial showed the *cheaper* run had seven
+  minor collections far past the 32 MB cap -- 551 MB allocated with nothing
+  able to collect -- against three (161 MB) in the other.
+- Charging bytes allocated under each outermost unvouched force to the native
+  that started it named `_array_of_list`: 808 MB of the compiler's work ran
+  inside `array.of_list`'s spine walk in one run, 74 MB in the other.
+
+`array.of_list (list.reverse acc)` at the end of a pass *is* the rest of the
+pass, run under a native that did not vouch, so none of it could collect. Which
+`if` forced what first decided how much of the program ended up in there, and
+an uncollected stretch is a huge nursery: little promotion, a little faster,
+and no bound on memory -- the failure that made `dreams --check --test` run out
+of its heap the same day, through `to_string`. `_array_of_list` now vouches.
+The two forms of `opt.settle` then cost the same; the self-compile is about 2%
+slower than when that work ran pinned, and holds 27% less from the OS (1.30 GB
+against 1.78 GB).
+
+Two things to take from it. A native that walks a lazy structure must vouch,
+or the work behind the structure runs uncollected; `bi_settled`'s comment and
+`core_array_of_list`'s say how. And when a change to hot code moves allocation,
+compare `--no-jit --stats` promotion before believing the change costs anything.
+
+A bigger nursery does not buy the time back: at 64 MB a self-compile measured
+2.737 s against 2.747 s at 32 MB, inside the noise. The cap is now a setting a
+program's root package can make, `[vm] nursery_max` in its `mind.toml`, carried
+in the image's `VMOP` section (docs/bytecode-format.md); `dream --nursery-max`
+and `DREAM_NURSERY_MAX` overrule it. Under the JIT a compiled loop reaches the
+collector's check less often, so its nursery overshoots any cap -- 3.4 MB and
+climbing against 256 KB -- which the interpreter does not.
+
 ## Strict by default: the experiment
 
 2026-10-09. The question: would Dream be better strict by default, with

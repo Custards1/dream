@@ -206,6 +206,19 @@ struct TypeRec {
 };
 static_assert(sizeof(TypeRec) == 16, "type records are 16 bytes on disk");
 
+/// A `VMOP` record: one setting the program's root package asked of the VM
+/// in its manifest's `[vm]` table. A key this VM does not know is ignored, so
+/// a newer compiler's settings do not stop an older VM from running the image.
+struct VmOptionRec {
+    uint32_t key;
+    uint32_t reserved;
+    uint64_t value;
+};
+static_assert(sizeof(VmOptionRec) == 16, "VM option records are 16 bytes on disk");
+
+/// `VMOP` keys. See `emit.vm_nursery_max` in dreams/emit.dr.
+inline constexpr uint32_t VMOP_NURSERY_MAX = 1;
+
 /// One module of a whole-program image. Compilation is whole-program, so an
 /// image carries every module it needs and records which globals belong to
 /// which -- for diagnostics, tooling, and reflection.
@@ -246,6 +259,13 @@ public:
     /// else it does (`strict_args_` in image.cpp), so a caller may evaluate
     /// that argument instead of suspending it.
     uint32_t strict_args(uint32_t function) const { return strict_args_[function]; }
+    /// The value the image's `VMOP` section gives `key`, or 0 when it gives
+    /// none -- every setting there is a size or a count, and 0 is neither.
+    uint64_t vm_option(uint32_t key) const {
+        for (uint32_t i = 0; i < n_vm_options_; ++i)
+            if (vm_options_[i].key == key) return vm_options_[i].value;
+        return 0;
+    }
     Image() = default;
     ~Image();
     Image(const Image&) = delete;
@@ -378,6 +398,7 @@ private:
     const DataRec* large_ = nullptr;         uint32_t n_large_ = 0;
     const TypeRec* integer_types_ = nullptr; uint32_t n_integer_types_ = 0;
     const TypeRec* types_ = nullptr;         uint32_t n_types_ = 0;
+    const VmOptionRec* vm_options_ = nullptr; uint32_t n_vm_options_ = 0;
 
     /// The payload bytes, and where its `u64` length header sits. The offset
     /// is kept because validation has to prove the payload ends inside the

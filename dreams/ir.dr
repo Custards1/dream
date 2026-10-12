@@ -283,6 +283,8 @@ mapping Image {
     payload_names = []
     float_params = []
     integer_params = []
+    // `[key, value]` per VM setting the root package asks for; see `emit.vm_sections`.
+    vm_options = []
 }
 
 /// `Node(op, flags, a, b, c)`. The VM's record also carries a 16-bit `aux`

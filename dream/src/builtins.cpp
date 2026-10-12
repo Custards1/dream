@@ -3401,6 +3401,17 @@ NativeResult core_array_new(Process& p, Value, Value* args, uint32_t) {
 
 NativeResult core_array_of_list(Process& p, Value, Value* args, uint32_t) {
     // Two passes: count, then fill. The elements stay lazy.
+    //
+    // The spine is forced here, and whatever made it lazily runs underneath:
+    // `array.of_list (list.reverse acc)` at the end of a pass is the rest of
+    // the pass. So it vouches (`VouchesForGc`), as `strict!` does. Unvouched,
+    // that work ran with nothing able to collect -- 808 MB of a self-compile,
+    // in one nursery per call, and how much depended on what an unrelated
+    // `if` elsewhere had happened to force first (see "Strict builtins and
+    // pinned forces" in docs/notes/vm-performance.md). Every head waits on the
+    // value stack, and `cur` is only ever handed straight to the force, so a
+    // collection underneath loses nothing.
+    VouchesForGc vouch(p);
     const size_t base = p.stack.size();
     Value cur = args[0];
     for (;;) {

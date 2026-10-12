@@ -57,6 +57,9 @@ const char* USAGE =
     "                           (default 4M; also $DREAM_MAX_DEPTH)\n"
     "      --max-stack <n>      values one process may hold on its stack\n"
     "                           (default 4M; also $DREAM_MAX_STACK)\n"
+    "      --nursery-max <size> the most a process's nursery grows to, in bytes or\n"
+    "                           64M (default 32M; also $DREAM_NURSERY_MAX, then\n"
+    "                           the program's own `[vm] nursery_max`)\n"
     "      --dump-jit <fn>  print the LLVM IR generated for a function, named or\n"
     "                       given as #N, its index -- generated functions share names\n"
     "      --mindv2         mindv2 path override\n"
@@ -372,7 +375,7 @@ int dream_main(int argc, char** argv) {
     uint32_t jit_threshold = 0;
     unsigned jit_threads = 0;
     bool precompile = false;
-    size_t max_heap = 0, max_depth = 0, max_stack = 0;
+    size_t max_heap = 0, max_depth = 0, max_stack = 0, nursery_max = 0;
 
     std::vector<std::string> program_args;
     bool past_image = false;
@@ -446,6 +449,13 @@ int dream_main(int argc, char** argv) {
             precompile = true;
         } else if (a == "--jit-threads") {
             jit_threads = unsigned(std::stoul(next("--jit-threads")));
+        } else if (a == "--nursery-max") {
+            const std::string text = next("--nursery-max");
+            if (!parse_size(text.c_str(), &nursery_max)) {
+                std::fprintf(stderr, "dream: --nursery-max takes a size such as 65536 or 64M, not `%s`\n",
+                             text.c_str());
+                return 2;
+            }
         } else if (a == "--max-heap" || a == "--max-depth" || a == "--max-stack") {
             const std::string text = next(a.c_str());
             size_t n = 0;
@@ -498,6 +508,15 @@ int dream_main(int argc, char** argv) {
     if (!rt.load_image_file(path, error)) {
         std::fprintf(stderr, "dream: %s\n", error.c_str());
         return 1;
+    }
+    // The nursery's cap, in the order the person running the program can
+    // overrule the program: this command line, then the environment (which
+    // `nursery_max_bytes` reads itself), then what the image carries from its
+    // manifest. Before any process exists, so every heap is made with it.
+    if (nursery_max) {
+        set_nursery_max(nursery_max);
+    } else if (!std::getenv("DREAM_NURSERY_MAX")) {
+        if (const uint64_t asked = rt.image().vm_option(VMOP_NURSERY_MAX)) set_nursery_max(size_t(asked));
     }
 
     if (profile_top) rt.enable_profile(profile_top);

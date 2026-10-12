@@ -33,7 +33,18 @@ version = "0.1.0"
 
 [dependencies]
 util = "../util"
+
+[vm]                            # optional: asked of the VM that runs it
+nursery_max = "64M"
 ```
+
+`[vm]` is what a program asks of the VM that runs it, and only the root
+package's counts -- a library has no say in how the program using it runs.
+The compiler writes it into the image, so it holds however the image is run;
+`dream --nursery-max` and `DREAM_NURSERY_MAX` still overrule it. One setting
+so far: `nursery_max`, the most a process's nursery may grow to, as bytes or a
+size such as `"64M"` (the VM's default is 32 MB). A key it does not know is an
+error in the manifest.
 
 Every command but `new` looks for `mind.toml` here or above, so they work from
 anywhere inside a project, the way `git` finds its root. `-C DIR` names

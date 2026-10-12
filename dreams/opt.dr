@@ -270,17 +270,9 @@ let memo s       = State.memo s;
 /// its way back up, so settling at the top of that catches every write with a
 /// chain three long rather than one. Settling at each write instead cost 2.8%
 /// of a self-compile to force what the next call would have forced anyway.
-///
-/// The two lists are forced with `type_of` rather than `lazy.forced`, which
-/// forces exactly as far. Measured under `--no-jit`, where a compile is
-/// deterministic: `lazy.forced` on these two alone made a self-compile allocate
-/// 2.7% more and promote more, and run 3% slower, with the same output and the
-/// same reductions, while on the three maps it costs nothing and in a loop
-/// written to reproduce it, nothing either. Why is not yet understood; until it
-/// is, these two say it the older way.
 let settle : State -> State;
 let settle s =
-    if type_of (out s) != :nothing && type_of (out_kids s) != :nothing && lazy.forced (seen s)
+    if lazy.forced (out s) && lazy.forced (out_kids s) && lazy.forced (seen s)
        && lazy.forced (runs s) && lazy.forced (memo s) { s } else { s };
 
 let node_at : :integer -> State -> ir.Node;

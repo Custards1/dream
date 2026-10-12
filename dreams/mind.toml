@@ -4,3 +4,9 @@ version = "0.1.0"
 src = "."
 
 [dependencies]
+
+[vm]
+# A compile keeps a lot alive for a pass at a time. Measured at 64 MB against
+# the VM's 32 MB a self-compile was no slower and held no more; see "Strict
+# builtins and pinned forces" in docs/notes/vm-performance.md.
+nursery_max = "64M"

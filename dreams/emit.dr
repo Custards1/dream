@@ -156,6 +156,11 @@ let t_payl = tag 80 65 89 76;   // PAYL
 let t_lnam = tag 76 78 65 77;   // LNAM
 let t_ityp = tag 73 84 89 80;   // ITYP
 let t_type = tag 84 89 80 69;   // TYPE
+let t_vmop = tag 86 77 79 80;   // VMOP
+
+/// The keys of `VMOP` records. The VM ignores a key it does not know, so a
+/// setting added here is one an older VM runs without.
+let vm_nursery_max = 1;
 
 // --- the records ---------------------------------------------------------------------
 
@@ -297,6 +302,17 @@ let type_sections kind hints =
                  (list.length hints)]
     };
 
+/// `VMOP`, or nothing: one 16-byte record per setting the root package's
+/// manifest made in `[vm]` -- the key (`vm_nursery_max`), a reserved word,
+/// and the value. Nothing at all for a program that made none, so its image
+/// is the bytes it was before the section existed.
+let vm_sections options =
+    if list.is_empty options { [] }
+    else {
+        [section t_vmop (concat_map (fn e -> u32 (list.head e) + u32 0 + u64 (list.nth 1 e)) options)
+                 (list.length options)]
+    };
+
 /// Every section, in the order a reader meets them.
 let sections_of img = {
     let strs = ir.Image.strs img;
@@ -320,6 +336,7 @@ let sections_of img = {
     // `u32` offset could not reach.
     list.concat [base, type_sections t_type (ir.Image.float_params img),
                  type_sections t_ityp (ir.Image.integer_params img),
+                 vm_sections (ir.Image.vm_options img),
                  data_sections (ir.Image.payloads img) (ir.Image.payload_names img)]
 };
 

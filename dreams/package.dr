@@ -19,6 +19,7 @@ import std.file;
 import std.io;
 import std.list;
 import std.macros;
+import std.num;
 import std.os;
 import std.path;
 import std.str;
@@ -36,6 +37,20 @@ let module_extensions = ["dr"];
 
 // --- a package --------------------------------------------------------------
 
+/// What a package asks of the VM that runs a program it is the root of: its
+/// manifest's `[vm]` table. The compiler writes it into the image (`VMOP` in
+/// docs/bytecode-format.md), because the image is the one thing every way of
+/// running the program has in hand -- `just` runs `dreams.dream` with no `mind`
+/// in sight. The VM's own `--nursery-max` and `DREAM_NURSERY_MAX` still win.
+/// `()` is a setting left to the VM.
+mapping Vm {
+    /// The most a process's nursery may grow to, in bytes. The VM's default is
+    /// 32 MB; a program that keeps a lot alive for a while may do better with
+    /// more (see "Strict builtins and pinned forces" in
+    /// docs/notes/vm-performance.md).
+    nursery_max : :integer | :unit = ()
+}
+
 mapping Package {
     name = ""
     version = "0.0.0"
@@ -44,12 +59,13 @@ mapping Package {
     deps = []
     manifest = ""
     overlays = []
+    vm : Vm = Vm.new ()
 }
 
 /// A package as its manifest describes it. Overlays are never in a manifest --
 /// they are what a build adds (`-L KEY+=DIR`) -- so they start empty.
 let make : :string -> :string -> :string -> :string -> [Dependency] -> :string -> Package;
-let make n v r s d m = Package.make n v r s d m [];
+let make n v r s d m = Package.make n v r s d m [] (Vm.new ());
 
 let name : Package -> :string;
 let name p = Package.name p;
@@ -65,6 +81,8 @@ let deps : Package -> [Dependency];
 let deps p = Package.deps p;
 let manifest : Package -> :string;
 let manifest p = Package.manifest p;
+let vm : Package -> Vm;
+let vm p = Package.vm p;
 
 /// A dependency: a name, and where to find it relative to the depending
 /// package's root. The path is `()` for a dependency given some other way,
@@ -204,6 +222,32 @@ let dep_location spec =
         _       => (),
     };
 
+/// A manifest's `[vm]` table, read into a `Vm`. A key it does not know is an
+/// error rather than a warning: a misspelt setting would otherwise be a
+/// setting silently not made.
+let vm_settings : [[:any]] -> [:ok, Vm] | [:error, :string];
+let vm_settings entries =
+    list.fold (fn acc [key, value] -> match acc {
+        [:ok, settings] => match key {
+            "nursery_max" => match size_of value {
+                () => [:error, "[vm] nursery_max takes a size such as 65536 or \"64M\", not "
+                               + to_string value],
+                n => [:ok, Vm.set_nursery_max n settings],
+            },
+            _ => [:error, "[vm] has no setting `" + key + "`; the one it has is nursery_max"],
+        },
+        failed => failed,
+    }) [:ok, Vm.new ()] entries;
+
+/// A size in a manifest: a positive count of bytes, or text `num.parse_size`
+/// reads, so `65536` and `"64K"` mean the same.
+priv let size_of : :any -> :integer | :unit;
+priv let size_of v = match type_of v {
+    :integer => if v > 0 { v } else { () },
+    :string => num.parse_size v,
+    _ => (),
+};
+
 /// Load a manifest.
 ///
 /// Three answers, not two. `[:none]` means the file is there but names no
@@ -235,11 +279,16 @@ let load_manifest! filename =
                                                   } else { root_dir },
                                             s  => path.join root_dir s,
                                         };
-                                    [:ok, make n (toml.get "0.0.0" doc "package" "version")
-                                              root_dir src_dir
-                                              (list.map (fn [name, location] -> dep name (dep_location location))
-                                                        (toml.entries doc "dependencies"))
-                                              filename]
+                                    match vm_settings (toml.entries doc "vm") {
+                                        [:ok, settings] =>
+                                            [:ok, make n (toml.get "0.0.0" doc "package" "version")
+                                                      root_dir src_dir
+                                                      (list.map (fn [name, location] -> dep name (dep_location location))
+                                                                (toml.entries doc "dependencies"))
+                                                      filename
+                                                  |> Package.set_vm settings],
+                                        [:error, why] => [:error, filename + ": " + why],
+                                    }
                                 },
                                 why => [:error, filename + ": " + why],
                             },
@@ -577,7 +626,19 @@ when test {
 
     let find_index s n = ((by_name s)).[n else ()];
 
+    let vm_of text = vm_settings (toml.entries (doc text) "vm");
+
     let tests = [
+        test.case "no [vm] table leaves every setting to the VM"
+            $( test.eq! [:ok, Vm.new ()] (vm_of "[package]\nname = \"a\"") ),
+        test.case "a nursery cap, as a size or a count of bytes"
+            $( test.eq! [[:ok, 67108864], [:ok, 65536]]
+                        [match vm_of "[vm]\nnursery_max = \"64M\"" { [:ok, v] => [:ok, Vm.nursery_max v], e => e },
+                         match vm_of "[vm]\nnursery_max = 65536" { [:ok, v] => [:ok, Vm.nursery_max v], e => e }] ),
+        test.case "a [vm] key it does not know is an error"
+            $( test.eq! :error (list.head (vm_of "[vm]\nnursery = \"64M\"")) ),
+        test.case "a size that is not one is an error"
+            $( test.eq! :error (list.head (vm_of "[vm]\nnursery_max = \"lots\"")) ),
         test.case "a manifest names its package"
             $( test.eq! ["std", "0.1.0"]
                         { let m = parsed "[package]\nname = \"std\"\nversion = \"0.1.0\"";

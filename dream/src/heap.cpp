@@ -19,6 +19,7 @@
 #include <unordered_set>
 
 #include "gc_pool.hpp"
+#include "interp.hpp"
 
 namespace dream {
 
@@ -141,16 +142,26 @@ inline uint32_t class_size(uint32_t bytes) {
 /// the survival rate decide gives each of them what it needs.
 ///
 /// The default cap is 32 MiB, which is where the self-compile stops improving.
-/// `DREAM_NURSERY_MAX` overrides it, for measuring the next workload.
+/// A program can ask for another in its root package's manifest (`[vm]
+/// nursery_max`, carried in the image's `VMOP` section), and the person
+/// running it can overrule that: `dream --nursery-max SIZE` first, then
+/// `DREAM_NURSERY_MAX`, then the image, then the default. `set_nursery_max` is
+/// how the command line and the image get here; it is called before the
+/// first process, so every heap is made with the same cap.
+static std::atomic<size_t> g_nursery_max{0};
+
+void set_nursery_max(size_t bytes) {
+    // Below the nursery a process starts with, a cap would only ever shrink it.
+    g_nursery_max.store(std::max(bytes, size_t(64) << 10));
+}
+
 static size_t nursery_max_bytes() {
-    static const size_t value = [] {
-        if (const char* env = std::getenv("DREAM_NURSERY_MAX")) {
-            long long n = std::atoll(env);
-            if (n > 0) return size_t(n);
-        }
-        return size_t(32) << 20;
-    }();
-    return value;
+    if (const size_t set = g_nursery_max.load()) return set;
+    if (const char* env = std::getenv("DREAM_NURSERY_MAX")) {
+        size_t n = 0;
+        if (parse_size(env, &n)) return std::max(n, size_t(64) << 10);
+    }
+    return size_t(32) << 20;
 }
 
 Heap::Heap(size_t initial_bytes)

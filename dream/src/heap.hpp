@@ -111,6 +111,10 @@ struct RootSource {
     virtual void visit_roots(Heap& heap) = 0;
 };
 
+/// The most any process's nursery may grow to, from here on; see
+/// `nursery_max_bytes` in heap.cpp for who sets it and in what order.
+void set_nursery_max(size_t bytes);
+
 class Heap {
 public:
     explicit Heap(size_t initial_bytes = 64 * 1024);

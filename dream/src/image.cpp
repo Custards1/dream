@@ -420,6 +420,9 @@ bool Image::parse(std::string& error) {
         } else if (s.kind == tag("TYPE")) {
             if (!fits(sizeof(TypeRec))) { error = "TYPE section is short"; return false; }
             types_ = reinterpret_cast<const TypeRec*>(base); n_types_ = s.count;
+        } else if (s.kind == tag("VMOP")) {
+            if (!fits(sizeof(VmOptionRec))) { error = "VMOP section is short"; return false; }
+            vm_options_ = reinterpret_cast<const VmOptionRec*>(base); n_vm_options_ = s.count;
         } else if (s.kind == tag("SPAN")) {
             if (!fits(sizeof(SpanRec))) { error = "SPAN section is short"; return false; }
             spans_ = reinterpret_cast<const SpanRec*>(base); n_spans_ = s.count;

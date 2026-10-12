@@ -1,6 +1,6 @@
 import std.console;
 import std.os;
-import dreams.path;
+import std.path;
 
 let main! = {
     console.print! (path.normalize "/a/b/../c" == "/a/c")
