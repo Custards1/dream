@@ -44,6 +44,7 @@
 // friends -- write the statements that are always the same shape from data, so
 // a `mapping` record can go into a table as it is.
 
+import std.atom;
 import std.list;
 import std.map;
 import std.str;
@@ -190,7 +191,7 @@ let qualified names = raw (str.join_str "." (list.map quote_ident names));
 /// Quote an identifier, doubling embedded double quotes.
 let quote_ident : :any -> :string;
 let quote_ident name = {
-    let text = if type_of name == :atom { value.atom_name name } else { to_string name };
+    let text = if type_of name == :atom { atom.name name } else { to_string name };
     "\"" + str.replace "\"" "\"\"" text + "\""
 };
 

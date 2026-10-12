@@ -53,6 +53,7 @@
 // response says the URL it finally came from. `stream!` and `download!`
 // take a body a piece at a time, and `with_stream` sends one that way.
 
+import std.atom;
 import std.crypto;
 import std.error;
 import std.io;
@@ -177,7 +178,7 @@ priv let header_value v = str.filter (fn c -> c != '\r' && c != '\n') (text_of v
 
 /// Convert a body or header value to its string representation.
 priv let text_of : :any -> :string;
-priv let text_of v = match type_of v { :string => v, :atom => str.slice 1 (len (to_string v)) (to_string v), _ => to_string v };
+priv let text_of v = match type_of v { :string => v, :atom => atom.name v, _ => to_string v };
 
 /// The media type, without its parameters and in lower case:
 /// `application/json` for `Application/JSON; charset=utf-8`.

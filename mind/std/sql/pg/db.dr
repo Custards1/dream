@@ -47,6 +47,7 @@
 // `:connection_failure`, carrying the socket's own error as `:cause`, and that
 // connection should be closed: the exchange stopped somewhere in the middle.
 
+import std.atom;
 import std.error;
 import std.file;
 import std.io;
@@ -778,7 +779,7 @@ let begin_statement options = str.join_str " " (list.filter (fn s -> s != "") [
         :read_committed => "ISOLATION LEVEL READ COMMITTED",
         :repeatable_read => "ISOLATION LEVEL REPEATABLE READ",
         :serializable => "ISOLATION LEVEL SERIALIZABLE",
-        other => "ISOLATION LEVEL " + str.upper (value.atom_name other),
+        other => "ISOLATION LEVEL " + str.upper (atom.name other),
     },
     match Transaction.read_only options { true => "READ ONLY", false => "READ WRITE", _ => "" },
     match Transaction.deferrable options { true => "DEFERRABLE", false => "NOT DEFERRABLE", _ => "" },
@@ -897,7 +898,7 @@ priv let counted r = match Result.count r {
 
 /// Convert a name to its SQL identifier text.
 priv let to_string_name : :any -> :string;
-priv let to_string_name t = if type_of t == :atom { value.atom_name t } else { to_string t };
+priv let to_string_name t = if type_of t == :atom { atom.name t } else { to_string t };
 
 /// Read until the server is ready to be sent rows. A failure -- no such table
 /// -- arrives instead, and is read to the end and answered.

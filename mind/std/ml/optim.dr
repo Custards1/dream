@@ -68,10 +68,10 @@ let sgd lr = sgd_with lr (Sgd.new ());
 /// What `sgd_with` takes beyond the rate: `Sgd.new () |> Sgd.set_momentum 0.9`,
 /// or a map of just the keys it changes.
 mapping Sgd {
-    momentum : :float | :integer = 0.0
+    momentum : :number = 0.0
     nesterov : :bool = false
     /// Added to the gradient as `wd * p`, which is L2 regularization.
-    weight_decay : :float | :integer = 0.0
+    weight_decay : :number = 0.0
 }
 
 /// SGD with momentum, Nesterov's correction or weight decay (`Sgd`).
@@ -110,13 +110,13 @@ let adamw lr wd = adam_with lr (Adam.new () |> Adam.set_decay wd);
 
 /// What `adam_with` takes beyond the rate.
 mapping Adam {
-    beta1 : :float | :integer = 0.9
-    beta2 : :float | :integer = 0.999
-    eps : :float | :integer = 1.0e-8
+    beta1 : :number = 0.9
+    beta2 : :number = 0.999
+    eps : :number = 1.0e-8
     /// Decoupled weight decay, as AdamW.
-    decay : :float | :integer = 0.0
+    decay : :number = 0.0
     /// L2 regularization, through the gradient.
-    weight_decay : :float | :integer = 0.0
+    weight_decay : :number = 0.0
 }
 
 /// Adam with its moments, epsilon or either kind of weight decay changed (`Adam`).
@@ -155,8 +155,8 @@ let rmsprop lr = rmsprop_with lr (RmsProp.new ());
 
 /// What `rmsprop_with` takes beyond the rate.
 mapping RmsProp {
-    rho : :float | :integer = 0.9
-    eps : :float | :integer = 1.0e-8
+    rho : :number = 0.9
+    eps : :number = 1.0e-8
 }
 
 /// RMSProp with its decay or epsilon changed (`RmsProp`).

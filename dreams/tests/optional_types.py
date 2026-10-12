@@ -95,6 +95,17 @@ let main! = {
 };
 ''', '[true, true, false, false, false]\n[true, false]\n[true, false]\n')
 
+    # `:number` is no kind `type_of` answers, but it is what `types.number`
+    # is: an integer or a float. As a map's key it names a kind, so that is a
+    # map keyed by numbers and not a record with a field `:number`.
+    success(prelude + '''
+type Scale = :number;
+type Weights = %{ :number => :string };
+let main! = console.print! [types.accepts Scale 1, types.accepts Scale 1.5, types.accepts Scale "x",
+                            types.accepts Scale :number, types.accepts Weights %{ 1 => "a", 2.5 => "b" },
+                            types.accepts Weights %{ "1" => "a" }];
+''', '[true, true, false, true, true, false]\n')
+
     # --- parameters, recursion, locals, privacy ------------------------------
     (temp / 'contracts.dr').write_text('''
 import std.types;

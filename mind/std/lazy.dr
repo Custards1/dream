@@ -1,0 +1,36 @@
+// Evaluation, said in a pure program.
+//
+// Everything is suspended until something needs it, and usually that is the
+// right default. The exception is a value that is kept: a suspension carries
+// the frame that would compute it, so a lazy value stored in a persistent
+// table holds whatever that frame held -- in a walk that threads the table
+// through every step, the table as it stood a step ago. N stored values hold
+// N versions of the table. Forcing what is stored is the fix, and `strict!`
+// is impure by name, because forcing is when an effect inside a value happens.
+// A pure program that builds its own values has none to perform, and
+// `settled` is the same force said where `strict!` cannot be.
+
+/// True, once `value` has been forced all the way down, as `strict!` forces it.
+///
+/// It answers rather than handing the value back because an argument is not
+/// evaluated: `keep (settled v) table` would suspend the call and force
+/// nothing. A condition is the one place the language must evaluate, so it is
+/// written `if lazy.settled v { .. } else { .. }`, and the `else` is never
+/// taken. A force underneath may collect, so a deep structure costs its live
+/// size rather than everything made on the way to it.
+let settled : :any -> :bool;
+let settled value = _settled value;
+
+when test {
+    import std.test;
+    import std.list;
+
+    let tests = [
+        test.case "a settled value is forced all the way down"
+            $( test.eq! true (settled [1, [2, %{ :a => 3 }], #[4]]) ),
+        test.case "a long list nothing else has forced is forced"
+            $( test.eq! true (settled (list.map (fn n -> n * 2) (list.range 0 100000))) ),
+        test.case "what forcing raises is raised"
+            $( test.raises! $( settled [1, test.boom] ) ),
+    ];
+}

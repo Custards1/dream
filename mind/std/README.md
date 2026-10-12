@@ -118,17 +118,21 @@ sql.transaction_with! db (sql.Transaction.new () |> sql.Transaction.set_isolatio
 
 or as a map of just those keys, `%{ :epochs => 50 }`, which is the same
 value: reading a field a `mapping` has not got answers its default. Both are
-checked where they are written -- `ml.Fit.set_epochs "ten"` and
-`%{ :epochs => "ten" }` are compile errors -- and a default costs nothing
-where it is not used, since an accessor is the one `c.[k else d]` opcode.
+checked where they are written -- `ml.Fit.set_epochs "ten"`,
+`%{ :epochs => "ten" }` and the misspelled `%{ :epoch => 50 }` are compile
+errors -- and a default costs nothing where it is not used, since an
+accessor is the one `c.[k else d]` opcode.
 
-Three rules keep these predictable:
+A default is an expression like any other, and may name what the file
+around the record can: `optimizer : optim.Optimizer = optim.adam 0.001`. It
+is computed once, when first read. What stays `()` is a setting that is
+genuinely absent -- no validation set, no patience -- or one whose default
+depends on another field, as `nn.Dense`'s weight initializer depends on the
+activation; the field's comment says what `()` stands for, and the function
+resolves it with a `match`.
 
-- **A default may not name anything** (the parser's rule; see
-  `names_something` in dreams/parser.dr), so a setting whose default is
-  computed -- an optimizer, an initializer that depends on the activation, a
-  server to run in -- defaults to `()`, and the field's comment says what
-  `()` stands for. The function resolves it with a `match`.
+Two rules keep these predictable:
+
 - **`X.new ()` writes every default in.** So a map merged over defaults of
   your own (`map.merge mine opts`) is undone by a caller who built `opts`
   with `new`. A function that has defaults of its own takes a *configure

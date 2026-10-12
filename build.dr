@@ -235,7 +235,7 @@ let llvm_parts = ["core", "orcjit", "native", "support", "target", "analysis", "
 /// the question changes, and a first build on a machine without `pkg-config`
 /// would keep "nothing" for good.
 let asked_again : :any -> :any;
-let asked_again a = match a { [:artifact, s, n] => build.artifact (build.uncached s) n };
+let asked_again a = match a { build.Input.artifact(s, n) => build.artifact (build.uncached s) n };
 
 /// A strict request fails as a build step, with a useful diagnostic.
 let unavailable : :string -> :map;

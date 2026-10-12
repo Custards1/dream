@@ -797,7 +797,11 @@ when test {
             let plain = http.get! (local_url s + "/who");
             http.close_client! c
             stop! s
-            test.eq! [true, true] [result.is_ok first && first == second, result.map http.body plain != result.map http.body first]
+            // The bodies, not the responses: each carries a `Date`, and two
+            // either side of a second's boundary are different responses
+            // from the same connection.
+            let who r = result.map http.body r;
+            test.eq! [true, true] [result.is_ok first && who first == who second, who plain != who first]
         } ),
         test.case "a client's base URL and headers" $( {
             let s = serve! 0 (router |> get "/api/v1/users" (fn req -> http.text (or_empty (http.header "x-token" req))));
@@ -852,7 +856,7 @@ when test {
             stop! s
             test.eq! [30, 1, true] [list.length (list.filter (fn r -> result.is_ok r) all),
                                     list.length (list.unique (list.map (fn r -> result.map http.body r) all)),
-                                    list.head all == first]
+                                    result.map http.body (list.head all) == result.map http.body first]
         } ),
         test.case "static files, and nothing outside them" $( {
             let dir = "/tmp/dream-http-static-" + to_string (time.now! ());

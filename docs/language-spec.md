@@ -870,6 +870,7 @@ everywhere else `[:integer]` is still the list holding one atom.
 |---|---|
 | `:integer`, `:string`, `:pure_fn`, ... | a primitive: an atom `type_of` answers ([§3](#3-values)) |
 | `:any`, `:never` | everything (without forcing it), and nothing |
+| `:number` | an integer or a float, as `types.number` is; not a kind `type_of` answers |
 | `:ok`, `"fast"`, `3`, `'c'`, `true`, `()` | a literal: that value and no other |
 | `Name`, `mod.Name`, `Name arg` | a named type, and a parameterised one applied |
 | `a`, `b`, ... | in a signature, a lowercase name nothing defines is a type variable |
@@ -935,7 +936,11 @@ At compile time, the checker holds:
 - the standard library's own signatures, so `list.map 5 xs` is an error in a
   program that annotated nothing;
 - every `match` on a declared union, for a variant it does not handle
-  ([§10](#unions)).
+  ([§10](#unions));
+- every key written in a map literal where a `mapping` is expected, against
+  the fields it declares, so `fit! m ds %{ :epoch => 5 }` is an error when
+  the field is `epochs`. Only a literal is: a map built elsewhere may carry
+  other keys, as a record type allows.
 
 ```
 error: argument 2 of `add` should be `:integer`, but this is `"two"`
@@ -1052,7 +1057,10 @@ the atom its values carry (below).
 - **A default** (`y = 0`) is what `new` fills in, and, for a `mapping`, what
   reading the field answers when the map has nothing there. It is compiled
   inside the record's module, which sees the names of the file it is written
-  in (see [Modules](#modules)).
+  in (see [Modules](#modules)), so it may name what a member may
+  (`optimizer : optim.Optimizer = optim.adam 0.001`). It is a global of that
+  module, computed once when first read, and a typed field's default is held
+  to the field's type. It must be pure, as reading a field is.
 - **A member** is an entry with parameters (`say_hi self = ..`): an ordinary
   function compiled inside the record's module, where the accessors,
   setters and other members are in scope without an import, as is
@@ -1074,7 +1082,7 @@ the atom its values carry (below).
   it is a [strict parameter](#strict-parameters) of `make`, `new` and
   `set_x`. A suspended field holds whatever its frame reached, and a record
   kept in a table then keeps the table it was computed from; `!` is the fix.
-  A default is not forced, since it names nothing and so holds nothing.
+  A default is not forced: it is computed once, when first read.
   Only a field can be strict: `!` before a member is an error.
 
 **What a record is at run time.** A value of a `group` or a `struct` holds its

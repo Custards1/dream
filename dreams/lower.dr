@@ -17,6 +17,7 @@
 // time and so need a VM to run them on, and the image writer that turns this
 // arena into bytes. Both are their own step.
 
+import std.atom;
 import std.list;
 import std.map;
 import std.str;
@@ -101,7 +102,7 @@ let func_bodies l = Lowering.func_bodies l;
 /// the function's body was finished. One per function is not many, but it is
 /// one *whole arena* apiece.
 let set_func_body fi n l =
-    if type_of n != :nothing {
+    if ir.settled n {
         (l |> Lowering.set_func_bodies ((func_bodies l).[fi => n]))
     } else { l };
 
@@ -2796,9 +2797,7 @@ let rec emit_const v l =
         :char    => const_char v l,
         :bool    => const_bool v l,
         :unit    => emit_leaf :unit l,
-        // `to_string` of an atom keeps the leading colon, which is not part of
-        // the name the image stores.
-        :atom    => const_atom (str.slice 1 (str.byte_length (to_string v) - 1) (to_string v)) l,
+        :atom    => const_atom (atom.name v) l,
         :list    => const_seq :make_list (list.map (fn x -> x) v) l,
         :array   => const_seq :make_array (array.to_list v) l,
         :map     => const_seq :make_map
@@ -2806,7 +2805,7 @@ let rec emit_const v l =
                                                (map.pairs v))) l,
         _ => match types.record_id v {
             () => emit_leaf :unit l,
-            id => const_record (atom_name id) (types.record_fields v) (types.is_variant v) l,
+            id => const_record (atom.name id) (types.record_fields v) (types.is_variant v) l,
         },
     };
 
@@ -2823,9 +2822,6 @@ let rec const_record id fields variant l = {
                   (if variant { index + ir.record_variant } else { index }))
          (set_prog program (list.head placed))
 };
-
-/// The name of an atom, without the colon `to_string` writes in front of it.
-let atom_name a = { let t = to_string a; str.slice 1 (str.byte_length t - 1) t };
 
 let rec const_seq op items l = {
     let done = list.fold (fn acc x -> {

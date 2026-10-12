@@ -204,6 +204,10 @@ let rec accepts description value = match description {
                             && accepts pair.[1] value.[pair.[0]]) (_map_pairs fields),
     [:refine, base, predicate] => accepts base value && predicate value == true,
     kind if type_of kind == :atom && primitive kind => primitive_accepts kind value,
+    // Not a kind -- `type_of` answers `:integer` or `:float` -- but what
+    // the grammar means by `:number`, and an atom is still compared, as a
+    // kind's spelling is.
+    :number => if type_of value == :atom { value == :number } else { accepts number value },
     // Everything else -- an atom that names no kind, a number, a string, a
     // character -- stands for itself.
     expected => value == expected,

@@ -7,6 +7,15 @@
 // program was written with is one it can match on, and any other name is not
 // one it could have been expecting.
 
+/// An atom's name, without the colon it is written with: `name :ok` is `"ok"`.
+///
+/// `to_string` writes an atom as its name after a `:`, so this is that
+/// rendering less its first byte -- one place for what a dozen modules had
+/// each spelled out again, some slicing one byte too many and leaning on the
+/// slice's clamp to come out right.
+let name : :atom -> :string;
+let name a = { let shown = to_string a; _str_slice shown 1 (len shown - 1) };
+
 /// The atom with this name, or `()` if nothing has ever interned it.
 let existing : (:string | :bigstr) -> (:atom | :unit);
 let existing name = _to_existing_atom name;

@@ -44,6 +44,7 @@
 // terminal, a pipe or a file opened for appending. For tests, `log.capture!`
 // collects events as values instead of writing them.
 
+import std.atom;
 import std.agent;
 import std.console;
 import std.error;
@@ -335,7 +336,7 @@ priv let json_line stamp event = {
 let jsonable : :any -> :any;
 let jsonable v = match type_of v {
     :integer => v, :float => v, :bool => v, :string => v, :unit => v,
-    :atom => atom_name v,
+    :atom => atom.name v,
     :list => list.map jsonable v,
     :array => list.map jsonable (_array_to_list v),
     :map => map.from_pairs (list.map (fn [k, x] -> [key_text k, jsonable x]) (map.pairs v)),
@@ -343,13 +344,10 @@ let jsonable v = match type_of v {
     _ => to_string v,
 };
 
-/// Return an atom's spelling without its leading colon.
-priv let atom_name : :atom -> :string;
-priv let atom_name a = { let t = to_string a; if str.starts_with ":" t { str.slice 1 (len t) t } else { t } };
 
 /// Format a structured field's key as text.
 priv let key_text : :any -> :string;
-priv let key_text k = match type_of k { :atom => atom_name k, :string => k, _ => to_string k };
+priv let key_text k = match type_of k { :atom => atom.name k, :string => k, _ => to_string k };
 
 /// A field's value in text and logfmt: bare when it is one word, quoted when
 /// it has space, quotes or `=` in it. An error is described, an atom named.
@@ -357,7 +355,7 @@ priv let value_text : :any -> :string;
 priv let value_text v = {
     let t = match type_of v {
         :string => v,
-        :atom => atom_name v,
+        :atom => atom.name v,
         :error => error.describe v,
         _ => to_string v,
     };

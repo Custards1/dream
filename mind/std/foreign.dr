@@ -274,10 +274,13 @@ let owned! u = ffi.owned! u;
 /// The answer is forced all the way down before the release: a lazy answer
 /// that read through `h` would otherwise be forced later, against a handle
 /// that is gone. So `f` should answer data, not an infinite structure.
+///
+/// When `f` raised, a release that raises too is ignored, so the error raised
+/// is `f`'s and not its cleanup's.
 let using! : Handle t -> (Handle t -> a) -> a;
 let using! h f = {
     let answer = try! { strict! (f h) } catch e {
-        release_if_alive! h
+        try! { release_if_alive! h } catch ignored { () }
         raise! e
     };
     release_if_alive! h

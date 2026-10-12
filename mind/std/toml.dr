@@ -30,6 +30,7 @@
 
 derive std.codec;
 
+import std.atom;
 import std.char;
 import std.list;
 import std.num;
@@ -394,15 +395,12 @@ priv let escape_byte b = match b {
 let quote : :string -> :string;
 let quote s = "\"" + str.escape_bytes specials escape_byte s + "\"";
 
-/// Return an atom's name without its leading colon.
-priv let atom_name : :atom -> :string;
-priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a);
 
 /// The text a key or a section name stands for, by the rule `std.json` uses:
 /// an atom is its name, a string itself, anything else its digits.
 priv let key_text : :any -> :string;
 priv let key_text k = match type_of k {
-    :atom   => atom_name k,
+    :atom   => atom.name k,
     :string => k,
     _       => to_string k,
 };
@@ -446,7 +444,7 @@ let write_string s = quote s;
 
 /// Encode an atom's name as a quoted string.
 let write_atom : :atom -> :string;
-let write_atom a = quote (atom_name a);
+let write_atom a = quote (atom.name a);
 
 /// Join already encoded elements into the format's array syntax.
 let write_list : [:string] -> :string;

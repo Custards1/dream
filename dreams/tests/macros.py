@@ -262,7 +262,9 @@ let main! = expand loop 1;
     for declaration in ('group Bad { new }', 'mapping Bad { x, new self = 1 }',
                         'struct Bad { x, x self = 1 }'):
         failure(declaration, 'conflicts with a generated helper')
-    failure('mapping Bad { x, y = x }', 'may not name anything')
+    # A default may name things, and one that names nothing there is is
+    # reported where it was written, not in the module it was compiled into.
+    failure('mapping Bad { x, y = nowhere }', 'cannot find `nowhere`', 'main.dr:1:22')
     # The library returns actionable syntax errors, with no runtime imports
     # needed by its generated expressions. Effects remain checked at the call.
     for expression, message in (

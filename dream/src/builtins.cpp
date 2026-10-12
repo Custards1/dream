@@ -604,18 +604,30 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
         }
         case ObjType::Map: {
             out->append("%{");
-            p.stack.push_back(w);
+            // The entries wait on the value stack, a key then its value, for
+            // the reason `force_deep`'s map case gives: rendering one forces
+            // it, a force under a native that vouches may collect, and a
+            // collection rewrites what it can see. A vector of `Value` is not that, so
+            // the entries after the first would be husks of moved objects.
             std::vector<std::pair<Value, Value>> entries;
-            map_collect(p.stack.back(), entries);
-            bool first = true;
+            map_collect(w, entries);
+            const size_t base = p.stack.size();
             for (auto& [k, val] : entries) {
-                if (!first) out->append(", ");
-                first = false;
-                if (!stringify_into(p, k, out, true, depth + 1)) { p.stack.pop_back(); return false; }
-                out->append(" => ");
-                if (!stringify_into(p, val, out, true, depth + 1)) { p.stack.pop_back(); return false; }
+                p.stack.push_back(k);
+                p.stack.push_back(val);
             }
-            p.stack.pop_back();
+            const size_t count = entries.size();
+            entries.clear();
+            for (size_t i = 0; i < count; ++i) {
+                if (i) out->append(", ");
+                if (!stringify_into(p, p.stack[base + 2 * i], out, true, depth + 1) ||
+                    (out->append(" => "),
+                     !stringify_into(p, p.stack[base + 2 * i + 1], out, true, depth + 1))) {
+                    if (!p.force_blocked) p.stack.resize(base);
+                    return false;
+                }
+            }
+            p.stack.resize(base);
             out->push_back('}');
             return true;
         }
@@ -646,14 +658,22 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
             return true;
         }
         case ObjType::ErrorBox: {
-            auto* e = static_cast<ErrorObj*>(as_obj(w));
+            // Kept on the value stack across the first force, and the payload
+            // read from there after it, since that force may move the box.
             out->append("<error ");
+            p.stack.push_back(w);
             std::string tmp;
-            stringify_into(p, e->kind, &tmp, true, depth + 1);
+            if (!stringify_into(p, static_cast<ErrorObj*>(as_obj(p.stack.back()))->kind, &tmp,
+                                true, depth + 1)) {
+                if (!p.force_blocked) p.stack.pop_back();
+                return false;
+            }
             out->append(tmp);
             out->push_back(' ');
             tmp.clear();
-            stringify_into(p, e->payload, &tmp, false, depth + 1);
+            Value payload = static_cast<ErrorObj*>(as_obj(p.stack.back()))->payload;
+            p.stack.pop_back();
+            stringify_into(p, payload, &tmp, false, depth + 1);
             out->append(tmp);
             out->push_back('>');
             return true;
@@ -908,6 +928,29 @@ NativeResult bi_to_string(Process& p, Value, Value* args, uint32_t) {
     std::string s;
     if (!stringify(p, args[0], &s)) return NativeResult::raise(p.result);
     return NativeResult::ok(p.heap().make_string(s.data(), uint32_t(s.size())));
+}
+
+/// `_settled value` -- true, once `value` has been forced all the way down.
+///
+/// `strict!` without the `!`, for a pure caller that keeps what it makes: a
+/// lazy value stored in a persistent table holds the frame that would compute
+/// it, and that frame holds the table as it stood when the value was made, so
+/// N of them hold N versions of the table (see "A lazy value stored in a map
+/// pins the map it was made in"). Forcing is pure wherever the value is, which
+/// is why `to_string` could do this job before; it did it by rendering a
+/// string nobody read, and without vouching, so a deep lazy chain ran in one
+/// nursery no collection could touch -- a gigabyte of it, checking std's
+/// tests, before the heap limit stopped it.
+///
+/// It answers a bool rather than the value because an argument is not
+/// evaluated: `record (settled what)` would suspend the call and change
+/// nothing, and a condition is the one place the language must evaluate. It
+/// vouches as `bi_strict` does, and for the same reason it is safe to.
+NativeResult bi_settled(Process& p, Value, Value* args, uint32_t) {
+    VouchesForGc vouch(p);
+    Value out;
+    if (!force_deep(p, args[0], &out)) return NativeResult::raise(p.result);
+    return NativeResult::ok(make_bool(true));
 }
 
 NativeResult bi_len(Process& p, Value, Value* args, uint32_t) {
@@ -4485,6 +4528,13 @@ const BuiltinDef BUILTINS[] = {
     {"_str_ascii_case", 2, 0b11, core_str_ascii_case},
     {"_str_span_back", 3, 0b111, core_str_span_back},
     {"_str_rfind", 3, 0b111, core_str_rfind},
+    // Mask 0, as `strict!`, which this is without the effect. It vouches, but
+    // is not marked as vouching: the mark keeps the JIT off every function
+    // that calls it, and the compiler calls it once per node it emits and per
+    // name it resolves -- marked, a self-compile was 1.3% slower, unmarked as
+    // fast as `to_string` was, and std's test check fits in its heap either
+    // way, since the deep chains it forces are met from interpreted code.
+    {"_settled", 1, 0b0, bi_settled},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

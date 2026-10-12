@@ -7,6 +7,7 @@
 // breaks nothing else; tables a case makes are `TEMP`, which belong to its
 // connection and vanish with it.
 
+import std.atom;
 import std.console;
 import std.file;
 import std.list;
@@ -272,7 +273,7 @@ let transactions! u = {
 };
 
 let to_string_status : :atom -> :string;
-let to_string_status s = value.atom_name s;
+let to_string_status s = atom.name s;
 
 // --- prepared statements, streaming --------------------------------------------------------
 

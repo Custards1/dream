@@ -15,6 +15,7 @@
 // Everything in this module is pure and total: these are constructors and
 // accessors, and none of them can fail.
 
+import std.atom;
 import std.list;
 
 // --- spans ------------------------------------------------------------------
@@ -570,10 +571,6 @@ let quote_str s =
         _ => str.of_chars [ch],
     }) (str.chars s)) + "\"";
 
-/// An atom's name, without the leading `:`. Operators are atoms, and a tree
-/// reads better with `(binary add ..)` than `(binary :add ..)`.
-let atom_name : :atom -> :string;
-let atom_name a = { let s = to_string a; str.slice 1 (str.byte_length s - 1) s };
 
 let show : [:any] -> :string;
 let rec show e =
@@ -589,8 +586,8 @@ let rec show e =
         [:field, o, n, _]   => "(field " + show o + " " + n + ")",
         [:apply, f, args, _] => "(apply " + show f + " " + show_all args + ")",
         [:pipe, l, r, _]    => "(pipe " + show l + " " + show r + ")",
-        [:unary, op, x, _]  => "(unary " + atom_name op + " " + show x + ")",
-        [:binary, op, l, r, _] => "(binary " + atom_name op + " " + show l + " " + show r + ")",
+        [:unary, op, x, _]  => "(unary " + atom.name op + " " + show x + ")",
+        [:binary, op, l, r, _] => "(binary " + atom.name op + " " + show l + " " + show r + ")",
         [:if, cond, t, el, _] =>
             "(if " + show cond + " " + show t + (if el == () { "" } else { " " + show el }) + ")",
         [:block, stmts, _]  => "(block" + (if list.is_empty stmts { "" } else { " " + show_all stmts }) + ")",

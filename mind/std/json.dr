@@ -24,6 +24,7 @@
 
 derive std.codec;
 
+import std.atom;
 import std.char;
 import std.list;
 import std.num;
@@ -333,11 +334,7 @@ let write_string s = quote s;
 /// writes in front of one. It comes back a string, which is the loss this
 /// format takes and `std.wire` does not.
 let write_atom : :atom -> :string;
-let write_atom a = quote (atom_name a);
-
-/// Return an atom's name without its leading colon.
-priv let atom_name : :atom -> :string;
-priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a);
+let write_atom a = quote (atom.name a);
 
 /// The text of a key.
 ///
@@ -350,7 +347,7 @@ priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a)
 /// to guess at.
 priv let key_text : :any -> :string;
 priv let key_text k = match type_of k {
-    :atom   => atom_name k,
+    :atom   => atom.name k,
     :string => k,
     _       => to_string k,
 };

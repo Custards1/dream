@@ -493,7 +493,7 @@ priv let name_of v = if type_of v == :string { ident v } else { sql_of v };
 /// can be inserted as it stands.
 priv let key_text : :any -> :string;
 priv let key_text k = match type_of k {
-    :atom => str.slice 1 (len (to_string k) - 1) (to_string k),
+    :atom => atom.name k,
     _ => to_string k,
 };
 
@@ -1918,11 +1918,13 @@ let close! c = {
     go! c.[:state]
 };
 
-/// `work c`, and then `c` closed, whether `work` answered or raised.
+/// `work c`, and then `c` closed, whether `work` answered or raised. When
+/// `work` raised, a close that raises too is ignored: the error worth having
+/// is the first one, and the connection is likely broken for the same reason.
 let using! : Connection -> (Connection -> a) -> a;
 let using! c work = {
     let answer = try! { strict! (work c) } catch e {
-        close! c
+        try! { close! c } catch ignored { () }
         raise! e
     };
     close! c

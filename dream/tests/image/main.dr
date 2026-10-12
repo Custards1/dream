@@ -31,7 +31,10 @@ image fallback from (image.any_of [image.installed "no-such-image", image.embedd
 
 let main! = {
     console.print! (to_string (shapes.area [:square, 3.0]))
-    console.print! (to_string (shapes.total [[:square, 2.0], [:circle, 1.0]]))
+    // By key: a map prints in its atoms' order, and that is the order they
+    // first appear in this whole program, which any change to `std` moves.
+    let total = shapes.total [[:square, 2.0], [:circle, 1.0]];
+    console.print! (to_string [total.[:sum], total.[:count]])
     shapes.log! "hello from the caller"
     console.print! shapes.version
     console.print! (to_string (shapes.cm 2.0))

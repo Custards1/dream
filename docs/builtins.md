@@ -126,6 +126,10 @@ interned text it did not write would grow that table until it died, with no
 collector able to reach it. So the only direction offered is the one that
 cannot leak.
 
+The other direction needs no primitive: `atom.name :ok` is `"ok"`, the atom as
+`to_string` writes it less its leading `:`. Use it rather than slicing a
+rendering by hand.
+
 | Primitive | Write | Signature | Description |
 |-----------|-------|-----------|-------------|
 | `_to_existing_atom` | `atom.existing name` | `string\|bigstr → atom\|unit` | The atom of this name if there already is one, `unit` if there is not. Never creates one. A name is an atom when the program writes it as one anywhere — an image's atoms are interned when it loads — so this is how text from outside is matched against names the program does know. Accepts a bigstr, since it reads the bytes and builds nothing. Raises `:type_error` on anything that is not a string. The answer only moves one way: the table never forgets, so an atom stays one. |
@@ -166,6 +170,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 | `_record_id` | `types.record_id v` | `value → atom\|unit` | The atom naming what made a `group`, `struct` or union value -- `app.Point`, `app.Shape.circle` -- or `()` for anything no constructor made. |
 | `_record_fields` | `types.record_fields v` | `record → array` | Its fields in declared order, unforced. |
 | `_record_of` | a constructor's body | `atom → bool → array → record` | A record with that id, a variant's when the bool is true, its fields the array's items, unforced. What `syntax.record` writes as a constructor, which lowering turns into `record_make`; `types.make_record` for a decoder. |
+| `_settled` | `lazy.settled v` | `value → bool` | `true`, once the value has been forced all the way down, as `strict!` forces it but pure. For a pure program that keeps what it makes, where a lazy value held in a persistent table would hold every version of the table it was made from. Vouches for the collector, so a deep force may collect, except under a compiled caller, which pins the heap as it does for every native. Raises what forcing raises. |
 | `_sort_keyed` | `list.sort_on key xs` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
 ### Large data
@@ -1405,6 +1410,12 @@ match error.kind e {
 | `raise_as! k p` | Raise one of a named kind. The typed form of `raise!`, which otherwise wraps everything in `:error`. |
 | `rethrow! e` | Re-raise unchanged, which is what keeps the original kind readable. |
 | `trace! e` · `trace_lines! e` | Where it was first raised: the functions running, innermost first, and the ones that made each value being forced -- in a lazy program usually the line that matters, since a value fails where it is needed and not where it was written. The lines are what an uncaught error is printed with, and what `std.test` prints under a case that failed. A place is a function's, not a line within it. |
+
+### `std.lazy`
+
+| Name | What it does |
+|------|-------------|
+| `settled v` | `true`, once `v` has been forced all the way down: `strict!` for a pure program, which cannot say `!`. Asked in a condition (`if lazy.settled v { .. }`), because an argument is not evaluated and a call that hands the value back would be suspended with it. For a value about to be kept in a persistent table, where a suspension would hold every version of the table it was made from. |
 
 ### `std.proc`
 

@@ -526,6 +526,7 @@ Later appends: `_sort_keyed` (50), `_tensor_matmul` (51) and `_str_interp`
 (57) and `_error_trace!` (58). Then `_tensor_of_bytes` (59), and the record
 primitives `_record_is` (60), `_record_id` (61), `_record_fields` (62) and
 `_record_of` (63). Then `_pow` (64), `num.pow`, and the string walks `_str_char_count` (65),
-`_str_ascii_case` (66), `_str_span_back` (67) and `_str_rfind` (68).
+`_str_ascii_case` (66), `_str_span_back` (67) and `_str_rfind` (68). Then
+`_settled` (69), `lazy.settled`.
 
 Images importing the removed `std.core` or `std.native` modules must be recompiled.

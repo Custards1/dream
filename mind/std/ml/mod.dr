@@ -141,14 +141,11 @@ priv let metric_fn loss_name m = match m {
 /// Return a metric's display name.
 priv let metric_name : :any -> :string;
 priv let metric_name m = match type_of m {
-    :atom => atom_text m,
+    :atom => atom.name m,
     :list => m.[0],
     _ => "metric",
 };
 
-/// Return an atom's spelling without its leading colon.
-priv let atom_text : :atom -> :string;
-priv let atom_text a = str.slice 1 (str.length (to_string a) - 1) (to_string a);
 
 /// How `fit!` trains. Every field has a default, so a caller says only what
 /// it changes -- by chaining setters onto `Fit.new ()`,
@@ -161,8 +158,8 @@ priv let atom_text a = str.slice 1 (str.length (to_string a) - 1) (to_string a);
 mapping Fit {
     /// A name `loss.of` knows, or a function of the output and the target.
     loss : :any = :mse
-    /// An `optim` optimizer; `()` is `optim.adam 0.001`.
-    optimizer : :any = ()
+    /// An `optim` optimizer.
+    optimizer : optim.Optimizer = optim.adam 0.001
     /// Passes over the data.
     epochs : :integer = 10
     /// Examples per step; a dataset smaller than this is one batch.
@@ -235,7 +232,7 @@ priv let train! model ds opts = {
                 + to_string (ops.rows (data.y ds)) + " of y")
     }
     let loss_name = Fit.loss opts;
-    let opt = match Fit.optimizer opts { () => optim.adam 0.001, o => o };
+    let opt = Fit.optimizer opts;
     let epochs = Fit.epochs opts;
     let batch = num.min n (Fit.batch opts);
     let seed = Fit.seed opts;
@@ -452,7 +449,7 @@ let save! path t = {
 priv let key_text : :any -> :string;
 priv let key_text k = match type_of k {
     :integer => "#" + to_string k,
-    :atom => ":" + atom_text k,
+    :atom => ":" + atom.name k,
     _ => "=" + k,
 };
 

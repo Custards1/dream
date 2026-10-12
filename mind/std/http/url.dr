@@ -20,6 +20,7 @@
 // `resolve` is RFC 3986 section 5: how a browser turns `href="../x"` into a
 // URL, and how a client follows a `Location` header that is relative.
 
+import std.atom;
 import std.char;
 import std.list;
 import std.map;
@@ -303,7 +304,7 @@ let encode_query pairs = {
 
 /// Convert a query-field value to its string representation.
 priv let text_of : :any -> :string;
-priv let text_of v = match type_of v { :string => v, :atom => str.slice 1 (len (to_string v)) (to_string v), _ => to_string v };
+priv let text_of v = match type_of v { :string => v, :atom => atom.name v, _ => to_string v };
 
 /// A URL's query as pairs.
 let query_pairs : Url -> [[:string]];

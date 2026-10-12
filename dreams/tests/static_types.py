@@ -415,6 +415,78 @@ mapping Config { host : :string, retries : :integer = 3 }
 mapping Loose { name, greeting = "Hi" }
 let main! = console.print! [Config.retries %{}, Loose.greeting %{}];
 ''', '[3, "Hi"]\n')
+    # A default may name anything a member may -- the file's globals and
+    # imports, another module's record, the record's own functions -- and is
+    # written once, as a global of its own, so what is wrong in one is
+    # reported where it was written.
+    (temp / 'opt.dr').write_text('''
+mapping Optimizer { name : :string = "adam", rate : :number = 0.001 }
+let adam : :number -> Optimizer;
+let adam r = Optimizer.new () |> Optimizer.set_rate r;
+''')
+    success(prelude + '''
+import std.list;
+import opt;
+let base = 40;
+mapping Fit {
+    epochs : :integer = base + 2
+    order : [:integer] = list.range 0 3
+    optimizer : opt.Optimizer = opt.adam 0.01
+    twice = fn x -> x * 2
+}
+group P { x, y : :integer = base }
+let main! = {
+    let f = Fit.new ();
+    console.print! [Fit.epochs f, Fit.order %{}, opt.Optimizer.rate (Fit.optimizer %{}), (Fit.twice f) 5]
+    console.print! [P.new 1, types.accepts Fit f, types.accepts Fit f.[:optimizer => 3]]
+};
+''', '[42, [0, 1, 2], 0.01, 10]\n[P(1, 40), true, false]\n')
+    failure(prelude + '''
+mapping Fit { epochs : :integer = missing + 2 }
+let main! = console.print! (Fit.new ());
+''', 'main.dr:3:35: error: cannot find `missing` in this scope')
+    failure(prelude + '''
+mapping Fit { name : :string = 3 }
+let main! = console.print! (Fit.new ());
+''', 'main.dr:3:32: error: the default of `name` should be `:string`, but this is `3`')
+    failure(prelude + '''
+mapping Fit { now = console.print! "x" }
+let main! = console.print! (Fit.new ());
+''', 'cannot use the impure function `console.print!` in the default of `now`')
+    # A field typed `:number` takes an integer or a float, as `types.number`
+    # does, and nothing else.
+    success(prelude + '''
+mapping Rate { lr : :number = 0.1 }
+let scaled : :number -> :number;
+let scaled x = x * 2;
+let main! = console.print! [Rate.lr (Rate.new () |> Rate.set_lr 1), Rate.lr (Rate.make 0.5), scaled 3, scaled 1.5];
+''', '[1, 0.5, 6, 3]\n')
+    failure(prelude + '''
+mapping Rate { lr : :number = 0.1 }
+let main! = console.print! (Rate.make "fast");
+''', 'argument 1 of `Rate.make` should be `:integer | :float`, but this is `"fast"`')
+    # So a map of options fits a record whose every field has a default, and a
+    # misspelled key used to be a setting silently not made. A key written in
+    # a literal is held to the fields the mapping declares; a map built
+    # elsewhere may still carry others.
+    options = '''
+mapping Fit { epochs : :integer = 10, batch : :integer = 32 }
+let fit : Fit -> :integer;
+let fit o = Fit.epochs o;
+let maybe : Fit | :unit -> :integer;
+let maybe o = match o { () => 0, f => Fit.batch f };
+'''
+    failure(prelude + options + '''
+let main! = console.print! (fit %{ :epoch => 5 });
+''', '`:epoch` is not a field of `Fit`, which has :epochs, :batch')
+    failure(prelude + options + '''
+let settings : Fit = %{ :bach => 2 };
+let main! = console.print! (maybe %{ :batc => 1 });
+''', '`:bach` is not a field of `Fit`', '`:batc` is not a field of `Fit`')
+    success(prelude + options + '''
+let wider = %{ :epochs => 3, :name => "run" };
+let main! = console.print! [fit %{ :epochs => 5 }, fit wider, maybe %{ :batch => 8 }, maybe ()];
+''', '[5, 3, 8, 0]\n')
 
     # --- unions -----------------------------------------------------------------------
     shapes = '''

@@ -106,7 +106,7 @@ let module_within m = Module.within m;
 /// index, and what the loader had to say about them -- and, while it works,
 /// where it has been.
 mapping Loader {
-    // Both set by `loader`: a default may not name the modules they come from.
+    // Both set by `loader`, which is the only place a Loader is made.
     packages = ()
     config = ()
     // Every `-D KEY:..` whose key names no package.

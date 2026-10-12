@@ -23,6 +23,7 @@ import std.list;
 import std.str;
 import std.dynamic.{fold, map}
 import std.char;
+import std.lazy;
 
 import dreams.ast;
 
@@ -421,20 +422,14 @@ let atoms p  = Program.atoms p;
 /// Forcing the *spine* is not enough and that was measured too -- the fields
 /// are where the frames hang, so all five are named here.
 ///
-/// The shape is `fold_strict`'s and the reason is the one given there: an
-/// argument is not evaluated, so `push_node (settled n) p` would suspend the
-/// call to `settled` and change nothing. A condition is the one place the
-/// language must evaluate something. `type_of` is the cheapest builtin that
-/// cannot answer without evaluating, `:nothing` is not one of its answers, so
-/// every clause is true, `&&` reaches the last of them, and the answer is
-/// always true -- which is why the caller's `else` is unreachable and says so.
-///
-/// Asked through `to_string`, which is one native call that cannot answer
-/// without evaluating every part of what it is given: the five questions
-/// written out were a dozen reductions a node, and this is asked of every node
-/// the compiler emits and every flag it sets.
+/// It is `lazy.settled`, which is one native call that forces every part of
+/// what it is given and answers true: the five questions written out were a
+/// dozen reductions a node, and this is asked of every node the compiler emits
+/// and every flag it sets. It answers rather than handing the node back
+/// because `push_node (settled n) p` would suspend the call and change
+/// nothing, so the caller asks it in a condition whose `else` is unreachable.
 let settled : :any -> :bool;
-let settled n = type_of (to_string n) == :string;
+let settled n = lazy.settled n;
 
 /// Force the arena's spine.
 ///
@@ -501,7 +496,7 @@ let push_kids xs p = {
 let fill_kids : :map -> :integer -> [:any] -> :map;
 let rec fill_kids !m at xs = match xs {
     [] => m,
-    [kid, ..rest] => fill_kids (if type_of kid != :nothing { m.[at => kid] } else { m }) (at + 1) rest,
+    [kid, ..rest] => fill_kids (if settled kid { m.[at => kid] } else { m }) (at + 1) rest,
 };
 
 let intern_int : :integer -> Program -> [Program, :integer];

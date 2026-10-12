@@ -59,6 +59,7 @@
 // A program that wants another decoding for some type says so with
 // `Config.decoders`: a map from OID to a function of the text.
 
+import std.atom;
 import std.json as js;
 import std.list;
 import std.map;
@@ -164,7 +165,7 @@ let encode v = match type_of v {
     :float => float_text v,
     :bool => if v { "t" } else { "f" },
     :char => str.of_chars [v],
-    :atom => atom_name v,
+    :atom => atom.name v,
     :list => array_literal v,
     :array => if is_typed v { v.[2] } else { array_literal (array.to_list v) },
     :map => js.write v,
@@ -181,10 +182,6 @@ priv let float_text x = match to_string x {
     "-inf" => "-Infinity",
     text => text,
 };
-
-/// An atom's name, without the colon `to_string` puts in front.
-let atom_name : :atom -> :string;
-let atom_name a = { let t = to_string a; str.slice 1 (len t - 1) t };
 
 /// A list as an array literal: `{1,"two",NULL,{3,4}}`. Every element that is
 /// not a number, a bool or a nested list is quoted, which is always correct --

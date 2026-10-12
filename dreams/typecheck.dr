@@ -50,6 +50,7 @@
 // a signature is never resolved, because it never runs -- and they are looked
 // up in the module's environment the way `scope` would have (`type_ref`).
 
+import std.atom;
 import std.list;
 import std.str;
 
@@ -57,6 +58,7 @@ import dreams.ast;
 import dreams.diag;
 import dreams.modules;
 import dreams.scope;
+import dreams.syntax;
 import std.array;
 import std.map;
 import std.types;
@@ -290,6 +292,9 @@ let gi_of k mi n = match env_of k mi {
 let in_module mi = [mi, %{}, %{}];
 
 let rec eval_type k ev t = match t {
+    // `:number` is no kind `type_of` answers, but it is what `types.number`
+    // is, and `std.types` reads it the same way.
+    [:atom, "number", _] => union_of [:integer, :float],
     [:atom, n, _] => match primitives.[n else ()] { () => Ty.lit :atom n, p => p },
     [:int, v, _] => Ty.lit :integer v,
     [:float, v, _] => Ty.lit :float v,
@@ -514,7 +519,7 @@ let std_types f args = match [f, args] {
 
 /// `:list` read as a value rather than a kind.
 let as_literal t = if type_of t == :atom && t != :any && t != :never {
-    Ty.lit :atom (str.slice 1 (str.byte_length (to_string t) - 1) (to_string t))
+    Ty.lit :atom (atom.name t)
 } else { t };
 
 /// A named type's description, with its parameters bound. An unapplied
@@ -1007,13 +1012,92 @@ let rec check k h e expected why ds =
                     else { ds1 }
                 },
             },
-            _ => {
-                let [t, ds1] = infer k h e ds;
-                if fits k t expected { contract_of k h e t expected why ds1 }
-                else { mismatch k h t expected (ast.span e) why ds1 }
-            },
+            [:map, _, _] => written_keys k h e expected (held k h e expected why ds),
+            _ => held k h e expected why ds,
         }
     };
+
+/// `e` inferred and then held to `expected` whole: what `check` does with an
+/// expression that has no parts to hold separately.
+let held : Checker -> Here -> ast.Expr -> (Ty | :atom) -> :string -> [:any] -> [:any];
+let held k h e expected why ds = {
+    let [t, ds1] = infer k h e ds;
+    if fits k t expected { contract_of k h e t expected why ds1 }
+    else { mismatch k h t expected (ast.span e) why ds1 }
+};
+
+/// A key a map literal names that the `mapping` it is held to does not
+/// declare: `%{ :epoch => 5 }` where an `ml.Fit` is expected, whose field is
+/// `epochs`. Every field of an options record has a default, so each is
+/// optional and the literal fits the record's type as it stands -- which made
+/// the misspelling a setting silently not made.
+///
+/// Only a literal is held to this. A record type is open, as rule 2 needs:
+/// a map may carry keys its type does not name, and one built elsewhere and
+/// passed along is entitled to. What is written in the literal itself is
+/// another matter, since a key written where only the declared ones mean
+/// anything is a mistake, and the place it was written is where to say so.
+/// The same distinction is TypeScript's excess-property check, and for the
+/// same reason.
+let undeclared_keys : Checker -> Here -> [[ast.Expr]] -> (Ty | :atom) -> [:any] -> [:any];
+let undeclared_keys k h kvs expected ds = match declared_fields k expected fuel {
+    () => ds,
+    [names, keys] => list.fold (fn acc kv -> {
+        let key = list.nth 0 kv;
+        match key {
+            [:atom, n, sp] if not (list.contains (Ty.lit :atom n) keys) =>
+                // The fields by name: a `derive dyn` mapping's table is a key
+                // too, `0`, and nobody writes that one.
+                bad h sp ("`:" + n + "` is not a field of `" + str.join_str "` or `" names + "`, which has "
+                          + str.join_str ", " (list.flat_map (fn f -> match f { Ty.lit(:atom, _) => [show f], _ => [] }) keys)) acc,
+            _ => acc,
+        }
+    }) ds kvs,
+};
+
+/// `undeclared_keys` for an expression that is a map literal, and nothing
+/// for any other.
+let written_keys : Checker -> Here -> ast.Expr -> (Ty | :atom) -> [:any] -> [:any];
+let written_keys k h e expected ds = match e {
+    [:map, kvs, _] => undeclared_keys k h kvs expected ds,
+    _ => ds,
+};
+
+/// `[names, keys]` when every map `t` admits is a `mapping` -- `Fit`, or
+/// `Fit | :unit` -- and `()` when any map it admits could hold other keys,
+/// which is every map but a mapping's: a written `%{ :x => t }`, a
+/// `%{k => v}`, `:map` and `:any`. A union of two mappings takes a key
+/// either declares. What `t` admits that is not a map at all decides
+/// nothing, and a type with no map in it is not this check's business.
+let declared_fields : Checker -> (Ty | :atom) -> :integer -> [[:string], [(Ty | :atom)]] | :unit;
+let declared_fields k t n =
+    if n <= 0 { () }
+    else {
+        match t {
+            Ty.named(shown, gi, []) => match (Checker.named k).[gi else ()] {
+                [_, [], [:list, [[:atom, "shape", _], [:atom, "map", _], _], _], _] => match unfold k t {
+                    Ty.record(ps) => [[shown], list.map (fn p -> list.nth 0 p) ps],
+                    _ => (),
+                },
+                _ => declared_fields k (unfold k t) (n - 1),
+            },
+            Ty.one_of(ts) => {
+                let each = list.map (fn m -> declared_fields k m (n - 1)) ts;
+                let maps = list.filter (fn i -> admits_map k (list.nth i ts)) (list.range 0 (list.length ts));
+                if list.is_empty maps || list.any (fn i -> list.nth i each == ()) maps { () }
+                else {
+                    let found = list.map (fn i -> list.nth i each) maps;
+                    [list.concat (list.map (fn f -> list.nth 0 f) found), list.concat (list.map (fn f -> list.nth 1 f) found)]
+                }
+            },
+            _ => (),
+        }
+    };
+
+/// Whether a value of type `t` could be a map: anything whose kinds the
+/// checker cannot see could be.
+let admits_map : Checker -> (Ty | :atom) -> :bool;
+let admits_map k t = match kinds_of k t { () => true, ks => list.contains :map ks };
 
 let mismatch k h t expected span why ds =
     if fits k t expected { ds }
@@ -1318,7 +1402,7 @@ let typed_apply k h f ft args sp ds1 = {
             // against them as solved, so a message never gains a `| :unit`
             // nobody wrote.
             else if fits k (list.nth i known) (if generic { solved admitted param false } else { param }) {
-                [s, admitted, contract_of k h a (list.nth i known) p ("argument " + to_string (i + 1) + " of " + who) d]
+                [s, admitted, written_keys k h a p (contract_of k h a (list.nth i known) p ("argument " + to_string (i + 1) + " of " + who) d)]
             }
             else {
                 [s, admitted, mismatch k h (list.nth i known) p (ast.span a)
@@ -2201,7 +2285,7 @@ let is_tag t = match t {
 
 let tag_name t = match t {
     Ty.lit(:atom, n) => n,
-    p => str.slice 1 (str.byte_length (to_string p) - 1) (to_string p),
+    p => atom.name p,
 };
 
 let show_variant v = match v {
@@ -2333,16 +2417,15 @@ union Datum {
     record(id, variant, fields)
 }
 
-let atom_name v = str.slice 1 (str.byte_length (to_string v) - 1) (to_string v);
 
 let rec datum_of v = match type_of v {
-    :atom => Datum.atom (atom_name v),
+    :atom => Datum.atom (atom.name v),
     :list => Datum.list (list.map (fn x -> datum_of x) v),
     :array => Datum.array (list.map (fn x -> datum_of x) (array.to_list v)),
     :map => Datum.map (list.map (fn kv -> [datum_of (list.nth 0 kv), datum_of (list.nth 1 kv)]) (map.pairs v)),
     _ => match types.record_id v {
         () => v,
-        id => Datum.record (atom_name id) (types.is_variant v) (list.map (fn x -> datum_of x) (types.record_fields v)),
+        id => Datum.record (atom.name id) (types.is_variant v) (list.map (fn x -> datum_of x) (types.record_fields v)),
     },
 };
 
@@ -2876,17 +2959,21 @@ let check_decl_inferring : Checker -> [:any] -> [:any] -> [[:any], :any];
 let check_decl_inferring k b ds = {
     let [mi, source, d, _] = b;
     let n = scope.decl_name d;
-    if named_body (scope.decl_body d) != () || str.starts_with "<" n { [ds, ()] }
+    let sig = match gi_of k mi n { () => (), gi => (Checker.sigs k).[gi else ()] };
+    // A global the compiler made -- `<dispatch>`, a virtual's fallback -- is
+    // checked only when it was given a signature, which a typed field's
+    // default is (`syntax.record_sigs`).
+    if named_body (scope.decl_body d) != () || (scope.is_hidden_name n && sig == ()) { [ds, ()] }
     else {
         let h = here mi source n;
-        let sig = match gi_of k mi n { () => (), gi => (Checker.sigs k).[gi else ()] };
+        let what = match syntax.default_field n { () => "`" + n + "`", f => "the default of `" + f + "`" };
         let ps = scope.decl_params d;
         match [ps, sig] {
             [[], ()] => {
                 let [t, ds1] = infer k h (scope.decl_body d) ds;
                 [ds1, answered k mi n t]
             },
-            [[], t] => [check k h (scope.decl_body d) t ("`" + n + "`") ds, ()],
+            [[], t] => [check k h (scope.decl_body d) t what ds, ()],
             [_, ()] => {
                 let [t, ds1] = lambda k h ps (scope.decl_body d) :any (scope.decl_span d) ds;
                 [ds1, answered k mi n t]

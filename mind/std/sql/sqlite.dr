@@ -90,9 +90,9 @@ mapping Options {
     busy_timeout : :integer = 5000
     /// Enforce `REFERENCES`, which SQLite does not do unless asked.
     foreign_keys : :bool = true
-    /// A `foreign.start!` server to own the database, or `()` for this
-    /// process (`foreign.here`).
-    place : :any = ()
+    /// A `foreign.start!` server to own the database, or `foreign.here`
+    /// for this process.
+    place : foreign.Place = foreign.here
 }
 
 /// The database at `path`, made if there is none. A `file:` URI is taken too.
@@ -106,7 +106,7 @@ let memory! u = open_with! ":memory:" (Options.new ());
 /// The database at `path`, opened as `options` says (`Options`).
 let open_with! : :string -> Options -> sql.Connection;
 let open_with! path options = {
-    let place = match Options.place options { () => foreign.here, p => p };
+    let place = Options.place options;
     let flags = (if Options.readonly options { open_readonly } else { open_readwrite + open_create }) + open_uri;
     let db = foreign.run! place (fn () -> open_here! path flags options);
     let effects = %{ :run => run!, :run_many => run_many!, :script => script!, :close => close!,

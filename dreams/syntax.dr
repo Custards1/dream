@@ -1,6 +1,7 @@
 // Utilities shared by declaration sugar and macro expansion. Generated syntax
 // needs distinct occurrence offsets: resolution keys names and binders by span.
 
+import std.atom;
 import std.list;
 import std.str;
 import dreams.ast;
@@ -45,7 +46,7 @@ let rec literal value span = match type_of value {
     :bool => ast.bool_e value span,
     :char => ast.char_e value span,
     :string => ast.str_e value span,
-    :atom => ast.atom_e (ast.atom_name value) span,
+    :atom => ast.atom_e (atom.name value) span,
     :unit => ast.unit_e span,
     :list => ast.list_e (list.map (fn v -> literal v span) value) span,
     :array => ast.array_e (list.map (fn v -> literal v span) (array.to_list value)) span,
@@ -82,11 +83,26 @@ let rec literal value span = match type_of value {
 /// Everything generated is freshened first and the members are appended after,
 /// which is not tidiness: `fresh` exists because resolution keys names and
 /// binders by span, and the generated declarations need new spans because
-/// several of them stand where one declaration was written and a default is
-/// emitted twice. A member is written once, at a real place, so freshening it
-/// would throw away the only spans a diagnostic inside it could point at.
-/// Generated spans live above 2^31 and written ones below, so the two cannot
-/// collide.
+/// several of them stand where one declaration was written. A member is
+/// written once, at a real place, so freshening it would throw away the only
+/// spans a diagnostic inside it could point at. Generated spans live above
+/// 2^31 and written ones below, so the two cannot collide.
+///
+/// A default is used in three places -- the accessor, `new` and the
+/// description -- and a copy in each, freshened, is only right for one that
+/// names nothing: whatever a name in it got wrong would be reported at a place
+/// nobody wrote. So a default that names anything is the same case as a
+/// member, and is treated as one: a global of its own, `<default x>`, keeping
+/// the spans it was written at, which the three name. It may name what a
+/// member may -- the file's imports and globals, the record's own functions
+/// -- and its value is computed once, when first read, as any global's is.
+/// A typed field's default is lifted too, whatever it is, so that it is held
+/// to the field's type (`record_sigs`) where it was written.
+///
+/// Everything else -- `retries = 3`, `seen = %{}`, nearly every default there
+/// is -- stays a copy. A literal costs nothing where it is written, and as a
+/// global it cost a self-compile 3%: the compiler's own state is mappings
+/// with hundreds of such defaults, read on its hottest paths.
 let record : :atom -> :string -> [[:any]] -> [[:any]] -> ast.Span -> ast.Decl;
 let record kind name fields members span = record_derived "" kind name fields members [] span;
 
@@ -118,6 +134,45 @@ let constructed id variant items span =
 /// around it, which is a test's.
 let qualified : :string -> :string -> :string;
 let qualified owner name = if owner == "" { name } else { owner + "." + name };
+
+/// The global a field's default is: `<default epochs>`. Angle brackets cannot
+/// be written, so it can name nothing else.
+let default_name : [:any] -> :string;
+let default_name f = "<default " + ast.field_name f + ">";
+
+/// The field whose default the global `n` is -- `default_name` read back --
+/// or `()`, so that a diagnostic says "the default of `epochs`".
+let default_field : :string -> :string | :unit;
+let default_field n =
+    if str.starts_with "<default " n && str.ends_with ">" n { str.slice 9 (str.byte_length n - 10) n }
+    else { () };
+
+/// Whether a field's default is a global of its own rather than a copy
+/// wherever it is used (see `record`).
+let lifted : [:any] -> :bool;
+let lifted f = match ast.field_default f {
+    () => false,
+    d => ast.field_type f != () || names_something d,
+};
+
+/// What stands for a field's default where it is used -- the default itself,
+/// or the global it was lifted into -- or `()` for a field without one.
+let default_of : [:any] -> ast.Span -> ast.Expr | :unit;
+let default_of f span = match ast.field_default f {
+    () => (),
+    d => if lifted f { ast.name_e (default_name f) span } else { d },
+};
+
+/// Does this expression name anything? A lambda does, since its body names
+/// its own parameter: a binder is keyed by its span too, and two copies of
+/// one would be one binder in two places.
+let names_something : ast.Expr -> :bool;
+let rec names_something e =
+    match e {
+        [:name, _, _] => true,
+        [:field, _, _, _] => true,
+        _ => type_of e == :list && list.any (fn x -> names_something x) e,
+    };
 
 /// The global a `derive dyn` record's values carry in slot 0. Angle brackets
 /// cannot be written, so it can name nothing else.
@@ -165,7 +220,7 @@ let record_parts owner kind name fields members bases span = {
     let from_default = ast.let_d "new"
         (if list.is_empty required { [ast.param () span] }
          else { list.map (fn f -> ast.field_param f) required })
-        (build (fn f -> match ast.field_default f { () => named f, d => d })) false span;
+        (build (fn f -> match default_of f span { () => named f, d => d })) false span;
     let helpers = list.concat (list.map (fn i -> {
         let f = list.nth i fields;
         let field = ast.field_name f;
@@ -179,7 +234,7 @@ let record_parts owner kind name fields members bases span = {
         // `P.set_x 1` is a function of the record ("`group`, `struct` and
         // `mapping`" in docs/language-spec.md).
         [ast.let_d field [ast.param "record" span]
-                   (ast.get_e obj key (ast.field_default f) span) false span,
+                   (ast.get_e obj key (default_of f span) span) false span,
          ast.let_d ("set_" + field) [value, ast.param "record" span]
                    (ast.set_e obj key (ast.name_e "value" span) span) false span]
     }) (list.range 0 (list.length fields)));
@@ -191,7 +246,7 @@ let record_parts owner kind name fields members bases span = {
         let key = if kind == :map { ast.atom_e (ast.field_name f) span }
                   else { ast.int_e (i + offset) span };
         let description = match ast.field_type f { () => ast.atom_e "any" span, t => t };
-        let defaults = match ast.field_default f { () => [], d => [d] };
+        let defaults = match default_of f span { () => [], d => [d] };
         ast.list_e [key, description, ast.list_e defaults span] span
     }) (list.range 0 (list.length fields));
     let table_field = if dispatched {
@@ -226,8 +281,12 @@ let record_parts owner kind name fields members bases span = {
     let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
                                               (own_names name (ast.member_body m)) true (ast.member_span m))
                            members;
+    // Each lifted default once, as a global of its own, where it was written.
+    let defaults = list.flat_map (fn f -> if lifted f {
+        [ast.let_d (default_name f) [] (own_names name (ast.field_default f)) false (ast.field_span f)]
+    } else { [] }) fields;
     // Each field type occurs once, so retain its written spans for diagnostics.
-    [ast.mod_d name (bases + generated + [description] + record_sigs kind name fields span + written) span,
+    [ast.mod_d name (bases + generated + [description] + record_sigs kind name fields span + defaults + written) span,
      list.last made]
 };
 
@@ -272,7 +331,12 @@ let record_sigs kind name fields span =
          ast.sig_d "new" (arrows (takes required) self) span]
         + list.concat (list.map (fn f ->
               [ast.sig_d (ast.field_name f) (arrow (reads f) (field_t f)) span,
-               ast.sig_d ("set_" + ast.field_name f) (arrow (field_t f) (arrow self self)) span])
+               ast.sig_d ("set_" + ast.field_name f) (arrow (field_t f) (arrow self self)) span]
+              + match [ast.field_type f, ast.field_default f] {
+                  [(), _] => [],
+                  [_, ()] => [],
+                  [t, _] => [ast.sig_d (default_name f) t span],
+              })
               fields)
     };
 

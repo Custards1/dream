@@ -51,6 +51,7 @@
 // behavior of its own. Where that collides, the way out is the one the language
 // already offers: the operations are ordinary functions, so pass them.
 
+import std.atom;
 import std.list;
 import std.map;
 import std.str;
@@ -122,11 +123,6 @@ virtual let record_id u = ();
 let to_map : :any -> %{:atom => :any};
 let to_map self = map.from_pairs (list.zip (fields ()) (to_fields self));
 
-/// The record's field name `k` spelled as text, which is what a format with no
-/// atoms will have made of it.
-priv let text_of : :atom -> :string;
-priv let text_of k = str.slice 1 (str.byte_length (to_string k)) (to_string k);
-
 /// The value `m` holds for field `k`, under either spelling, or `()`.
 ///
 /// Either spelling is the whole point. A map that has been through `std.wire`
@@ -136,7 +132,7 @@ priv let text_of k = str.slice 1 (str.byte_length (to_string k)) (to_string k);
 /// Dream, and a record that could only read the second would have thrown away
 /// the exactness `std.wire` exists to keep.
 let value_of : :map -> :atom -> :any;
-let value_of m k = m.[k else m.[text_of k else ()]];
+let value_of m k = m.[k else m.[atom.name k else ()]];
 
 /// One of these, from such a map. A field the map does not mention is `()`,
 /// which is what every other reader in this library answers for a missing
@@ -159,7 +155,7 @@ let arity u = list.length (fields ());
 /// was meant. Either way, check the values next; this is the first half only.
 let fits : :any -> :bool;
 let fits v = match type_of v {
-    :map => list.all (fn k -> _map_has v k || _map_has v (text_of k)) (fields ()),
+    :map => list.all (fn k -> _map_has v k || _map_has v (atom.name k)) (fields ()),
     _    => record_id () != () && types.record_id v == record_id (),
 };
 
@@ -170,7 +166,7 @@ let fits v = match type_of v {
 /// but a person reading a record expects to see it as it was written.
 let describe : :any -> :string;
 let describe self = {
-    let one p = text_of (list.nth 0 p) + ": " + to_string (list.nth 1 p);
+    let one p = atom.name (list.nth 0 p) + ": " + to_string (list.nth 1 p);
     record_name () + "("
         + str.join_str ", " (list.map one (list.zip (fields ()) (to_fields self))) + ")"
 };
@@ -196,7 +192,7 @@ let with_fields : :any -> :map -> :any;
 let with_fields self changes = {
     let pick p = {
         let k = list.nth 0 p;
-        if _map_has changes k || _map_has changes (text_of k) { value_of changes k }
+        if _map_has changes k || _map_has changes (atom.name k) { value_of changes k }
         else { list.nth 1 p }
     };
     of_fields (list.map pick (list.zip (fields ()) (to_fields self)))

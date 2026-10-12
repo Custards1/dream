@@ -200,8 +200,8 @@ mapping Dense {
     /// The weights' initializer; `()` is He normal after a relu and Glorot
     /// uniform otherwise.
     init : :any = ()
-    /// The bias's initializer; `()` is zeros.
-    bias_init : :any = ()
+    /// The bias's initializer.
+    bias_init : :any = initial.zeros
 }
 
 /// The initializer a layer's weights get when none is given: He normal ahead
@@ -222,7 +222,7 @@ let dense_with units opts = {
     let act = Dense.activation opts;
     let use_bias = Dense.bias opts;
     let w_init = weight_init act (Dense.init opts);
-    let b_init = match Dense.bias_init opts { () => initial.zeros, f => f };
+    let b_init = Dense.bias_init opts;
     let f = activation act;
     let make seed shape = {
         let d = shape.[len shape - 1];
@@ -373,9 +373,9 @@ let batch_norm = batch_norm_with (BatchNorm.new ());
 
 /// What `batch_norm_with` takes.
 mapping BatchNorm {
-    epsilon : :float | :integer = 1.0e-5
+    epsilon : :number = 1.0e-5
     /// The new batch's weight in the running statistics.
-    momentum : :float | :integer = 0.1
+    momentum : :number = 0.1
 }
 
 /// `batch_norm` with another epsilon or momentum (`BatchNorm`).

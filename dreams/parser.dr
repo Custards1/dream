@@ -1077,7 +1077,7 @@ priv let primitive_atoms = [
     "any", "never",
     "integer", "float", "char", "bool", "unit", "string", "atom",
     "list", "array", "map", "module", "error", "process",
-    "pure_fn", "impure_fn", "bigstr", "tensor",
+    "pure_fn", "impure_fn", "bigstr", "tensor", "number",
 ];
 
 priv let primitive_atom_set = comp set_of primitive_atoms;
@@ -2534,14 +2534,7 @@ let record_field_default c name fields members entry at_name strict ts = {
     } else { match peek_kind ts {
         :eq => match parse_expr c (list.tail ts) {
             [:error, m, s] => err m s,
-            [:ok, e, after] =>
-                if names_something e {
-                    err ("a record field's default may not name anything: it is "
-                         + "compiled inside the module `" + name + "` becomes, which "
-                         + "cannot see the one it is written in") (ast.span e)
-                } else {
-                    ok [:field, ast.record_field param e] after
-                },
+            [:ok, e, after] => ok [:field, ast.record_field param e] after,
         },
         _ => ok [:field, ast.record_field param ()] ts,
     } }
@@ -2550,7 +2543,7 @@ let record_field_default c name fields members entry at_name strict ts = {
 /// A member: an ordinary function, compiled inside the module the record
 /// becomes. Its body may name anything that module holds -- the accessors, the
 /// setters, `make`, `new`, another member -- which is the whole point of
-/// writing it there, and is why `names_something` does not apply to it.
+/// writing it there. A default may too (`syntax.record`).
 let record_member_entry c name fields members entry at_name params ts =
     if taken name fields members entry {
         err ("record member `" + entry + "` conflicts with a generated helper") at_name
@@ -2572,30 +2565,6 @@ let taken name fields members n =
     n == "make" || n == "new" || n == "type"
     || list.any (fn f -> ast.field_name f == n || "set_" + ast.field_name f == n) fields
     || list.any (fn m -> ast.member_name m == n) members;
-
-/// Does this expression name anything?
-///
-/// A field's default is compiled *inside* the module the record becomes, and a
-/// module does not see the one it was written in -- `mod M { let f () = outer;
-/// }` cannot find `outer` either. So a default that named a global would be a
-/// "cannot find" reported against a span nobody wrote, which is the worst kind
-/// of diagnostic there is: the rewrite hands the generated module fresh spans,
-/// because a default appears twice in it -- in the accessor's `else` and in
-/// `new`'s body -- and two occurrences cannot share one span.
-///
-/// A member is under no such restriction, and for both halves of that reason:
-/// it appears once, so it keeps the spans it was written at, and naming the
-/// module's own globals is what it is for.
-///
-/// A lambda is caught by this too, because its body names its own parameter.
-/// That is stricter than it has to be and it is the honest boundary: what can
-/// be written is what needs nothing from any scope.
-let rec names_something e =
-    match e {
-        [:name, _, _] => true,
-        [:field, _, _, _] => true,
-        _ => type_of e == :list && list.any (fn x -> names_something x) e,
-    };
 
 /// A dotted path: `std.list`. Answers `[segments, rest]`.
 let rec dotted_path !acc ts =

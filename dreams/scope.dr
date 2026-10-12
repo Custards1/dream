@@ -40,6 +40,7 @@ import dreams.lint;
 import dreams.modules;
 import dreams.unit;
 import std.array;
+import std.lazy;
 
 // --- what a name in front of a dot can be ------------------------------------
 //
@@ -1298,17 +1299,16 @@ let ref_key ctx source start = (ctx * 65536 + source) * 4294967296 + start;
 /// them holds the context and the environment it would have been computed
 /// from.
 ///
-/// `type_of` is the cheapest builtin that cannot answer without evaluating and
-/// `:nothing` is not one of its answers, so every arm is true and the callers'
-/// `else` below is unreachable -- the shape `ir.settled` and
-/// `list.fold_strict` both use, and for the reason given there: an argument is
-/// not evaluated, so `record .. (forced what)` would suspend the call and
-/// change nothing.
-///
-/// Asked through `to_string`, which cannot answer without evaluating all of
-/// its argument, and does it in one native call where a walk written here was
-/// a call per cell -- three million reductions of a self-compile.
-let forced v = type_of (to_string v) == :string;
+/// It is `lazy.settled`, one native call where a walk written here was a call
+/// per cell -- three million reductions of a self-compile -- and it answers
+/// true rather than handing `v` back, because `record .. (forced what)` would
+/// suspend the call and change nothing: the callers ask it in a condition, and
+/// their `else` below is unreachable. It was `to_string` once, which forced
+/// the same way but rendered a string nobody read, and did it where nothing
+/// could be collected; checking std's tests ran a gigabyte through one
+/// nursery that way, a resolution here being a deep chain of suspensions.
+let forced : :any -> :bool;
+let forced v = lazy.settled v;
 
 /// Force the two tables' spines.
 ///
@@ -1591,9 +1591,15 @@ let warn_note c span message note r =
 let note_effect c span what r =
     if impure_ok r { r }
     else {
-        report_note c span
-            ("cannot use " + what + " inside the pure function `" + display_of r + "`")
-            "mark the function impure by ending its name with `!`, e.g. `let f! x = ..`" r
+        match syntax.default_field (display_of r) {
+            // There is no `!` to add: a default is what reading the field
+            // answers, and reading a field is pure.
+            () => report_note c span
+                      ("cannot use " + what + " inside the pure function `" + display_of r + "`")
+                      "mark the function impure by ending its name with `!`, e.g. `let f! x = ..`" r,
+            f => report c span ("cannot use " + what + " in the default of `" + f
+                                + "`: a default is what reading the field answers, and that is pure") r,
+        }
     };
 
 /// A member reached through a module: `list.map`, or `map` after
@@ -1919,7 +1925,18 @@ let rec check_expr c e r =
                                         (group_contents (ctx_l c) prefix) r,
                                 _ => check_member c m shown field span r,
                             },
-                        inner => not_a_value c inner (shown + "." + field) span r,
+                        inner => match m {
+                            // `optim.Optimizer` where a value belongs: the
+                            // module a record became, and beside it the
+                            // global of the same name holding its
+                            // description -- which is what `Optimizer`
+                            // unqualified reads, so the dotted name reads it
+                            // too. That is how a field's type names another
+                            // module's record.
+                            Ref.dream(target) if has_global (env_of c r target) field =>
+                                check_member c m shown field span r,
+                            _ => not_a_value c inner (shown + "." + field) span r,
+                        },
                     }
                 },
             },
