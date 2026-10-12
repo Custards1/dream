@@ -208,6 +208,29 @@ priv let rec count_bits !n !acc =
     else if n == 0 { acc }
     else { count_bits (n >> 1) (acc + 1) };
 
+/// The integer base-2 logarithm: the greatest `k` with `2^k <= n`, exact at
+/// any size, where `math.log2` is a float and rounds the wrong way just below
+/// a power of two. Raises for `n` below one.
+let ilog2 : :integer -> :integer;
+let ilog2 n = bit_length (type_assert (n >= 1) "a positive integer" n) - 1;
+
+/// The integer base-10 logarithm: the greatest `k` with `10^k <= n` -- one
+/// less than the number of digits `n` is written with. Exact at any size,
+/// and without writing the number out: the bit length gives an estimate
+/// that is never too high, and the powers of ten above it correct it.
+/// Raises for `n` below one.
+let ilog10 : :integer -> :integer;
+let ilog10 n = {
+    let m = type_assert (n >= 1) "a positive integer" n;
+    // 1233 / 4096 is just under log10 2, so this never overshoots.
+    let k = (bit_length m - 1) * 1233 / 4096;
+    climb_log10 m k (pow 10 (k + 1))
+};
+
+/// Raise `k` while the next power of ten still fits; `next` is `10^(k+1)`.
+priv let climb_log10 : :integer -> :integer -> :integer -> :integer;
+priv let rec climb_log10 n !k !next = if next <= n { climb_log10 n (k + 1) (next * 10) } else { k };
+
 /// The integer square root: the greatest `r` with `r * r <= n`, exact at any
 /// size, where `math.sqrt` is a float and wrong past 2^53. Raises for a
 /// negative `n`.
@@ -462,6 +485,11 @@ when test {
         test.case "lcm"                  $( test.eq! [36, 0, 12] [lcm 12 18, lcm 0 3, lcm (0 - 4) 6] ),
         test.case "bit_length"           $( test.eq! [0, 1, 8, 9, 101, 3] [bit_length 0, bit_length 1, bit_length 255,
                                                                           bit_length 256, bit_length (pow 2 100), bit_length (0 - 5)] ),
+        test.case "ilog2"                $( test.eq! [0, 0, 1, 7, 8, 100] (list.map ilog2 [1, 1, 2, 255, 256, pow 2 100]) ),
+        test.case "ilog10"               $( test.eq! [0, 0, 1, 2, 2, 3, 99, 100]
+                                                     (list.map ilog10 [1, 9, 10, 99, 999 - 899, 1000, pow 10 100 - 1, pow 10 100]) ),
+        test.case "ilog10 at a large size" $( test.eq! [4999, 5000] [ilog10 (pow 10 5000 - 1), ilog10 (pow 10 5000)] ),
+        test.case "ilog2 refuses zero"   $( test.raises! $( ilog2 0 ) ),
         test.case "isqrt"                $( test.eq! [0, 1, 1, 2, 3, 3, 4] (list.map isqrt [0, 1, 3, 4, 9, 15, 16]) ),
         test.case "isqrt of a bignum"    $( test.eq! [pow 10 30, pow 10 30 - 1] [isqrt (pow 10 60), isqrt (pow 10 60 - 1)] ),
         test.case "isqrt is the floor everywhere"

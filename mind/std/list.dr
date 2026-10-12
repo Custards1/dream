@@ -782,6 +782,19 @@ let rec each! f! xs =
         each! f! (_list_tail xs)
     };
 
+/// `each!` with each element's position, counting from `0`: `f! i x`. What a
+/// numbered listing wants, without zipping the list to a range first.
+let each_index! : (:integer -> a -> :any) -> [a] -> :unit;
+let each_index! f! xs = each_from! f! 0 xs;
+
+priv let each_from! : (:integer -> a -> :any) -> :integer -> [a] -> :unit;
+priv let rec each_from! f! !i xs =
+    if _list_is_empty xs { () }
+    else {
+        f! i (xs.[0])
+        each_from! f! (i + 1) (_list_tail xs)
+    };
+
 // --- conversion -------------------------------------------------------------
 
 /// Materialize the list as an array in the same order.
@@ -977,6 +990,13 @@ when test {
             let b = recv! ();
             let c = recv! ();
             test.eq! [10, 20, 30] [a, b, c]
+        } ),
+        test.case "each_index! counts from zero" $( {
+            let me = self! ();
+            each_index! (fn i x -> send! me [i, x]) [:a, :b]
+            let a = recv! ();
+            let b = recv! ();
+            test.eq! [[0, :a], [1, :b]] [a, b]
         } ),
         test.case "is_sorted stops at the first descent" $( test.false! (is_sorted (_list_cons 1 (_list_cons 0 (from 0)))) ),
     ];

@@ -279,6 +279,30 @@ let split sep s = {
     if seplen == 0 { [s] } else { go 0 }
 };
 
+/// `split` that stops after `n` parts, the last holding the rest of the text
+/// separators and all: `split_n 2 "=" "k=v=w"` is `["k", "v=w"]`. For a
+/// line whose last field may contain the separator -- a log line, a header,
+/// a `key=value` whose value has an `=`. `n` below one is taken as one.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.split_n 3 " " "GET /a b c HTTP/1.1")
+/// };
+/// ```
+let split_n : :integer -> :string -> :string -> [:string];
+let split_n n sep s = {
+    let seplen = len sep;
+    let rec go !left from = {
+        let at = if left <= 1 { 0 - 1 } else { _str_find s sep from };
+        if at < 0 { [_str_slice s from (len s - from)] }
+        else { _list_cons (_str_slice s from (at - from)) (go (left - 1) (at + seplen)) }
+    };
+    if seplen == 0 { [s] } else { go n 0 }
+};
+
 /// The lines of the text, without their endings. A `\r` before a `\n` goes
 /// with the ending, and a final line ending ends the last line rather than
 /// starting an empty one -- so a file read whole and split here gives the
@@ -700,6 +724,9 @@ when test {
         test.case "join_str"         $( test.eq! "a-b-c" (join_str "-" ["a", "b", "c"]) ),
         test.case "join_str of empty" $( test.eq! "" (join_str "-" []) ),
         test.case "split"            $( test.eq! ["a", "b", "c"] (split "," "a,b,c") ),
+        test.case "split_n keeps the rest whole" $( test.eq! [["k", "v=w"], ["a", "b", "c"], ["a,b"], ["x"]]
+                                                       [split_n 2 "=" "k=v=w", split_n 5 "," "a,b,c",
+                                                        split_n 0 "," "a,b", split_n 2 "" "x"] ),
         test.case "split without separator" $( test.eq! ["abc"] (split "," "abc") ),
         test.case "split on empty separator" $( test.eq! ["abc"] (split "" "abc") ),
         test.case "split round trip" $( test.eq! "a,b,c" (join_str "," (split "," "a,b,c")) ),

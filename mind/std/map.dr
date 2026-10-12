@@ -143,6 +143,14 @@ let remove k m = _map_remove m k;
 let update : v -> (v -> v) -> k -> %{ k => v } -> %{ k => v };
 let update default f k m = m.[k => (f (m.[k else default]))];
 
+/// Store `value` at `k` when nothing is there, and otherwise apply `f` to what
+/// is: `upsert 1 (fn n -> n + 1) word counts`. Unlike `update`, the first value
+/// is stored as given rather than passed through `f` -- the shape of a map
+/// from a key to the list of everything seen under it, whose first entry is
+/// `[x]` and whose later ones are `[x] + old`.
+let upsert : v -> (v -> v) -> k -> %{ k => v } -> %{ k => v };
+let upsert value f k m = if _map_has m k { m.[k => (f (m.[k]))] } else { m.[k => value] };
+
 /// `put` and `update` that force the value before storing it.
 ///
 /// A value stored suspended holds its frame, and when that frame holds the
@@ -249,6 +257,9 @@ when test {
         test.case "update_strict forces what f answers"
             $( test.raises! $( size (update_strict 0 (fn _ -> test.boom) :a m) ) ),
         test.case "update_strict"          $( test.eq! 2 (get 0 :a (update_strict 0 (fn n -> n + 1) :a m)) ),
+        test.case "upsert stores the first value as given"
+            $( test.eq! [[1], [2, 1]] [get () :k (upsert [1] (fn xs -> [2] + xs) :k %{}),
+                                       get () :a (upsert [9] (fn xs -> [2] + xs) :a %{ :a => [1] })] ),
         test.case "put_new keeps the first" $( test.eq! 1 (get 0 :a (put_new :a 9 m)) ),
         test.case "map_values"             $( test.eq! [10, 20]
                                                 (list.map (fn k -> get 0 k (map_values (fn v -> v * 10) m))
