@@ -17,6 +17,7 @@
 // time and so need a VM to run them on, and the image writer that turns this
 // arena into bytes. Both are their own step.
 
+import std.progress;
 import std.atom;
 import std.list;
 import std.lazy;
@@ -2406,7 +2407,7 @@ let link_parallel! ld r cache = {
     // child as a suspension holding every body, and be dealt there.
     strict! work
     let running = strict! (list.map (fn w -> part_elsewhere! cache (list.head w) (list.nth 1 w)) work);
-    let parts = strict! (list.map (fn pr -> join! pr) running);
+    let parts = progress.join_all! "lowering" running;
     let offsets = list.map (fn w -> scope.part_offsets (list.head w)) work;
     let head = link_head rs offsets parts;
     // Sharing across the parts starts now, in a process of its own, and runs

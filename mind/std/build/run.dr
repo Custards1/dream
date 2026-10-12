@@ -49,6 +49,7 @@ import std.list;
 import std.map;
 import std.os;
 import std.proc;
+import std.progress;
 import std.str;
 import std.wire;
 
@@ -479,7 +480,17 @@ mapping Run {
     waiting : [:string]
     running = %{}
     keep_going : :bool = false
+    // The bar the run draws (std.progress), or `()` before there is one.
+    bar : :any = ()
 }
+
+/// Move the run's bar on: everything not waiting or running is done, made or
+/// found made. `note` is the step just finished.
+let tick! : :map -> :string -> :unit;
+let tick! run note = match Run.bar run {
+    () => (),
+    bar => progress.show! bar (progress.Bar.total bar - len (Run.waiting run) - len (map.keys (Run.running run))) note,
+};
 
 /// Test whether all dependencies of a scheduled step have completed.
 let ready : :map -> :string -> :bool;
@@ -590,6 +601,7 @@ let rec drive! ctx run = {
             let [key, scratch] = (Run.running started).[shape];
             let s = (Run.steps started).[shape];
             let running = Run.set_running (_map_remove (Run.running started) shape) started;
+            tick! running (build.Step.name s)
             let st = Run.state running;
             let timed = State.set_ms ((State.ms st).[shape => ms]) st;
             match outcome {
@@ -617,7 +629,9 @@ let build_all! : :map -> :map -> :map -> :bool -> :map;
 let build_all! ctx st steps keep_going = {
     let wanted = list.filter (fn sh -> not (_map_has (State.done st) sh)) (map.keys steps);
     let deps = list.fold (fn m sh -> m.[sh => upstream (steps.[sh])]) (%{}) wanted;
-    let finished = drive! ctx (Run.make st steps deps wanted (%{}) keep_going);
+    let bar = progress.start! "building" (len wanted);
+    let finished = drive! ctx (Run.make st steps deps wanted (%{}) keep_going bar);
+    progress.finish! bar
     let state = Run.state finished;
     match [keep_going, map.values (State.failures state)] {
         [false, [[_, why], .._]] => raise! [:build_failed, "in `" + build.Context.package ctx + "`, " + why],

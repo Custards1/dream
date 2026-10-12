@@ -369,7 +369,25 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
         }
     };
 
-    if (::pipe(out_pipe) != 0 || ::pipe(err_pipe) != 0) {
+    // Close-on-exec, so that only *this* child gets these pipes: the spawn's
+    // `dup2` onto 1 and 2 clears the flag on the copies it means to hand over.
+    // Without it every child started while this one runs inherits our write
+    // ends, and our reader sees no end of file until the last of those exits
+    // -- an example that printed and quit at once was reported as timing out
+    // because an unrelated, endless one was spawned beside it. macOS has no
+    // `pipe2`; the window between `pipe` and `fcntl` there is a race this
+    // narrows rather than closes.
+    auto cloexec_pipe = [](int fds[2]) {
+#if defined(__APPLE__)
+        if (::pipe(fds) != 0) return false;
+        ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        ::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+        return true;
+#else
+        return ::pipe2(fds, O_CLOEXEC) == 0;
+#endif
+    };
+    if (!cloexec_pipe(out_pipe) || !cloexec_pipe(err_pipe)) {
         job->error = std::string("cannot create a pipe: ") + std::strerror(errno);
         for (int fd : {out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]}) {
             if (fd >= 0) ::close(fd);

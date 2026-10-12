@@ -25,6 +25,7 @@
 // from a module declared after it. Every module's environment is built first,
 // then every body is checked against the finished environments.
 
+import std.progress;
 import std.list;
 import std.map;
 import std.vm;
@@ -2840,7 +2841,7 @@ let resolve_parts! l cache = {
         _ => part_key under base common (list.head (list.nth 1 (list.head slice))),
     };
     let running = strict! (list.map (fn slice -> walk_elsewhere! cache shared_l base (key_of slice) slice) slices);
-    let walked = strict! (list.map (fn pr -> join! pr) running);
+    let walked = progress.join_all! "resolving" running;
     merge_parts declared seeded declared_base walked
 };
 

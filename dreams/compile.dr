@@ -23,6 +23,7 @@
 // line, and the payload streamed after it -- is the command line's business,
 // and the REPL writes somewhere else entirely.
 
+import std.progress;
 import std.list;
 
 import dreams.diag;
@@ -226,7 +227,7 @@ let checked_in_parts! how cache ks r = {
     strict! work
     let running = strict! (list.map (fn w -> check_elsewhere! how (match list.nth 2 w { () => (), _ => cache })
                                                               (list.nth 2 w) (list.head w) (list.nth 1 w)) work);
-    let said = list.concat (strict! (list.map (fn pr -> join! pr) running));
+    let said = list.concat (progress.join_all! (if how == :first { "checking" } else { "inferring" }) running);
     list.map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said)
 };
 

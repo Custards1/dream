@@ -13,6 +13,7 @@ import std.list;
 import std.num;
 import std.os;
 import std.path;
+import std.progress;
 import std.str;
 import std.toml;
 import std.vm;
@@ -736,6 +737,25 @@ let dep_hosts g =
     list.concat (list.map (fn n -> match node_manifest n { () => [], dm => manifest.host_modules dm })
                           (nodes g));
 
+/// Every payload the program carries: the package's own and every
+/// dependency's, as `[:ok, ["--payload", "NAME=FILE", ..]]`, or `[:error, why]`
+/// for a `[payload]` that is wrong or a name two packages give two files.
+let payload_args m g = {
+    let manifests = list.cons m (list.flat_map (fn n -> match node_manifest n { () => [], dm => [dm] }) (nodes g));
+    match list.first_or () (list.flat_map (fn mm -> match manifest.payload_problem mm { () => [], why => [why] }) manifests) {
+        () => {
+            let all = list.unique (list.flat_map manifest.payloads manifests);
+            let clash = list.find (fn [n, p] -> list.any (fn [n2, p2] -> n2 == n && p2 != p) all) all;
+            match clash {
+                () => [:ok, repeated "--payload" (list.map (fn [n, p] -> n + "=" + p) all)],
+                [n, _] => [:error, "two packages carry a payload named `" + n + "`: "
+                                   + str.join_str " and " (list.map (fn e -> list.nth 1 e) (list.filter (fn e -> list.head e == n) all))],
+            }
+        },
+        why => [:error, why],
+    }
+};
+
 /// Where the standard library is.
 ///
 /// Every program gets `std` without asking for it, so finding it is `mind`'s
@@ -1097,9 +1117,10 @@ let forget_unit! path now = match io.stat! path {
 let compile_args! m o =
     match search_paths! m o {
         [:error, why] => [:error, why],
-        [:ok, g, paths] => match script_args! m o g {
-            [:error, why] => [:error, why],
-            [:ok, from_scripts] => [:ok, list.concat [
+        [:ok, g, paths] => match [script_args! m o g, payload_args m g] {
+            [[:error, why], _] => [:error, why],
+            [_, [:error, why]] => [:error, why],
+            [[:ok, from_scripts], [:ok, carried]] => [:ok, list.concat [
               [match option o :entry () { () => manifest.entry! m, e => e }],
               paths,
               repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
@@ -1111,6 +1132,7 @@ let compile_args! m o =
               setting_args m o g,
               units_args! (),
               from_scripts,
+              carried,
               ["-o", output_of m o],
               manifest.compiler_flags m,
               manifest.profile_flags m (profile_of o),
@@ -1167,7 +1189,11 @@ let compile! m o = {
                     if option o :verbose false {
                         console.error! (str.join_str " " (list.cons program (list.append lead args)))
                     }
-                    let r = os.exec! program (list.append lead args);
+                    // The compiler's output is read here, so its standard error is
+                    // a pipe and would draw no progress. Told to draw on the
+                    // terminal instead -- when there is one this run is drawing on
+                    // -- its bars reach the person watching (see std.progress).
+                    let r = os.exec_with! (os.cwd! ()) (progress.child_env! ()) program (list.append lead args) 0;
                     let code = r.[:code else (0 - 1)];
                     if code == 0 { [:ok, r.[:out else ""]] }
                     else {

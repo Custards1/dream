@@ -1,0 +1,184 @@
+// Progress on a terminal: one line on standard error, redrawn in place.
+//
+// A bar draws only when standard error is a terminal that takes ANSI. A
+// pipe, a file, a CI log and every test in this repository see nothing at
+// all, so a tool can report progress unconditionally and its output stays
+// what it was. `DREAM_PROGRESS` overrides that: `off` turns bars off, and
+// `tty` draws them on the controlling terminal even when standard error is
+// captured -- which is how `mind`, which reads what the compiler says, lets
+// the compiler's bar reach the person watching. `NO_PROGRESS` and `TERM=dumb`
+// turn bars off too. That is all decided once, by `start!`, and the bar
+// carries the handle it draws on: asking at every step would be a system
+// call per step.
+//
+// A bar holds no count. A step is whatever the caller says it is, and a caller
+// whose work finishes in several processes counts in the one that collects the
+// answers -- which is where `proc.map_reporting!` calls back. Two bars drawn at
+// once share one line and fight over it; nest the work, not the bars.
+//
+// What is drawn is `line`, a pure function of the bar and the step, so the
+// layout is tested as a string and the effects are one write each.
+import std.io;
+import std.streams;
+import std.os;
+import std.str;
+import std.num;
+import std.list;
+import std.vm;
+
+/// A bar in progress: what it counts, how many there are, and whether this
+/// run draws it at all.
+mapping Bar {
+    label : :string = ""
+    total : :integer = 0
+    on : :bool = false
+    out : :any = ()
+    started : :integer = 0
+}
+
+/// A bar for `total` steps of `label`, decided now whether it is drawn.
+let start! : :string -> :integer -> Bar;
+let start! label total = {
+    let out = target! ();
+    Bar.new () |> Bar.set_label label |> Bar.set_total total |> Bar.set_out out
+               |> Bar.set_on (out != ()) |> Bar.set_started (vm.wall_ms! ())
+};
+
+/// Write `text` on the bar's handle, all of it.
+priv let put! : Bar -> :string -> :unit;
+priv let put! bar text = {
+    streams.write_all! (Bar.out bar) text
+    ()
+};
+
+/// Where a bar started now would be drawn: standard error, the controlling
+/// terminal, or `()` for nowhere. See the head of this file.
+let target! : :unit -> :any;
+let target! () =
+    if os.env! "NO_PROGRESS" != () || os.env! "TERM" == "dumb" { () }
+    else {
+        match os.env! "DREAM_PROGRESS" {
+            "off" => (),
+            "tty" => try! { io.open! "/dev/tty" :append } catch _ { () },
+            _ => if io.enable_ansi! (io.stderr! ()) { io.stderr! () } else { () },
+        }
+    };
+
+/// Whether a bar started now would be drawn.
+let drawn! : :unit -> :bool;
+let drawn! () = match target! () {
+    () => false,
+    out => {
+        if out != io.stderr! () { io.close! out }
+        true
+    },
+};
+
+/// The terminal's width as `COLUMNS` says, or eighty.
+let columns! : :unit -> :integer;
+let columns! () = match num.parse_int (match os.env! "COLUMNS" { () => "", c => c }) {
+    n if n != () && n >= 20 => n,
+    _ => 80,
+};
+
+/// The width of the bar itself, between its brackets.
+priv let bar_width : :integer;
+priv let bar_width = 24;
+
+/// The line for `done` of the bar's steps with `note` after it, at most
+/// `columns` characters: `label [=====>    ] 12/48 note`. The note is cut to
+/// fit, the rest never is.
+let line : Bar -> :integer -> :string -> :integer -> :string;
+let line bar done note columns = {
+    let total = Bar.total bar;
+    let shown = num.clamp 0 total done;
+    let filled = if total <= 0 { bar_width } else { shown * bar_width / total };
+    let arrow = if filled > 0 && filled < bar_width { str.repeat (filled - 1) "=" + ">" } else { str.repeat filled "=" };
+    let head = (if Bar.label bar == "" { "" } else { Bar.label bar + " " })
+        + "[" + str.pad_end bar_width " " arrow + "] " + to_string shown + "/" + to_string total;
+    let room = columns - 1 - str.length head - 1;
+    if note == "" || room < 4 { head } else { head + " " + str.truncate room note }
+};
+
+/// Draw the bar at `done` steps, with `note` beside it: what was just
+/// finished, or what is being worked on.
+let show! : Bar -> :integer -> :string -> :unit;
+let show! bar done note =
+    if Bar.on bar { put! bar ("\r\u{1b}[K" + line bar done note (columns! ())) } else { () };
+
+/// Take the bar off the line, leaving the cursor where the bar began, so the
+/// next thing written starts on a clean line.
+let finish! : Bar -> :unit;
+let finish! bar = if Bar.on bar {
+    put! bar "\r\u{1b}[K"
+    if Bar.out bar != io.stderr! () { io.close! (Bar.out bar) }
+} else { () };
+
+/// Write a whole line above the bar -- a warning, a step's output -- and draw
+/// the bar again under it, so messages and progress do not overwrite each
+/// other.
+let say! : Bar -> :integer -> :string -> :unit;
+let say! bar done message =
+    if Bar.on bar {
+        put! bar ("\r\u{1b}[K" + message + "\n" + line bar done "" (columns! ()))
+    } else {
+        streams.write_all! (io.stderr! ()) (message + "\n")
+        ()
+    };
+
+/// What to add to a child's environment so its bars reach the terminal this
+/// program would draw on: `["DREAM_PROGRESS=tty"]` when there is one, and
+/// nothing when there is not. For a child whose output is read rather than
+/// shown -- a compiler run by a build tool -- whose standard error is a pipe.
+let child_env! : :unit -> [:string];
+let child_env! () = if drawn! () { ["DREAM_PROGRESS=tty"] } else { [] };
+
+/// Join every process in order, drawing a bar of how many have answered, and
+/// answer their values in that order. What a program that has spread its work
+/// over processes waits on, made visible.
+let join_all! : :string -> [:process] -> [:any];
+let join_all! label ps = {
+    let bar = start! label (len ps);
+    show! bar 0 ""
+    let values = joined! bar 0 ps [];
+    finish! bar
+    values
+};
+
+/// `join_all!`'s loop: each value forced as it is joined, the bar moved on.
+priv let joined! : Bar -> :integer -> [:process] -> [:any] -> [:any];
+priv let rec joined! bar !done ps !acc = match ps {
+    [] => list.reverse acc,
+    [p, ..rest] => {
+        let v = join! p;
+        show! bar (done + 1) ""
+        joined! bar (done + 1) rest (list.cons v acc)
+    },
+};
+
+/// Milliseconds since the bar started.
+let elapsed! : Bar -> :integer;
+let elapsed! bar = vm.wall_ms! () - Bar.started bar;
+
+when test {
+    import std.test;
+
+    let bar = Bar.new () |> Bar.set_label "docs" |> Bar.set_total 8;
+
+    let tests = [
+        test.case "an empty bar"       $( test.eq! "docs [                        ] 0/8" (line bar 0 "" 80) ),
+        test.case "half way"           $( test.eq! "docs [===========>            ] 4/8" (line bar 4 "" 80) ),
+        test.case "full has no arrow"  $( test.eq! "docs [========================] 8/8" (line bar 8 "" 80) ),
+        test.case "past the end is the end" $( test.eq! (line bar 8 "" 80) (line bar 12 "" 80) ),
+        test.case "a note follows"     $( test.eq! "docs [===========>            ] 4/8 api/std/list" (line bar 4 "api/std/list" 80) ),
+        test.case "a long note is cut to the width"
+            $( test.eq! 59 (str.length (line bar 4 (str.repeat 100 "x") 60)) ),
+        test.case "no room, no note"   $( test.eq! (line bar 4 "" 36) (line bar 4 "anything" 36) ),
+        test.case "nothing to count is complete"
+            $( test.eq! "[========================] 0/0" (line (Bar.new ()) 0 "" 80) ),
+        test.case "join_all! answers in order"
+            $( test.eq! [1, 2, 3] (join_all! "parts" [spawn! $( 1 ), spawn! $( 2 ), spawn! $( 3 )]) ),
+        test.case "join_all! of nothing" $( test.eq! [] (join_all! "parts" []) ),
+        test.case "an unlabelled bar"  $( test.eq! "[===========>            ] 1/2" (line (Bar.set_total 2 (Bar.new ())) 1 "" 80) ),
+    ];
+}

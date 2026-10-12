@@ -1,5 +1,6 @@
 // `mind docs`: Markdown guides and documented Dream declarations, as an
-// offline site. No compiler, network request or project build script is run.
+// offline site. No network request or project build script is run; the
+// compiler is run for the fenced examples, several at a time.
 import std.cli;
 import std.console;
 import std.file;
@@ -9,6 +10,7 @@ import std.list;
 import std.os;
 import std.num;
 import std.path;
+import std.progress;
 import std.vm;
 import documentation.examples;
 import std.str;
@@ -23,6 +25,7 @@ let opts = [
     cli.value "" "guides" "DIR" "Markdown directory (default: docs, relative to project)",
     cli.value "" "compiler" "PATH" "compiler for documentation examples",
     cli.value "" "example-timeout" "MS" "compile and run deadline per example (default: 5000 ms)",
+    cli.value "j" "jobs" "N" "examples to run at once (default: one per core)",
     cli.flag "" "no-api" "compile only Markdown guides",
     cli.flag "" "strict-examples" "fail when an example's outcome is not the one its fence promises",
     cli.flag "h" "help" "show documentation options",
@@ -41,37 +44,43 @@ let html_path path = str.slice 0 (len path - 3) path + ".html";
 let relative_root url = str.repeat (list.length (str.split "/" url) - 1) "../";
 let ignored path = list.any (fn p -> list.contains p ["target", "build", ".git", ".hg", ".svn", "node_modules", "tests", "examples"]) (str.split "/" path);
 let files! dir = if io.is_dir! dir { list.sort (list.filter (fn p -> not (ignored p)) (io.walk! dir)) } else { [] };
-let guide! ctx dir rel = {
+/// A guide, read: its page and its Markdown.
+let guide! dir rel = %{ :url => "guides/" + html_path rel, :rel => rel, :text => read! (path.join dir rel) };
+let guide_page ctx g = page g.[:url] (markdown.title g.[:rel] g.[:text])
+                            (examples.render ctx.[:page => g.[:url]] g.[:text]) g.[:text];
+/// A module, read: where its page goes, its source and its documented entries.
+let module! m label dir rel = {
     let text = read! (path.join dir rel);
-    let url = "guides/" + html_path rel;
-    page url (markdown.title rel text) (examples.render! ctx.[:page => url] text) text
+    %{ :manifest => m, :label => label, :rel => rel, :text => text, :entries => api.extract text,
+       :url => "api/" + label + "/" + html_path rel }
 };
-let module_pages! ctx label dir rel = {
-    let text = read! (path.join dir rel);
-    let entries = api.extract text;
-    let url = "api/" + label + "/" + html_path rel;
+let module_pages ctx info = {
+    let label = info.[:label];
+    let rel = info.[:rel];
+    let entries = info.[:entries];
+    let url = info.[:url];
     let source = "source/" + label + "/" + html_path rel;
     let module = str.slice 0 (len rel - 3) rel;
     let stem = if module == "mod" { "" } else if str.ends_with "/mod" module { str.slice 0 (len module - 4) module } else { module };
     let name = label + (if stem == "" { "" } else { "." + str.replace "/" "." stem });
     if list.is_empty entries { [] } else {
-        [page url name ("<h1>" + markdown.escape name + "</h1>" + api.render! ctx.[:page => url] (relative_root url + source) entries)
+        [page url name ("<h1>" + markdown.escape name + "</h1>" + api.render ctx.[:page => url] (relative_root url + source) entries)
              (str.join_str "\n" (list.map (fn e -> e.[:name] + " " + e.[:signature] + " " + e.[:doc]) entries)),
-         page source (name + " source") ("<h1>" + markdown.escape name + " source</h1>" + api.source_html text) ""]
+         page source (name + " source") ("<h1>" + markdown.escape name + " source</h1>" + api.source_html info.[:text]) ""]
     }
 };
-let package_pages! ctx m = {
+let package_modules! m = {
     let label = manifest.name m;
     if label == "" || markdown.slug label != label { fail! "package names used in docs must contain only lowercase letters, digits, hyphens and underscores" }
     let dir = manifest.src! m;
-    list.flat_map (fn rel -> module_pages! ctx.[:manifest => m] label dir rel) (list.filter (str.ends_with ".dr") (files! dir))
+    list.map (fn rel -> module! m label dir rel) (list.filter (str.ends_with ".dr") (files! dir)) |> strict!
 };
-let api_pages! ctx m = {
-    let own = if manifest.is_package m { package_pages! ctx m } else { [] };
+let api_modules! m = {
+    let own = if manifest.is_package m { package_modules! m } else { [] };
     let children = list.flat_map (fn member -> match manifest.find! (path.join (manifest.root m) member) {
-        [:ok, child] => package_pages! ctx child,
+        [:ok, child] => package_modules! child,
         [:error, why] => fail! why,
-    }) (manifest.members m);
+    }) (manifest.members m) |> strict!;
     list.append own children
 };
 let css = "
@@ -118,19 +127,33 @@ let build! c m = {
     let timeout = num.parse_int (cli.get (to_string (toml.get 5000 cfg "docs" "example-timeout")) c "example-timeout");
     if timeout == () || timeout <= 0 { fail! "example-timeout must be a positive number of milliseconds" }
     let scratch = path.join root ("target/docs-examples/" + file.scratch_suffix! () + "-" + to_string (vm.wall_ms! ()));
-    let ctx = examples.context m (cli.get () c "compiler") timeout scratch;
-    let guides = list.map (guide! ctx guide_dir) (list.filter (str.ends_with ".md") guide_files) |> strict!;
-    let apis = if cli.flag_set c "no-api" || toml.get true cfg "docs" "api" == false { [] } else { api_pages! ctx m };
+    let jobs = match cli.get () c "jobs" {
+        () => (vm.scheduler! ()).[:workers else 1],
+        n => match num.parse_int n { j if j != () && j > 0 => j, _ => fail! ("-j wants a number of jobs, not `" + n + "`") },
+    };
+    let read_guides = list.map (guide! guide_dir) (list.filter (str.ends_with ".md") guide_files) |> strict!;
+    let modules = if cli.flag_set c "no-api" || toml.get true cfg "docs" "api" == false { [] } else { api_modules! m };
+    // Every example, from every page, run before any page is drawn.
+    let sources = list.append (list.map (fn g -> [g.[:url], g.[:text], m]) read_guides)
+                              (list.map (fn i -> [i.[:url], str.join_str "\n" (list.map (fn e -> e.[:doc]) i.[:entries]), i.[:manifest]]) modules);
+    let [results, unexpected] = examples.run_all! (examples.context m (cli.get () c "compiler") timeout scratch) jobs sources;
+    let ctx = (examples.context m (cli.get () c "compiler") timeout scratch).[:results => results];
+    let guides = list.map (guide_page ctx) read_guides;
+    let apis = list.flat_map (module_pages ctx) modules;
     let listed = list.append guides (list.filter (fn p -> str.starts_with "api/" p.[:url]) apis);
     let overview = "<h1>" + markdown.escape title + "</h1><p>Browse the guides and API reference, or search for a function or topic.</p><ul>"
         + str.join_str "" (list.map (fn p -> "<li><a href=\"" + markdown.escape p.[:url] + "\">" + markdown.escape p.[:title] + "</a></li>") listed) + "</ul>";
     let index = page "index.html" "Overview" overview title;
     let navigation = list.cons index listed;
     let pages = list.cons index (list.append guides apis);
-    list.each! (fn p -> {
-        console.error! ("writing " + p.[:url])
+    // On a terminal, a bar naming the page being written; anywhere else, a
+    // line per page, which is what says where a build stopped.
+    let bar = progress.start! "pages" (list.length pages);
+    list.each! (fn [i, p] -> {
+        if progress.Bar.on bar { progress.show! bar i p.[:url] } else { console.error! ("writing " + p.[:url]) }
         write! out p.[:url] (shell title (manifest.version m) navigation p)
-    }) pages
+    }) (list.enumerate pages)
+    progress.finish! bar
     // Copy local images and downloadable guide assets alongside their pages.
     list.each! (fn rel -> {
         let to = path.join out ("guides/" + rel);
@@ -142,8 +165,6 @@ let build! c m = {
     let search = list.map (fn p -> %{ "title" => p.[:title], "url" => p.[:url], "text" => p.[:text] }) listed;
     write! out "assets/search.js" ("window.mindDocs=" + json.write search + ";\n")
     write! out "search-index.json" (json.write search)
-    // Read before the scratch directory goes: see the head of examples.dr.
-    let unexpected = examples.unexpected_in! scratch;
     file.remove_all! scratch
     console.print! ("made " + path.join out "index.html" + " (" + to_string (list.length guides) + " guides, " + to_string (list.length listed - list.length guides) + " API modules)")
     if not (list.is_empty unexpected) {

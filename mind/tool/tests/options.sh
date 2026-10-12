@@ -138,6 +138,23 @@ check "a profile is a directory of its own" tgt 0 "target/linux/release/app.drea
 check "and so is the default build's" prof 0 "target/debug/app.dream" info
 check "and --output is used as written" tgt 0 "  output   elsewhere.dream" info --target macos -o elsewhere.dream
 
+# `[payload]`: files carried in the image, named, found by that name -- the
+# package's own and its dependencies' -- and the names that are refused.
+pl_code='import std.console;\nimport std.payload;\nimport note.lib;\nlet main! = console.print! (match payload.text "greeting" { () => "missing", t => t + " / " + lib.note () });\n'
+pkg pl/app '[dependencies]\nnote = "../note"\n[payload]\ngreeting = "hello.txt"\n' "$pl_code"
+mv "$tmp/pl/app/lib.dr" "$tmp/pl/app/main.dr"
+printf 'hello' >"$tmp/pl/app/hello.txt"
+pkg pl/note '[payload]\nnote = "data/note.txt"\n' 'import std.payload;\nlet note u = match payload.text "note" { () => "missing", t => t };\n'
+mkdir -p "$tmp/pl/note/data" && printf 'from a dependency' >"$tmp/pl/note/data/note.txt"
+check "a [payload] file is carried and found by name, a dependency's too" pl 0 "hello / from a dependency" run
+pkg plbad/app '[payload]\n"a/b" = "x.txt"\n' 'let main! = ();\n'
+mv "$tmp/plbad/app/lib.dr" "$tmp/plbad/app/main.dr"
+check "a payload name with a slash is refused" plbad 1 "[payload] name \`a/b\` cannot be empty or hold" build
+pkg plclash/app '[dependencies]\nother = "../other"\n[payload]\nnote = "mine.txt"\n' 'import other.lib;\nlet main! = ();\n'
+mv "$tmp/plclash/app/lib.dr" "$tmp/plclash/app/main.dr"
+pkg plclash/other '[payload]\nnote = "theirs.txt"\n'
+check "two packages may not give one name two files" plclash 1 "two packages carry a payload named \`note\`" build
+
 echo
 echo "$pass option cases passed, $fail failed"
 [ "$fail" -eq 0 ]

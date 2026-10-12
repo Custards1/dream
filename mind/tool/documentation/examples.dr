@@ -2,24 +2,29 @@
 //
 // An example either works or is written to fail -- a compile error or a raise
 // is documentation too -- and the fence says which: ```dream for one that
-// should run cleanly, ```dream fails for one that should not. An example whose
-// outcome is not the one its fence promises is recorded as it runs, under
-// `unexpected/` in the scratch directory, because the pages are rendered
-// lazily and there is no other point where every result is in one place;
-// `docs.dr` reads the records back before it removes the directory.
+// should run cleanly, ```dream fails for one that should not.
+//
+// Every example is found and run before any page is drawn (`run_all!`): each
+// distinct one once, several at a time, with a progress bar on a terminal.
+// Pages are then rendered from the answers, so drawing a page performs no
+// effect. Running them where the pages are drawn did both of the wrong things:
+// one at a time, and from inside the lazy string a page is built as -- see
+// "JIT retried an impure body" (dream/tests/programs/jit_impure_lambda.dr).
 import std.file;
 import std.io;
 import std.list;
 import std.map;
 import std.os;
 import std.path;
+import std.proc;
+import std.progress;
 import std.str;
 import build;
 import manifest;
 import documentation.markdown;
 
 let context m compiler timeout scratch = %{ :manifest => m, :compiler => compiler, :timeout => timeout,
-                                            :scratch => scratch, :page => "" };
+                                            :scratch => scratch, :page => "", :results => %{} };
 let output r = r.[:out else ""] + r.[:err else ""];
 let report phase r = {
     let label = if r.[:timed_out else false] { phase + " timed out" }
@@ -45,26 +50,27 @@ let fence_info info = {
 let runs : :string -> :bool;
 let runs language = language == "dream" || language == "dr";
 
+/// Every runnable example in Markdown `text`, as `[code, expected to fail]`.
+let rec found lines = match lines {
+    [] => [],
+    [line, ..rest] => {
+        let s = str.trim line;
+        if str.starts_with "```" s || str.starts_with "~~~" s {
+            match markdown.fenced (str.slice 0 3 s) rest [] {
+                [code, more] => {
+                    let [language, fails] = fence_info (markdown.tail 3 s);
+                    if runs language { list.cons [code, fails] (found more) } else { found more }
+                },
+            }
+        } else { found rest }
+    },
+};
+
 /// The example's page and its first line of substance, to find it by.
-let describe : :map -> :string -> :string;
-let describe ctx code = {
+let describe : :string -> :string -> :string;
+let describe page code = {
     let line = list.first_or "" (list.filter (fn l -> not (str.is_blank l) && not (str.starts_with "import " (str.trim l))) (str.lines code));
-    ctx.[:page] + ": " + str.truncate 70 (str.trim line)
-};
-
-/// Note an example whose outcome is not the one its fence promised.
-let unexpected! : :map -> :string -> :string -> :unit;
-let unexpected! ctx code why = {
-    let dir = path.join ctx.[:scratch] "unexpected";
-    file.mkdir_all! dir
-    file.write! (path.join dir (io.digest (ctx.[:page] + code))) (describe ctx code + " (" + why + ")")
-};
-
-/// The records `unexpected!` left, sorted: one line each.
-let unexpected_in! : :string -> [:string];
-let unexpected_in! scratch = {
-    let dir = path.join scratch "unexpected";
-    list.sort (list.map (fn rel -> match file.read! (path.join dir rel) { () => rel, text => text }) (file.walk! dir))
+    page + ": " + str.truncate 70 (str.trim line)
 };
 
 /// Compile and run one example: `[html, whether both phases finished cleanly]`.
@@ -96,32 +102,33 @@ let run! ctx code = try! {
         },
     }
 } catch e { [report "Example" (%{ :code => 1, :err => to_string e }), false] };
-let rec collect! ctx lines results = match lines {
-    [] => results,
-    [line, ..rest] => {
-        let s = str.trim line;
-        if str.starts_with "```" s || str.starts_with "~~~" s {
-            match markdown.fenced (str.slice 0 3 s) rest [] {
-                [code, more] => {
-                    let [language, fails] = fence_info (markdown.tail 3 s);
-                    if runs language {
-                        let [html, ok] = run! ctx code;
-                        match [ok, fails] {
-                            [false, false] => unexpected! ctx code "failed",
-                            [true, true] => unexpected! ctx code "marked `fails` but ran cleanly",
-                            _ => (),
-                        }
-                        collect! ctx more (map.put code html results)
-                    } else { collect! ctx more results }
-                },
-            }
-        } else { collect! ctx rest results }
-    },
+
+/// Run every example in `sources` -- `[page, Markdown, manifest]`, the
+/// manifest being the package the example is compiled against -- `jobs` at a
+/// time, and answer `[results, unexpected]`: the context's `:results`, each
+/// distinct example's `[html, clean]` by its code, and a line for each example
+/// whose outcome is not the one its fence promises.
+let run_all! ctx jobs sources = {
+    let wanted = list.flat_map (fn [page, text, m] ->
+        list.map (fn [code, fails] -> [page, code, fails, m]) (found (str.split "\n" text))) sources;
+    let distinct = list.unique_on (fn w -> list.nth 1 w) wanted;
+    let bar = progress.start! "examples" (list.length distinct);
+    progress.show! bar 0 ""
+    let answers = proc.map_reporting! jobs (fn k -> progress.show! bar k "")
+                                      (fn [_, code, _, m] -> run! ctx.[:manifest => m] code) distinct;
+    progress.finish! bar
+    let results = map.from_pairs (list.zip (list.map (fn w -> list.nth 1 w) distinct) answers);
+    let unexpected = list.flat_map (fn [page, code, fails, _] -> match [list.nth 1 results.[code], fails] {
+        [false, false] => [describe page code + " (failed)"],
+        [true, true] => [describe page code + " (marked `fails` but ran cleanly)"],
+        _ => [],
+    }) wanted;
+    [results, unexpected]
 };
-let render! ctx text = {
-    let results = collect! ctx (str.split "\n" text) (%{});
-    markdown.render_with (fn info code -> {
-        let language = list.head (fence_info info);
-        markdown.code_html language code + (if runs language { map.get "" code results } else { "" })
-    }) text
-};
+
+/// Markdown with each example's result after it, from `run_all!`'s answers.
+let render ctx text = markdown.render_with (fn info code -> {
+    let language = list.head (fence_info info);
+    markdown.code_html language code
+        + (if runs language { list.first_or "" (ctx.[:results].[code else []]) } else { "" })
+}) text;

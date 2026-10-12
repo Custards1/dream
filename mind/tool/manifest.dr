@@ -124,6 +124,34 @@ let includes m = list.map (fn d -> path.join (root m) d) (build_list m "includes
 /// Modules the host registers at run time, so importing them compiles.
 let host_modules m = build_list m "host-modules";
 
+// --- `[payload]`: files carried in the image ---------------------------------
+//
+// `[payload]` maps a name to a file, relative to the manifest:
+//
+//     [payload]
+//     logo = "assets/logo.png"
+//
+// and the program finds the bytes by that name through `std.payload`. It is
+// the compiler's `--payload NAME=FILE` (see "payloads" in dreams/main.dr),
+// written down once for every build of the package. A dependency's payloads
+// travel with it into the program that uses it, since its code reads them.
+
+/// This package's payloads as `[name, path]`, sorted by name so the image
+/// does not depend on the order a table happens to be read in.
+let payloads m =
+    list.sort (list.map (fn [n, p] -> [n, path.join (root m) (to_string p)])
+                        (map.pairs (toml.section (doc m) "payload")));
+
+/// What is wrong with this manifest's `[payload]`, or `()`. A name is how the
+/// compiler is told it -- `NAME=FILE` -- so it cannot hold a `/` or an `=`.
+let payload_problem m =
+    list.first_or () (list.flat_map (fn [n, p] ->
+        if n == "" || str.contains_str "/" n || str.contains_str "=" n {
+            [root m + "/mind.toml: [payload] name `" + n + "` cannot be empty or hold `/` or `=`"]
+        } else if type_of p != :string {
+            [root m + "/mind.toml: [payload] `" + n + "` should be a path, as a string"]
+        } else { [] }) (map.pairs (toml.section (doc m) "payload")));
+
 /// Arguments passed to the compiler as written, for whatever this does not
 /// name yet. An escape hatch, and deliberately last on the command line.
 let compiler_flags m = build_list m "flags";

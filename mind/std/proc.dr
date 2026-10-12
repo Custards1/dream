@@ -116,6 +116,78 @@ let map! f xs = wait_all! (start_each! (fn x -> f x) xs);
 let try_map! : (a -> b) -> [a] -> [Outcome b];
 let try_map! f xs = outcomes! (start_each! (fn x -> f x) xs);
 
+/// `map!` with at most `n` processes running at once: the next element starts
+/// as soon as one finishes, and the answers come back in the list's order.
+/// What a slow `f` over a long list wants -- a compile per element, a request
+/// per element -- where one process each would start them all at once.
+///
+/// Each answer is forced all the way down in the process that made it, since
+/// an answer sent back unforced would be computed by the caller, one at a
+/// time. The first failure, in the list's order, is raised once every element
+/// has finished.
+let map_limit! : :integer -> (a -> b) -> [a] -> [b];
+let map_limit! n f xs = map_reporting! n (fn _ -> ()) f xs;
+
+/// `map_limit!`, calling `done!` with how many have finished each time one
+/// does -- in the caller's process, so a progress bar or a log line written
+/// there needs no locking.
+let map_reporting! : :integer -> (:integer -> :any) -> (a -> b) -> [a] -> [b];
+let map_reporting! n done! f xs = {
+    let items = list.to_array xs;
+    let total = len items;
+    // Bound here, where the block sequences them. Passed as arguments they
+    // would be suspended, and the first worker to need `me` would compute it
+    // -- as itself -- and send every answer to its own mailbox.
+    let me = self! ();
+    let ref = vm.unique! ();
+    let results = pool! me ref done! f items (if n < 1 { 1 } else { n }) 0 0 (%{});
+    strict! (list.map (fn i -> match results.[i] {
+        [:ok, v] => v,
+        [:error, e] => error.rethrow! e,
+    }) (list.range 0 total))
+};
+
+/// The pool's loop: start while there is room and work, otherwise wait for an
+/// answer and note it. `started` and `finished` count elements, and every
+/// element started is answered exactly once, so they meet at the end.
+priv let pool! : Process -> :integer -> (:integer -> :any) -> (a -> b) -> #[a] -> :integer -> :integer -> :integer -> %{:integer => Outcome b} -> %{:integer => Outcome b};
+priv let rec pool! me ref done! f items width !started !finished results = {
+    let total = len items;
+    if finished == total { results }
+    else if started < total && started - finished < width {
+        launch! me ref f started (items.[started])
+        pool! me ref done! f items width (started + 1) finished results
+    } else {
+        let m = recv_where! (fn m -> is_mapped_of ref m);
+        let [_, _, i, outcome] = m;
+        done! (finished + 1)
+        pool! me ref done! f items width started (finished + 1) (results.[i => outcome])
+    }
+};
+
+/// Start one element in a process of its own. A function of its own, so the
+/// thunk handed to `spawn!` carries only these arguments and not the pool's
+/// frame -- the whole list and every answer so far.
+priv let launch! : Process -> :integer -> (a -> b) -> :integer -> a -> Process;
+priv let launch! me ref f i x = spawn! $( answer! me ref f i x );
+
+/// Work out `f x` here, all the way down, and send it home as an outcome.
+priv let answer! : Process -> :integer -> (a -> b) -> :integer -> a -> :any;
+priv let answer! me ref f i x = {
+    let outcome = try! {
+        let v = strict! (f x);
+        [:ok, v]
+    } catch e { [:error, e] };
+    send! me [:mapped, ref, i, outcome]
+};
+
+/// Whether `m` is an answer to the pool with this reference.
+priv let is_mapped_of : :integer -> :any -> :bool;
+priv let is_mapped_of ref m = match m {
+    [:mapped, r, _, _] => r == ref,
+    _ => false,
+};
+
 // --- talking ----------------------------------------------------------------
 //
 // A request carries the process to answer, because the runtime has no notion of
@@ -342,6 +414,35 @@ when test {
             $( test.eq! [1, 2, 3] (parallel! [$( 1 ), $( 2 ), $( 3 )]) ),
         test.case "map! is a map"
             $( test.eq! [2, 4, 6] (map! double [1, 2, 3]) ),
+        test.case "map_limit! answers in order however they finish"
+            $( test.eq! [30, 20, 10, 0] (map_limit! 2 (fn ms -> { sleep! ms; ms }) [30, 20, 10, 0]) ),
+        // Six sleeps of 40 ms, two at a time, cannot finish in under three
+        // rounds; one each would be one round.
+        test.case "map_limit! runs no more than it is allowed"
+            $( {
+                let t0 = vm.wall_ms! ();
+                map_limit! 2 (fn ms -> sleep! ms) [40, 40, 40, 40, 40, 40]
+                test.true! (vm.wall_ms! () - t0 >= 115)
+            } ),
+        test.case "map_limit! of nothing"   $( test.eq! [] (map_limit! 4 double []) ),
+        test.case "map_limit! below one runs one at a time"
+            $( test.eq! [2, 4] (map_limit! 0 double [1, 2]) ),
+        test.case "map_limit! forces the answers where they are made"
+            $( test.eq! [[2, [4]]] (map_limit! 1 (fn x -> [double x, [double (double x)]]) [1]) ),
+        test.case "map_limit! raises the first failure"
+            $( {
+                let got = outcome! (spawn! $( map_limit! 3 (fn x -> if x == 2 { raise! :bad } else { x }) [1, 2, 3] ));
+                test.eq! :bad (error.payload (list.nth 1 got))
+            } ),
+        test.case "map_reporting! counts every finish, in the caller"
+            $( {
+                let me = self! ();
+                map_reporting! 2 (fn k -> send! me [:tick, k]) double [1, 2, 3]
+                let a = recv_where! (fn m -> match m { [:tick, _] => true, _ => false });
+                let b = recv_where! (fn m -> match m { [:tick, _] => true, _ => false });
+                let c = recv_where! (fn m -> match m { [:tick, _] => true, _ => false });
+                test.eq! [[:tick, 1], [:tick, 2], [:tick, 3]] [a, b, c]
+            } ),
         test.case "outcome! of a value"
             $( test.eq! [:ok, 7] (outcome! (spawn! $( 7 ))) ),
         // `catch` binds the error itself, not what was raised: `raise! :boom`

@@ -7,6 +7,10 @@
 // that would decode it does. `std.foreign` is the main reader: it is how a C
 // library carried this way is found (`foreign.embedded`).
 
+import std.ffi;
+import std.list;
+import std.str;
+
 /// How many payloads the image carries.
 let count : :unit -> :integer;
 let count u = _data_count u;
@@ -15,10 +19,36 @@ let count u = _data_count u;
 let at : :integer -> :bigstr;
 let at i = _data_at i;
 
+/// Which payload is called `name` -- the name `--payload NAME=FILE` or a
+/// manifest's `[payload]` gave it -- or `()` when none is.
+let index : :string -> (:integer | :unit);
+let index name = ffi.payload_index name;
+
+/// The payload called `name`, or `()` when the image carries none by that
+/// name. How a program reads a file its manifest lists:
+/// `[payload] logo = "assets/logo.png"` is `payload.named "logo"`.
+let named : :string -> (:bigstr | :unit);
+let named name = match index name {
+    () => (),
+    i => _data_at i,
+};
+
+/// The payload called `name` copied into an ordinary string, or `()` when
+/// there is none: what a small data file -- a template, a table, a config --
+/// is read as, so that `+`, `str.find` and printing work on it. A copy, a
+/// byte at a time, so it is for kilobytes; a large payload is read where it
+/// lies, through `named` and `str.slice`, `str.byte` and `io.write!`.
+let text : :string -> (:string | :unit);
+let text name = match named name {
+    () => (),
+    b => str.of_bytes (list.map (fn i -> str.byte i b) (list.range 0 (len b))),
+};
+
 when test {
     import std.test;
 
     let tests = [
         test.case "an image built for tests carries none" $( test.eq! 0 (count ()) ),
+        test.case "nothing is found by a name it does not carry" $( test.eq! [(), (), ()] [index "logo", named "logo", text "logo"] ),
     ];
 }

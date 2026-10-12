@@ -60,6 +60,7 @@ learn.
 | | |
 |---|---|
 | `proc` | the shapes `spawn!`, `send!`, `recv!` and `join!` leave to the caller |
+| `progress` | a progress bar on the terminal, and nothing anywhere else; `join_all!` over processes |
 | `server` | a process that holds state and answers questions -- a `gen_server` |
 | `agent` | a server whose whole job is to hold one value |
 | `supervisor` | children started together and restarted when they die |
@@ -76,7 +77,7 @@ learn.
 | `streams` | writing all of a string through a writer that may take less |
 | `cli` | command lines: one description of an option, read, checked and printed as usage |
 | `foreign` | wrapping a C library on `std.ffi`; what the `foreign` declaration builds on ([docs/ffi.md](../../docs/ffi.md)) |
-| `payload` | the files an image carries (`dreams --payload`) |
+| `payload` | the files an image carries (`[payload]` in `mind.toml`, `dreams --payload`), by index or by name |
 | `sql` | SQL for any database: fragments, query builders, dialects, a pool, and SQLite |
 | `sql.pg` | a PostgreSQL client in pure Dream ([README](sql/pg/README.md)) |
 

@@ -46,6 +46,23 @@ so far: `nursery_max`, the most a process's nursery may grow to, as bytes or a
 size such as `"64M"` (the VM's default is 32 MB). A key it does not know is an
 error in the manifest.
 
+`[payload]` lists files the program carries in its image, each under the
+name it is found by, as paths relative to the manifest:
+
+```toml
+[payload]
+logo = "assets/logo.png"
+schema = "sql/schema.sql"
+```
+
+`payload.named "logo"` (`std.payload`) answers the bytes where the image
+lies, and `payload.text "schema"` a copy as an ordinary string, for a small
+file. A dependency's payloads go into every program that uses it, since its
+code reads them; two packages naming two different files the same is an error,
+as is a name with `/` or `=` in it. It is the compiler's `--payload NAME=FILE`
+written down once, and a build script's `build.payload` is the same for a file
+that has to be made first.
+
 Every command but `new` looks for `mind.toml` here or above, so they work from
 anywhere inside a project, the way `git` finds its root. `-C DIR` names
 another.

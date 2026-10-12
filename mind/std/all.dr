@@ -65,6 +65,7 @@ import std.payload;
 import std.macros;
 import std.parse;
 import std.proc;
+import std.progress;
 import std.property;
 import std.random;
 import std.record;

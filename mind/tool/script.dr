@@ -39,6 +39,7 @@ import std.list;
 import std.map;
 import std.os;
 import std.proc;
+import std.progress;
 import std.str;
 import std.wire;
 
@@ -248,7 +249,7 @@ priv let compile_driver! setting dir group = {
     let [program, args] = compiler_args setting (list.concat [[path.join dir "driver/main.dr"], driver_roots group,
                                                               ["-o", scratch]]);
     if Setting.verbose setting { console.error! (str.join_str " " (list.cons program args)) }
-    let r = os.exec! program args;
+    let r = os.exec_with! (os.cwd! ()) (progress.child_env! ()) program args 0;
     match r.[:code] {
         0 => { io.rename! scratch (path.join dir "script.dream"); [:ok, ()] },
         _ => [:error, "the build scripts of " + str.join_str ", " (list.map (fn s -> "`" + Scripted.key s + "`") group)
@@ -320,7 +321,9 @@ priv let run_group! job = {
                     let ctx_file = path.join dir ("contexts-" + run_id);
                     let out_file = path.join dir ("outcomes-" + run_id);
                     file.write! ctx_file (wire.encode contexts)
-                    let r = os.exec_for! (Setting.vm setting) [image, "--contexts", ctx_file, "--outcomes", out_file] deadline_ms;
+                    // Read, not shown, so told where its bars go (std.progress).
+                    let r = os.exec_with! (os.cwd! ()) (progress.child_env! ()) (Setting.vm setting)
+                                          [image, "--contexts", ctx_file, "--outcomes", out_file] deadline_ms;
                     let answer = file.read! out_file;
                     strict! answer
                     file.remove_all! ctx_file
