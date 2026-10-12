@@ -79,7 +79,7 @@ let sources assets = match assets {
 /// can be run.
 let test_body : Spec -> Layout -> :string;
 let test_body sp lay = match spec.text sp "brew" "test" "" {
-    "" => match list.filter (fn i -> match i { [:file, p, m, _, _] => str.starts_with "bin/" (layout.relative sp p) && m % 2 == 1, _ => false })
+    "" => match list.filter (fn i -> match i { item.Item.file(p, m, _, _) => str.starts_with "bin/" (layout.relative sp p) && m % 2 == 1, _ => false })
                              (Layout.items lay) {
         [] => "    assert_predicate prefix, :exist?\n",
         programs => str.concat_all (list.map (fn i -> "    assert_predicate bin/" + quote (list.last (str.split "/" (item.path i)))

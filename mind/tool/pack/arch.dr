@@ -110,12 +110,12 @@ let mtree_escape path = str.concat_all (list.map (fn i -> {
 let mtree_line! : :integer -> Item -> :string;
 let mtree_line! epoch i = {
     let t = " time=" + to_string epoch + ".0";
-    "./" + mtree_escape (match i { [:dir, p, _] => str.slice 0 (str.byte_length p - 1) p, _ => item.path i }) + t
+    "./" + mtree_escape (match i { item.Item.dir(p, _) => str.slice 0 (str.byte_length p - 1) p, _ => item.path i }) + t
     + (match i {
-        [:dir, _, m] => " mode=" + bytes.octal 3 m + " type=dir",
-        [:link, _, target] => " mode=777 type=link link=" + mtree_escape target,
-        [:file, _, m, source, n] => " mode=" + bytes.octal 3 m + " size=" + to_string n + " sha256digest=" + io.digest! source,
-        [:text, _, m, data] => " mode=" + bytes.octal 3 m + " size=" + to_string (str.byte_length data)
+        item.Item.dir(_, m) => " mode=" + bytes.octal 3 m + " type=dir",
+        item.Item.link(_, target) => " mode=777 type=link link=" + mtree_escape target,
+        item.Item.file(_, m, source, n) => " mode=" + bytes.octal 3 m + " size=" + to_string n + " sha256digest=" + io.digest! source,
+        item.Item.text(_, m, data) => " mode=" + bytes.octal 3 m + " size=" + to_string (str.byte_length data)
                                + " sha256digest=" + io.digest data,
     })
     + "\n"

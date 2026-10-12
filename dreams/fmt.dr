@@ -266,9 +266,19 @@ let place t old top =
     }
     else { [at_least_zero (old + Frame.delta top), top] };
 
-/// The new indent of every line, forward. A comment line cannot be placed
-/// until the code after it has been, so it is left as `[:after, d]`, where `d`
-/// is how far the code before it moved.
+/// Where `walk` put a line.
+union Placed {
+    // Code, at its new indent: `moved` is how far it moved, and `closes`
+    // whether it starts by closing a bracket.
+    at(indent, moved, closes)
+    // A comment line, which cannot be placed until the code after it has
+    // been: `moved` is how far the code before it moved.
+    after(moved)
+    // A line left as it is.
+    keep
+}
+
+/// The new indent of every line, forward.
 let rec walk lines stack !last acc =
     match lines {
         [] => list.reverse acc,
@@ -279,13 +289,13 @@ let rec walk lines stack !last acc =
                 let [new, top] = place t old (list.head stack);
                 let d = new - old;
                 let stack2 = brackets (Line.toks l) new d () false 0 (list.cons top (list.tail stack));
-                walk rest stack2 d (list.cons [:at, new, d, is_closer (lexer.kind t)] acc)
+                walk rest stack2 d (list.cons (Placed.at new d (is_closer (lexer.kind t))) acc)
             },
             // A line that starts inside a string still has its tokens, and any
             // bracket among them counts.
-            :verbatim => walk rest (brackets (Line.toks l) 0 last () false 1 stack) last (list.cons [:keep] acc),
-            :other => walk rest stack last (list.cons [:after, last] acc),
-            _ => walk rest stack last (list.cons [:keep] acc),
+            :verbatim => walk rest (brackets (Line.toks l) 0 last () false 1 stack) last (list.cons Placed.keep acc),
+            :other => walk rest stack last (list.cons (Placed.after last) acc),
+            _ => walk rest stack last (list.cons Placed.keep acc),
         },
     };
 
@@ -295,12 +305,12 @@ let rec settle_comments placed lines next acc =
     match [placed, lines] {
         [[], _] => acc,
         [[p, ..ps], [l, ..ls]] => match p {
-            [:at, new, d, closes] => settle_comments ps ls (if closes { () } else { d }) (list.cons new acc),
-            [:after, before] => {
+            Placed.at(new, d, closes) => settle_comments ps ls (if closes { () } else { d }) (list.cons new acc),
+            Placed.after(before) => {
                 let d = match next { () => before, n => n };
                 settle_comments ps ls next (list.cons (at_least_zero (Line.lead l + d)) acc)
             },
-            _ => settle_comments ps ls next (list.cons () acc),
+            Placed.keep => settle_comments ps ls next (list.cons () acc),
         },
     };
 

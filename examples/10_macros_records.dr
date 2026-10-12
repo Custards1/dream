@@ -1,4 +1,7 @@
-// Records are ordinary collections with generated helpers.
+// Records: a declaration and the functions generated for it. A `group` and a
+// `struct` are values of their own -- `Point.make 3 4` prints as a `Point`,
+// says it is one, and is taken apart with `Point(x, y)` -- and a `mapping` is
+// a map with names for its keys.
 import std.console;
 
 group Point { x, y }
@@ -41,6 +44,8 @@ let main! = {
     console.print! [point, Point.x point, Point.set_y 9 point, point]
     let vector = Vector.make 5 6;
     console.print! [vector, Vector.y vector, Vector.set_x 7 vector, vector]
+    let Point(px, py) = point;
+    console.print! [type_of point, px * py, point == Point.make 3 4, point == [3, 4]]
     console.print! (Empty.make ())
     let position = Position.make 3 4;
     console.print! [type_of position, Position.x position,

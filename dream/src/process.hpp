@@ -47,6 +47,8 @@ enum class ContKind : uint8_t {
     NativeArgs,  // a = the call node, b = stack base, c = index just evaluated,
                  // v1 = frame; the arguments filled in so far sit at the base
     NativeRetry, // a = stack base, b = argc, v1 = callee; re-invoke after a block
+    ClosureArgs, // a = the call node, b = stack base, c = index just evaluated,
+                 // v1 = frame; as NativeArgs, for a closure's strict arguments
     MapEntry,    // a = stack base, b = pair count, c = index, v1 = the map
     IndexKey,    // b = the get/set node, v1 = frame; the container is the result
     IndexApply,  // b = the get/set node, v1 = frame; the container is on the value stack

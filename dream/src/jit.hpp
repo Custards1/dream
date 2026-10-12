@@ -67,7 +67,16 @@ public:
     CompiledFn tier(uint32_t func_index) {
         if (func_index >= cached_.size()) return nullptr;
         CompiledFn fn = cached_[func_index].load(std::memory_order_acquire);
-        if (fn) return reinterpret_cast<uintptr_t>(fn) <= kQueuedBits ? nullptr : fn;
+        if (fn) {
+            if (reinterpret_cast<uintptr_t>(fn) == kQueuedBits) {
+                // Still counted while it waits, so the compile threads can
+                // take the hottest function first (`take_hottest`).
+                counts_[func_index].store(counts_[func_index].load(std::memory_order_relaxed) + 1,
+                                          std::memory_order_relaxed);
+                return nullptr;
+            }
+            return reinterpret_cast<uintptr_t>(fn) == kRejectedBits ? nullptr : fn;
+        }
         // Counting is a heuristic, so it is a relaxed load and store rather
         // than a read-modify-write: two racing workers may lose a count
         // between them, and a function compiled one entry late is not an
@@ -113,7 +122,22 @@ public:
     /// Compile now, regardless of temperature. Returns nullptr on failure.
     CompiledFn compile(uint32_t func_index, std::string* error);
 
+    /// What `precompile` did.
+    struct Precompiled {
+        uint32_t compiled = 0;
+        uint32_t refused = 0;
+        double ms = 0;
+    };
+    /// Compile every function the tier can take, on `threads` threads, before
+    /// the program starts: `--precompile`. Each answer goes straight into the
+    /// tier table, so the first call of a function is already compiled and
+    /// nothing is queued while the program runs.
+    Precompiled precompile(unsigned threads);
+
     void set_threshold(uint32_t calls);
+    /// How many compile threads to start, before the first function gets
+    /// hot. `--jit-threads`; otherwise `DREAM_JIT_THREADS`, or two.
+    void set_threads(unsigned n);
     uint32_t threshold() const;
     uint64_t compiled_count() const;
     /// Human-readable IR for one function, for `--dump-jit`.
@@ -149,8 +173,12 @@ private:
     /// reaching through the PIMPL.
     std::atomic<uint32_t> threshold_{0};
 
-    /// Caller must hold the JIT lock.
-    CompiledFn compile_locked(uint32_t func_index, std::string* error);
+    /// Compile one function, from any thread; see "Several compile threads"
+    /// in jit.cpp.
+    CompiledFn compile_one(uint32_t func_index, std::string* error);
+    /// The queued function with the most entries counted, taken off the
+    /// queue. Caller holds the queue's lock.
+    uint32_t take_hottest();
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

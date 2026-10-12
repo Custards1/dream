@@ -446,7 +446,16 @@ when test {
 
     let parsed text = value (parse text);
 
+    struct Point { x, y }
+    union Shape { circle(radius), empty }
+
     let tests = [
+        // A record is written as what it was built as before it was one
+        // (`codec.as_written`), not as the text it prints as.
+        test.case "a struct is its fields"
+            $( test.eq! "[1,2]" (write (Point.make 1 2)) ),
+        test.case "a variant is its tag and fields, or its tag"
+            $( test.eq! "[[\"circle\",2],\"empty\"]" (write [Shape.circle 2, Shape.empty]) ),
         // scalars
         test.case "integer"        $( test.eq! 42 (parsed "42") ),
         test.case "negative"       $( test.eq! (0 - 7) (parsed "-7") ),

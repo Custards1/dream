@@ -30,6 +30,7 @@ import std.toml;
 import manifest;
 import util;
 
+<<<<<<< HEAD:mind/tool/pack/commands.dr
 import pack.arch;
 import pack.aur;
 import pack.brew;
@@ -46,6 +47,25 @@ import pack.spec;
 import pack.spec.Spec;
 import pack.sums;
 import pack.tarball;
+=======
+import arch;
+import aur;
+import brew;
+import bytes;
+import compress;
+import deb;
+import installer;
+import item;
+import layout;
+import layout.Layout;
+import release;
+import rpm;
+import scratch;
+import spec;
+import spec.Spec;
+import sums;
+import tarball;
+>>>>>>> main:ship/main.dr
 
 let version : :string = "0.1.0";
 
@@ -192,8 +212,8 @@ let cmd_files! c = {
     let sp = spec! c;
     let lay = layout! sp;
     each! (fn i -> console.print! (match i {
-        [:file, path, mode, source, size] => bytes.octal 4 mode + " " + bytes.pad_left 10 " " (to_string size) + "  /" + path + "  <- " + source,
-        [:link, path, target] => "link " + bytes.pad_left 10 " " "" + "  /" + path + "  -> " + target,
+        item.Item.file(path, mode, source, size) => bytes.octal 4 mode + " " + bytes.pad_left 10 " " (to_string size) + "  /" + path + "  <- " + source,
+        item.Item.link(path, target) => "link " + bytes.pad_left 10 " " "" + "  /" + path + "  -> " + target,
         _ => "",
     })) (Layout.items lay)
 };

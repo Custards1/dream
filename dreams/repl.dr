@@ -294,47 +294,58 @@ let load_file! s path roots cfg source image =
         },
     };
 
-/// One entry. Answers `[:go, session]` or `[:done]`.
+/// What an entry leaves the loop to do: go on with a session, or stop.
+union Next {
+    go(session)
+    done
+}
+
+/// One entry.
 let step! s text roots cfg source image =
     if is_command text {
-        let word = first_word text;
-        if word == ":quit" || word == ":exit" || word == ":q" { [:done] }
-        else if word == ":help" || word == ":?" {
-            console.print! help
-            [:go, s]
-        }
-        else if word == ":list" {
-            show_session! s
-            [:go, s]
-        }
-        else if word == ":reset" {
-            console.print! "session reset"
-            [:go, empty_session]
-        }
-        else if word == ":load" {
-            [:go, load_file! s (command_argument text) roots cfg source image]
-        }
-        else {
-            console.error! ("dreams: no such command " + word + " (try :help)")
-            [:go, s]
+        match first_word text {
+            ":quit" => Next.done,
+            ":exit" => Next.done,
+            ":q" => Next.done,
+            ":help" => {
+                console.print! help
+                Next.go s
+            },
+            ":?" => {
+                console.print! help
+                Next.go s
+            },
+            ":list" => {
+                show_session! s
+                Next.go s
+            },
+            ":reset" => {
+                console.print! "session reset"
+                Next.go empty_session
+            },
+            ":load" => Next.go (load_file! s (command_argument text) roots cfg source image),
+            word => {
+                console.error! ("dreams: no such command " + word + " (try :help)")
+                Next.go s
+            },
         }
     }
     else if declarative text {
-        // A definition or an expression is a session inside a lazy pair element,
-        // where `define!`'s compile would wait for who knows what to force it --
-        // the loop only ever needs its `[:go, s2]` result. Forcing here, in a
-        // statement, makes the compile part of entering the entry: `[:go,
-        // strict! ..]` would force only to shallow head normal form and leave
-        // the work inside. (The same shape bit `supervisor` -- the supervisor
-        // sat waiting for a child nobody had started.)
+        // A definition or an expression is a session inside a lazy record
+        // field, where `define!`'s compile would wait for who knows what to
+        // force it -- the loop only ever needs its `Next.go` result. Forcing
+        // here, in a statement, makes the compile part of entering the entry:
+        // `Next.go (strict! ..)` would force only to shallow head normal form
+        // and leave the work inside. (The same shape bit `supervisor` -- the
+        // supervisor sat waiting for a child nobody had started.)
         let d = define! s text roots cfg source image;
         strict! d
-        [:go, d]
+        Next.go d
     }
     else {
         let e = evaluate! s text roots cfg source image;
         strict! e
-        [:go, e]
+        Next.go e
     };
 
 let rec loop! h s roots cfg source image = {
@@ -350,8 +361,8 @@ let rec loop! h s roots cfg source image = {
             if str.is_empty (str.trim text) { loop! h s roots cfg source image }
             else {
                 match step! s (str.trim text) roots cfg source image {
-                    [:done] => 0,
-                    [:go, s2] => loop! h s2 roots cfg source image,
+                    Next.done => 0,
+                    Next.go(s2) => loop! h s2 roots cfg source image,
                 }
             },
     }

@@ -47,85 +47,142 @@ import std.map;
 /// which is what makes a program importing a module registered at run time
 /// compilable. It is deliberately not a wildcard: naming the module is what
 /// keeps a typo in an import an error rather than a mystery later.
+let native_modules : [:string];
 let native_modules =
     ["std.crypto", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.tensor", "std.tls", "std.vm"];
 
+let is_native : :string -> :bool;
 let is_native p = list.contains p native_modules;
 
 // --- a loaded module ---------------------------------------------------------
 
-/// What `load!` answers: every module and file the program reaches, keyed by
-/// index, and what the loader had to say about them.
-type Loader = :map;
-
 /// `source` is an index into the loader's file list, so a diagnostic raised
-/// about this module can quote the line it came from.
+/// about this module can quote the line it came from. `private_spans` are the
+/// spans of its `priv` declarations: visibility travels with them. `within` is
+/// the module a `mod` was written inside -- and so a record's or a union's,
+/// which the loader writes as one -- or `()` for a file's own module.
 mapping Module {
     name = ""
     path = ""
     source = 0
     items = []
+    private_spans = []
+    within = ()
 }
 
-// Visibility travels with the module's declarations.
+let loaded : :string -> :string -> :integer -> [ast.Decl] -> Module;
 let loaded name path source items =
-    (Module.make name path source
-        (list.filter (fn item -> ast.kind item != :private) items)).[:private_spans =>
-            list.map ast.span (list.filter (fn item -> ast.kind item == :private) items)];
+    Module.make name path source (list.filter (fn item -> ast.kind item != :private) items)
+                (list.map ast.span (list.filter (fn item -> ast.kind item == :private) items)) ();
 
-let with_new_items m items = m.[:items => items];
+let with_new_items : Module -> [ast.Decl] -> Module;
+let with_new_items m items = Module.set_items items m;
 
+let private_declaration : Module -> ast.Span -> :bool;
 let private_declaration m span =
     list.any (fn sp -> ast.span_start sp <= ast.span_start span
                    && ast.span_end span <= ast.span_end sp)
-             (m.[:private_spans else []]);
+             (Module.private_spans m);
 
+let module_name : Module -> :string;
 let module_name m = Module.name m;
+let module_path : Module -> :string;
 let module_path m = Module.path m;
+let module_source : Module -> :integer;
 let module_source m = Module.source m;
+let module_items : Module -> [ast.Decl];
 let module_items m = Module.items m;
+
+/// The module a `mod` was written inside, or `()` for a file's own module. Its
+/// name alone cannot say: `std.time.zone` is a file, not a `mod` of
+/// `std.time`. `scope.inherit_enclosing` is what reads it.
+let module_within : Module -> :string | :unit;
+let module_within m = Module.within m;
 
 // --- the loader --------------------------------------------------------------
 
+/// What `load!` answers: every module and file the program reaches, keyed by
+/// index, and what the loader had to say about them -- and, while it works,
+/// where it has been.
+mapping Loader {
+    // Both set by `loader`: a default may not name the modules they come from.
+    packages = ()
+    config = ()
+    // Every `-D KEY:..` whose key names no package.
+    unknown_scopes = []
+    search_paths = []
+    host_modules = []
+    // Dependencies first, so a later pass never meets a module before what it
+    // uses. That ordering is the reason a module is recorded only once
+    // everything it imports has been -- and it is why the table is keyed by a
+    // dense index rather than by name: the index *is* the order.
+    modules = %{}
+    module_count = 0
+    by_name = %{}
+    by_path = %{}
+    files = %{}
+    file_count = 0
+    expanding = %{}
+    natives = []
+    namespaces = []
+    diags = []
+    visited = %{}
+    in_progress = []
+    // Files whose contents come from memory rather than from disk. An editor
+    // holds a buffer that has not been saved -- often has never been saved --
+    // and every question it asks is about the buffer.
+    overlay = %{}
+    // Files whose text has been parsed before: path -> [text, parse result].
+    // A language server reuses a module's parse across requests -- the only
+    // file that changes is the buffer being edited, and re-lexing and
+    // re-parsing every reachable module on every keystroke is the whole cost
+    // of answering one -- so a same-text hit skips the parse entirely.
+    parsed = %{}
+    records = []
+    // Every setting a `when` read, as a set.
+    reads = %{}
+    foreigns = []
+    expansions = []
+    metering = false
+    macro_meter = ()
+    std_sources = %{}
+    package_roots = ()
+    // Files read ahead of their importers, path -> [text, parse].
+    prefetch = %{}
+    prefetch_enabled = true
+    share_parses = false
+    units = ()
+}
+
+let loader : package.Packages -> config.Configuration -> [:string] -> [:string] -> Loader;
 let loader packages cfg search_paths host_modules = {
     let [scoped, unknown] = scoped_config packages cfg;
-    %{ :packages => packages, :config => scoped, :unknown_scopes => unknown,
-       :search_paths => search_paths, :host_modules => host_modules,
-       // Dependencies first, so a later pass never meets a module before what
-       // it uses. That ordering is the reason a module is recorded only once
-       // everything it imports has been -- and it is why the table is keyed by
-       // a dense index rather than by name: the index *is* the order.
-       :modules => %{}, :module_count => 0,
-       :by_name => %{}, :by_path => %{},
-       :files => %{}, :file_count => 0, :expanding => %{},
-       :natives => [], :namespaces => [],
-       :diags => [], :visited => %{}, :in_progress => [],
-       // Files whose contents come from memory rather than from disk. An
-       // editor holds a buffer that has not been saved -- often has never been
-       // saved -- and every question it asks is about the buffer.
-       :overlay => %{},
-       // Files whose text has been parsed before: path -> [text, parse result].
-       // A language server reuses a module's parse across requests -- the only
-       // file that changes is the buffer being edited, and re-lexing and
-       // re-parsing every reachable module on every keystroke is the whole cost
-       // of answering one -- so a same-text hit skips the parse entirely.
-       :parsed => %{} }
+    Loader.new ()
+        |> Loader.set_packages packages
+        |> Loader.set_config scoped
+        |> Loader.set_unknown_scopes unknown
+        |> Loader.set_search_paths search_paths
+        |> Loader.set_host_modules host_modules
 };
 
 /// The configuration with every package's options filed under the name it
 /// goes by, now that the packages are known, and every `-D KEY:..` whose key
 /// names none of them.
+let scoped_config : package.Packages -> config.Configuration -> [:any];
 let scoped_config ps cfg = {
     let aliases = list.fold (fn m [n, i] -> m.[n => package.name (package.at ps i)])
                             (%{}) (map.pairs (package.by_name ps));
     config.with_aliases aliases (fn k -> package.find ps k != ()) cfg
 };
 
-let packages l     = l.[:packages else package.empty];
-let config_of l    = l.[:config else config.empty];
+let packages : Loader -> package.Packages;
+let packages l     = Loader.packages l;
+let config_of : Loader -> config.Configuration;
+let config_of l    = Loader.config l;
 
 /// The package module `name` belongs to: the one its first segment names,
 /// which is how it was found, and otherwise the one the root file is in.
+let owner_of : Loader -> :string -> :string | :unit;
 let owner_of l name = {
     let ps = packages l;
     match package.find ps (list.head (dotted_segments name)) {
@@ -136,18 +193,25 @@ let owner_of l name = {
 
 /// What a `when` in module `name` is evaluated against: the program's
 /// settings, with its own package's options in front of them.
+let config_in : Loader -> :string -> config.Configuration;
 let config_in l name = config.within (owner_of l name) (config_of l);
-let search_paths l = l.[:search_paths else []];
-let host_modules l = l.[:host_modules else []];
+let search_paths : Loader -> [:string];
+let search_paths l = Loader.search_paths l;
+let host_modules : Loader -> [:string];
+let host_modules l = Loader.host_modules l;
 /// Every module that was loaded, in order. Derived, because the table it
 /// comes from is keyed by index -- so ask `module_count` when the count is all
 /// that is wanted, which is what nearly every caller wanted.
+let modules : Loader -> [Module];
 let modules l      = list.map (fn i -> module_at l i) (list.range 0 (module_count l));
-let module_map l   = l.[:modules else %{}];
+let module_map : Loader -> %{:integer => Module};
+let module_map l   = Loader.modules l;
 let module_count : Loader -> :integer;
-let module_count l = l.[:module_count else 0];
-let by_name l      = l.[:by_name else (%{})];
-let by_path l      = l.[:by_path else (%{})];
+let module_count l = Loader.module_count l;
+let by_name : Loader -> %{:string => :integer};
+let by_name l      = Loader.by_name l;
+let by_path : Loader -> %{:string => :integer};
+let by_path l      = Loader.by_path l;
 /// Every source file, in order. Derived from the table below, and wanted in
 /// this shape by exactly one caller: `diag.render_all`, which is handed the
 /// whole program's files once, at the end of a compile that has something to
@@ -155,18 +219,21 @@ let by_path l      = l.[:by_path else (%{})];
 /// one -- and asks `file_at`.
 let files : Loader -> [:any];
 let files l        = list.map (fn i -> file_at l i) (list.range 0 (file_count l));
-let file_map l     = l.[:files else %{}];
+let file_map : Loader -> %{:integer => diag.Source};
+let file_map l     = Loader.files l;
 let file_count : Loader -> :integer;
-let file_count l   = l.[:file_count else 0];
+let file_count l   = Loader.file_count l;
 let file_at l i    = (file_map l).[i else ()];
 
 /// Record a file's text and say where it went. Keyed by index like the module
 /// table above and for the same two reasons: appending copied the list, once
 /// per file, and `expand.install!` rewrote one entry with the `set` opcode,
 /// which copies every cell in front of it, once per macro call.
+let add_file : diag.Source -> Loader -> Loader;
 let add_file f l =
-    put :file_count (file_count l + 1) (put :files ((file_map l).[file_count l => f]) l);
-let set_file i f l = put :files ((file_map l).[i => f]) l;
+    Loader.set_file_count (file_count l + 1) (Loader.set_files ((file_map l).[file_count l => f]) l);
+let set_file : :integer -> diag.Source -> Loader -> Loader;
+let set_file i f l = Loader.set_files ((file_map l).[i => f]) l;
 
 /// Where the word `expand` is written in each file, by source index: the
 /// parser's answer (`parser.expand_sites`), kept where the pass that needs it
@@ -178,40 +245,53 @@ let set_file i f l = put :files ((file_map l).[i => f]) l;
 /// self-compile and every program paid it, macros or not, because "has this
 /// declaration got an `expand` in it?" was asked by reading the whole
 /// program's syntax. See `parser.expand_sites` for why the answer is sound.
-let expanding l = l.[:expanding else %{}];
+let expanding : Loader -> %{:integer => [:integer]};
+let expanding l = Loader.expanding l;
+let expand_sites : Loader -> :integer -> [:integer];
 let expand_sites l source = (expanding l).[source else []];
+let note_expanding : :integer -> [:integer] -> Loader -> Loader;
 let note_expanding source sites l =
-    if list.is_empty sites { l } else { put :expanding ((expanding l).[source => sites]) l };
+    if list.is_empty sites { l } else { Loader.set_expanding ((expanding l).[source => sites]) l };
 let natives : Loader -> [:string];
-let natives l      = l.[:natives else []];
-let namespaces l   = l.[:namespaces else []];
+let natives l      = Loader.natives l;
+let namespaces : Loader -> [:string];
+let namespaces l   = Loader.namespaces l;
 let diags : Loader -> [:map];
-let diags l        = l.[:diags else []];
-let visited l      = l.[:visited else (%{})];
-let in_progress l  = l.[:in_progress else []];
+let diags l        = Loader.diags l;
+let visited : Loader -> %{:string => :bool};
+let visited l      = Loader.visited l;
+let in_progress : Loader -> [:string];
+let in_progress l  = Loader.in_progress l;
 /// Path to text, for the files this loader should not read from disk.
-let overlay l      = l.[:overlay else (%{})];
-let with_overlay o l = l.[:overlay => o];
+let overlay : Loader -> %{:string => :string};
+let overlay l      = Loader.overlay l;
+let with_overlay : %{:string => :string} -> Loader -> Loader;
+let with_overlay o l = Loader.set_overlay o l;
 /// Path to a `[text, parse result]` pair for a file that has been parsed
 /// before. Feeding a loader a previous loader's map is what makes two analyses
 /// of the same program parse nothing twice.
-let parsed l       = l.[:parsed else (%{})];
-let with_parsed p l = l.[:parsed => p];
+let parsed : Loader -> :map;
+let parsed l       = Loader.parsed l;
+let with_parsed : :map -> Loader -> Loader;
+let with_parsed p l = Loader.set_parsed p l;
+let put_parsed : :string -> [:any] -> Loader -> Loader;
 let put_parsed file v l = with_parsed (((parsed l)).[file => v]) l;
 
 /// `[owner, kind, name, fields, members, span]` for each `group`, `struct` or
 /// `mapping` declaration, where `owner` is the module it was written in.
 /// `note_records` is the only thing that adds to this and says why it exists.
-let records l      = l.[:records else []];
+let records : Loader -> [[:any]];
+let records l      = Loader.records l;
 /// Every setting a `when` condition read while loading, taken or not, as a
 /// set. What pins an image to the platform it was compiled for.
 let reads : Loader -> [:string];
-let reads l        = map.pairs (l.[:reads else (%{})]) |> list.map (fn [k, _] -> k) |> list.sort;
+let reads l        = map.pairs (Loader.reads l) |> list.map (fn [k, _] -> k) |> list.sort;
 
 /// `[owner, name, library, entries, span]` for each `foreign` declaration,
 /// as the parser left it (`ast.foreign_d`). `note_foreigns` adds to this, for
 /// the reason `note_records` gives.
-let foreigns l     = l.[:foreigns else []];
+let foreigns : Loader -> [[:any]];
+let foreigns l     = Loader.foreigns l;
 
 /// What each `expand` in the program named: `[module, source, offset, what]`,
 /// one entry per call site, where `what` is the resolution of the macro's own
@@ -223,7 +303,8 @@ let foreigns l     = l.[:foreigns else []];
 /// question -- hover and go-to-definition are "what is this name" -- so the
 /// pass that did resolve it says so here, and `scope.resolve!` seeds its
 /// occurrence table with these. See `note_macro` in dreams/expand.dr.
-let expansions l   = l.[:expansions else []];
+let expansions : Loader -> [[:any]];
+let expansions l   = Loader.expansions l;
 
 /// Should macro expansion measure itself, and what did it measure?
 ///
@@ -239,14 +320,15 @@ let expansions l   = l.[:expansions else []];
 /// `expand.publish_meter` and read by `main.show_time!`. Nothing in the
 /// compiler reads it, the way nothing reads `records` -- it is here because
 /// the pass that spends the time is the only one that can say where.
-let metering l     = l.[:metering else false];
+let metering : Loader -> :bool;
+let metering l     = Loader.metering l;
 let with_metering : Loader -> Loader;
-let with_metering l = put :metering true l;
-let macro_meter l  = l.[:macro_meter else ()];
-
-let put k v l = l.[k => v];
+let with_metering l = Loader.set_metering true l;
+let macro_meter : Loader -> :any;
+let macro_meter l  = Loader.macro_meter l;
 
 /// The index of a module, by any name it answers to, or `()`.
+let find : Loader -> :string -> :integer | :unit;
 let find l name = ((by_name l)).[name else ()];
 
 let module_at l i = (module_map l).[i else ()];
@@ -257,9 +339,10 @@ let module_at l i = (module_map l).[i else ()];
 /// was O(modules^2) bytes. See "A table indexed by module wants to be a map" in
 /// docs/notes/compiler-scaling.md: this is the same finding as `scope.envs`, on the loader's copy of
 /// the same table.
+let add_module : Module -> Loader -> Loader;
 let add_module m l = {
-    let added = put :module_count (module_count l + 1) (put :modules ((module_map l).[module_count l => m]) l);
-    if in_std (module_name m) { put :std_sources ((std_sources added).[module_source m => true]) added }
+    let added = Loader.set_module_count (module_count l + 1) (Loader.set_modules ((module_map l).[module_count l => m]) l);
+    if in_std (module_name m) { Loader.set_std_sources ((std_sources added).[module_source m => true]) added }
     else { added }
 };
 
@@ -268,7 +351,8 @@ let add_module m l = {
 let in_std : :string -> :bool;
 let in_std name = name == "std" || str.starts_with "std." name;
 
-let std_sources l = l.[:std_sources else (%{})];
+let std_sources : Loader -> %{:integer => :bool};
+let std_sources l = Loader.std_sources l;
 
 /// Was this file written as part of `std`? Asked of a source rather than a
 /// module because a body inherited through `derive` is resolved in the module
@@ -280,43 +364,56 @@ let written_in_std l source = (std_sources l).[source else false];
 
 /// Replace module `mi`. Expansion rewrites a declaration in place and puts the
 /// module back; nothing here changes the count.
-let set_module mi m l = put :modules ((module_map l).[mi => m]) l;
+let set_module : :integer -> Module -> Loader -> Loader;
+let set_module mi m l = Loader.set_modules ((module_map l).[mi => m]) l;
 
 /// Rewrite every module. Expansion does this twice -- once to stage a snapshot
 /// and once to turn `macro` declarations into ordinary `let`s -- and both used
 /// to rebuild the whole list.
+let map_modules : (Module -> Module) -> Loader -> Loader;
 let map_modules f l =
-    put :modules (list.fold (fn acc i -> acc.[i => f (module_at l i)])
+    Loader.set_modules (list.fold (fn acc i -> acc.[i => f (module_at l i)])
                             (module_map l) (list.range 0 (module_count l))) l;
 
 /// Is this path provided by the runtime rather than by Dream source?
+let is_host : Loader -> :string -> :bool;
 let is_host l p = is_native p || list.contains p (host_modules l);
 
-let note d l = put :diags (list.append (diags l) [d]) l;
+let note : :map -> Loader -> Loader;
+let note d l = Loader.set_diags (list.append (diags l) [d]) l;
 
 /// Record a diagnostic against the file it was found in.
+let complain : ast.Span -> :string -> :integer -> Loader -> Loader;
 let complain span message source l = note (diag.in_source source (diag.error span message)) l;
 
+let complain_note : ast.Span -> :string -> :string -> :integer -> Loader -> Loader;
 let complain_note span message extra source l =
     note (diag.in_source source (diag.with_note extra (diag.error span message))) l;
 
-let mark_visited name l = put :visited (((visited l)).[name => true]) l;
+let mark_visited : :string -> Loader -> Loader;
+let mark_visited name l = Loader.set_visited (((visited l)).[name => true]) l;
+let is_visited : Loader -> :string -> :bool;
 let is_visited l name = map.has name (visited l);
 
 /// Native modules are recorded in first-seen order, because that order is the
 /// index a call to one is compiled to.
+let record_native : :string -> Loader -> Loader;
 let record_native p l =
-    if list.contains p (natives l) { l } else { put :natives (list.append (natives l) [p]) l };
+    if list.contains p (natives l) { l } else { Loader.set_natives (list.append (natives l) [p]) l };
 
-let enter name l = put :in_progress (list.append (in_progress l) [name]) l;
+let enter : :string -> Loader -> Loader;
+let enter name l = Loader.set_in_progress (list.append (in_progress l) [name]) l;
+let leave : Loader -> Loader;
 let leave l = {
     let stack = in_progress l;
-    put :in_progress (list.take (list.length stack - 1) stack) l
+    Loader.set_in_progress (list.take (list.length stack - 1) stack) l
 };
+let is_loading : Loader -> :string -> :bool;
 let is_loading l name = list.contains name (in_progress l);
 
 // --- resolving a name to a file ----------------------------------------------
 
+let dotted_segments : :string -> [:string];
 let dotted_segments p = list.filter (fn s -> not (str.is_empty s)) (str.split "." p);
 
 let rec search_for! bases rel =
@@ -378,6 +475,7 @@ let resolve_path! l dotted = {
 /// `derive shape` inside `a.circle` means `a.shape`, the sibling, so the search
 /// walks outwards: `a.circle.shape`, then `a.shape`, then nothing. Answers with
 /// the qualified name it found.
+let local_module : Loader -> :string -> :string -> :string | :unit;
 let rec local_module l scope dep = {
     let candidate = scope + "." + dep;
     if find l candidate != () { candidate }
@@ -396,6 +494,7 @@ let rec local_module l scope dep = {
 /// the depending package's directory, so comparing the text would claim the
 /// wrong owner. Nested packages are legal, so the innermost one wins: the
 /// longest source root still containing the file is its real owner.
+let canonical_name! : Loader -> :string -> :string -> :string;
 let canonical_name! l file fallback = {
     let real = path.segments (path.drop_extension (path.absolute! file));
     let best = list.fold (fn found root -> {
@@ -418,7 +517,7 @@ let canonical_name! l file fallback = {
 /// for every file was most of what loading a program of many modules cost. So
 /// the root's load works them out once and the loader carries them; a loader
 /// that does not carry them works them out where it is asked.
-let package_roots! l = match l.[:package_roots else ()] {
+let package_roots! l = match Loader.package_roots l {
     () => list.map (fn pkg -> [path.segments (path.absolute! (package.src pkg)), package.name pkg])
                    (package.packages (packages l)),
     roots => roots,
@@ -427,11 +526,12 @@ let package_roots! l = match l.[:package_roots else ()] {
 let with_package_roots! l = {
     let roots = package_roots! l;
     strict! roots
-    l.[:package_roots => roots]
+    Loader.set_package_roots roots l
 };
 
 // --- explaining a failure ----------------------------------------------------
 
+let comma_list : [:string] -> :string;
 let comma_list xs = if list.is_empty xs { "nothing" } else { str.join_str ", " xs };
 
 /// Explain a failed import in terms of what was actually searched. An import
@@ -484,12 +584,15 @@ let unresolved_note! l dotted = {
 /// as the file is read, so the rest of the compiler never sees a conditional
 /// item at all -- and an `import` inside a `when` that is off is never
 /// followed, so a module only test builds need is never even opened.
-let expand_items cfg items = {
-    let flat = flatten_items cfg items;
+let expand_items owner cfg items = {
+    let flat = (if config.is_defined "strict_everything" cfg { strict_everything } else { fn x -> x })
+                   (flatten_items cfg items);
     let inherited = list.filter whole_import flat;
     list.concat (list.map (fn item ->
         match item {
-            // A record's members are written in the file and read as if they
+            // A record is a module and, in the parent, a global of the same
+            // name holding its description -- see `syntax.record_parts`.
+            // Its members are written in the file and read as if they
             // were, so they see what the file imports. Its module is a `mod`
             // of its own, which would otherwise see nothing -- and a member
             // that calls `list.cons` has no other way to reach it, now that
@@ -498,11 +601,11 @@ let expand_items cfg items = {
             // selected member could be the name of a field, and a `let` and an
             // import of one name is an error (`report_clashes` in scope.dr).
             [:record, kind, name, fields, members, bases, span] =>
-                [syntax.record_derived kind name fields members (inherited + bases) span],
+                syntax.record_parts owner kind name fields members (inherited + bases) span,
             // A union is a module and, in the parent, a global of the same
             // name holding its description -- see `syntax.union_decl`.
             [:union_decl, name, params, variants, members, kind, span] =>
-                syntax.union_decl name params variants members kind span,
+                syntax.union_decl owner name params variants members kind span,
             // A C library is a module of bindings -- see `syntax.foreign_decl`.
             [:foreign_decl, name, library, entries, span] =>
                 syntax.foreign_decl name library entries span,
@@ -512,6 +615,38 @@ let expand_items cfg items = {
             other => [other],
         }) flat)
 };
+
+/// `-D strict_everything`: every named parameter of every `let` and `fn`
+/// written as though it were `!x`, so the program runs call-by-value in its
+/// arguments while everything else -- a list's cells, a map's values, a
+/// block's `let` -- stays as lazy as it was. It is an experiment and not a
+/// mode: it answers what a strict-by-default Dream would break and what it
+/// would cost or save, by compiling a real program that way and running it.
+/// "Strict by default: the experiment" in docs/notes/vm-performance.md is what
+/// it found. A pattern parameter and a record's member are left alone, and so
+/// is a `let` whose body is one call or one `.[ ]`: that is the shape `scope.wrapper_of`
+/// turns into the call it stands for, which it will not do for a function
+/// with a strict parameter -- and a strict-by-default compiler would still
+/// inline it, since the primitive under it evaluates what it needs.
+let rec strict_everything node : :any =
+    match node {
+        [:lambda, ps, b, sp] => [:lambda, strict_params ps, strict_everything b, sp],
+        [:let, n, ps, b, r, sp] =>
+            [:let, n, (if wrapper_shaped b { ps } else { strict_params ps }), strict_everything b, r, sp],
+        _ => if type_of node == :list { list.map strict_everything node } else { node },
+    };
+
+priv let wrapper_shaped b =
+    type_of b == :list && not (list.is_empty b) && list.contains (list.head b) [:apply, :get, :set];
+
+priv let strict_params ps =
+    if type_of ps != :list { ps }
+    else {
+        list.map (fn p -> match p {
+            [name, span] => if type_of name == :string { ast.strict_param name span } else { p },
+            _ => p,
+        }) ps
+    };
 
 /// `when` resolved and `priv` unwrapped, with every other item as written.
 let rec flatten_items cfg items =
@@ -554,7 +689,7 @@ let rec record_items cfg items =
 /// answered `x ` and the end of the file. This is that, kept, and nothing in
 /// the compiler reads it: `owner + "." + name` is the module the rewrite made.
 let note_records owner items l =
-    put :records (records l + list.map (fn r -> list.cons owner r)
+    Loader.set_records (records l + list.map (fn r -> list.cons owner r)
                                        (record_items (config_in l owner) items)) l;
 
 /// The settings the `when` conditions among these items read: each condition
@@ -574,12 +709,12 @@ let rec when_reads cfg items =
 let note_reads name items l =
     match when_reads (config_in l name) items {
         [] => l,
-        rs => put_reads (list.fold (fn m r -> m.[r => true]) (l.[:reads else (%{})]) rs) l,
+        rs => put_reads (list.fold (fn m r -> m.[r => true]) (Loader.reads l) rs) l,
     };
 
 /// Forced as it is stored, so the table does not hold a suspension that pins
 /// the loader it was made from.
-let put_reads (strict m) l = put :reads m l;
+let put_reads (strict m) l = Loader.set_reads m l;
 
 /// Every `foreign` block `expand_items` is about to rewrite, as `record_items`
 /// finds records.
@@ -598,7 +733,7 @@ let rec foreign_items cfg items =
 /// survives only as the Dream type it was translated into. Nothing in the
 /// compiler reads this either.
 let note_foreigns owner items l =
-    put :foreigns (foreigns l + list.map (fn f -> list.cons owner f)
+    Loader.set_foreigns (foreigns l + list.map (fn f -> list.cons owner f)
                                          (foreign_items (config_in l owner) items)) l;
 
 // --- loading -----------------------------------------------------------------
@@ -668,12 +803,12 @@ let rec load_named! l dotted at from_source =
                 let owner = nested_module containing parent;
                 let tried = load_package! containing dotted at from_source;
                 if nested != () {
-                    mark_visited dotted (put :by_name
+                    mark_visited dotted (Loader.set_by_name
                         (((by_name containing)).[dotted => nested]) containing)
                 }
                 else if owner != () {
                     // Resolution binds the final segment like a selective import.
-                    put :by_name (((by_name containing)).[parent => owner]) containing
+                    Loader.set_by_name (((by_name containing)).[parent => owner]) containing
                 }
                 else if list.nth 1 tried { list.head tried }
                 else {
@@ -703,14 +838,14 @@ let rec load_named! l dotted at from_source =
                             // way to reach the module it found.
                             let aliased = match find after name {
                                 () => after,
-                                i  => put :by_name (((by_name after)).[dotted => i]) after,
+                                i  => Loader.set_by_name (((by_name after)).[dotted => i]) after,
                             };
                             mark_visited dotted aliased
                         }
                     },
                     existing =>
                         mark_visited dotted
-                            (put :by_name (((by_name l)).[dotted => existing]) l),
+                            (Loader.set_by_name (((by_name l)).[dotted => existing]) l),
                 }
             },
         }
@@ -735,7 +870,7 @@ let rec load_package! l dotted at from_source =
             }
             else {
                 let seen = mark_visited dotted
-                    (put :namespaces (list.append (namespaces l) [dotted]) l);
+                    (Loader.set_namespaces (list.append (namespaces l) [dotted]) l);
                 [list.fold (fn acc m -> {
                     let full = dotted + "." + m;
                     // A module of the package that is already being loaded is
@@ -781,7 +916,7 @@ let rec hoist_mod! l parent source m =
             else {
                 // Its own `when`s and nested `mod`s, resolved the way a file's
                 // are: by the time this is recorded it is an ordinary module.
-                let kept = expand_items (config_in l full) items;
+                let kept = expand_items full (config_in l full) items;
                 // Consed and reversed once, as `load_items!` does its own.
                 let nested = list.fold (fn acc item ->
                     match item {
@@ -807,8 +942,8 @@ let rec hoist_mod! l parent source m =
                 let recorded = leave followed;
                 let index = module_count recorded;
                 [mark_visited full
-                    (put :by_name (((by_name recorded)).[full => index])
-                        (add_module (loaded full full source inner_items) recorded)),
+                    (Loader.set_by_name (((by_name recorded)).[full => index])
+                        (add_module (Module.set_within parent (loaded full full source inner_items)) recorded)),
                  stand_in]
             }
         },
@@ -839,7 +974,7 @@ let rec hoist_mod! l parent source m =
 // `:crashed`, and the file is parsed again in place, where the raise happens
 // exactly as it did before there was a child.
 
-let fetched l = l.[:prefetch else (%{})];
+let fetched l = Loader.prefetch l;
 
 /// The text a file would be loaded with: the editor's buffer, then the disk.
 let text_of! l file = match ((overlay l)).[file else ()] {
@@ -918,9 +1053,9 @@ let rec prefetch! l deps = match deps {
         let text = if wanted { text_of! l file } else { () };
         if text == () { prefetch! l rest }
         else {
-            let child = if l.[:share_parses else false] { parse_shared! (l.[:units else ()]) text }
+            let child = if Loader.share_parses l { parse_shared! (Loader.units l) text }
                         else { parse_elsewhere! text };
-            let marked = put :prefetch ((fetched l).[file => [text, child]]) l;
+            let marked = Loader.set_prefetch ((fetched l).[file => [text, child]]) l;
             prefetch! (prefetch! marked (scanned_imports text)) rest
         }
     },
@@ -940,7 +1075,7 @@ let rec load_text! l0 text display name file = {
     // For batch loads, every file this one leads to starts parsing first.
     // For the root that is the whole program; for any other file it is almost
     // always nothing, because the root's scan already reached it.
-    let l = if l0.[:prefetch_enabled else true] { prefetch! l0 (scanned_imports text) }
+    let l = if Loader.prefetch_enabled l0 { prefetch! l0 (scanned_imports text) }
             else { l0 };
     let source = file_count l;
     let read = add_file (diag.source display text) l;
@@ -972,7 +1107,7 @@ let load_items! l source parsed display name file text = {
         [:error, message, span] => complain span message source l,
         [:ok, items, sites] => {
             // Resolve `when` before anything else looks at the module.
-            let kept = expand_items (config_in l name) items;
+            let kept = expand_items name (config_in l name) items;
             let noted = note_reads name items
                             (note_foreigns name items (note_records name items (note_expanding source sites l)));
 
@@ -1012,8 +1147,8 @@ let load_items! l source parsed display name file text = {
             let recorded = leave followed;
             let index = module_count recorded;
             mark_visited name
-                (put :by_path (((by_path recorded)).[(path.absolute! file) => index])
-                    (put :by_name (((by_name recorded)).[name => index])
+                (Loader.set_by_path (((by_path recorded)).[(path.absolute! file) => index])
+                    (Loader.set_by_name (((by_name recorded)).[name => index])
                         (add_module (loaded name file source items_out) recorded)))
         },
     }
@@ -1080,7 +1215,7 @@ let unknown_scopes l =
     list.fold (fn acc k ->
         complain_note ast.no_span ("-D " + k + ":.. sets an option of `" + k + "`, and no package is called that")
                       ("known packages: " + comma_list (package.names (packages l))) 0 acc)
-              l (l.[:unknown_scopes else []]);
+              l (Loader.unknown_scopes l);
 
 /// The session form of `load_root!`: a loader that already holds a program is
 /// given the root file again, and the root is re-read in place at the *same*
@@ -1102,11 +1237,11 @@ let reload_root! l file test_mode = {
         root_index => {
             let last = module_count l - 1;
             let unmounted =
-                put :module_count last
-                    (put :modules (map.remove last (module_map l))
-                        (put :by_name (map.remove name (by_name l))
-                            (put :by_path (map.remove (path.absolute! file) (by_path l))
-                                (put :visited (map.remove name (visited l)) l))));
+                Loader.set_module_count last
+                    (Loader.set_modules (map.remove last (module_map l))
+                        (Loader.set_by_name (map.remove name (by_name l))
+                            (Loader.set_by_path (map.remove (path.absolute! file) (by_path l))
+                                (Loader.set_visited (map.remove name (visited l)) l))));
             load_file! unmounted file name ast.no_span 0
         }
     }
@@ -1168,7 +1303,7 @@ let load! file roots cfg test_mode =
 /// compile is also the one that may be handed a unit cache.
 let load_shared! : :string -> [:string] -> :any -> :bool -> unit.Cache -> Loader;
 let load_shared! file roots cfg test_mode units =
-    load_root! (put :units units (put :share_parses true
+    load_root! (Loader.set_units units (Loader.set_share_parses true
                     (loader (package.discover! file roots) cfg (default_search_paths! file roots) [])))
                file test_mode;
 
@@ -1192,15 +1327,17 @@ let load_overlaid! file roots cfg test_mode ov =
 /// retains completed processes for later joins; launching them on every editor
 /// request accumulates whole parser heaps even when no text has changed.
 let load_overlaid_cached! file roots cfg test_mode ov parsed =
-    load_root! (put :prefetch_enabled false
+    load_root! (Loader.set_prefetch_enabled false
                    (with_parsed parsed (with_overlay ov (loader (package.discover! file roots) cfg
                                                                 (default_search_paths! file roots) []))))
                file test_mode;
 
+let failed : Loader -> :bool;
 let failed l = diag.error_count (diags l) > 0;
 
 /// Every module that was loaded, in the order a later pass must walk them:
 /// dependencies before what uses them.
+let names : Loader -> [:string];
 let names l = list.map (fn m -> module_name m) (modules l);
 
 // --- tests -------------------------------------------------------------------
@@ -1229,9 +1366,9 @@ when test {
 
         // --- `when`, resolved as the file is read ---
         test.case "a when that holds contributes its items"
-            $( test.eq! 1 (list.length (expand_items on (items_of "when test { let a = 1; }"))) ),
+            $( test.eq! 1 (list.length (expand_items "" on (items_of "when test { let a = 1; }"))) ),
         test.case "a when that does not hold contributes nothing"
-            $( test.eq! [] (expand_items config.empty (items_of "when test { let a = 1; }")) ),
+            $( test.eq! [] (expand_items "" config.empty (items_of "when test { let a = 1; }")) ),
 
         // What `expand_items` is about to destroy, kept for a tool. Nothing in
         // the compiler reads it -- see `note_records`.
@@ -1262,7 +1399,7 @@ when test {
                                   (foreign_items on (items_of
                                       "foreign m {\n    resource R = r_free\n    f! : :void -> R\n}"))) ),
         test.case "a nested when is resolved too"
-            $( test.eq! 1 (list.length (expand_items on
+            $( test.eq! 1 (list.length (expand_items "" on
                    (items_of "when test { when test { let a = 1; } }"))) ),
         test.case "an import inside a when that is off is never followed"
             $( test.eq! [] (natives (from_text! config.empty "when test { import std.io; }")) ),
@@ -1324,12 +1461,12 @@ when test {
         // --- the module a name is already loaded under ---
         test.case "a sibling is found by walking outwards"
             $( test.eq! ["a.shape", ()]
-                        { let l = put :by_name (((%{})).["a.shape" => 0])
+                        { let l = Loader.set_by_name (((%{})).["a.shape" => 0])
                                       (bare on);
                           [local_module l "a.circle" "shape", local_module l "a.circle" "nope"] } ),
         test.case "a module's own submodule is found first"
             $( test.eq! "a.b.util"
-                        (local_module (put :by_name (((((%{})).["a.b.util" => 0])).["a.util" => 1]) (bare on))
+                        (local_module (Loader.set_by_name (((((%{})).["a.b.util" => 0])).["a.util" => 1]) (bare on))
                                       "a.b" "util") ),
 
         // --- the stack that catches a cycle ---

@@ -73,7 +73,7 @@ check() {
     return
   fi
   # A warning is a failure here: the examples are meant to be clean.
-  if grep -q '^warning:' "$WORK/$name.compile"; then
+  if grep -qE '(^|: )warning:' "$WORK/$name.compile"; then
     echo "FAIL $name (compiled with warnings)"
     sed 's/^/    /' "$WORK/$name.compile"
     fail=$((fail + 1))

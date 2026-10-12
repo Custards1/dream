@@ -39,33 +39,51 @@ import dreams.diag;
 import dreams.emit;
 import dreams.ir;
 import dreams.lower;
+import dreams.typecheck;
 
 // --- a datum, as nodes -------------------------------------------------------
 //
 // `typecheck` spells a compile-time value as a *datum* -- scalars as
-// themselves, atoms, lists, arrays and maps tagged -- and this is that
+// themselves, and the rest a `typecheck.Datum` -- and this is that
 // spelling lowered to the constants that rebuild it, the way `lower.emit_const`
 // does for a `comp`'s answer.
 
-let rec emit_datum d l = match type_of d {
-    :integer => lower.const_int d l,
-    :string => lower.const_str d l,
-    :float => lower.const_float d l,
-    :char => lower.const_char d l,
-    :bool => lower.const_bool d l,
-    :unit => lower.emit_leaf :unit l,
-    :list => match d {
-        [:atom_d, n] => lower.const_atom n l,
-        [:list_d, xs] => datum_seq :make_list xs (list.length xs) l,
-        [:array_d, xs] => datum_seq :make_array xs (list.length xs) l,
-        [:map_d, ps] => datum_seq :make_map (list.concat ps) (list.length ps) l,
+let emit_datum : :any -> lower.Lowering -> [lower.Lowering, :integer];
+let rec emit_datum d l = match d {
+    typecheck.Datum.atom(n) => lower.const_atom n l,
+    typecheck.Datum.list(xs) => datum_seq :make_list xs (list.length xs) l,
+    typecheck.Datum.array(xs) => datum_seq :make_array xs (list.length xs) l,
+    typecheck.Datum.map(ps) => datum_seq :make_map (list.concat ps) (list.length ps) l,
+    typecheck.Datum.record(id, variant, xs) => {
+        let [program, index] = ir.intern_atom id (lower.prog l);
+        datum_record xs (if variant { index + ir.record_variant } else { index })
+                     (lower.set_prog program l)
+    },
+    _ => match type_of d {
+        :integer => lower.const_int d l,
+        :string => lower.const_str d l,
+        :float => lower.const_float d l,
+        :char => lower.const_char d l,
+        :bool => lower.const_bool d l,
         _ => lower.emit_leaf :unit l,
     },
-    _ => lower.emit_leaf :unit l,
+};
+
+/// A record, as `datum_seq` makes a sequence: the fields, then the
+/// `record_make` naming them, its id the atom `c` says.
+let datum_record : [:any] -> :integer -> lower.Lowering -> [lower.Lowering, :integer];
+let datum_record items c l = {
+    let done = list.fold (fn acc x -> {
+        let got = emit_datum x (list.head acc);
+        [list.head got, list.cons (list.nth 1 got) (list.nth 1 acc)]
+    }) [l, []] items;
+    let placed = lower.kids (list.reverse (list.nth 1 done)) (list.head done);
+    lower.emit (ir.node :record_make (list.nth 1 placed) (list.length items) c) (list.head placed)
 };
 
 /// The children first, then the run of kids naming them, then the node: a
 /// kid is an index, so it can only be written once what it names exists.
+let datum_seq : :atom -> [:any] -> :integer -> lower.Lowering -> [lower.Lowering, :integer];
 let datum_seq op items n l = {
     let done = list.fold (fn acc x -> {
         let got = emit_datum x (list.head acc);
@@ -77,12 +95,13 @@ let datum_seq op items n l = {
 
 // --- a formula, as nodes -------------------------------------------------------
 
-/// `[lowering, node]` for one contract's formula. `:all` and `:any` become the
+/// `[lowering, node]` for one contract's formula. `all` and `any` become the
 /// short-circuiting `and` and `or`, so a union stops at the first member that
 /// accepts and a list stops at the first element that does not -- the same
 /// order `types.accepts` asks in.
+let emit_formula : (typecheck.Formula | :bool) -> lower.Lowering -> [lower.Lowering, :integer];
 let rec emit_formula f l = match f {
-    [:pred, gi, path, d] => {
+    typecheck.Formula.pred(gi, path, d) => {
         let g = lower.emit (ir.node :global gi ir.no_node ir.no_node) l;
         let reached = list.fold (fn acc key -> {
             let k = emit_datum key (list.head acc);
@@ -91,11 +110,12 @@ let rec emit_formula f l = match f {
         let arg = emit_datum d (list.head reached);
         lower.emit_apply (list.nth 1 reached) [list.nth 1 arg] (list.head arg)
     },
-    [:all, fs] => chain :and fs l,
-    [:any, fs] => chain :or fs l,
+    typecheck.Formula.all(fs) => chain :and fs l,
+    typecheck.Formula.any(fs) => chain :or fs l,
     b => lower.const_bool (b == true) l,
 };
 
+let chain : :atom -> [(typecheck.Formula | :bool)] -> lower.Lowering -> [lower.Lowering, :integer];
 let rec chain op fs l = match fs {
     [one] => emit_formula one l,
     [first, ..rest] => {
@@ -109,6 +129,7 @@ let rec chain op fs l = match fs {
 /// One element of the batch: the formula, or `:raised` if asking it raised.
 /// Slot 0 is where a `try` puts what it caught, which is why the function this
 /// goes into has one slot and no parameters.
+let emit_guarded : (typecheck.Formula | :bool) -> lower.Lowering -> [lower.Lowering, :integer];
 let emit_guarded f l = {
     let body = emit_formula f l;
     let handler = lower.const_atom "raised" (list.head body);
@@ -120,9 +141,10 @@ let emit_guarded f l = {
 /// The linked program with one function more, answering every contract's
 /// formula as a list, and that function's index: `[bytes, function]`. The
 /// bytes hold only what that function can reach.
+let batch_image : lower.Lowering -> [typecheck.Contract] -> [:string, :integer];
 let batch_image low contracts = {
     let done = list.fold (fn acc c -> {
-        let got = emit_guarded (list.nth 5 c) (list.head acc);
+        let got = emit_guarded (typecheck.Contract.formula c) (list.head acc);
         [list.head got, list.cons (list.nth 1 got) (list.nth 1 acc)]
     }) [low, []] contracts;
     let placed = lower.kids (list.reverse (list.nth 1 done)) (list.head done);
@@ -134,7 +156,7 @@ let batch_image low contracts = {
     let record = %{ :name => name, :body => list.nth 1 made, :arity => 0, :flags => 0,
                     :slots => 1, :n_captures => 0, :captures_off => 0,
                     :line => 0, :col => 0, :source => 0 };
-    let p2 = p1.[:funcs => (ir.funcs p1 + [record])];
+    let p2 = ir.Program.set_funcs (ir.funcs p1 + [record]) p1;
     // Cut down to what the predicates can reach, as a `comp`'s image is: the
     // rest of the program is a stub each, and was most of what a batch cost --
     // 0.4 s of a self-compile to serialize an arena for a handful of calls.
@@ -142,28 +164,35 @@ let batch_image low contracts = {
 };
 
 /// What a contract that did not hold says, at the place its value was written.
+let broken : typecheck.Contract -> :any -> :map;
 let broken c answer = {
-    let [_, source, span, wanted, shown, _] = c;
     let why = match answer {
         :raised => "checking it raised at compile time",
         false => "a `where` it has to satisfy answered `false` at compile time",
         other => "a `where` it has to satisfy answered `" + to_string other
                  + "` at compile time, which is not `true`",
     };
-    diag.in_source source (diag.error span (wanted + ", but `" + shown + "` is not: " + why))
+    diag.in_source (typecheck.Contract.source c)
+                   (diag.error (typecheck.Contract.span c)
+                               (typecheck.Contract.wanted c + ", but `" + typecheck.Contract.shown c + "` is not: " + why))
 };
+
+/// The batch raised as a whole, as what its `try!` caught: a record of this
+/// module's own, so that no list of answers a predicate gave is taken for one.
+struct Unrun { why }
 
 /// Every contract that does not hold, as diagnostics. Impure because asking is
 /// running the program, and a program with no contracts runs nothing.
+let settle! : lower.Lowering -> [typecheck.Contract] -> [:map];
 let settle! low contracts =
     if list.is_empty contracts { [] }
     else {
         let [bytes, _] = batch_image low contracts;
-        let answers = try! { vm.eval_image! bytes } catch e { [:unrun, e] };
+        let answers = try! { vm.eval_image! bytes } catch e { Unrun.make e };
         match answers {
-            [:unrun, why] => {
-                let [_, source, span, _, _, _] = list.head contracts;
-                [diag.in_source source (diag.error span
+            Unrun(why) => {
+                let first = list.head contracts;
+                [diag.in_source (typecheck.Contract.source first) (diag.error (typecheck.Contract.span first)
                     ("the compile-time contracts of this program could not be checked: " + to_string why))]
             },
             _ => list.concat (list.map (fn ca -> match list.nth 1 ca {

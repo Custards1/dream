@@ -23,7 +23,7 @@ let file path = build.Input.file path;
 
 /// Test whether a command argument is a file or generated artifact input.
 let is_input : :any -> :bool;
-let is_input a = match a { [:file, _] => true, [:artifact, _, _] => true, _ => false };
+let is_input a = match a { build.Input.file(_) => true, build.Input.artifact(_, _) => true, _ => false };
 
 /// The arguments as a key reads them: where each input goes rather than what
 /// it is. The inputs are in the key already, by content, and a path would
@@ -94,7 +94,7 @@ when test {
         test.case "inputs and outputs come from the argument list"
             $( {
                 let s = step "t" "cc" [file "a.c", "-o", out "a.o"];
-                test.eq! [[[:file, "a.c"]], ["a.o"]] [build.Step.inputs s, build.Step.outputs s]
+                test.eq! [[build.Input.file "a.c"], ["a.o"]] [build.Step.inputs s, build.Step.outputs s]
             } ),
         test.case "an artifact is an input"
             $( {

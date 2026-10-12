@@ -68,6 +68,11 @@ enum class Op : uint8_t {
     // The bitwise operators, on integers: `a & b`, `a | b`, `a ^ b`, `~a`,
     // `a << b` and `a >> b`. Binary but for `BitNot`, whose operand is `a`.
     BitAnd = 75, BitOr = 76, BitXor = 77, BitNot = 78, Shl = 79, Shr = 80,
+    // A value of a declared record or union (`RecordObj`): `a` is a kids
+    // offset and `b` a count, the fields, each in a lazy position as an array
+    // literal's items are; `c` is the atom naming what it is, with
+    // `RECORD_MAKE_VARIANT` set when that is a union's variant.
+    RecordMake = 81,
     Count
 };
 
@@ -94,6 +99,11 @@ inline constexpr bool is_primitive(Op op) { return primitive_builtin(op) != 0xFF
 const char* op_name(Op op);
 
 inline constexpr uint32_t NO_NODE = 0xFFFFFFFFu;
+
+/// `RecordMake`'s `c`: the top bit says the id names a variant, the rest is
+/// the atom's index.
+inline constexpr uint32_t RECORD_MAKE_VARIANT = 0x80000000u;
+inline constexpr uint32_t RECORD_MAKE_ATOM = 0x7FFFFFFFu;
 
 // Node flags, set by the compiler.
 inline constexpr uint8_t F_STRICT = 1 << 0;
@@ -224,6 +234,10 @@ public:
         int64_t key = 0;
     };
     const Accessor& accessor(uint32_t function) const { return accessors_[function]; }
+    /// Bit `i` set when the function forces parameter `i` before anything
+    /// else it does (`strict_args_` in image.cpp), so a caller may evaluate
+    /// that argument instead of suspending it.
+    uint32_t strict_args(uint32_t function) const { return strict_args_[function]; }
     Image() = default;
     ~Image();
     Image(const Image&) = delete;
@@ -320,6 +334,7 @@ public:
 
 private:
     std::vector<Accessor> accessors_;
+    std::vector<uint32_t> strict_args_;
     /// `TYPE`, spread out by function so that asking costs an index. Empty
     /// when the image has no such section, which is every image built from a
     /// program without a float in a signature.

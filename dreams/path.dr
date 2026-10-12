@@ -24,17 +24,20 @@ import std.macros;
 import std.os;
 import std.str;
 
+let separator : :string;
 let separator = "/";
 
 // --- taking a path apart ----------------------------------------------------
 
 // Windows accepts both separators. Keep the platform query at runtime so
 // this compiler image can be copied unchanged between operating systems.
+let slashes : :string -> :string;
 let slashes p = match os.platform () {
     :windows => str.join_str "/" (str.split "\\" p),
     _ => p,
 };
 
+let root : :string -> :string;
 let root p = match os.platform () {
     :windows => match p {
         _ if str.byte_length p >= 3 && str.slice 1 2 p == ":/" => str.slice 0 3 p,
@@ -51,7 +54,9 @@ let root p = match os.platform () {
     _ => if str.starts_with "/" p { "/" } else { "" },
 };
 
+let is_absolute : :string -> :bool;
 let is_absolute p = not (str.is_empty (root (slashes p)));
+let home! : :unit -> :string | :unit;
 let home! () = match os.env! "HOME" {
     () => os.env! "USERPROFILE",
     home => home,
@@ -60,8 +65,10 @@ let home! () = match os.env! "HOME" {
 /// The non-empty pieces between the slashes. A leading slash is not one of
 /// them -- `is_absolute` is what remembers it -- so `of_segments` needs telling
 /// which kind of path it is rebuilding.
+let segments : :string -> [:string];
 let segments p = list.filter (fn s -> not (str.is_empty s)) (str.split separator (slashes p));
 
+let of_segments : :bool -> [:string] -> :string;
 let of_segments absolute segs = {
     let body = str.join_str separator segs;
     if absolute { separator + body } else { body }
@@ -69,6 +76,7 @@ let of_segments absolute segs = {
 
 /// Everything before the last `/`, or `"."` when there is none. The parent of
 /// `"/"` is itself, which is what stops a walk up the tree.
+let dirname : :string -> :string;
 let dirname original = {
     let p = slashes original;
     let anchor = root p;
@@ -81,6 +89,7 @@ let dirname original = {
     }
 };
 
+let basename : :string -> :string;
 let basename p = {
     let segs = segments p;
     if list.is_empty segs { p } else { list.last segs }
@@ -89,6 +98,7 @@ let basename p = {
 /// `a/b` -- but an empty or `.` side is dropped rather than kept, because these
 /// paths are read by people in diagnostics and `././main.dr` helps nobody. An
 /// absolute right-hand side wins outright: it is already anchored.
+let join : :string -> :string -> :string;
 let join original_a original_b = {
     let a = slashes original_a;
     let b = slashes original_b;
@@ -103,6 +113,7 @@ let join original_a original_b = {
     }
 };
 
+let join_all : :string -> [:string] -> :string;
 let rec join_all base parts =
     match parts {
         [] => base,
@@ -128,6 +139,7 @@ let rec last_index needle p from best = match str.find_from from needle p {
 /// The dot's offset, or `-1`. A leading dot names a hidden file rather than
 /// starting an extension, so `.gitignore` has none, and a dot before the last
 /// separator is in a directory's name, not the file's.
+let dot_at : :string -> :integer;
 let dot_at original = {
     let p = slashes original;
     let base_at = last_index separator p 0 (0 - 1) + 1;
@@ -136,20 +148,24 @@ let dot_at original = {
 };
 
 /// The extension without its dot, or `""`.
+let extension : :string -> :string;
 let extension p = {
     let at = dot_at p;
     if at < 0 { "" } else { str.slice (at + 1) (str.byte_length p - at - 1) p }
 };
 
 /// The path with any extension removed.
+let drop_extension : :string -> :string;
 let drop_extension p = {
     let at = dot_at p;
     if at < 0 { p } else { str.slice 0 at p }
 };
 
+let with_extension : :string -> :string -> :string;
 let with_extension ext p = drop_extension p + "." + ext;
 
 /// The file name with neither directory nor extension: `a/b/list.dr` -> `list`.
+let stem : :string -> :string;
 let stem p = drop_extension (basename p);
 
 // --- normalising ------------------------------------------------------------
@@ -157,6 +173,7 @@ let stem p = drop_extension (basename p);
 /// Fold away `.` and `..`. A `..` that would climb above the root of an
 /// absolute path is dropped, since `/..` is `/`; one at the front of a relative
 /// path is kept, since there is nothing yet to cancel it against.
+let normalize : :string -> :string;
 let normalize original = {
     let p = slashes original;
     let anchor = root p;
@@ -191,6 +208,7 @@ let normalize original = {
 /// which looks like a missing library rather than a quoted tilde. `~other`,
 /// which names another user's home, is left alone: guessing where that is would
 /// be worse than not answering.
+let expand_home! : :string -> :string;
 let expand_home! p =
     if p == "~" || str.starts_with "~/" p {
         expand macros.if_some home (home! ())
@@ -199,14 +217,17 @@ let expand_home! p =
     else { p };
 
 /// The path as an absolute, normalised one: what stands in for `canonicalize`.
+let absolute! : :string -> :string;
 let absolute! p = normalize (if is_absolute p { p } else { join (os.cwd! ()) p });
 
 /// Do these two paths name the same file? Compared after normalising, so
 /// `./a/../b/list.dr` and `b/list.dr` are one file rather than two.
+let same_file! : :string -> :string -> :bool;
 let same_file! a b = absolute! a == absolute! b;
 
 /// `p` with `base` removed from the front, or `()` when `p` is not inside
 /// `base`. Compared segment by segment, so `/a/bc` is not inside `/a/b`.
+let strip_prefix_segs : [:string] -> [:string] -> [:string] | :unit;
 let rec strip_prefix_segs base_segs segs =
     match [base_segs, segs] {
         [[], rest] => rest,
@@ -216,6 +237,7 @@ let rec strip_prefix_segs base_segs segs =
 
 /// The segments of `p` relative to directory `base`, or `()`. Both are
 /// normalised first, so this answers about files rather than about spelling.
+let relative_to : :string -> :string -> [:string] | :unit;
 let relative_to base p = {
     let b = normalize base;
     let f = normalize p;
@@ -225,18 +247,21 @@ let relative_to base p = {
 
 // --- asking the file system -------------------------------------------------
 
+let is_file! : :string -> :bool;
 let is_file! p = io.exists! p && not (io.is_dir! p);
 
 /// The whole file as one string, or `()` when it cannot be opened. A missing
 /// file is an answer rather than a failure: the loader asks about files that
 /// may not be there, and an import that resolves to nothing is reported in
 /// terms of what was searched, not as a raised error.
-let rec read_chunks! h acc = {
+let read_chunks! : :any -> [:string] -> :string;
+let rec read_chunks! h !acc = {
     let chunk = io.read! h 65536;
     if len chunk == 0 { str.join_str "" (list.reverse acc) }
     else { read_chunks! h (list.cons chunk acc) }
 };
 
+let read_file! : :string -> :string | :unit;
 let read_file! p = {
     let opened = try! { io.open! p :read } catch e { () };
     match opened {
@@ -252,6 +277,7 @@ let read_file! p = {
 /// A directory's entries as full paths, or `[]` when it cannot be read. A
 /// missing directory is an ordinary answer here -- a search path that does not
 /// exist simply holds nothing.
+let list_dir! : :string -> [:string];
 let list_dir! p = {
     let names = try! { os.list_dir! p } catch e { [] };
     list.map (fn n -> join p n) names

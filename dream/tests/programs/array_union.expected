@@ -1,5 +1,6 @@
-#[:clamp, 1, 2]
+Op.clamp(1, 2)
 10
-[:array_push, :list_push, :array_scale, :array_shift, :other, :other]
-[true, false, true]
+[:op_push, :list_push, :array_push, :op_add, :atom_add, :other]
+[true, false, true, false]
+[:Op, true, false, true]
 1000000

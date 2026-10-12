@@ -11,6 +11,7 @@ const char* obj_type_name(ObjType t) {
         case ObjType::Tensor: return "tensor";
         case ObjType::Cons: return "list";
         case ObjType::Array: return "array";
+        case ObjType::Record: return "record";
         case ObjType::Map: return "map";
         // Never user-visible: a leaf only ever hangs off a branch.
         case ObjType::MapLeaf: return "map entry";
@@ -50,6 +51,7 @@ dream_type surface_type(Value v) {
         case ObjType::Tensor: return DREAM_TYPE_TENSOR;
         case ObjType::Cons: return DREAM_TYPE_LIST;
         case ObjType::Array: return DREAM_TYPE_ARRAY;
+        case ObjType::Record: return DREAM_TYPE_RECORD;
         case ObjType::Map: return DREAM_TYPE_MAP;
         case ObjType::MapLeaf: return DREAM_TYPE_MAP;
         case ObjType::Module: return DREAM_TYPE_MODULE;

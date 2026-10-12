@@ -14,6 +14,7 @@
 
 #include "builtins.hpp"
 #include "image.hpp"
+#include <thread>
 #include "interp.hpp"
 #include "jit.hpp"
 #include "os.hpp"
@@ -28,7 +29,7 @@ namespace {
 const char* USAGE =
     "dream -- the Dream virtual machine\n"
     "\n"
-    "usage: dream <image> [options]\n"
+    "usage: dream [options] <image> [arguments for the program]\n"
     "\n"
     "<image> is a file, that file with `.dream` added, or either of those in\n"
     "the installation -- so `dream mind` runs ./mind.dream, or the installed one.\n"
@@ -45,6 +46,17 @@ const char* USAGE =
     "      --no-jit         stay in the interpreter\n"
     "      --any-target     run an image built for another platform anyway\n"
     "      --jit-threshold <n>  calls before a function is compiled\n"
+    "      --precompile         compile every function the JIT can take, on every\n"
+    "                           core, before running anything\n"
+    "      --jit-threads <n>    threads compiling in the background (default 2;\n"
+    "                           also $DREAM_JIT_THREADS)\n"
+    "      --max-heap <size>    heap one process may grow to before it fails with\n"
+    "                           :out_of_memory: bytes, or 512M, 2G (default 1G;\n"
+    "                           also $DREAM_MAX_HEAP)\n"
+    "      --max-depth <n>      continuations one process may have pending\n"
+    "                           (default 4M; also $DREAM_MAX_DEPTH)\n"
+    "      --max-stack <n>      values one process may hold on its stack\n"
+    "                           (default 4M; also $DREAM_MAX_STACK)\n"
     "      --dump-jit <fn>  print the LLVM IR generated for a function, named or\n"
     "                       given as #N, its index -- generated functions share names\n"
     "      --mindv2         mindv2 path override\n"
@@ -179,6 +191,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
         case Op::MakeList:
         case Op::MakeArray:
         case Op::MakeMap:
+        case Op::RecordMake:
             std::snprintf(buf, sizeof buf, "/%u", n.b);
             out += buf;
             break;
@@ -222,6 +235,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
         case Op::Block:
         case Op::MakeList:
         case Op::MakeArray:
+        case Op::RecordMake:
             dump_kids(img, n.a, n.b, depth + 1, out);
             break;
         case Op::MakeMap:
@@ -348,6 +362,9 @@ int dream_main(int argc, char** argv) {
     bool dump = false, stats = false, use_jit = true, any_target = false;
     size_t profile_top = 0;
     uint32_t jit_threshold = 0;
+    unsigned jit_threads = 0;
+    bool precompile = false;
+    size_t max_heap = 0, max_depth = 0, max_stack = 0;
 
     std::vector<std::string> program_args;
     bool past_image = false;
@@ -417,6 +434,19 @@ int dream_main(int argc, char** argv) {
             return 0;
         } else if (a == "--jit-threshold") {
             jit_threshold = uint32_t(std::stoul(next("--jit-threshold")));
+        } else if (a == "--precompile") {
+            precompile = true;
+        } else if (a == "--jit-threads") {
+            jit_threads = unsigned(std::stoul(next("--jit-threads")));
+        } else if (a == "--max-heap" || a == "--max-depth" || a == "--max-stack") {
+            const std::string text = next(a.c_str());
+            size_t n = 0;
+            if (!parse_size(text.c_str(), &n)) {
+                std::fprintf(stderr, "dream: %s takes a size such as 4096, 512M or 2G, not `%s`\n",
+                             a.c_str(), text.c_str());
+                return 2;
+            }
+            (a == "--max-heap" ? max_heap : a == "--max-depth" ? max_depth : max_stack) = n;
         } else if (a == "--dump-jit") {
             dump_jit_fn = next("--dump-jit");
         } else if (!a.empty() && a[0] == '-') {
@@ -433,6 +463,9 @@ int dream_main(int argc, char** argv) {
             program_args.push_back(a);
         }
     }
+
+    // Before anything runs: the limits are read once, by the first process.
+    override_limits(max_depth, max_stack, max_heap);
 
     if (path.empty()) {
         std::fputs(USAGE, stderr);
@@ -481,6 +514,7 @@ int dream_main(int argc, char** argv) {
     std::unique_ptr<Jit> jit_owner;
     if (use_jit && Jit::available()) jit_owner = std::make_unique<Jit>(rt);
     if (jit_threshold && jit_owner) jit_owner->set_threshold(jit_threshold);
+    if (jit_threads && jit_owner) jit_owner->set_threads(jit_threads);
 
     if (!dump_jit_fn.empty()) {
         if (!Jit::available()) {
@@ -523,6 +557,17 @@ int dream_main(int argc, char** argv) {
         return 1;
     }
 
+    if (precompile && jit_owner) {
+        // Every core: nothing else is running yet. `--jit-threads` still
+        // says otherwise when given.
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const Jit::Precompiled pc = jit_owner->precompile(jit_threads ? jit_threads : hw);
+        if (stats) {
+            std::fprintf(stderr, "; precompiled %u functions (%u refused) in %.0f ms on %u threads\n",
+                         pc.compiled, pc.refused, pc.ms, jit_threads ? jit_threads : hw);
+        }
+    }
+
     uint32_t func = NO_NODE;
     if (!entry.empty()) {
         int g = rt.image().find_global(entry.c_str());
@@ -554,8 +599,15 @@ int dream_main(int argc, char** argv) {
 
     bool clean = sched.run(root);
 
+    // The root's failure first: a run ends when the root fails, with the
+    // processes it started possibly still alive (`Scheduler::finish`), and
+    // that is not a deadlock.
     int status = 0;
-    if (!clean) {
+    if (root->failed) {
+        std::string text = describe_failure(*root, root->exit_value);
+        std::fprintf(stderr, "dream: uncaught error: %s\n", text.c_str());
+        status = 1;
+    } else if (!clean) {
         std::fprintf(stderr,
                      "dream: deadlock -- every process is waiting for a message that "
                      "cannot arrive\n");
@@ -563,10 +615,6 @@ int dream_main(int argc, char** argv) {
         // that a program is stuck, which the person running it already knew;
         // the useful part is which process is parked on which thing.
         sched.dump("deadlock");
-        status = 1;
-    } else if (root->failed) {
-        std::string text = describe_failure(*root, root->exit_value);
-        std::fprintf(stderr, "dream: uncaught error: %s\n", text.c_str());
         status = 1;
     }
 

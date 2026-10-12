@@ -81,14 +81,14 @@ let block style name prefix mode size epoch kind linkname = {
 /// The type flag of an item: a file, a link, a directory.
 let kind_of : Item -> :string;
 let kind_of i = match i {
-    [:file, _, _, _, _] => "0",
-    [:text, _, _, _] => "0",
-    [:dir, _, _] => "5",
-    [:link, _, _] => "2",
+    item.Item.file(_, _, _, _) => "0",
+    item.Item.text(_, _, _) => "0",
+    item.Item.dir(_, _) => "5",
+    item.Item.link(_, _) => "2",
 };
 
 let link_target : Item -> :string;
-let link_target i = match i { [:link, _, t] => t, _ => "" };
+let link_target i = match i { item.Item.link(_, t) => t, _ => "" };
 
 /// `data` and the zeros that fill out its last block.
 let padded : :string -> :string;
@@ -96,7 +96,7 @@ let padded data = data + bytes.zeros (bytes.padding 512 (str.byte_length data));
 
 /// The bytes an item's header says follow it.
 let body_size : Item -> :integer;
-let body_size i = match i { [:link, _, _] => 0, [:dir, _, _] => 0, _ => item.size i };
+let body_size i = match i { item.Item.link(_, _) => 0, item.Item.dir(_, _) => 0, _ => item.size i };
 
 /// A pax header: a record first when the name, the link or the size does not
 /// fit ustar, then the ustar header, carrying a cut-down name for a reader
@@ -156,11 +156,11 @@ let member! : :any -> Style -> :integer -> Item -> :unit;
 let member! h style epoch i = {
     out.write! h (header style epoch i)
     match i {
-        [:file, _, _, source, size] => {
+        item.Item.file(_, _, source, size) => {
             out.copy_exactly! h source size
             out.write! h (bytes.zeros (bytes.padding 512 size))
         },
-        [:text, _, _, data] => out.write! h (padded data),
+        item.Item.text(_, _, data) => out.write! h (padded data),
         _ => (),
     }
 };

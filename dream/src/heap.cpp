@@ -516,6 +516,14 @@ Value Heap::make_array(uint32_t len) {
     return from_obj(o);
 }
 
+Value Heap::make_record(uint32_t tag, uint32_t len) {
+    auto* o = static_cast<RecordObj*>(
+        alloc(ObjType::Record, 8 + size_t(len) * sizeof(Value)));
+    o->len = len;
+    o->tag = tag;
+    return from_obj(o);
+}
+
 Value Heap::make_map(uint32_t) {
     return make_map_branch(0);
 }
@@ -1257,6 +1265,12 @@ inline void for_each_slot(Obj* o, ObjType type, F&& visit) {
             for (uint32_t i = 0; i < a->len; ++i) visit(&a->items()[i]);
             break;
         }
+        case ObjType::Record: {
+            // The id is an atom, an immediate, so the fields are all of it.
+            auto* r = static_cast<RecordObj*>(o);
+            for (uint32_t i = 0; i < r->len; ++i) visit(&r->items()[i]);
+            break;
+        }
         case ObjType::Map: {
             auto* m = static_cast<MapObj*>(o);
             uint32_t n = map_bit_count(m->bitmap);
@@ -1702,9 +1716,22 @@ void Heap::pin_conservative(bool full) {
     // each block is walked once however many words point into it. A nursery
     // block is one run of objects with no index, so finding the object an
     // address is inside is a walk from the block's start.
+    //
+    // Most words are not candidates at all, and saying so costs two compares
+    // rather than a binary search: a fixnum or any other immediate has a tag
+    // bit set, an object is eight-byte aligned, and a return address or a
+    // pointer into the stack is usually outside every block. On a precompiled
+    // self-compile, where almost every collection runs under compiled code,
+    // the search was most of this function and this function was 8% of the
+    // run.
+    if (ranges.empty()) return;
+    const uintptr_t lowest = ranges.front().lo;
+    uintptr_t highest = 0;
+    for (const Range& r : ranges) highest = std::max(highest, r.hi);
     std::vector<std::pair<size_t, uintptr_t>> hits;
     for (const uintptr_t* w = cons_lo_; w < cons_hi_; ++w) {
         const uintptr_t a = *w;
+        if ((a & 7) != 0 || a < lowest || a >= highest) continue;
         auto it = std::upper_bound(ranges.begin(), ranges.end(), a,
                                    [](uintptr_t key, const Range& r) { return key < r.lo; });
         if (it == ranges.begin()) continue;
@@ -2696,6 +2723,21 @@ struct VerifyWalk {
                     for (uint32_t i = 0; i < a->len; ++i) push(a->items()[i], v);
                     break;
                 }
+                case ObjType::Record: {
+                    auto* r = static_cast<RecordObj*>(o);
+                    size_t need = sizeof(Obj) + 8 + size_t(r->len) * sizeof(Value);
+                    if (r->bytes < need) {
+                        problem("record at " + addr(o) + " says it holds " +
+                                std::to_string(r->len) + " fields but is too small");
+                        return;
+                    }
+                    if (!is_atom(r->id())) {
+                        problem("record at " + addr(o) + " has an id that is not an atom");
+                        return;
+                    }
+                    for (uint32_t i = 0; i < r->len; ++i) push(r->items()[i], v);
+                    break;
+                }
                 case ObjType::MapLeaf: {
                     auto* l = static_cast<MapLeafObj*>(o);
                     if (l->bytes < sizeof(Obj) + 8 + 3 * sizeof(Value)) {
@@ -3097,6 +3139,17 @@ Value copy_object(Dest& dest, Value v, CopySeen& seen) {
                 static_cast<ArrayObj*>(as_obj(arr))->items()[i] = item;
             }
             return arr;
+        }
+        case ObjType::Record: {
+            // The id is an atom of this runtime, as the copy is.
+            auto* src = static_cast<RecordObj*>(o);
+            Value rec = dest.make_record(src->tag, src->len);
+            seen.emplace(v, rec);
+            for (uint32_t i = 0; i < src->len; ++i) {
+                Value item = copy_value(dest, static_cast<RecordObj*>(o)->items()[i], seen);
+                static_cast<RecordObj*>(as_obj(rec))->items()[i] = item;
+            }
+            return rec;
         }
         case ObjType::Map: {
             // Copied branch for branch, so the shape -- and with it the
@@ -3538,6 +3591,14 @@ Value SharedArea::make_cons(Value head, Value tail) {
 Value SharedArea::make_array(uint32_t len) {
     auto* o = static_cast<ArrayObj*>(alloc(ObjType::Array, 8 + size_t(len) * sizeof(Value)));
     o->len = len;
+    return from_obj(o);
+}
+
+Value SharedArea::make_record(uint32_t tag, uint32_t len) {
+    auto* o = static_cast<RecordObj*>(
+        alloc(ObjType::Record, 8 + size_t(len) * sizeof(Value)));
+    o->len = len;
+    o->tag = tag;
     return from_obj(o);
 }
 

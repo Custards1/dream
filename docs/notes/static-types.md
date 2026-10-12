@@ -3,9 +3,10 @@
 The checker, compile-time contracts, and what a signature buys the JIT. Moved out of `CLAUDE.md` on 2026-09-25; the prose is as it was, so a date or number in it is as of when it was written.
 
 `let add : :integer -> :integer -> :integer` is checked at compile time, by
-[dreams/typecheck.dr](../../dreams/typecheck.dr), which runs after `scope.resolve!`
-and before lowering and produces diagnostics and nothing else. Its header is
-the design; what is here is what to know before changing it.
+[dreams/typecheck.dr](../../dreams/typecheck.dr), which runs after resolution, lowering and compile-time evaluation. Its analysis
+contains diagnostics, contracts to run, and parameter hints for the JIT; it
+does not rewrite the IR. Its header is the design; what is here is what to know
+before changing it.
 
 **The three rules, and every false positive so far broke one of them.**
 Unannotated code is never an error (a name with no signature is `:any`); only
@@ -256,3 +257,308 @@ a type says what a value is, not whether it is evaluated. The escape-time loop
 written `if i >= limit { i } else if zr * zr + zi * zi > 4.0 ..` compiles
 nothing typed or untyped, because `zr` is not forced on the first path; the
 same loop with the two tests swapped is compiled either way.
+
+## Records are values of their own
+
+2026-10-09. A `group` was a list, a `struct` an array, and a union's variant
+the tagged list `[:circle, r]` (or the atom `:empty`). That was what made
+records cheap to add and what kept them from being types: `type_of` on a
+`User` said `:array`, the checker typed a read by position as `:any` because
+a list here was as often a record as a sequence, a union's tag could collide
+with any list that began with the same atom, and "is this a `User`?" could
+only mean "is it the right length". Now a `group`, a `struct` and every
+union variant is a value of its own; a `mapping` is still a map, because it is
+built from map literals and decoded JSON and is meant to be.
+
+**What a record is.** `RecordObj` in dream/src/value.hpp: the fields, lazy,
+by position, and one atom naming the declaration, qualified by its module --
+`app.Point` for a record, `app.Shape.circle` for a variant, which a flag bit
+marks. `type_of` answers the declaration's own name (`:Point`, `:Shape`),
+printing writes `Point(3, 4)` and `Shape.empty`, equality wants the same atom
+and equal fields, `compare` orders by the atom and then the fields, a variant
+with no fields is a map key by value as an atom is, and `send!`, `std.wire`
+(`WIRE_RECORD`), `std.image` and a `comp`'s answer carry one across as itself.
+Fields are read and changed through `get` and `set`, the opcodes an array's
+are, so the accessors `syntax.record` generates did not change at all -- and
+the interpreter's accessor shortcut, `thunk_for`'s read and the JIT's
+`dream_rt_peek` take a record where they took an array.
+
+**How one is made.** A constructor's body is `_record_of :app.Point false
+#[x, y]` (`syntax.constructed`), an ordinary call of a primitive, so that the
+resolver, the checker, the linter, the formatter and the language server see
+nothing new. Lowering recognises that exact shape and emits one `record_make`
+node instead (`lower.lower_apply`; opcode 81, `a`/`b` the fields, `c` the
+atom with the variant bit on top). The resolver files every constructor in
+its wrapper table as `[[:record, id, variant, rewritable, fields], plan,
+arity]` (`scope.constructor_of`), which does two things: a saturated call of a
+constructor whose fields are lazy and passed through in order becomes the
+`record_make` itself, as a call of an accessor becomes its `get`; and every
+part of a parallel build -- lowering's and the checker's -- can find the id of
+a constructor another part walked, because the wrapper table is the one thing
+each part is given whole. A constructor with a strict field is filed but not
+rewritten: its frame is what forces the field. Merging parts renumbers
+`record_make`'s atom as it renumbers `const_atom`'s (`opt.remap_field`, and
+`ShareArenas::rebuild_node` in C++); that was missed the first time, and a
+`Point` built in one part came out named after whatever atom had that index
+in another.
+
+**How one is matched.** `Shape.circle(r)`, `Shape.empty`, `Point(x, y)` --
+`[:record_p, ctor, fields, span]`, the constructor an expression resolved
+like any other, `Point(..)` meaning `Point.make`. It lowers to `_record_is id
+subject` and then each field by `_match_at`, as an array pattern's elements
+are; a name that is no constructor or the wrong number of fields is a compile
+error. A dotted name in a pattern was an error before, so any `a.b` there can
+begin one; a capitalised name needs its `(` to touch it, so `let f P (x)` still
+reads as it did. A member is compiled inside the declaration's own module,
+where `Shape` names nothing, so the loader reads `Shape.circle` in a member as
+the local `circle` (`syntax.own_names`) -- otherwise a member would have had
+to write a bare `empty`, which in a pattern binds anything.
+
+**What the checker does with it.** A description `[:constructed, id, [field
+types]]` becomes `[:nominal, id, [t, ..]]`, and `sub` holds it exactly: the
+same id and fields that fit, and nothing else -- not a tuple, not an array.
+A `group` and a `struct` now always give their generated functions
+signatures, so `Point.x [1, 2]` is an error where it used to be allowed. A
+constructor pattern binds its fields to that variant's field types, covers
+what that constructor made for exhaustiveness, and an arm whose pattern no
+value of a declared type could fit -- `[:circle, r]` against a `Shape` -- is
+reported, which is what found most of the migration below.
+`resolved_pattern` asks the resolution once per arm for every constructor in
+a pattern, because `covers`, `may_match` and `arm_misses` have only a pattern
+and a type to go on.
+
+**The bootstrap took two reseeds.** The seed has to parse whatever the
+compiler imports, and has to know a primitive by name before `std` may call
+it. So the first seed carried the VM's record kind, the four primitives and
+the lowering, with nothing in the compiler's own reach using any of it; the
+second could then parse constructor patterns in `std`. Four records the
+compiler used to describe *syntax* -- `Span`, `RecordField`, `RecordMember`
+and the IR's `Node` -- became plain list functions instead: syntax is lists
+that macros build and read, and an IR node is read by position in C++ by
+`vm.share_arenas`.
+
+**What moving to it found.** Most of the migration was mechanical -- `std.build`'s
+`Input`/`Op`/`Goal`, `std.build.cc`'s `Setting`, the PostgreSQL driver's
+`Message`, `ship`'s `Item`, `sleep`'s `Stage` -- but three things were not:
+
+- `std.sql.pg.db`'s `forced set p !v = set p v` was called with the value
+  second and the record third, so `!v` forced the record and left the list it
+  existed to force suspended. Invisible while a `Pending` was a list too; a
+  type error the day it was a record.
+- `random.split` hashed `to_string rng`, so its streams depended on how a
+  generator printed. It hashes the text it always hashed, spelled out, so a
+  recorded seed still replays.
+- `std.build`'s key encoding fell through to `"?" + type` for anything it did
+  not know, which would have given every record of a type the same key. A
+  record now encodes as its id and its fields.
+
+**What it costs.** A record was first one word bigger than the array it
+replaced, for its id. A loop that makes a `struct`, reads both fields and sets one,
+three million times, same VM, compiled by the compiler before and after:
+
+| | before (array) | after (record) | |
+|---|---|---|---|
+| interpreted | 884 ms | 778 ms | -12% |
+| compiled | 106-114 ms | 111-113 ms | level |
+| reductions | 7.07 M | 4.08 M | -42% |
+| bytes allocated | 203 MB | 248 MB | +22% |
+
+The interpreter is faster because a constructor call is now the
+`record_make` itself rather than a call of `make`. The compiled loop was 20%
+*slower* until `Emitter::get` learnt to read a record's field inline, as it
+read an array's; before that every accessor in compiled code was a call of
+`dream_rt_get`.
+
+The id was an atom, and an atom is an immediate, so it cost the collector
+nothing -- but it was a whole `Value` in the header, beside a length and a
+flags word that between them filled a word of their own. An atom's index is
+32 bits, and so is a `RecordMake` node's operand, which already packed the
+variant bit in its top bit. So the header now holds the index and that bit in
+the word beside the length (`RecordObj::tag`), and is an array's sixteen
+bytes; the fields start where an array's items do, and `Emitter::get` reads
+both the same way. A loop making a two-field `struct`, setting it and reading
+both fields three million times, one image, the VM before and after:
+
+| | 24-byte header | 16-byte header | |
+|---|---|---|---|
+| bytes allocated | 577 MB | 529 MB | -8% (records: -20%) |
+| interpreted | 941-960 ms | 955-969 ms | level |
+| compiled | 303-319 ms | 303-315 ms | level |
+
+Records are 36% of what that loop allocates; frames are most of the rest.
+
+**What a type is worth at run time.** A `match` over a union used to ask
+`_record_is` of each arm in turn. A constructor arm now has a key, its
+record's id, and `switch_atom` keys a record by that id (`arm_key` in
+dreams/lower.dr; `take_switch`, `Emitter::switch_node`), so the match jumps
+to the variant's arm -- the id is in the header, so reading it forces
+nothing. Wiring that up found that the JIT had never compiled a function
+whose `match` had a switch, of any kind: a switch's targets are suffixes of
+the arm chain, so the analysis met each arm's `bind` twice and refused it as
+"one slot, one binding", silently. The same node met again is the same
+binding now. Writing every target out is quadratic in the arms, though --
+`std.types.check` took nine seconds to compile -- so past `kMaxSwitchCode`
+nodes the emitter writes the chain once, from its head, which is the program
+the switch was a shortcut through. A 4-variant match, two million times:
+
+| | before | after |
+|---|---|---|
+| union, interpreted | 1348 ms | 1158 ms |
+| union, compiled | 151 ms | 152 ms |
+| tagged list, interpreted | 2005 ms | 1976 ms |
+| tagged list, compiled | 1641 ms | 251 ms |
+
+**The compiler, written for it.** On the same input and VM, the compiler
+built with records was 1.2% more reductions than the one before them -- the
+checker checking the signatures records generate, spread thinly over `sub`,
+`infer` and `solve`. Two changes more than paid that back (CPU seconds of a
+self-compile, all threads, median of six): `typecheck.sub`, the checker's
+hottest function, matches on its parameters in four steps instead of on a
+pair it built every call (12.69 s to 12.53 s; its reductions 9.9 M to 3.9 M);
+and an IR node is `ir.Node`, a record, instead of a five-cell list
+(12.53 s to 12.31 s, a fifth fewer bytes per node and one load per field).
+Three other rewrites measured worse and were not kept: `list.fold` walks in
+`lint` turned into hand-written recursions, a pre-walk in
+`lazy_accumulators` that `uses`' early exit already made pointless, and
+`skip_trivia` split to match on a parameter, which moved its reductions
+without removing any.
+
+The checker's own types went the same way: `[:fn, a, b]`, `[:named, ..]` and
+the rest of the tagged lists are the variants of `typecheck.Ty`, with the
+kinds (`:integer`, `:any`, ..) left as atoms, which a switch keys as cheaply.
+Every `match` the checker makes on a type now jumps by the record's id, and a
+field is one load. `fn` and `union` are keywords, so those two are `arrow`
+and `one_of`. The `types` stage went from 382-392 ms to 327-329 ms, the
+whole self-compile from 12.32 s to 12.10 s of CPU (median of eight,
+interleaved), and from 255.8 M reductions to 248.9 M, with allocation level.
+Ninety-four programs -- every example, every program under
+dream/tests/programs, `std`'s tests, `mind`, `lucid` and `ship` -- report the
+same diagnostics and compile to the same bytes under both checkers.
+
+**A record sees the file it is written in.** A record is a `mod` once the
+loader has read it, and a module sees only what it declares and imports --
+so a field could not be typed with the record declared beside it, and a
+member could not call the function declared above it. It cannot import its
+parent instead, since the parent imports it and imports form a tree. So a
+module hoisted out of another (`modules.module_within`) is lent its parent's
+names once every module has declared its own (`scope.inherit_enclosing`):
+each global, import and selected member the parent binds and it does not, as
+import entries, so they resolve to the parent's globals and the unit cache's
+key -- the declared state -- already covers them. It may read the parent's
+`priv` names too. This holds for every `mod`, not only records.
+
+A field's type is also a *value*: it goes into the record's description.
+Inside one, `Period` named a module, which is not a value, so a record could
+not be named in any description -- `type Ps = [Period]` failed as well. A
+record now leaves a global of its own name in its parent holding its
+description, as a union always did (`syntax.record_parts`). A signature never
+reads it, since `type_ref` asks for the module first.
+
+**Walkers that switch on `type_of`.** A record's `type_of` is its own name,
+so `match type_of v { :list => .., :array => .., _ => .. }` sends it to the
+default arm. Every such switch in the repository was read for whether a
+record could reach it. Four could, and did the wrong thing quietly:
+
+- `std.codec`'s walk (JSON and TOML) wrote a record as the string it prints
+  as. It writes what the record was built as before: a `struct`'s fields, a
+  variant's `[tag, ..fields]` or its tag (`codec.as_written`). `std.wire` is
+  native and keeps records as records.
+- `std.ml.tree` took a record for a leaf, so parameters held in a `struct`
+  were never trained. A record is a branch again, rebuilt as the record it was.
+- `std.build.run`'s `forced!` forced only a record's outside, so its fields
+  crossed into a step's process suspended, frames and all. Arrays had the same
+  gap.
+- `std.log` writes a record as its printed form, which is the readable choice
+  and was left as it is.
+
+**What is not done.** `mapping` is still nominal only in name.
+
+
+**The compiler using its own types (2026-10-11).** Private tagged lists became
+unions through scope, fusion, lowering, units, checking, contracts, the REPL,
+sessions and formatting. The constructors name the alternatives, and the
+patterns say which alternative a branch handles. Two changes also remove a
+collision with user values: a failed `comp` is `lower.Raised`, and a contract
+batch that could not run is `contract.Unrun`. Returning `[:comp_error, ..]`
+from a `comp`, or `:unrun` from a predicate, cannot impersonate either failure.
+
+Three bugs surfaced during that work. Source files had two representations,
+a record and a three-element list; they are always `diag.Source` now. A `()`
+arm could be called unreachable by the checker even when its subject admitted
+unit. Tuple patterns also failed to narrow the types of their components.
+The checker now handles both cases.
+
+The first signature pass covered AST, paths, configuration, lexing, fusion,
+syntax, packages and modules. The next added 257 signatures across scope,
+lowering, IR, optimization, checking, expansion, parsing, contracts and
+compilation; the new state declarations added their own accessor signatures
+and another 23 explicit signatures. Syntax aliases describe lists, not a new
+AST representation. Values whose contents genuinely vary remain `:any`;
+optional lookups that would spread unit checks into callers that already know
+the lookup succeeded remain unsigned. Neither choice invents a type guarantee.
+
+The state maps are mappings: loader and module, package set, program and image,
+then `scope.State`, `scope.Resolution`, `scope.Function`, `lower.Lowering` and
+`opt.State`. Their constructors, accessors and writes name the declared fields.
+The scope state and resolver remain maps, because `unit` stores the difference
+between a base and a completed walk and reapplies it on a cache hit. Function
+metadata remains a map too; its recursion flag is named `recursive`, since
+`rec` cannot name a declared field. The mapping declaration still provides no
+runtime nominal identity.
+
+The parser's unary and statement dispatch now match the next token rather
+than repeating an `if` chain. Finite accumulators in the parser, IR table
+flattening, optimizer child rebuilding, checker masks and arrow collection,
+scope collection and macro-hole walking are strict at loop entry. Only the
+spine is forced for lists. Conditional chains that ask different questions
+remain; changing every conditional into a guarded match is not required for
+these representation changes.
+
+Four protocols deliberately stay lists: macro-visible AST nodes,
+`[:ok, ..]`/`[:error, ..]` results used by `let?`, `[:crashed, e]` wrapping only
+compiler-owned values, and placeholder holes within syntax trees.
+
+Measured against `02ca40d`, the commit before the union migration, with the
+same `build-dream/bin/dream` VM, each compiler building its own source,
+interleaved, six runs each (medians):
+
+| | Before | After |
+|---|---:|---:|
+| Self-compile wall | 2.34 s | 2.70 s |
+| Self-compile CPU (all threads) | 11.96 s | 12.98 s |
+| `types` stage (`--time`) | 338 ms | 435 ms |
+
+**That is the input growing, not the compiler slowing.** The two compilers
+are building different programs: the source after the migration is 112
+modules and 4,456 functions against 78 and 3,972 -- every union, record and
+mapping is a module of generated constructors, accessors and signatures --
+and it carries several hundred more signatures to hold calls to. On inputs
+that did not change the new compiler is the faster one: `ship` 449 ms
+against 483, all of `std` with its tests 3.55 s against 3.67, the `types`
+stage 9-12% less on both. Stripping the 742 written signatures from a copy of
+the compiler's source takes the `types` stage from about 600 ms to 389 ms,
+which was the bound on what checking them could cost.
+
+Two things in the checker were spending most of that, and are fixed (the
+first measurement of this migration was +22% wall and +77% `types`):
+
+- **A named type was evaluated again at every unfolding.** `unfold` read a
+  declaration's description and built its type each time a comparison looked
+  inside a name -- a `mapping` of thirty fields, rebuilt for every argument
+  held to one. A type with no parameters unfolds to the same thing everywhere,
+  so `unfolded_table` builds each once with the checker. `types` 600 ms to
+  445.
+- **`refined_table` walked every named type eight times.** It stops at the
+  first depth that finds nothing new, which is exact: a depth is decided by
+  the table below it (see the comment there).
+
+And a call to a function with no type variables -- most of a program's own
+signatures -- no longer solves, substitutes or admits `()` per argument
+(`typed_apply`'s `generic`); that one is CPU rather than wall, since the check
+runs in parts.
+
+Where the `types` stage's wall time goes now, on a self-compile: building and
+sharing the checker 120 ms (sequential: evaluating every signature 31,
+finding unknown names 20, the rest small), the first check 155, the second
+check against inferred answers 140, ordering the results 23. Before the
+migration the same four were 70, 120, 120 and 21.
