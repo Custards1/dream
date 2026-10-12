@@ -91,6 +91,152 @@ inline void push_retry(Process& p, ContKind k, uint32_t a, uint32_t b, uint32_t 
 }
 
 // ---------------------------------------------------------------------------
+// The effect check
+// ---------------------------------------------------------------------------
+//
+// Compiled code that parks is retried from the top (`EnterRetry`), and the
+// whole of what makes that sound is two assumptions: a compiled body performs
+// no effect itself, and anything it forces that does is memoised, so the
+// second attempt reads what the first one did instead of doing it again. Both
+// have had gaps. The last one was a lambda built inside an impure function and
+// handed to a pure peer: the retry built it afresh, and `mind docs` started the
+// same example compiles until it was killed -- which looked like a hang in a
+// tool, a long way from the JIT.
+//
+// `DREAM_JIT_CHECK_EFFECTS=1` turns the next such gap into an abort at the
+// place it happens. Every call of a `!` native made while compiled code is on
+// the machine stack is fingerprinted -- its name and a shallow hash of its
+// arguments -- and kept against each compiled call it is under; when one of
+// those calls parks, its retry carries the fingerprints of every attempt so
+// far, and the same effect turning up again under the retry stops the VM,
+// naming the function and the native. The legitimate repeat -- the native that
+// parked, called again when it is woken -- is never under the retry: it is in
+// the suspended work the retry is spliced beneath (`push_retry`), which runs
+// after the compiled frames are gone.
+//
+// Off, all of this is one load of a static and a branch per compiled call and
+// per native call.
+
+static bool effect_check_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("DREAM_JIT_CHECK_EFFECTS");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+namespace {
+
+uint64_t mix(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
+/// What an argument looks like without forcing anything: the bytes of a
+/// string, an immediate as it is, the first few elements of a list, and for
+/// anything else its type. A thunk is not looked into -- a retry makes a new
+/// one each time, so its address would make every call look different, and
+/// forcing it here would itself be an effect.
+uint64_t shallow_hash(Value v, int depth) {
+    v = resolve(v);
+    if (!is_ptr(v)) return mix(1, uint64_t(v));
+    Bytes b;
+    if (string_bytes(v, &b)) {
+        uint64_t h = 2;
+        for (uint64_t i = 0; i < b.len; ++i) h = mix(h, uint8_t(b.data[i]));
+        return h;
+    }
+    Obj* o = as_obj(v);
+    uint64_t h = mix(3, uint64_t(o->type));
+    if (o->type == ObjType::Cons && depth > 0) {
+        int n = 0;
+        for (Value c = v; n < 16; ++n) {
+            c = resolve(c);
+            if (!is_obj(c, ObjType::Cons)) break;
+            auto* cell = static_cast<ConsObj*>(as_obj(c));
+            h = mix(h, shallow_hash(cell->head, depth - 1));
+            c = cell->tail;
+        }
+    }
+    return h;
+}
+
+std::string native_name(Value callee) {
+    if (is_builtin(callee)) return builtin_def(uint32_t(imm_payload(callee))).name;
+    Bytes b;
+    auto* nat = static_cast<NativeObj*>(as_obj(callee));
+    if (string_bytes(nat->name, &b)) return std::string(b.data, b.len);
+    return "<native>";
+}
+
+std::string function_name(Process& p, uint32_t fi) {
+    StringRef name = img_of(p).str(img_of(p).func(fi).name);
+    return std::string(name.data, name.len);
+}
+
+/// A `!` native is about to be called under compiled code: abort if an
+/// earlier attempt of a retried compiled call made the same call, and
+/// otherwise record it against every compiled call it is under.
+void effect_check_native(Process& p, Value callee, const Value* args, uint32_t argc) {
+    const std::string name = native_name(callee);
+    if (name.empty() || name.back() != '!') return;
+    uint64_t fp = 4;
+    for (char ch : name) fp = mix(fp, uint8_t(ch));
+    for (uint32_t i = 0; i < argc; ++i) fp = mix(fp, shallow_hash(args[i], 2));
+    for (const auto& a : p.effect_attempts) {
+        for (uint64_t seen : a.prior) {
+            if (seen != fp) continue;
+            std::fprintf(stderr,
+                "dream: DREAM_JIT_CHECK_EFFECTS: `%s` was called again by a retry of "
+                "compiled `%s` (function #%u).\n"
+                "  A compiled call that parks is run again from the top, and this effect\n"
+                "  had already happened in an earlier attempt: something under the call\n"
+                "  is not memoised. `DREAM_JIT_DENY=%s` keeps the function out of the JIT.\n",
+                name.c_str(), function_name(p, a.func).c_str(), a.func,
+                function_name(p, a.func).c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    p.effect_attempts.back().seen.push_back(fp);
+}
+
+/// Entering a compiled call: its record, and what earlier attempts did if
+/// this is a retry.
+void effect_check_enter(Process& p, uint32_t fi) {
+    Process::EffectAttempt a{fi, {}, {}};
+    if (p.effect_retry_id) {
+        auto it = p.effect_retries.find(p.effect_retry_id);
+        if (it != p.effect_retries.end()) {
+            a.prior = std::move(it->second);
+            p.effect_retries.erase(it);
+        }
+        p.effect_retry_id = 0;
+    }
+    p.effect_attempts.push_back(std::move(a));
+}
+
+/// Leaving one. An inner call's effects are the outer's too, so they move up;
+/// a call that parked keeps every attempt's for its retry, under the id it
+/// answers.
+uint32_t effect_check_leave(Process& p, bool parked) {
+    Process::EffectAttempt a = std::move(p.effect_attempts.back());
+    p.effect_attempts.pop_back();
+    if (!p.effect_attempts.empty()) {
+        auto& up = p.effect_attempts.back().seen;
+        up.insert(up.end(), a.seen.begin(), a.seen.end());
+    }
+    if (!parked) return 0;
+    a.prior.insert(a.prior.end(), a.seen.begin(), a.seen.end());
+    const uint32_t id = p.effect_retry_next++;
+    if (p.effect_retry_next == 0) p.effect_retry_next = 1;
+    p.effect_retries[id] = std::move(a.prior);
+    return id;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // Numbers
 // ---------------------------------------------------------------------------
 
@@ -390,8 +536,12 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             // ones, entered from forces under it, are inside that already.
             void* const outer_hi = p.jit_stack_hi;
             if (!outer_hi) p.jit_stack_hi = p.loop_stack_hi;
+            const bool checking = effect_check_on();
+            if (checking) effect_check_enter(p, func_index);
             Value r = fn(&p, frame, &status);
             p.jit_stack_hi = outer_hi;
+            const uint32_t effect_retry =
+                checking ? effect_check_leave(p, p.park_requested) : 0;
             // Clamped, because a nested force underneath this call may have
             // re-armed the budget (`Process::slice_spent`), which leaves more
             // in it than there was to start with.
@@ -415,8 +565,8 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
             // once it has finished. Compiled bodies are pure, and forcing is
             // memoised, so the second run repeats no effect.
             if (p.park_requested) {
-                push_retry(p, ContKind::EnterRetry, func_index, uint32_t(stack_before), 0,
-                           frame);
+                push_retry(p, ContKind::EnterRetry, func_index, uint32_t(stack_before),
+                           effect_retry, frame);
                 return;  // the park left the mode at Return
             }
             if (status == JitOk) {
@@ -626,6 +776,7 @@ void resume_native(Process& p, Value callee, uint32_t base, uint32_t argc, uint3
     const bool pinned = !is_builtin(callee);
     Pin callee_pin(p, pinned ? callee : UNIT);
 
+    if (!p.effect_attempts.empty()) effect_check_native(p, callee, p.stack.data() + base, argc);
     NativeResult r = fn(p, callee, p.stack.data() + base, argc);
     if (pinned) callee = callee_pin.get();
 
@@ -2435,7 +2586,11 @@ void step_return(Process& p, size_t floor) {
             // anything above the recorded height is what the abandoned
             // compiled call left there (a native's arguments).
             p.stack.resize(c.b);
+            p.effect_retry_id = c.c;
             enter_function(p, c.a, img_of(p).func(c.a), c.v1);
+            // Not taken: the function has left the tier since it parked.
+            if (p.effect_retry_id) p.effect_retries.erase(p.effect_retry_id);
+            p.effect_retry_id = 0;
             return;
 
         case ContKind::BinRight: {

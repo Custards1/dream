@@ -203,6 +203,27 @@ private:
     int64_t next_ = 1;
 };
 
+/// The variables that switch on a VM's debugging -- tracing, synchronous or
+/// refused compiles, heap verification -- and are not passed to a child
+/// `exec!` starts. Each is about the VM it was set for; inherited, it made a
+/// whole tree of VMs slow and noisy where one was being looked at. Tuning
+/// (`DREAM_CORES`, `DREAM_NURSERY_MAX`, ..) and finding things
+/// (`DREAM_LIBRARY_PATH`, `MINDV2_PATH`) are still inherited.
+bool debug_variable(const std::string& name) {
+    static const char* const names[] = {
+        "DREAM_JIT_SYNC", "DREAM_JIT_WHY", "DREAM_JIT_TRACE", "DREAM_JIT_DENY",
+        "DREAM_JIT_AHEAD", "DREAM_JIT_CHECK_EFFECTS", "DREAM_PROBE_THUNK",
+        "DREAM_VERIFY_HEAP", "DREAM_GC_TRACE", "DREAM_IO_TRACE", "DREAM_STUCK_SECONDS",
+    };
+    for (const char* n : names) if (name == n) return true;
+    return false;
+}
+
+bool inherit_debug_variables() {
+    const char* v = std::getenv("DREAM_DEBUG_INHERIT");
+    return v && *v && std::strcmp(v, "0") != 0;
+}
+
 #ifdef _WIN32
 // Pipe reads live on helper threads, just as on POSIX. Only the explicitly
 // listed standard handles are inherited by the child.
@@ -270,7 +291,7 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     // `NAME=value` NUL-terminated, and one more NUL at the end. Names compare
     // without case, as Windows compares them.
     std::wstring block;
-    if (!job->env.empty()) {
+    if (!job->env.empty() || !inherit_debug_variables()) {
         auto upper_name = [](const std::wstring& kv) {
             std::wstring n = kv.substr(0, kv.find(L'=', 1));
             for (auto& c : n) c = towupper(c);
@@ -281,7 +302,9 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
         wchar_t* inherited = GetEnvironmentStringsW();
         for (wchar_t* e = inherited; e && *e; e += wcslen(e) + 1) {
             std::wstring entry(e);
-            bool replaced = false;
+            bool replaced = !inherit_debug_variables() &&
+                            debug_variable(std::string(upper_name(entry).begin(),
+                                                         upper_name(entry).end()));
             for (const std::wstring& kv : ours) {
                 if (upper_name(kv) == upper_name(entry)) { replaced = true; break; }
             }
@@ -424,22 +447,26 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
     // mean what it means in a shell.
     // This VM's environment with the job's variables laid over it: a name the
     // job sets is dropped from what is inherited, and the job's value added.
+    //
+    // And without the VM's debugging switches (`debug_variable`), which are
+    // about *this* VM: `DREAM_JIT_SYNC=1 mind docs` made every compiler mind
+    // started compile synchronously, and its examples reported timeouts that
+    // were not there. A job that names one passes it on, and
+    // `DREAM_DEBUG_INHERIT=1` passes them all.
     std::vector<char*> envp;
-    if (!job->env.empty()) {
-        auto name_of = [](const std::string& kv) { return kv.substr(0, kv.find('=')); };
-        for (char** e = environ; *e; ++e) {
-            std::string entry(*e);
-            bool replaced = false;
-            for (const std::string& kv : job->env) {
-                if (name_of(kv) == name_of(entry)) { replaced = true; break; }
-            }
-            if (!replaced) envp.push_back(*e);
+    auto name_of = [](const std::string& kv) { return kv.substr(0, kv.find('=')); };
+    const bool inherit_debug = inherit_debug_variables();
+    for (char** e = environ; *e; ++e) {
+        std::string entry(*e);
+        bool replaced = !inherit_debug && debug_variable(name_of(entry));
+        for (const std::string& kv : job->env) {
+            if (name_of(kv) == name_of(entry)) { replaced = true; break; }
         }
-        for (std::string& kv : job->env) envp.push_back(kv.data());
-        envp.push_back(nullptr);
+        if (!replaced) envp.push_back(*e);
     }
-    int rc = ::posix_spawnp(&child, args[0], &actions, nullptr, args.data(),
-                            job->env.empty() ? environ : envp.data());
+    for (std::string& kv : job->env) envp.push_back(kv.data());
+    envp.push_back(nullptr);
+    int rc = ::posix_spawnp(&child, args[0], &actions, nullptr, args.data(), envp.data());
     posix_spawn_file_actions_destroy(&actions);
     ::close(out_pipe[1]);
     ::close(err_pipe[1]);

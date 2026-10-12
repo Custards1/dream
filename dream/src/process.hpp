@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "heap.hpp"
@@ -266,6 +267,26 @@ public:
     /// the outer operation's retry must be spliced in, *below* them.
     bool force_blocked = false;
     size_t force_resume_at = 0;
+
+    /// `DREAM_JIT_CHECK_EFFECTS`: what each compiled call on this process's
+    /// machine stack has done that is an effect, innermost last, and what the
+    /// attempts before it did when it is a retry. A compiled call that parks
+    /// is run again from the top, which is only sound because compiled bodies
+    /// are pure and forcing is memoised; an effect seen twice across attempts
+    /// is the proof that one of those has a gap. Empty unless the check is on.
+    /// See `effect_check` in interp.cpp.
+    struct EffectAttempt {
+        uint32_t func;
+        std::vector<uint64_t> prior;
+        std::vector<uint64_t> seen;
+    };
+    std::vector<EffectAttempt> effect_attempts;
+    /// The attempts of a parked compiled call, carried by its `EnterRetry`
+    /// (in the continuation's `c`) until the retry runs.
+    std::unordered_map<uint32_t, std::vector<uint64_t>> effect_retries;
+    uint32_t effect_retry_next = 1;
+    /// Set by `EnterRetry` for the one `enter_function` it makes.
+    uint32_t effect_retry_id = 0;
 
     /// Whether a nested force may collect, and what it costs to say so.
     ///

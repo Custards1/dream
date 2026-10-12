@@ -83,6 +83,8 @@ VM options go **before** the image; everything after it belongs to the program.
 | `DREAM_JIT_SYNC` | compile on the calling thread rather than in the background |
 | `DREAM_JIT_TRACE` | print every compile, whether it was taken, and what it cost |
 | `DREAM_JIT_DENY` | keep these functions out of the JIT: names, or `#` and an index from the trace, comma-separated -- bisect a fault the interpreter does not have |
+| `DREAM_JIT_CHECK_EFFECTS` | abort, naming the function and the native, when a retried compiled call performs an effect an earlier attempt already performed -- a gap in the rule that compiled bodies are pure |
+| `DREAM_DEBUG_INHERIT` | pass the debugging variables above (`DREAM_JIT_*`, `DREAM_VERIFY_HEAP`, `DREAM_GC_TRACE`, `DREAM_IO_TRACE`, `DREAM_STUCK_SECONDS`, `DREAM_PROBE_THUNK`) to children `exec!` starts; by default they are dropped, as they describe this VM only |
 | `DREAM_TENSOR_THREADS`, `DREAM_OPENCL_LIB` | tensor parallelism, and which OpenCL to `dlopen` |
 
 ## Why the interpreter is a state machine
