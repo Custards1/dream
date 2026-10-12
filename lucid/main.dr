@@ -46,6 +46,7 @@ import dreams.package;
 
 import analysis;
 import background;
+import hints;
 import index as indexed;
 import complete;
 import pos;
@@ -156,7 +157,8 @@ let refresh! out s path = {
 let requested! : :map -> :map -> :string -> :map;
 let requested! s m path = {
     let job = snapshot s path;
-    send! s.[:worker] [:request, job, m]
+    let worker = if rpc.method m == "textDocument/inlayHint" { s.[:hints_worker] } else { s.[:worker] };
+    send! worker [:request, job, m]
     s.[:pending => ((s.[:pending else (%{})]).[rpc.id m => job])]
 };
 
@@ -365,10 +367,13 @@ let rec events! out !s = match recv! () {
             %{ "type" => 1, "message" => "Lucid background worker stopped: " + why })
         list.map (fn id -> rpc.write_message! out
             (rpc.error_response id (0 - 32803) why)) (map.keys (s.[:pending else (%{})])) |> strict!
-        let worker = background.start! (self! ());
+        let owner = self! ();
+        strict! owner
+        let worker = if process == s.[:hints_worker] { hints.start! owner } else { background.start! owner };
         strict! worker
         proc.monitor! worker
-        let next = refresh! out s.[:worker => worker].[:pending => (%{})] "worker restart";
+        let restarted = if process == s.[:hints_worker] { s.[:hints_worker => worker] } else { s.[:worker => worker] };
+        let next = refresh! out restarted.[:pending => (%{})] "worker restart";
         events! out next
     },
     [:eof] => 0,
@@ -380,10 +385,13 @@ let serve! inh out s = {
     strict! owner
     let reader = rpc.start_reader! inh owner;
     let worker = background.start! owner;
+    let hints_worker = hints.start! owner;
     strict! reader
     strict! worker
+    strict! hints_worker
     proc.monitor! worker
-    events! out s.[:worker => worker]
+    proc.monitor! hints_worker
+    events! out s.[:worker => worker].[:hints_worker => hints_worker]
 };
 
 // --- the command line --------------------------------------------------------------

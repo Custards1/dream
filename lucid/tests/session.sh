@@ -22,6 +22,10 @@ say_fail() { echo "FAIL: $*"; fail=1; }
 
 python3 lucid/tests/editor.py "$dream" "$image" || exit 1
 python3 lucid/tests/responsive.py "$dream" "$image" || exit 1
+python3 lucid/tests/hints.py "$dream" "$image" || exit 1
+
+"$dream" "$dreams" lucid/tests/declarations.dr -L mind -L . -o "$tmp/declarations.dream" || exit 1
+timeout 60 "$dream" "$tmp/declarations.dream" || exit 1
 
 # --- a workspace, and a buffer that disagrees with it -----------------------
 

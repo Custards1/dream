@@ -262,7 +262,7 @@ own `main.dr` blocked the next request for about 5.6 seconds. Loading the full
 graph took 1975 ms, macro expansion 231 ms, resolution 2215 ms and diagnostics
 1298 ms. Reusing an analysis after that pause did not address cold opens or edits.
 
-The server now has three persistent processes: an RPC reader, the request loop
+This change introduced three persistent processes: an RPC reader, the request loop
 that owns stdout, and a compiler worker. The worker owns its parse cache,
 coalesces pending checks by source path, and returns diagnostics, rename results
 and type hints. Revisions gate diagnostic publication and reject stale request
@@ -283,7 +283,7 @@ With the same VM, the recorded `analysis.inlay_hints` reference in the preceding
 repeated definitions take about 8–15 ms and hover about 5–12 ms. The live
 regression against the current Lucid source measured 285 ms cold, 7 ms cached
 and 85 ms after ten edits. Full diagnostics and the first type-hint request
-still take seconds on this graph; they run independently of navigation.
+still took seconds on this graph; they ran independently of navigation.
 
 `tests/responsive.py` opens the `lucid` package as the workspace, queues hints
 before navigation, verifies the exact cross-file definition, cancellation and
@@ -291,3 +291,40 @@ navigation through an edit burst. `tests/conversation.py` drives the existing
 recorded session one exchange at a time so asynchronous diagnostics and replies
 are checked before shutdown. The VS Code extension also searches parent Dream
 checkouts for the local server build when only a package folder is open.
+
+## Visible type hints and hover documentation (2026-10-12)
+
+Hints now have a fourth persistent process, with their own parse and result
+caches. A diagnostic batch cannot queue ahead of a hint request. The hint index
+resolves declarations intersecting the requested lines and their unsigned
+callees, loading only imports referenced by those declarations. Signed callees
+contribute their signatures without resolving their implementations. The hint
+pass remains `typecheck.hints`; unknown types are omitted rather than guessed.
+
+`declarations.dr` uses the compiler lexer and declaration parser, suspending
+ordinary named let implementations until resolution needs them. All parameter
+and implementation spans remain the compiler's; declaration ends conservatively
+include closing parentheses. The corpus regression forces the deferred bodies
+and compares the result with `parser.parse_module` across every stdlib, compiler
+and Lucid source. Macros in the current source still expand normally. Imported
+implementations containing unexpanded macros can contribute unknown types;
+the full diagnostic worker retains whole-program expansion and checking.
+
+Without a simultaneous Nix/C++ build, the RPC latency regression measured cold
+hints at 506 ms for 25 lines of `lucid/main.dr`, 731 ms for the whole file plus
+a signed `std.num.parse_int` probe, 641 ms for the hint implementation in
+`lucid/analysis.dr`, and 870 ms for `dreams/typecheck.dr`. Repeated requests took
+138, 288, 173 and 356 ms. `tests/hints.py` requires nonempty results within
+one second, verifies line ranges and the stdlib probe's actual inferred type.
+These measurements include a concurrently running diagnostic worker, but do
+not guarantee a fixed latency on every machine, document or CPU load. Running
+the regression during a Nix/C++ rebuild exceeded the target at 1.33 seconds.
+
+Hover appends adjacent documentation from the function's signature or
+implementation, including inherited definitions, preserving Markdown. Ordinary
+`//`, `///`, and block comments are supported. Blank lines separate file headers
+from declarations so unrelated comments are not attached.
+
+Nix flakes built from a Git checkout include tracked files only. New server
+modules must be added to Git before `nix profile add .` can compile them; local
+compiler builds alone do not verify that packaging boundary.

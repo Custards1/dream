@@ -76,6 +76,8 @@ def run(vm, image):
         assert hints not in order, 'navigation waited for whole-program hints'
         warm = definition()
         assert warm < .25, f'cached navigation took {warm:.3f}s'
+        hovered = receive(send('textDocument/hover', params, True))
+        assert 'The hints for this file between two lines' in hovered['result']['contents']['value'], hovered
         send('$/cancelRequest', dict(id=hints))
         assert receive(hints)['error']['code'] == -32800
         for revision in range(2, 12):

@@ -1,0 +1,45 @@
+// Force every suspended implementation and compare it with the compiler's
+// parser. Only the outer declaration end can differ: the outline includes a
+// closing parenthesis that the expression parser may leave outside its span.
+import std.console;
+import std.file;
+import std.list;
+import std.os;
+import std.str;
+import dreams.parser;
+import lucid.declarations;
+
+let normalized_decl : :any -> :any;
+let rec normalized_decl d = match d {
+    [:let, n, ps, body, recursive, sp] => [:let, n, ps, body, recursive, [list.head sp, 0]],
+    [:sig, n, t, sp] => [:sig, n, t, [list.head sp, 0]],
+    [:priv, d, sp] => [:priv, normalized_decl d, [list.head sp, 0]],
+    _ => d,
+};
+
+let normalized : :any -> :any;
+let normalized p = match p {
+    [:ok, ds, sites] => [:ok, list.map normalized_decl ds, sites],
+    _ => p,
+};
+
+let sources! : :string -> [:string];
+let sources! dir = list.map (fn p -> dir + "/" + p) (file.walk! dir);
+
+let main! = {
+    let paths = list.filter (fn p -> str.ends_with ".dr" p)
+        (sources! "mind/std" + sources! "dreams" + sources! "lucid");
+    let failed = list.filter (fn p -> {
+        let text = file.read! p;
+        match text {
+            () => true,
+            s => normalized (parser.parse_module s) != normalized (declarations.parse s),
+        }
+    }) paths;
+    strict! failed
+    if failed != [] {
+        console.error! ["declaration parser disagrees with compiler", failed]
+        os.exit! 1
+    }
+    console.print! ("deferred declarations match the compiler across " + to_string (len paths) + " sources")
+};

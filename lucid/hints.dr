@@ -1,0 +1,37 @@
+// Hints have their own persistent worker: a diagnostic batch cannot queue in
+// front of the visible lines. The index suspends imported implementations and
+// resolves only the visible declarations and their unsigned callees. Inference
+// remains the compiler's own pass; unknown types are simply not shown.
+import std.list;
+import std.map;
+import analysis;
+import index as indexed;
+import rpc;
+
+let serve! : :process -> :map -> :map -> :any;
+let rec serve! parent parsed cached = match recv! () {
+    [:request, job, m] => {
+        let range = (rpc.params m).["range" else (%{})];
+        let first = (range.["start" else (%{})]).["line" else 0];
+        let last = (range.["end" else (%{})]).["line" else 1000000000];
+        let key = [job.[:path], first, last];
+        let held = cached.[key else ()];
+        let [a, result] = match held {
+            [same, a, result] if same == job
+                && analysis.texts_current! job.[:path] job.[:roots] job.[:docs] a
+                && indexed.current! job.[:path] job.[:roots] job.[:docs] a.[:hint_wanted] a => [a, result],
+            _ => {
+                let a = indexed.hints! job.[:path] job.[:roots] job.[:docs] parsed first last;
+                [a, analysis.inlay_hints a first last]
+            },
+        };
+        strict! result
+        send! parent [:background_reply, job, rpc.id m, [:ok, result]]
+        let kept = if map.size cached >= 16 { %{} } else { cached };
+        serve! parent (map.merge parsed (analysis.parses a)) (kept.[key => [job, a, result]])
+    },
+    _ => serve! parent parsed cached,
+};
+
+let start! : :process -> :process;
+let start! !parent = spawn! $( serve! parent (%{}) (%{}) );

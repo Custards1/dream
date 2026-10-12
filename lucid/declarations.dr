@@ -1,0 +1,113 @@
+// Imported signatures do not need every implementation parsed first. Keep
+// the compiler's lexer and declaration parser, but suspend ordinary let bodies
+// until resolution actually asks for one. The original tokens and spans stay
+// attached, so forcing a body parses exactly the declaration the compiler sees.
+// Declaration spans conservatively include closing parentheses; every
+// parameter and implementation span is still the compiler's original span.
+import std.list;
+import std.str;
+import dreams.ast;
+import dreams.lexer;
+import dreams.parser;
+
+let depth : :atom -> :integer;
+let depth kind = match kind {
+    :lparen => 1,
+    :lbracket => 1,
+    :lbrace => 1,
+    :dollar_paren => 1,
+    :hash_bracket => 1,
+    :percent_brace => 1,
+    :rparen => 0 - 1,
+    :rbracket => 0 - 1,
+    :rbrace => 0 - 1,
+    _ => 0,
+};
+
+let chunk : [lexer.Token] -> [:any];
+let chunk tokens = {
+    let indent = lexer.col (list.head tokens);
+    let rec take rest !level !kept = match rest {
+        [] => [list.reverse kept, [], []],
+        [t, ..tail] => match lexer.kind t {
+            :semi if level == 0 => [list.reverse kept, tail, [t]],
+            _ if level == 0 && kept != [] && lexer.starts_line t && lexer.col t <= indent =>
+                [list.reverse kept, rest, [t]],
+            kind => take tail (level + depth kind) (list.cons t kept),
+        },
+    };
+    take tokens 0 []
+};
+
+let implementation : :any -> ast.Expr;
+let rec implementation item = match item {
+    [:let, _, _, body, _, _] => body,
+    [:sigged, _, d] => implementation d,
+    [:priv, d, _] => implementation d,
+    _ => ast.name_e "<unparsed>" ast.no_span,
+};
+
+let body : [lexer.Token] -> ast.Expr;
+let body tokens = match parser.parse_item (parser.at_statement parser.top tokens) tokens {
+    [:ok, item, _] => implementation item,
+    _ => ast.name_e "<unparsed>" ast.no_span,
+};
+
+let restored : :any -> [lexer.Token] -> :any;
+let rec restored item tokens = match item {
+    [:let, n, ps, _, recursive, sp] => ast.let_d n ps (body tokens) recursive sp,
+    [:sigged, sg, d] => [:sigged, sg, restored d tokens],
+    [:priv, d, sp] => [:priv, restored d tokens, sp],
+    _ => item,
+};
+
+let parse_item : [lexer.Token] -> [lexer.Token] -> [:any];
+let parse_item tokens terminal = {
+    let plain = parser.is_kw tokens "let" ||
+        (parser.is_kw tokens "priv" && parser.is_kw (list.tail tokens) "let");
+    let after = if parser.is_kw tokens "priv" { list.tail (list.tail tokens) } else { list.tail tokens };
+    let named = not (parser.starts_let_pattern (if parser.is_kw after "rec" { list.tail after } else { after }));
+    let rec header rest !level !kept = match rest {
+        [] => (),
+        [t, ..tail] => match lexer.kind t {
+            :eq if level == 0 => [list.reverse (list.cons t kept), tail],
+            kind => header tail (level + depth kind) (list.cons t kept),
+        },
+    };
+    let skimmed = if plain && named { header tokens 0 [] } else { () };
+    match skimmed {
+        [prefix, [first, .._]] => {
+            let start = lexer.span_start first;
+            let end = lexer.span_end (list.last tokens);
+            let stub = prefix + [lexer.make :lparen () start start false 0,
+                                 lexer.make :rparen () end end false 0];
+            match parser.parse_item (parser.at_statement parser.top stub) (stub + terminal) {
+                [:ok, item, rest] => [:ok, restored item (tokens + terminal), rest],
+                other => other,
+            }
+        },
+        _ => parser.parse_item (parser.at_statement parser.top tokens) (tokens + terminal),
+    }
+};
+
+let parse : :string -> [:any];
+let parse text = {
+    let rec items rest !kept = match rest {
+        [] => [:ok, list.reverse kept, []],
+        [t, ..tail] if lexer.kind t == :semi => items tail kept,
+        _ => {
+            let [own, tail, terminal] = chunk rest;
+            match parse_item own terminal {
+                [:ok, item, _] => items tail (parser.spliced item kept),
+                error => error,
+            }
+        },
+    };
+    let tokens = lexer.tokens text;
+    match items tokens [] {
+        [:ok, ds, _] => [:ok, ds, if str.contains_str "expand" text {
+            parser.expand_sites :none tokens []
+        } else { [] }],
+        other => other,
+    }
+};

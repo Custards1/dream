@@ -18,8 +18,10 @@ import dreams.modules;
 import dreams.package;
 import dreams.parser;
 import dreams.scope;
+import dreams.typecheck;
 
 import analysis;
+import declarations;
 import pos;
 
 /// Include dependencies inside inline modules and conditional declarations,
@@ -29,6 +31,9 @@ let dependencies : :any -> [:string];
 let rec dependencies tree = match tree {
     [:import, segs, _, _, _] => [str.join_str "." segs],
     [:derive, segs, _] => [str.join_str "." segs],
+    [:let, _, _, _, _, _] => [],
+    [:sig, _, _, _] => [],
+    [:macro, _, _, _, _] => [],
     xs if type_of xs == :list => list.flat_map dependencies xs,
     _ => [],
 };
@@ -50,8 +55,10 @@ let items parsed = match parsed { [:ok, ds, _] => ds, _ => [] };
 /// What import could lead to the cursor's chain. Selective and renamed
 /// imports bind the names the compiler says they do; derives are always
 /// needed because an inherited definition can be named without a prefix.
-let wanted_imports : :any -> :string -> [:string];
+let wanted_imports : :any -> :any -> [:string];
 let rec wanted_imports tree wanted = match tree {
+    [:import, _, _, _, _] if type_of wanted == :map =>
+        list.unique (list.flat_map (fn name -> wanted_imports tree name) (map.keys wanted)),
     [:import, segs, alias, selected, _] => {
         let dep = str.join_str "." segs;
         let first = list.head (str.split "." wanted);
@@ -67,6 +74,9 @@ let rec wanted_imports tree wanted = match tree {
         else { [] }
     },
     [:derive, segs, _] => [str.join_str "." segs],
+    [:let, _, _, _, _, _] => [],
+    [:sig, _, _, _] => [],
+    [:macro, _, _, _, _] => [],
     xs if type_of xs == :list => list.flat_map (fn x -> wanted_imports x wanted) xs,
     _ => [],
 };
@@ -83,12 +93,19 @@ let rec import_file! locator dotted = match modules.resolve_path! locator dotted
     },
 };
 
-let add! : modules.Loader -> :string -> [:string] -> :map -> :string -> [:string] -> modules.Loader;
-let rec add! l file roots docs wanted !visiting = {
+let add_with! : modules.Loader -> :string -> [:string] -> :map -> :any -> :any -> [:string] -> modules.Loader;
+let rec add_with! l file roots docs wanted full !visiting = {
     let absolute = path.absolute! file;
     if map.has absolute (modules.by_path l) || list.contains absolute visiting { l }
     else {
-        let [text, parsed] = parsed! file docs (modules.parsed l);
+        let [text, parsed] = if full != () {
+            let text = docs.[file else (match files.read! file { () => "", s => s })];
+            let parsed = match (modules.parsed l).[file else ()] {
+                [same, p] if same == text => p,
+                _ => declarations.parse text,
+            };
+            [text, parsed]
+        } else { parsed! file docs (modules.parsed l) };
         let kept = modules.with_parsed ((modules.parsed l).[file => [text, parsed]]) l;
         let locator = modules.loader (package.discover! file roots) (config.defaults! ())
                           (modules.default_search_paths! file roots) [];
@@ -98,7 +115,7 @@ let rec add! l file roots docs wanted !visiting = {
             else { match import_file! locator dep {
                 () => acc,
                 [target, spelling] => {
-                    let loaded = add! acc target roots docs "" (list.cons absolute visiting);
+                    let loaded = add_with! acc target roots docs "" full (list.cons absolute visiting);
                     let mi = (modules.by_path loaded).[(path.absolute! target) else ()];
                     if mi == () { loaded }
                     else { modules.Loader.set_by_name ((modules.by_name loaded).[spelling => mi]) loaded }
@@ -113,6 +130,9 @@ let rec add! l file roots docs wanted !visiting = {
     }
 };
 
+let add! : modules.Loader -> :string -> [:string] -> :map -> :string -> [:string] -> modules.Loader;
+let add! l file roots docs wanted visiting = add_with! l file roots docs wanted () visiting;
+
 let chain_at : :string -> :integer -> :integer -> :string;
 let chain_at text line character = {
     let here = analysis.name_start text (pos.offset_of text line character);
@@ -123,8 +143,8 @@ let chain_at text line character = {
 /// Build a small declaration environment, then resolve just the bodies whose
 /// references the client can ask about. The definition table covers imported
 /// declarations too, so cross-file locations keep the compiler's source spans.
-let prepared! : :string -> [:string] -> :map -> :map -> :string -> :bool -> :map;
-let prepared! file roots docs parsed wanted walk = {
+let prepared_with! : :string -> [:string] -> :map -> :map -> :any -> :bool -> :any -> :map;
+let prepared_with! file roots docs parsed wanted walk range = {
     let ps = package.discover! file roots;
     let initial = modules.loader ps (config.defaults! ()) (modules.default_search_paths! file roots) []
         |> modules.Loader.set_prefetch_enabled false
@@ -132,8 +152,19 @@ let prepared! file roots docs parsed wanted walk = {
         |> modules.with_overlay docs
         |> modules.with_parsed parsed
         |> modules.with_package_roots!;
-    let src = add! initial file roots docs wanted [];
-    let l = expansion.expand! src;
+    let src = add_with! initial file roots docs wanted (match range { () => (), _ => file }) [];
+    // Imported signatures do not require expanding their implementations.
+    // Unexpanded unsigned calls stay unknown until their evidence is available.
+    let active = match range {
+        () => src,
+        _ => {
+            let root = analysis.module_index src file;
+            let source_id = match root { () => (), mi => modules.module_source (modules.module_at src mi) };
+            let own = list.filter (fn pair -> list.head pair == source_id) (map.pairs (modules.expanding src));
+            modules.Loader.set_expanding (map.from_pairs own) src
+        },
+    };
+    let l = expansion.expand! active;
     let mi = analysis.module_index l file;
     let declared = scope.declare! l;
     let base = scope.resolver (scope.envs declared)
@@ -145,9 +176,109 @@ let prepared! file roots docs parsed wanted walk = {
         base (modules.expansions l);
     let all = scope.walk_base l declared seeded 0;
     let source_id = match mi { () => (), i => modules.module_source (modules.module_at l i) };
-    let mine = list.filter (fn p -> list.nth 1 p == source_id) (scope.pending declared);
+    let mine = list.filter (fn p -> list.nth 1 p == source_id && match range {
+        () => true,
+        [first, last] => {
+            let sp = scope.decl_span (list.nth 2 p);
+            ast.span_start sp <= last && ast.span_end sp >= first
+        },
+    }) (scope.pending declared);
     let r = if walk { list.fold_strict (fn acc p -> scope.check_body l p acc) all mine } else { all };
-    analysis.analysis l r mi src
+    let resolved = match range {
+        () => r,
+        _ => {
+            let [signed, _] = typecheck.sig_table l r;
+            let used = list.fold_strict (fn acc ref -> match scope.target_global ref {
+                () => acc,
+                gi => acc.[gi => true],
+            }) (%{}) (map.values (scope.refs r));
+            let extra = list.filter (fn p -> {
+                let d = list.nth 2 p;
+                let gi = scope.global_index ((scope.envs declared).[list.nth 0 p else ()]) (scope.decl_name d);
+                not (list.contains p mine) &&
+                ((str.starts_with "type " (str.slice (ast.span_start (scope.decl_span d)) 5
+                    (diag.source_text (modules.file_at l (list.nth 1 p))))) ||
+                    (map.has gi used && not (map.has gi signed)))
+            }) (scope.pending declared);
+            list.fold_strict (fn acc p -> scope.check_body l p acc) r extra
+        },
+    };
+    analysis.analysis l resolved mi src
+};
+
+let prepared! : :string -> [:string] -> :map -> :map -> :string -> :bool -> :map;
+let prepared! file roots docs parsed wanted walk = prepared_with! file roots docs parsed wanted walk ();
+
+/// Follow local declarations named by the visible bodies too. A local helper
+/// can introduce an import absent from its caller; signed helpers need only
+/// their signature. Names shadowed by locals may include extra declarations,
+/// which costs work but never removes evidence the checker could need.
+let reference_chain : :any -> :string;
+let rec reference_chain tree = match tree {
+    [:name, name, _] => name,
+    [:field, obj, field, _] => {
+        let head = reference_chain obj;
+        if head == "" { "" } else { head + "." + field }
+    },
+    _ => "",
+};
+
+let referenced : :any -> [:string];
+let rec referenced tree = match tree {
+    [:name, name, _] => [name],
+    [:field, obj, _, _] => list.cons (reference_chain tree) (referenced obj),
+    xs if type_of xs == :list => list.flat_map referenced xs,
+    _ => [],
+};
+
+let hint_declarations : [ast.Decl] -> [ast.Decl];
+let rec hint_declarations items = list.flat_map (fn d -> match d {
+    [:mod, _, ds, _] => hint_declarations ds,
+    [:when, _, ds, _] => hint_declarations ds,
+    [:priv, inner, _] => hint_declarations [inner],
+    _ => [d],
+}) items;
+
+let hint_imports : [ast.Decl] -> :integer -> :integer -> :map;
+let hint_imports items first last = {
+    let declarations = hint_declarations items;
+    let defs = list.fold_strict (fn acc d -> match d {
+        [:let, name, _, _, _, _] => acc.[name => d],
+        [:macro, name, _, _, _] => acc.[name => d],
+        _ => acc,
+    }) (%{}) declarations;
+    let sigs = list.fold_strict (fn acc d -> match d {
+        [:sig, name, _, _] => acc.[name => d],
+        _ => acc,
+    }) (%{}) declarations;
+    let picked = list.filter (fn d -> {
+        let sp = ast.span d;
+        ast.span_start sp <= last && ast.span_end sp >= first
+    }) declarations;
+    let rec follow todo !seen = match todo {
+        [] => seen,
+        [name, ..rest] if map.has name seen => follow rest seen,
+        [name, ..rest] => {
+            let d = sigs.[name else (defs.[name else ()])];
+            follow (match d { () => rest, tree => referenced tree + rest }) (seen.[name => true])
+        },
+    };
+    follow (list.flat_map referenced picked) (%{})
+};
+
+let hints! : :string -> [:string] -> :map -> :map -> :integer -> :integer -> :map;
+let hints! file roots docs parsed first last = {
+    let text = docs.[file else (match files.read! file { () => "", s => s })];
+    let full_key = file + "#hint-root";
+    let full = match parsed.[full_key else ()] {
+        [same, p] if same == text => p,
+        _ => declarations.parse text,
+    };
+    let kept = parsed.[file => [text, full]].[full_key => [text, full]];
+    let start = pos.line_start text first;
+    let end = pos.line_start text (last + 1);
+    let wanted = hint_imports (items full) start end;
+    (prepared_with! file roots docs kept wanted true [start, end]).[:hint_wanted => wanted]
 };
 
 let analyse! : :string -> [:string] -> :map -> :map -> :string -> :map;
@@ -157,7 +288,7 @@ let declared! file roots docs parsed wanted = prepared! file roots docs parsed w
 
 /// Source comparisons alone cannot notice that a previously missing import
 /// has been created. Verify requested import lookups against the loaded files.
-let current! : :string -> [:string] -> :map -> :string -> :map -> :bool;
+let current! : :string -> [:string] -> :map -> :any -> :map -> :bool;
 let current! file roots docs wanted a = {
     let locator = modules.loader (package.discover! file roots) (config.defaults! ())
                       (modules.default_search_paths! file roots) [];

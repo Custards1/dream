@@ -113,8 +113,11 @@ let analyse_cached! path roots open_docs parsed = {
 /// used still match. Open buffers take precedence over filesystem contents.
 let current! : :string -> [:string] -> :map -> :any -> :bool;
 let current! path roots docs a =
+    texts_current! path roots docs a && not (modules.failed (source a));
+
+let texts_current! : :string -> [:string] -> :map -> :any -> :bool;
+let texts_current! path roots docs a =
     module_index (source a) path == module_of a && module_of a != ()
-    && not (modules.failed (source a))
     && package.discover! path roots == modules.packages (source a)
     && list.all (fn f -> {
         let p = diag.source_path f;
@@ -1197,6 +1200,74 @@ let definition_at a line character = match module_of a {
 
 // --- hover ------------------------------------------------------------------------
 
+/// Comments immediately preceding a declaration belong to its hover. Read the
+/// original source so Markdown survives, including examples and fenced code.
+let documentation : :string -> :integer -> :string;
+let documentation text offset = {
+    let lines = list.reverse (str.split "\n" (str.slice 0 offset text));
+    let clean line = {
+        let trimmed = str.trim line;
+        let after = if str.starts_with "///" trimmed {
+            str.slice 3 (str.byte_length trimmed - 3) trimmed
+        } else { str.slice 2 (str.byte_length trimmed - 2) trimmed };
+        if str.starts_with " " after { str.slice 1 (str.byte_length after - 1) after } else { after }
+    };
+    let rec comments rest !kept = match rest {
+        [line, ..tail] if str.starts_with "//" (str.trim line) =>
+            comments tail (list.cons (clean line) kept),
+        _ => str.join_str "\n" kept,
+    };
+    let rec block rest !kept = match rest {
+        [] => "",
+        [line, ..tail] => {
+            let t = str.trim line;
+            if str.starts_with "/*" t {
+                str.join_str "\n" (list.cons (str.trim (str.slice 2 (str.byte_length t - 2) t)) kept)
+            } else {
+                let content = if str.starts_with "*" t { str.trim (str.slice 1 (str.byte_length t - 1) t) } else { t };
+                block tail (list.cons content kept)
+            }
+        },
+    };
+    match lines {
+        [prefix, ..rest] if str.trim prefix == "" || str.trim prefix == "priv" => match rest {
+            [line, ..tail] if str.ends_with "*/" (str.trim line) => {
+                let t = str.trim line;
+                block (list.cons (str.slice 0 (str.byte_length t - 2) t) tail) []
+            },
+            _ => comments rest [],
+        },
+        _ => "",
+    }
+};
+
+let function_docs : :map -> :integer -> :string -> :string;
+let function_docs a mi name = match signature_decl a mi name {
+    () => "",
+    [owner, d] => {
+        let text = module_text a owner;
+        let own = documentation text (ast.span_start (ast.span d));
+        match list.find (fn item -> match item {
+            [:sig, n, _, _] => n == name,
+            _ => false,
+        }) (source_items a owner) {
+            () => own,
+            sig => {
+                let signed = documentation text (ast.span_start (ast.span sig));
+                if signed == "" { own } else { signed }
+            },
+        }
+    },
+};
+
+let docs_for : :map -> :any -> :string;
+let rec docs_for a found = match found {
+    scope.Meaning.global(mi, n, _) => function_docs a mi n,
+    scope.Meaning.member(scope.Ref.dream(mi), n, _) => function_docs a mi n,
+    scope.Meaning.expanded(inner) => docs_for a inner,
+    _ => "",
+};
+
 /// How a local was bound, shown with its parameters when it has any.
 ///
 /// Found by *name* among what is in scope at the cursor, rather than by the
@@ -1262,10 +1333,12 @@ let hover_at a line character =
                 () => (),
                 mi => {
                     let src = module_text a mi;
+                    let docs = docs_for a found;
                     %{ "contents" =>
                            %{ "kind" => "markdown",
                               "value" => describe a (pos.offset_of src line character)
-                                                  (name_at src from) found },
+                                                  (name_at src from) found
+                                  + if docs == "" { "" } else { "\n\n" + docs } },
                        "range" => pos.range_in (diag.line_starts src) src from until }
                 },
             },
@@ -2032,6 +2105,15 @@ when test {
         test.case "hover shows a signature"
             $( test.eq! "`add x y : :integer -> :integer -> :integer` -- a global of module `buf`"
                         (hover_value! "let add : :integer -> :integer -> :integer;\nlet add x y = x + y;\nlet main! = add 1 2;\n" 2 12) ),
+        test.case "hover includes the function documentation before its signature"
+            $( test.true! (str.contains_str "Adds two integers.\n\n`add 1 2` answers 3."
+                (hover_value! "/// Adds two integers.\n///\n/// `add 1 2` answers 3.\nlet add : :integer -> :integer -> :integer;\nlet add x y = x + y;\nlet main! = add 1 2;\n" 5 12)) ),
+        test.case "hover includes ordinary line comments before a function"
+            $( test.true! (str.contains_str "Doubles its argument."
+                (hover_value! "// Doubles its argument.\nlet twice n = n * 2;\nlet main! = twice 21;\n" 2 12)) ),
+        test.case "hover includes a block documentation comment"
+            $( test.true! (str.contains_str "Doubles its argument."
+                (hover_value! "/* Doubles its argument. */\nlet twice n = n * 2;\nlet main! = twice 21;\n" 2 12)) ),
         test.case "hover shows a union's constructor with its type"
             $( test.true! (str.contains_str "circle radius : :float -> Shape"
                               (hover_value! "union Shape { circle(radius : :float), empty }\nlet main! = Shape.circle 1.0;\n" 1 18)) ),
