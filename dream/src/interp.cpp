@@ -3274,7 +3274,7 @@ inline void step_return_counted(Process& p, size_t floor) {
 }
 
 void run_process(Process& p, int64_t budget) {
-    LoopStack loop(p, __builtin_frame_address(0));
+    LoopStack loop(p, DREAM_FRAME_ADDRESS());
     p.reductions = budget;
     p.slice = budget;
     p.slice_spent = false;
@@ -3387,7 +3387,7 @@ Value literal_string_value(Process& p, uint32_t index) { return literal_string(p
 bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* out,
                  Value* taken) {
     ForceNest nest(p);
-    LoopStack loop(p, __builtin_frame_address(0));
+    LoopStack loop(p, DREAM_FRAME_ADDRESS());
     // Run a nested machine loop down to the current continuation depth.
     //
     // Whether it may collect is decided here and nowhere else. The caller

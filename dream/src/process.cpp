@@ -1,5 +1,9 @@
 #include "process.hpp"
 
+#ifdef _WIN32
+#include "windows.hpp"
+#endif
+
 #include "interp.hpp"
 #include "runtime.hpp"
 
@@ -173,8 +177,8 @@ namespace {
 /// The collection itself, one frame below the one that pushed the registers:
 /// its own frame address is then below every word that matters, the saved
 /// registers included. Never inlined, or that would stop being true.
-__attribute__((noinline)) void collect_from_here(Process& p, Heap& heap) {
-    heap.set_conservative_roots(__builtin_frame_address(0), p.jit_stack_hi);
+DREAM_NOINLINE void collect_from_here(Process& p, Heap& heap) {
+    heap.set_conservative_roots(DREAM_FRAME_ADDRESS(), p.jit_stack_hi);
     // A concurrent mark is not *started* from here. Its snapshot would be
     // read while compiled frames hold values it cannot see, and nothing
     // would pin those at the finalize but a second scan of a stack that has
@@ -191,18 +195,29 @@ __attribute__((noinline)) void collect_from_here(Process& p, Heap& heap) {
 
 }  // namespace
 
-__attribute__((noinline)) void Process::collect_under_compiled() {
+DREAM_NOINLINE void Process::collect_under_compiled() {
     // Every callee-saved register onto this frame, where the scan will read
     // it: a compiled caller may be keeping a value in one. (A caller-saved
     // register holding a value across the call that led here was spilled to
     // the caller's frame by the calling convention.) `setjmp` would do it
     // too, but glibc mangles the frame pointer it saves, and a compiled body
-    // with no frame pointer uses that register like any other.
+    // with no frame pointer uses that register like any other. MSVC has no
+    // `__builtin_unwind_init`; `RtlCaptureContext` writes every register into
+    // a `CONTEXT` here instead, which is more than is needed and no less.
+#if defined(_MSC_VER) && !defined(__clang__)
+    CONTEXT registers;
+    RtlCaptureContext(&registers);
+    collect_from_here(*this, heap_);
+    // Reading the capture after the call keeps it, and this frame, alive
+    // across it, as the empty `asm` below does for GCC.
+    static_cast<void>(*reinterpret_cast<volatile unsigned char*>(&registers));
+#else
     __builtin_unwind_init();
     collect_from_here(*this, heap_);
     // Keeps the call above from becoming a tail call, which would pop this
     // frame -- and the registers with it -- before the scan.
     asm volatile("" ::: "memory");
+#endif
 }
 
 void Process::visit_roots(Heap& heap) {

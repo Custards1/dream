@@ -1163,7 +1163,7 @@ bool math_arg(Process& p, Value v, const char* what, double* d, Value* err) {
 /// statistic computes on one number, where a tensor would be ceremony.
 NativeResult math_real(Process& p, Value callee, Value* args, uint32_t) {
     static const char* const names[] = {"exp", "log", "sin", "cos", "tan", "tanh", "atan"};
-    const uint32_t fn = static_cast<NativeObj*>(as_obj(callee))->user;
+    const uint32_t fn = static_cast<uint32_t>(static_cast<NativeObj*>(as_obj(callee))->user);
     double d;
     Value err;
     if (!math_arg(p, args[0], names[fn], &d, &err)) return NativeResult::raise(err);

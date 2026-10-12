@@ -24,6 +24,21 @@
 #include "image.hpp"
 #include "value.hpp"
 
+// The two compiler builtins the scan of the machine stack rests on, spelled
+// once for MSVC too (`collect_under_compiled`, `run_process`). Clang under
+// MSVC's driver and MinGW's GCC both have the GCC spellings, so only MSVC's
+// own compiler takes the other branch. `_AddressOfReturnAddress` is the slot
+// just above a function's frame rather than its base, which serves the same
+// purpose: a bound with all of the function's own words on one side.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define DREAM_NOINLINE __declspec(noinline)
+#define DREAM_FRAME_ADDRESS() _AddressOfReturnAddress()
+#else
+#define DREAM_NOINLINE __attribute__((noinline))
+#define DREAM_FRAME_ADDRESS() __builtin_frame_address(0)
+#endif
+
 namespace dream {
 
 class Runtime;

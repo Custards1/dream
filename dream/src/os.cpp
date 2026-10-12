@@ -302,9 +302,11 @@ void run_child(std::shared_ptr<Job> job, std::vector<std::string> argv,
         wchar_t* inherited = GetEnvironmentStringsW();
         for (wchar_t* e = inherited; e && *e; e += wcslen(e) + 1) {
             std::wstring entry(e);
+            // The name as UTF-8, converted once: building it from two calls'
+            // iterators paired the begin of one temporary with the end of
+            // another, and narrowed each UTF-16 unit to a byte on the way.
             bool replaced = !inherit_debug_variables() &&
-                            debug_variable(std::string(upper_name(entry).begin(),
-                                                         upper_name(entry).end()));
+                            debug_variable(windows::utf8(upper_name(entry)));
             for (const std::wstring& kv : ours) {
                 if (upper_name(kv) == upper_name(entry)) { replaced = true; break; }
             }
