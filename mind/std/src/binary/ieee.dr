@@ -3,7 +3,6 @@
 // ties and overflow do not depend on logarithms or host floating rounding.
 import std.num;
 import std.str;
-import std.result;
 
 /// Extract the IEEE-754 binary64 bit representation of a floating-point value.
 priv let raw64 value = {
@@ -22,7 +21,7 @@ priv let round_shift n shift = if shift <= 0 { n << (-shift) } else {
 
 /// Internal: eb/fb are (5,10) or (8,23).
 let to_bits eb fb value =
-    if type_of value != :float && type_of value != :integer { result.error "expected a number" }
+    if type_of value != :float && type_of value != :integer { Result.error "expected a number" }
     else {
         let raw = raw64 value;
         let sign = (raw >> 63) << (eb + fb);
@@ -43,7 +42,7 @@ let to_bits eb fb value =
                 if rounded == (1 << (fb + 1)) { (e + 1) << fb }
                 else { (e << fb) | (rounded & ((1 << fb) - 1)) }
             };
-        result.ok (sign | magnitude)
+        Result.ok (sign | magnitude)
     };
 
 /// Decode an IEEE-style bit pattern using explicit exponent and fraction widths.

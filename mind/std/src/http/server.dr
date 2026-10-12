@@ -607,7 +607,6 @@ let call! app req = finish! (answer! (handler app) req defaults) req defaults;
 when test {
     import std.agent;
     import std.test;
-    import std.result;
     import std.vm;
 
     let hello req = http.text ("hello, " + (match http.query_value "name" req { () => "world", n => n }));
@@ -722,14 +721,14 @@ when test {
             let s = serve! 0 loop_app;
             let got = http.send! (http.request "GET" (local_url s + "/") |> http.with_redirects 3);
             stop! s
-            test.eq! :too_many_redirects (error.kind (result.reason () got))
+            test.eq! :too_many_redirects (error.kind (Option.or_unit (Result.reason got)))
         } ),
         test.case "a client timeout" $( {
             let slow = router |> get "/" (fn req -> http.text (to_string (list.length (list.from 1))));
             let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_idle (time.milliseconds 300)) slow;
             let got = http.send! (http.request "GET" (local_url s + "/") |> http.with_timeout (time.milliseconds 100));
             stop! s
-            test.eq! :timeout (error.kind (result.reason () got))
+            test.eq! :timeout (error.kind (Option.or_unit (Result.reason got)))
             // The server gives up on the handler too, once `idle` has passed.
             test.eq! 2 (test.eventually! (fn () -> vm.processes! ()) (fn n -> n <= 2) test.patience)
         } ),
@@ -738,7 +737,7 @@ when test {
             let got = http.get_text! (local_url s);
             let out = raw! (port s) "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
             stop! s
-            test.eq! [true, true] [result.or_else "" got == str.concat_all (list.map (fn n -> to_string n + ",") (list.range 0 1000)),
+            test.eq! [true, true] [Result.unwrap_or "" got == str.concat_all (list.map (fn n -> to_string n + ",") (list.range 0 1000)),
                                    str.contains_str "Transfer-Encoding: chunked" out]
         } ),
         test.case "a stream made by a function, with effects" $( {
@@ -762,7 +761,7 @@ when test {
             let s = serve! 0 app;
             let got = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_stream ["one ", "two ", "three"]);
             stop! s
-            test.eq! (Result.ok "one two three") (result.map http.body got)
+            test.eq! (Result.ok "one two three") (Result.map http.body got)
         } ),
         test.case "a request body streamed to the handler" $( {
             let measure! req = http.text (to_string (len (http.body_text! req)));
@@ -771,7 +770,7 @@ when test {
             let first = http.post! (local_url s) big;
             let chunked = http.send! (http.request "POST" (local_url s) |> http.with_stream (list.replicate 50 (str.repeat 1000 "z")));
             stop! s
-            test.eq! [Result.ok "1200000", Result.ok "50000"] [result.map http.body first, result.map http.body chunked]
+            test.eq! [Result.ok "1200000", Result.ok "50000"] [Result.map http.body first, Result.map http.body chunked]
         } ),
         test.case "a handler that ignores a streamed body leaves the connection usable" $( {
             let ignore req = http.text "ignored";
@@ -800,8 +799,8 @@ when test {
             // The bodies, not the responses: each carries a `Date`, and two
             // either side of a second's boundary are different responses
             // from the same connection.
-            let who r = result.map http.body r;
-            test.eq! [true, true] [result.is_ok first && who first == who second, who plain != who first]
+            let who r = Result.map http.body r;
+            test.eq! [true, true] [Result.is_ok first && who first == who second, who plain != who first]
         } ),
         test.case "a client's base URL and headers" $( {
             let s = serve! 0 (router |> get "/api/v1/users" (fn req -> http.text (or_empty (http.header "x-token" req))));
@@ -809,7 +808,7 @@ when test {
             let got = http.call! c (http.request "GET" "/users");
             http.close_client! c
             stop! s
-            test.eq! (Result.ok "secret") (result.map http.body got)
+            test.eq! (Result.ok "secret") (Result.map http.body got)
         } ),
         test.case "a pooled connection the server closed is replaced" $( {
             let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_idle (time.milliseconds 100)) app;
@@ -819,7 +818,7 @@ when test {
             let second = http.call! c (http.request "GET" "/");
             http.close_client! c
             stop! s
-            test.true! (result.is_ok first && result.is_ok second)
+            test.true! (Result.is_ok first && Result.is_ok second)
         } ),
         // HTTP/2, in clear text by prior knowledge so that no certificate is needed.
         test.case "HTTP/2: a request and its answer" $( {
@@ -829,14 +828,14 @@ when test {
             let boom = h2_get! "/boom";
             let missing = h2_get! "/nope";
             stop! s
-            test.eq! [Result.ok "HTTP/2", Result.ok 500, Result.ok 404] [result.map http.body ok, result.map http.status boom, result.map http.status missing]
+            test.eq! [Result.ok "HTTP/2", Result.ok 500, Result.ok 404] [Result.map http.body ok, Result.map http.status boom, Result.map http.status missing]
         } ),
         test.case "HTTP/2: bodies past the flow-control window, both ways" $( {
             let s = serve! 0 app;
             let big = str.repeat 300000 "0123456789";
             let got = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_body big |> http.Request.set_options %{ :http2 => :prior_knowledge });
             stop! s
-            test.eq! (Result.ok true) (result.map (fn r -> http.body r == big) got)
+            test.eq! (Result.ok true) (Result.map (fn r -> http.body r == big) got)
         } ),
         test.case "HTTP/2: streams out and in" $( {
             let s = serve! 0 (router |> get "/" (fn req -> http.stream (list.map (fn n -> to_string n + ";") (list.range 0 300))) |> post "/echo" (fn req -> http.text (http.body req)));
@@ -845,7 +844,7 @@ when test {
             let up = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_stream ["x", "y", "z"] |> http.Request.set_options opts);
             stop! s
             test.eq! [Result.ok (str.concat_all (list.map (fn n -> to_string n + ";") (list.range 0 300))), Result.ok "xyz"]
-                     [result.map http.body down, result.map http.body up]
+                     [Result.map http.body down, Result.map http.body up]
         } ),
         test.case "HTTP/2: many requests at once over one connection" $( {
             let s = serve! 0 (router |> get "/who" (fn req -> http.text (http.Request.peer req)));
@@ -854,9 +853,9 @@ when test {
             let all = proc.parallel! (list.map (fn i -> $( http.call! c (http.request "GET" "/who") )) (list.range 0 30));
             http.close_client! c
             stop! s
-            test.eq! [30, 1, true] [list.length (list.filter (fn r -> result.is_ok r) all),
-                                    list.length (list.unique (list.map (fn r -> result.map http.body r) all)),
-                                    result.map http.body (list.head all) == result.map http.body first]
+            test.eq! [30, 1, true] [list.length (list.filter (fn r -> Result.is_ok r) all),
+                                    list.length (list.unique (list.map (fn r -> Result.map http.body r) all)),
+                                    Result.map http.body (list.head all) == Result.map http.body first]
         } ),
         test.case "static files, and nothing outside them" $( {
             let dir = "/tmp/dream-http-static-" + to_string (time.now! ());
@@ -871,8 +870,8 @@ when test {
             stop! s
             io.remove_all! dir
             test.eq! [Result.ok ["body {}", "text/css; charset=utf-8"], Result.ok "<p>home</p>", 404, 404]
-                     [result.map (fn r -> [http.body r, http.header "content-type" r]) css, home,
-                      result.or_else 0 (result.map http.status escape), result.or_else 0 (result.map http.status encoded)]
+                     [Result.map (fn r -> [http.body r, http.header "content-type" r]) css, home,
+                      Result.unwrap_or 0 (Result.map http.status escape), Result.unwrap_or 0 (Result.map http.status encoded)]
         } ),
     ];
 }

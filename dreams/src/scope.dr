@@ -1873,6 +1873,7 @@ let rec pattern_bindings p =
                         (rest_bindings rest),
         [:map_p, pairs, _] => list.concat (list.map (fn kv -> pattern_bindings (list.nth 1 kv)) pairs),
         [:record_p, _, fields, _] => list.concat (list.map (fn f -> pattern_bindings f) fields),
+        [:success_p, inner, _] => pattern_bindings inner,
         _ => [],
     };
 
@@ -2179,6 +2180,7 @@ let rec check_pattern c p r =
         // The constructor is an expression, resolved where the `match` is.
         [:record_p, ctor, fields, _] =>
             list.fold (fn acc f -> check_pattern c f acc) (check_expr c ctor r) fields,
+        [:success_p, inner, _] => check_pattern c inner r,
         _ => r,
     };
 

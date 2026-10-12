@@ -21,7 +21,6 @@
 import std.crypto;
 import std.file;
 import std.list;
-import std.result;
 import std.str;
 
 import pack.ar;
@@ -70,7 +69,7 @@ let relations : [[:string, :string]] = [
 
 let control : Spec -> Layout -> Result :string :string;
 let control sp lay = {
-    let? lines = result.all (list.map (fn [label, key] -> result.map (fn v -> field label v)
+    let? lines = Result.all (list.map (fn [label, key] -> Result.map (fn v -> field label v)
                                                                        (deps.deb_list (spec.strings sp "deb" key)))
                                       relations);
     Result.ok (field "Package" (Spec.name sp)

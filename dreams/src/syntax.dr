@@ -121,6 +121,18 @@ let rec own_names owner e =
         _ => if type_of e == :list { list.map (fn x -> own_names owner x) e } else { e },
     };
 
+/// The members of a record or union as the declarations they are: each
+/// definition a `let`, its body read with `own_names`, and each signature a
+/// `sig`, kept in front of the definition it was written in front of.
+let member_decls : :string -> [[:any]] -> [ast.Decl];
+let member_decls owner members =
+    list.map (fn m ->
+        if ast.is_member_sig m { ast.sig_d (ast.member_name m) (ast.member_body m) (ast.member_span m) }
+        else {
+            ast.let_d (ast.member_name m) (ast.member_params m)
+                      (own_names owner (ast.member_body m)) true (ast.member_span m)
+        }) members;
+
 /// `_record_of :id variant #[fields..]`: what a constructor's body is, and the
 /// one shape lowering turns into a `record_make` (`lower.lower_apply`) and
 /// the resolver files as a constructor (`scope.constructor_of`).
@@ -278,9 +290,7 @@ let record_parts owner kind name fields members bases span = {
     let made = list.head (fresh ([constructor, from_default] + helpers + identity + [alias])
                                 (2147483648 + ast.span_start span * 128));
     let generated = list.take (list.length made - 1) made;
-    let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
-                                              (own_names name (ast.member_body m)) true (ast.member_span m))
-                           members;
+    let written = member_decls name members;
     // Each lifted default once, as a global of its own, where it was written.
     let defaults = list.flat_map (fn f -> if lifted f {
         [ast.let_d (default_name f) [] (own_names name (ast.field_default f)) false (ast.field_span f)]
@@ -513,9 +523,7 @@ let union_decl owner name params variants members kind span = {
     // written at and a mistake in one is reported where it is, as a record's
     // description does.
     let [generated, _] = fresh (constructors + [alias]) (ast.generated_base + ast.span_start span * 128);
-    let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
-                                              (own_names name (ast.member_body m)) true (ast.member_span m))
-                           members;
+    let written = member_decls name members;
     let made = list.take (list.length constructors) generated;
     [ast.mod_d name (made + [description] + sigs + written) span, list.last generated]
 };

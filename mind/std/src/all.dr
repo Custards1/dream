@@ -178,7 +178,7 @@ when test {
 
         // and through the exact one, framed, which is the shape a server reads
         test.case "a framed record comes back"
-            $( test.eq! ada (User.of_map (result.or_else %{}
+            $( test.eq! ada (User.of_map (Result.unwrap_or %{}
                    (list.nth 0 (wire.next_frame (wire.frame (User.to_map ada)))))) ),
 
         // defaults
@@ -249,25 +249,25 @@ when test {
         test.case "wire type preserves more kinds than JSON" $( test.true!
             (types.accepts wire.Value %{ :key => #[1, 'x', :yes] }) ),
         test.case "TOML document type covers sections" $( test.true!
-            (types.accepts toml.Document (result.unwrap! (toml.parse "[app]\nport=80"))) ),
+            (types.accepts toml.Document (Result.unwrap! (toml.parse "[app]\nport=80"))) ),
         test.case "result types distinguish payloads and errors" $( test.eq! [true, false, true]
-            [types.accepts (result.Of :integer :string) (Result.ok 3),
-             types.accepts (result.Of :integer :string) (Result.ok "bad"),
-             types.accepts (result.Of :integer :string) (Result.error "why")] ),
+            [types.accepts (Result :integer :string) (Result.ok 3),
+             types.accepts (Result :integer :string) (Result.ok "bad"),
+             types.accepts (Result :integer :string) (Result.error "why")] ),
         test.case "result validation preserves an existing error" $( test.eq! (Result.error "original")
             (result.validate_ok :integer (Result.error "original")) ),
         test.case "typed errors remain inspectable values" $( test.true!
             (types.accepts (error.OfKind :type_error) (_error_new :type_error :integer)) ),
         test.case "compile time option schemas are reusable runtime data" $( test.eq! "fast"
-            (cli.get "" (result.unwrap! compiled_options) "mode") ),
+            (cli.get "" (Result.unwrap! compiled_options) "mode") ),
         test.case "derived option schemas keep optional fields optional" $( test.true!
-            (result.is_ok (cli.parse_as option_schema options_for_types [])) ),
+            (Result.is_ok (cli.parse_as option_schema options_for_types [])) ),
         test.case "derived option schemas validate defaults" $( test.eq! :type_error
             (mismatch_kind (cli.parse_typed [cli.flag "q" "quiet" "quiet" |> cli.default_to "wrong"] [])) ),
         test.case "option choices survive compilation into a schema" $( test.false!
             (types.accepts option_schema %{ "mode" => "unknown" }) ),
         test.case "compiled codec checks keep the decoded value" $( test.eq! 443
-            (result.unwrap! compiled_user).["port"] ),
+            (Result.unwrap! compiled_user).["port"] ),
         test.case "runtime decode uses the same schema as comp" $( test.eq! :type_error
             (mismatch_kind (json.decode_as UserData "{\"name\":\"\",\"port\":443}")) ),
         test.case "codec syntax errors are preserved" $( test.eq! (json.decode "{")

@@ -751,19 +751,24 @@ let rec parse_let c sp ts = {
 // --- `let?` ------------------------------------------------------------------
 //
 // Errors are values here -- raising is an effect, so a pure function that can
-// fail answers `[:ok, v]` or `[:error, e]` -- and a chain of fallible steps
-// written out by hand is a staircase of `match`es, each passing the error on.
-// `let?` is one step of that staircase:
+// fail answers `Result.ok v` or `Result.error e`, and one that may find
+// nothing answers `Option.some v` or `Option.none` -- and a chain of steps
+// written out by hand is a staircase of `match`es, each passing the failure
+// on. `let?` is one step of that staircase:
 //
 //     let? x = step one;          match step one {
-//     let? y = step x;      ==        Result.ok(x) => match step x {
-//     Result.ok (x + y)                   Result.ok(y) => Result.ok (x + y),
+//     let? y = step x;      ==        success(x) => match step x {
+//     Result.ok (x + y)                   success(y) => Result.ok (x + y),
 //                                         other => other },
 //                                     other => other }
 //
-// Anything that is not `Result.ok` is the block's answer as it stands, which is
-// what `macros.with_ok` and `result.and_then` already mean by it. A pattern
-// binds as a destructuring `let` does, lazily, out of the payload.
+// where `success(x)` is `Result.ok(x)` or `Option.some(x)`, whichever the
+// value is (`ast.success_p`). Anything else is the block's answer as it
+// stands, so an error or a `none` goes back out untouched -- not rebuilt, the
+// same value. `let? x = e else alt;` answers `alt` instead, which is how a
+// missing value becomes an error: `let? v = map.find k m else Result.error
+// :missing;`. A pattern binds as a destructuring `let` does, lazily, out of
+// the payload.
 //
 // It is unfolded here rather than given a node, because every later stage
 // already knows `match` and `let` -- scope, the checker, lowering, the language
@@ -785,18 +790,15 @@ let let_try_name = "<let?>";
 /// and reads it back (a binder and a use are kept apart), 3 reads the payload.
 let let_try_at span k = [ast.span_start span + k, ast.span_start span + k + 1];
 
-/// Where the names that do not fit inside the keyword are written: in the
+/// Where the names that do not fit inside a keyword are written: in the
 /// generated offsets the keyword's own offset owns (`ast.generated_base`).
 let let_try_far span k = [ast.generated_base + ast.span_start span * 128 + k,
                           ast.generated_base + ast.span_start span * 128 + k + 1];
 
-/// `Result.ok`, as written at `at`: the prelude's constructor
-/// (`std.prelude`), which every module can name without an import.
-let result_ok at = ast.field_e (ast.name_e "Result" at) "ok" at;
-
-/// `let? name = e` or `let? pattern = e`, as `[:let_try, binding, e, span,
-/// keyword]`: the `let` it binds with, its value replaced by the payload's
-/// name, and where the `let?` keyword is.
+/// `let? name = e [else alt]` or `let? pattern = e [else alt]`, as
+/// `[:let_try, binding, e, span, keyword, alt]`: the `let` it binds with, its
+/// value replaced by the payload's name, where the `let?` keyword is, and what
+/// to answer instead of passing a failure on (`()` to pass it on).
 ///
 /// The `let` is given the span of what it binds rather than the keyword's:
 /// the `match` it unfolds into starts at the keyword, and a `match` holds its
@@ -806,13 +808,22 @@ let rec parse_let_try c sp ts =
     match parse_let c (peek_span ts) ts {
         [:error, m, s] => err m s,
         [:ok, [:let, name, [], value, false, span], rest] =>
-            ok [:let_try, ast.let_d name [] (ast.name_e let_try_name (let_try_at sp 3)) false span,
-                value, span, sp] rest,
+            let_try_else c rest [:let_try, ast.let_d name [] (ast.name_e let_try_name (let_try_at sp 3)) false span,
+                                 value, span, sp],
         [:ok, [:let_p, pattern, value, span], rest] =>
-            ok [:let_try, ast.let_pattern_d pattern (ast.name_e let_try_name (let_try_at sp 3)) span,
-                value, span, sp] rest,
+            let_try_else c rest [:let_try, ast.let_pattern_d pattern (ast.name_e let_try_name (let_try_at sp 3)) span,
+                                 value, span, sp],
         [:ok, _, _] =>
             err "`let?` binds one value: it takes no parameters, `rec` or signature" sp,
+    };
+
+let let_try_else c ts step =
+    if not (is_kw ts "else") { ok (step + [()]) ts }
+    else {
+        match parse_expr c (list.tail ts) {
+            [:error, m, s] => err m s,
+            [:ok, alt, rest] => ok (step + [alt]) rest,
+        }
     };
 
 /// A block's statements with every `let?` folded into the `match` it means,
@@ -820,19 +831,21 @@ let rec parse_let_try c sp ts =
 let rec unfold_let_try stmts end =
     match stmts {
         [] => [],
-        [[:let_try, _, _, _, sp]] =>
+        [[:let_try, _, _, _, sp, _]] =>
             err "`let?` must be followed by the statements it guards" sp,
-        [[:let_try, binding, value, _, sp], ..rest] =>
+        [[:let_try, binding, value, _, sp, alt], ..rest] =>
             match unfold_let_try rest end {
                 [:error, m, s] => [:error, m, s],
                 after => {
                     let body = ast.span_to sp end;
-                    let ok_p = ast.record_p (result_ok (let_try_far sp 4))
-                                            [ast.bind_p let_try_name (let_try_at sp 1)] sp;
+                    let ok_p = ast.success_p (ast.bind_p let_try_name (let_try_at sp 1)) sp;
                     let passed = let_try_at sp 2;
+                    let otherwise = match alt {
+                        () => ast.arm (ast.bind_p let_try_name passed) () (ast.name_e let_try_name passed) sp,
+                        e => ast.arm (ast.wildcard_p sp) () e sp,
+                    };
                     [ast.match_e value
-                         [ast.arm ok_p () (ast.block_e (list.cons binding after) body) body,
-                          ast.arm (ast.bind_p let_try_name passed) () (ast.name_e let_try_name passed) sp]
+                         [ast.arm ok_p () (ast.block_e (list.cons binding after) body) body, otherwise]
                          body]
                 },
             },
@@ -1963,7 +1976,9 @@ let rec union_body c name params sp variants members ts =
         }
     };
 
-/// One entry: `name`, `name(field : t, ..)`, or a member `name params = body`.
+/// One entry: `name`, `name(field : t, ..)`, a member `name params = body`,
+/// or a member's signature `name : type`. A signature and its member share a
+/// name, so each is only checked against its own kind (and the variants).
 let union_entry c name variants members ts =
     if not (at ts :ident) {
         err ("expected a variant, a member or `}` in `" + name + "`, found " + describe ts) (peek_span ts)
@@ -1974,8 +1989,15 @@ let union_entry c name variants members ts =
         let entry = peek_value ts;
         let at_name = peek_span ts;
         let after = list.tail ts;
-        if union_taken variants members entry {
+        let signs = at after :colon;
+        if union_taken variants (list.filter (fn m -> ast.is_member_sig m == signs) members) entry {
             err ("`" + entry + "` is already a variant or a member of `" + name + "`") at_name
+        }
+        else if signs {
+            match parse_type_expr c (list.tail after) {
+                [:error, m, s] => err m s,
+                [:ok, t, rest] => ok [:member, ast.member_sig entry t (ast.span_to at_name (ast.span t))] rest,
+            }
         }
         else if at after :lparen && peek2_kind after != :rparen {
             if str.ends_with "!" entry {
@@ -3187,17 +3209,24 @@ when test {
             $( test.eq! "(block (name a) (name b))" (shape "{ a\n  b }") ),
         test.case "semicolons separate statements too"
             $( test.eq! "(block (name a) (name b))" (shape "{ a; b }") ),
-        test.case "`let?` is the match that passes anything but `Result.ok` on"
-            $( test.eq! "(block (match (name f) [(field (name Result) ok)(<let?>) (block (let x (name <let?>)) (apply (name g) (name x)))] [<let?> (name <let?>)]))"
+        test.case "`let?` is the match that passes anything but `Result.ok` or `Option.some` on"
+            $( test.eq! "(block (match (name f) [(success <let?>) (block (let x (name <let?>)) (apply (name g) (name x)))] [<let?> (name <let?>)]))"
                         (shape "{ let? x = f; g x }") ),
         test.case "the statements after a `let?` are what it guards, the ones before are not"
-            $( test.eq! ("(block (name a) (match (name f) [(field (name Result) ok)(<let?>) (block (let x (name <let?>))"
-                         + " (match (apply (name g) (name x)) [(field (name Result) ok)(<let?>) (block (let y (name <let?>))"
+            $( test.eq! ("(block (name a) (match (name f) [(success <let?>) (block (let x (name <let?>))"
+                         + " (match (apply (name g) (name x)) [(success <let?>) (block (let y (name <let?>))"
                          + " (apply (name h) (name x) (name y)))] [<let?> (name <let?>)]))] [<let?> (name <let?>)]))")
                         (shape "{ a\n  let? x = f\n  let? y = g x\n  h x y }") ),
         test.case "a `let?` pattern destructures the payload as a `let` does"
-            $( test.eq! "(block (match (name f) [(field (name Result) ok)(<let?>) (block (let [a b] (name <let?>)) (binary add (name a) (name b)))] [<let?> (name <let?>)]))"
+            $( test.eq! "(block (match (name f) [(success <let?>) (block (let [a b] (name <let?>)) (binary add (name a) (name b)))] [<let?> (name <let?>)]))"
                         (shape "{ let? [a, b] = f; a + b }") ),
+        test.case "`let? .. else` answers the alternative instead of passing the failure on"
+            $( test.eq! "(block (match (name f) [(success <let?>) (block (let x (name <let?>)) (name x))] [_ (name e)]))"
+                        (shape "{ let? x = f else e; x }") ),
+        test.case "a union body may sign its members"
+            $( test.eq! [true, true]
+                        [str.contains_str "(sig area" (items "union S { a, area : S -> :integer, area self = 1 }"),
+                         str.contains_str "already" (fails_module "union S { a, area : S -> :integer, area : S -> :integer }")] ),
         test.case "a `let?` with nothing after it has nothing to guard"
             $( test.eq! "`let?` must be followed by the statements it guards" (fails "{ let? x = f }") ),
         test.case "a `let?` binds a value, not a function"

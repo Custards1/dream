@@ -56,7 +56,6 @@
 derive std.codec;
 
 import std.list;
-import std.result;
 import std.str;
 import std.vm;
 import std.tensor;
@@ -390,12 +389,12 @@ priv let read_tensor buf at = {
 /// `frames`, which knows where each ends because the frame says so.
 /// One message, the way the writer and reader above spell it: the definition
 /// of the format, which the VM's `wire_decode` is held to by the tests below.
-let decode_by_hand : :string -> result.Of :any :string;
+let decode_by_hand : :string -> Result :any :string;
 let decode_by_hand text = match read text 0 {
-    () => result.error ("not a " + format_name () + " value"),
+    () => Result.error ("not a " + format_name () + " value"),
     [v, at] =>
-        if at == len text { result.ok v }
-        else { result.error ("trailing bytes after a " + format_name () + " value") },
+        if at == len text { Result.ok v }
+        else { Result.error ("trailing bytes after a " + format_name () + " value") },
 };
 
 // --- natively ----------------------------------------------------------------
@@ -417,7 +416,7 @@ let encode v = vm.wire_encode v;
 /// the format, and carrying on would read the next message as part of this
 /// one. A stream of several messages is `frames`, which knows where each ends
 /// because the frame says so.
-let decode : :string -> result.Of :any :string;
+let decode : :string -> Result :any :string;
 let decode text = vm.wire_decode text;
 
 // --- tests ---------------------------------------------------------------------
@@ -442,7 +441,7 @@ when test {
         test.case "malformed tensor shapes and payloads are refused"
             $( test.true! (list.all (fn bytes -> {
                 let native = decode bytes;
-                result.is_error native && result.is_error (decode_by_hand bytes)
+                Result.is_error native && Result.is_error (decode_by_hand bytes)
             }) [byte 12, byte 12 + byte 0, byte 12 + byte 7,
                 byte 12 + byte 1 + count 0,
                 byte 12 + byte 2 + count 4294967295 + count 4294967295,
@@ -468,13 +467,13 @@ when test {
 
         // the kinds stay apart, which is the whole reason for this format
         test.case "an array does not come back a list"
-            $( test.eq! :array (type_of (result.or_else () (decode (encode (_array_of_list [1]))))) ),
+            $( test.eq! :array (type_of (Result.unwrap_or () (decode (encode (_array_of_list [1]))))) ),
         test.case "an atom does not come back a string"
-            $( test.eq! :atom (type_of (result.or_else () (decode (encode :ok)))) ),
+            $( test.eq! :atom (type_of (Result.unwrap_or () (decode (encode :ok)))) ),
         test.case "an integer does not come back a float"
-            $( test.eq! :integer (type_of (result.or_else () (decode (encode 1)))) ),
+            $( test.eq! :integer (type_of (Result.unwrap_or () (decode (encode 1)))) ),
         test.case "a float that is whole stays a float"
-            $( test.eq! :float (type_of (result.or_else () (decode (encode 2.0)))) ),
+            $( test.eq! :float (type_of (Result.unwrap_or () (decode (encode 2.0)))) ),
 
         // nesting, which the walk in std.codec gives this format for nothing
         test.case "nested list"   $( test.true! (trip [[1], [2, [3]]]) ),
@@ -482,7 +481,7 @@ when test {
         test.case "list of maps"  $( test.true! (trip [%{ 1 => :a }, %{}]) ),
         test.case "map with mixed keys" $( test.true! (trip %{ 1 => :a, "b" => 2, :c => 3 }) ),
         test.case "a map value keeps its kind"
-            $( test.eq! :atom (type_of (map.get () "k" (result.or_else %{} (decode (encode %{ "k" => :v }))))) ),
+            $( test.eq! :atom (type_of (map.get () "k" (Result.unwrap_or %{} (decode (encode %{ "k" => :v }))))) ),
 
         // the edges of an integer, and past them
         test.case "the largest fixnum"   $( test.true! (trip 4611686018427387903) ),
@@ -509,20 +508,20 @@ when test {
         test.case "a string of non-ascii"   $( test.true! (trip "\u{e9}\u{1f600}") ),
 
         // a message that is wrong is an answer, not a raise
-        test.case "empty input"     $( test.true! (result.is_error (decode "")) ),
-        test.case "an unknown tag"  $( test.true! (result.is_error (decode (_str_of_bytes [99]))) ),
+        test.case "empty input"     $( test.true! (Result.is_error (decode "")) ),
+        test.case "an unknown tag"  $( test.true! (Result.is_error (decode (_str_of_bytes [99]))) ),
         test.case "a truncated integer"
-            $( test.true! (result.is_error (decode (_str_slice (encode 42) 0 5))) ),
+            $( test.true! (Result.is_error (decode (_str_slice (encode 42) 0 5))) ),
         test.case "a truncated string"
-            $( test.true! (result.is_error (decode (_str_slice (encode "hello") 0 6))) ),
+            $( test.true! (Result.is_error (decode (_str_slice (encode "hello") 0 6))) ),
         test.case "a truncated list"
-            $( test.true! (result.is_error (decode (_str_slice (encode [1, 2]) 0 7))) ),
+            $( test.true! (Result.is_error (decode (_str_slice (encode [1, 2]) 0 7))) ),
         test.case "trailing bytes"
-            $( test.true! (result.is_error (decode (encode 1 + encode 2))) ),
+            $( test.true! (Result.is_error (decode (encode 1 + encode 2))) ),
         test.case "a truncated bignum"
-            $( test.true! (result.is_error (decode (_str_slice (encode 9223372036854775808) 0 10))) ),
+            $( test.true! (Result.is_error (decode (_str_slice (encode 9223372036854775808) 0 10))) ),
         test.case "a name this program has no atom for"
-            $( test.true! (result.is_error
+            $( test.true! (Result.is_error
                    (decode (_str_concat [_str_of_bytes [6], _str_le 3 4, "zzq"]))) ),
 
         // the VM's codec is this module's, byte for byte
@@ -540,7 +539,7 @@ when test {
                                          -340282366920938463463374607431768211457]) ),
         test.case "and refuses what it refuses"
             $( test.eq! [true, true, true, true]
-                        (list.map (fn t -> result.is_error (decode t) && result.is_error (decode_by_hand t))
+                        (list.map (fn t -> Result.is_error (decode t) && Result.is_error (decode_by_hand t))
                                   ["", _str_of_bytes [99], encode 1 + encode 2,
                                    _str_concat [_str_of_bytes [6], _str_le 3 4, "zzq"]]) ),
 

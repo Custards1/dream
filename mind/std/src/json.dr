@@ -241,7 +241,7 @@ let rec parse_array cs acc first = match skip_ws cs {
 ///     console.print! (json.parse "{\"answer\":42}")
 /// };
 /// ```
-let parse : :string -> result.Of :any :string;
+let parse : :string -> Result :any :string;
 let parse text = {
     let r = parse_value (str.chars text);
     if r == () { Result.error "not valid JSON" }
@@ -253,10 +253,10 @@ let parse text = {
 };
 
 /// Test whether a parse result has the success tag.
-let ok : result.Of a e -> :bool;
-let ok r = result.is_ok r;
+let ok : Result a e -> :bool;
+let ok r = Result.is_ok r;
 /// Extract the payload from a parse result.
-let value : result.Of a e -> :any;
+let value : Result a e -> :any;
 let value r = match r { Result.ok(v) => v, Result.error(why) => why };
 
 /// The parsed value, or `default` if the text is not valid JSON.
@@ -371,7 +371,7 @@ let format_name u = "json";
 
 /// The other hole: reading is `parse`, which already answers the result shape
 /// `std.codec` asks for.
-let decode : :string -> result.Of :any :string;
+let decode : :string -> Result :any :string;
 let decode text = parse text;
 
 // --- the names this module had before it derived anything ---------------------
@@ -558,5 +558,5 @@ when test {
 type Value = :unit | :bool | :integer | :float | :string
            | [Value] | %{ :string => Value };
 /// Parse text and validate a successful value against `description`.
-let parse_as : :any -> :string -> result.Of :any :any;
+let parse_as : :any -> :string -> Result :any :any;
 let parse_as description text = decode_as description text;

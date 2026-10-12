@@ -218,13 +218,13 @@ let encode_all vs = list.map encode vs;
 /// The value, or `default` when the text does not decode. The form for when a
 /// fallback is more use than a diagnosis.
 let decode_or : :any -> :string -> :any;
-let decode_or default text = result.or_else default (decode text);
+let decode_or default text = Result.unwrap_or default (decode text);
 
 /// Does this value survive the trip? What a format's own tests are written
 /// with, and the honest way to state its limits: a format says which values
 /// round trip by listing the ones for which this is true.
 let round_trips : :any -> :bool;
-let round_trips v = decode (encode v) == result.ok v;
+let round_trips v = decode (encode v) == Result.ok v;
 
 /// Every value in the text, where the text is a sequence of whole messages --
 /// see framing below.
@@ -330,7 +330,7 @@ let frames buf = frames_from [] buf;
 // --- optional types ---------------------------------------------------------
 
 import std.types;
-type Decoded value = result.Of value :any;
+type Decoded value = Result value :any;
 // Syntax errors stay in the codec's error channel; a schema mismatch is a
 // :type_error value in that same channel. No exception is needed by a parser.
 /// Decode a value and validate a successful payload against `description`.

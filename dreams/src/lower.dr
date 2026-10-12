@@ -1174,6 +1174,7 @@ let rec pattern_test p subject binds l =
         [:array_p, items, rest, span] => array_test items rest subject binds span l,
         [:map_p, pairs, span] => map_test pairs subject binds span l,
         [:record_p, ctor, fields, span] => record_test ctor fields subject binds span l,
+        [:success_p, inner, _] => success_test inner subject binds l,
         _ => { let t = const_bool true l; [list.head t, list.nth 1 t, binds] },
     };
 
@@ -1209,6 +1210,25 @@ let rec record_test ctor fields subject binds span l =
                    (list.zip fields (list.range 0 (list.length fields)))
             },
     };
+
+/// `let?`'s pattern: the subject is the prelude's `Result.ok` or
+/// `Option.some` -- asked by id, as `record_test` asks -- and `inner` is
+/// matched against the one field both of them hold.
+let success_test inner subject binds l = {
+    let tests = list.fold (fn acc id -> {
+        let k = const_atom id (list.head acc);
+        let is = call_builtin "_record_is" [list.nth 1 k, subject] (list.head k);
+        match list.nth 1 acc {
+            () => is,
+            before => binary :or before (list.nth 1 is) (list.head is),
+        }
+    }) [l, ()] ast.success_ids;
+    let at = const_int 0 (list.head tests);
+    let field = call_builtin "_match_at" [subject, list.nth 1 at] (list.head at);
+    let inner_t = pattern_test inner (list.nth 1 field) binds (list.head field);
+    let both = bool_and (list.nth 1 tests) (list.nth 1 inner_t) (list.nth 0 inner_t);
+    [list.head both, list.nth 1 both, list.nth 2 inner_t]
+};
 
 /// The value must be a list at all. Without this `[]` would match anything that
 /// is not a cons cell -- an array, a map, a number -- because "not a cell" and

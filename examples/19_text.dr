@@ -58,6 +58,6 @@ let main! = {
     console.print! (regex.split (regex.compile "\\s*[,;]\\s*") "a, b;c ,d")
 
     // Text from outside is checked with `parse`, which answers a result.
-    console.print! (regex.parse "(unclosed" |> result.map (fn re -> ()))
+    console.print! (regex.parse "(unclosed" |> Result.map (fn re -> ()))
     console.print! (regex.problem "a{3,1}")
 };

@@ -1,197 +1,188 @@
-// Results: `Result.ok value` and `Result.error reason`, and what to do with
-// them.
+// Results checked against descriptions, and the tests of the prelude's
+// `Result` and `Option`.
 //
-// `Result` itself is the prelude's (`std.prelude`), so every module has it and
-// `let?` can chain it without an import; this module is the rest -- the
-// matches every caller would otherwise rewrite, named. It is how this library
-// reports a failure, and for one reason: raising is an effect. A pure function
-// cannot raise, so a pure parser cannot report a failure by raising; it has to
-// *answer* one. That is what makes this a value rather than an exception, and
-// `raise!`/`try!` are kept for what is not an answer -- a broken invariant, a
-// resource gone, a process killed.
+// `Result` and `Option` are the prelude's (`std.prelude`): every module has
+// them, and what to do with one -- `map`, `and_then`, `unwrap_or`, `flatten`,
+// `all` -- is a member of it, `Result.map f r`, so none of that needs an
+// import either. They are how this library reports a failure, and for one
+// reason: raising is an effect. A pure function cannot raise, so a pure parser
+// cannot report a failure by raising; it has to *answer* one. That is what
+// makes this a value rather than an exception, and `raise!`/`try!` are kept for
+// what is not an answer -- a broken invariant, a resource gone, a process
+// killed.
 //
-// Nothing here is clever -- the point is that `and_then` reads as "and then",
-// so a pipeline of steps that can each fail is written once and reads as the
-// sequence it is.
-
-import std.list;
-
-// --- making one ---------------------------------------------------------------
-
-/// Wrap a successful value: `Result.ok value`.
-///
-/// ```dream
-/// import std.result;
-/// import std.console;
-///
-/// let main! = {
-///     console.print! (result.ok "ready")
-/// };
-/// ```
-let ok : a -> Of a e;
-let ok value = Result.ok value;
-/// Wrap a failure reason: `Result.error reason`.
-///
-/// ```dream
-/// import std.result;
-/// import std.console;
-///
-/// let main! = {
-///     console.print! (result.error "not found")
-/// };
-/// ```
-let error : e -> Of a e;
-let error reason = Result.error reason;
-
-/// Test whether a result is an ok.
-let is_ok : Of a e -> :bool;
-let is_ok r = match r { Result.ok(_) => true, Result.error(_) => false };
-/// Test whether a result is an error.
-let is_error : Of a e -> :bool;
-let is_error r = match r { Result.error(_) => true, Result.ok(_) => false };
-
-/// The value, or `default` for an error. The usual way out of a result.
-let or_else : a -> Of a e -> a;
-let or_else default r = match r { Result.ok(v) => v, Result.error(_) => default };
-
-/// The reason, or `default` when there is none.
-let reason : e -> Of a e -> e;
-let reason default r = match r { Result.error(why) => why, Result.ok(_) => default };
-
-/// The value, raising the reason if there is not one. Impure by name, because
-/// raising is an effect -- which is the whole reason this module exists.
-let unwrap! : Of a e -> a;
-let unwrap! r = match r { Result.ok(v) => v, Result.error(why) => raise! why };
-
-// --- carrying on ----------------------------------------------------------------
-
-/// Change the value, leave an error alone.
-///
-/// ```dream
-/// import std.result;
-/// import std.console;
-///
-/// let main! = {
-///     console.print! (result.map (fn x -> x + 1) (result.ok 41))
-/// };
-/// ```
-let map : (a -> b) -> Of a e -> Of b e;
-let map f r = match r { Result.ok(v) => Result.ok (f v), Result.error(why) => Result.error why };
-
-/// Change the reason, leave a value alone. What to use when a failure needs to
-/// be reported in the caller's terms rather than the callee's.
-let map_error : (e -> f) -> Of a e -> Of a f;
-let map_error f r = match r { Result.error(why) => Result.error (f why), Result.ok(v) => Result.ok v };
-
-/// The next step, which may itself fail. This is the one that makes a pipeline:
-///
-///     read path |> and_then parse |> and_then validate
-let and_then : (a -> Of b e) -> Of a e -> Of b e;
-let and_then f r = match r { Result.ok(v) => f v, Result.error(why) => Result.error why };
-
-/// The first result if it is ok, otherwise the second. `r` is not forced when
-/// it does not have to be, so the fallback can be expensive.
-let or_try : Of a e -> Of a e -> Of a e;
-let or_try other r = if is_ok r { r } else { other };
-
-// --- several at once ------------------------------------------------------------
-
-/// `Result.ok values` when every one is ok, or the first error.
-///
-/// Stops at the first failure, which for a lazy list means the ones after it
-/// are never computed -- validating a thousand things costs one when the first
-/// is wrong.
-let all : [Of a e] -> Of [a] e;
-let rec all rs =
-    if list.is_empty rs { Result.ok [] }
-    else {
-        match list.head rs {
-            Result.error(why) => Result.error why,
-            Result.ok(v) => match all (list.tail rs) {
-                Result.error(why) => Result.error why,
-                Result.ok(vs) => Result.ok (list.cons v vs),
-            },
-        }
-    };
-
-/// The values of every ok, dropping the errors. For when a failure is worth
-/// skipping rather than stopping for.
-let oks : [Of a e] -> [a];
-let oks rs = list.concat (list.map (fn r -> match r { Result.ok(v) => [v], Result.error(_) => [] }) rs);
-
-/// The reasons of every error.
-let errors : [Of a e] -> [e];
-let errors rs = list.concat (list.map (fn r -> match r { Result.error(why) => [why], Result.ok(_) => [] }) rs);
-
-/// `Result.ok v` when `v` is not `()`, and `Result.error reason` when it is.
-/// The bridge from the other convention this library uses -- a lookup that
-/// answers `()` for "nothing there".
-let of_option : e -> a -> Of a e;
-let of_option reason v = match v { () => Result.error reason, found => Result.ok found };
-
-/// And back: the value, or `()`.
-let to_option : Of a e -> a;
-let to_option r = match r { Result.ok(v) => v, Result.error(_) => () };
-
-// --- tests -------------------------------------------------------------------
-
-when test {
-    import std.test;
-
-    let double x = ok (x * 2);
-    let fail _ = error :nope;
-
-    let tests = [
-        test.case "ok"                  $( test.true! (is_ok (ok 1)) ),
-        test.case "error"               $( test.true! (is_error (error :e)) ),
-        test.case "or_else takes the value"   $( test.eq! 1 (or_else 0 (ok 1)) ),
-        test.case "or_else takes the default" $( test.eq! 0 (or_else 0 (error :e)) ),
-        test.case "reason"              $( test.eq! :e (reason () (error :e)) ),
-
-        test.case "map"                 $( test.eq! (ok 2) (map (fn x -> x * 2) (ok 1)) ),
-        test.case "map leaves an error" $( test.eq! (error :e) (map (fn x -> x * 2) (error :e)) ),
-        test.case "map_error"           $( test.eq! (error ":e") (map_error to_string (error :e)) ),
-        test.case "and_then chains"     $( test.eq! (ok 4) (and_then double (double 1)) ),
-        test.case "and_then stops at the first error"
-            $( test.eq! (error :nope) (and_then double (and_then fail (ok 1))) ),
-        test.case "or_try"              $( test.eq! (ok 2) (or_try (ok 2) (error :e)) ),
-
-        test.case "all, every one ok"   $( test.eq! (ok [1, 2]) (all [ok 1, ok 2]) ),
-        test.case "all, the first error wins"
-            $( test.eq! (error :a) (all [ok 1, error :a, error :b]) ),
-        test.case "all of nothing"      $( test.eq! (ok []) (all []) ),
-        test.case "oks"                 $( test.eq! [1, 2] (oks [ok 1, error :e, ok 2]) ),
-        test.case "errors"              $( test.eq! [:e] (errors [ok 1, error :e]) ),
-
-        test.case "of_option, present"  $( test.eq! (ok 5) (of_option :missing 5) ),
-        test.case "of_option, absent"   $( test.eq! (error :missing) (of_option :missing ()) ),
-        test.case "to_option"           $( test.eq! 5 (to_option (ok 5)) ),
-        test.case "to_option of an error" $( test.eq! () (to_option (error :e)) ),
-
-        test.case "unwrap! raises the reason" $( test.raises! $( unwrap! (error :e) ) ),
-        test.case "unwrap! answers the value" $( test.eq! 5 (unwrap! (ok 5)) ),
-    ];
-}
-
-// --- optional types ---------------------------------------------------------
+// This module is the short spelling of the same things -- `result.ok x`,
+// `result.err why`, `result.map f r` -- for a module that would rather import
+// a name than write the union's. Each is a wrapper: one call of the member it
+// names, which the compiler replaces with that call (see "wrappers" in
+// `dreams/src/scope.dr`), so the two spellings compile to the same code and
+// the prelude's are still the ones fusion sees. The rest is what needs
+// `std.types`, which the prelude cannot import: a result's payloads checked
+// against a description at run time.
 
 import std.types;
-/// A result: the prelude's `Result`, under the name this module has always
-/// given it.
-type Of value reason = Result value reason;
+
+// --- the short spellings --------------------------------------------------------
+
+/// `Result.ok value`.
+let ok : a -> Result a e;
+let ok value = Result.ok value;
+/// `Result.error reason`.
+let err : e -> Result a e;
+let err reason = Result.error reason;
+/// `Result.error reason`, under the variant's own name.
+let error : e -> Result a e;
+let error reason = Result.error reason;
+
+/// `Result.is_ok`.
+let is_ok : Result a e -> :bool;
+let is_ok r = Result.is_ok r;
+/// `Result.is_error`.
+let is_err : Result a e -> :bool;
+let is_err r = Result.is_error r;
+
+/// `Result.map`.
+let map : (a -> b) -> Result a e -> Result b e;
+let map f r = Result.map f r;
+/// `Result.map_error`.
+let map_err : (e -> f) -> Result a e -> Result a f;
+let map_err f r = Result.map_error f r;
+/// `Result.and_then`.
+let and_then : (a -> Result b e) -> Result a e -> Result b e;
+let and_then f r = Result.and_then f r;
+/// `Result.or_else`.
+let or_else : (e -> Result a f) -> Result a e -> Result a f;
+let or_else f r = Result.or_else f r;
+/// `Result.otherwise`.
+let otherwise : Result a e -> Result a e -> Result a e;
+let otherwise other r = Result.otherwise other r;
+/// `Result.flatten`.
+let flatten : Result (Result a e) e -> Result a e;
+let flatten r = Result.flatten r;
+
+/// `Result.unwrap_or`.
+let unwrap_or : a -> Result a e -> a;
+let unwrap_or default r = Result.unwrap_or default r;
+/// `Result.unwrap_or_else`.
+let unwrap_or_else : (e -> a) -> Result a e -> a;
+let unwrap_or_else f r = Result.unwrap_or_else f r;
+/// `Result.unwrap!`.
+let unwrap! : Result a e -> a;
+let unwrap! r = Result.unwrap! r;
+/// `Result.to_option`.
+let to_option : Result a e -> Option a;
+let to_option r = Result.to_option r;
+
+/// `Result.all`.
+let all : [Result a e] -> Result [a] e;
+let all rs = Result.all rs;
+/// `Result.oks`.
+let oks : [Result a e] -> [a];
+let oks rs = Result.oks rs;
+/// `Result.errors`.
+let errors : [Result a e] -> [e];
+let errors rs = Result.errors rs;
+
+// --- checked against a description ----------------------------------------------
+
 /// Validate both possible payload types of a result, raising on a mismatch.
-let check : :any -> :any -> Of a e -> Of a e;
-let check value reason outcome = types.check (Of value reason) outcome;
+let check : :any -> :any -> Result a e -> Result a e;
+let check value reason outcome = types.check (Result value reason) outcome;
 /// Validate a successful payload against `description`, retaining failures unchanged.
-let validate_ok : :any -> Of a e -> Of a (e | :error);
+let validate_ok : :any -> Result a e -> Result a (e | :error);
 let validate_ok description outcome = match outcome {
     Result.ok(value) => types.validate description value,
     other => other,
 };
 
 /// Check a value against `description`, then wrap it as a successful result.
-let ok_as : :any -> a -> Of a e;
-let ok_as description value = ok (types.check description value);
+let ok_as : :any -> a -> Result a e;
+let ok_as description value = Result.ok (types.check description value);
 /// Check a reason against `description`, then wrap it as an error result.
-let error_as : :any -> e -> Of a e;
-let error_as description reason = error (types.check description reason);
+let error_as : :any -> e -> Result a e;
+let error_as description reason = Result.error (types.check description reason);
+
+// --- tests -------------------------------------------------------------------
+
+when test {
+    import std.test;
+
+    let double x = Result.ok (x * 2);
+    let fail _ = Result.error :nope;
+    let half n = if n % 2 == 0 { Option.some (n / 2) } else { Option.none };
+
+    let quarter n = {
+        let? h = half n;
+        let? q = half h;
+        Option.some q
+    };
+    let need n = {
+        let? q = quarter n else Result.error :odd;
+        let? d = double q;
+        Result.ok (d + 1)
+    };
+    let pair n = {
+        let? [a, b] = Result.ok [n, n + 1];
+        Result.ok (a * b)
+    };
+
+    let tests = [
+        test.case "is_ok"                   $( test.true! (Result.is_ok (Result.ok 1)) ),
+        test.case "is_error"                $( test.true! (Result.is_error (Result.error :e)) ),
+        test.case "tag"                     $( test.eq! [:ok, :error] [Result.tag (Result.ok 1), Result.tag (Result.error 2)] ),
+        test.case "unwrap_or takes the value"   $( test.eq! 1 (Result.unwrap_or 0 (Result.ok 1)) ),
+        test.case "unwrap_or takes the default" $( test.eq! 0 (Result.unwrap_or 0 (Result.error :e)) ),
+        test.case "unwrap_or_else"          $( test.eq! ":e" (Result.unwrap_or_else to_string (Result.error :e)) ),
+        test.case "reason"                  $( test.eq! (Option.some :e) (Result.reason (Result.error :e)) ),
+        test.case "to_option"               $( test.eq! [Option.some 5, Option.none]
+                                                        [Result.to_option (Result.ok 5), Result.to_option (Result.error :e)] ),
+
+        test.case "map"                     $( test.eq! (Result.ok 2) (Result.map (fn x -> x * 2) (Result.ok 1)) ),
+        test.case "map leaves an error"     $( test.eq! (Result.error :e) (Result.map (fn x -> x * 2) (Result.error :e)) ),
+        test.case "map_error"               $( test.eq! (Result.error ":e") (Result.map_error to_string (Result.error :e)) ),
+        test.case "and_then chains"         $( test.eq! (Result.ok 4) (Result.and_then double (double 1)) ),
+        test.case "and_then stops at the first error"
+            $( test.eq! (Result.error :nope) (Result.and_then double (Result.and_then fail (Result.ok 1))) ),
+        test.case "or_else recovers"        $( test.eq! (Result.ok 0) (Result.or_else (fn _ -> Result.ok 0) (Result.error :e)) ),
+        test.case "otherwise"               $( test.eq! (Result.ok 2) (Result.otherwise (Result.ok 2) (Result.error :e)) ),
+        test.case "a chain through |>"
+            $( test.eq! (Result.error ":nope")
+                        (Result.ok 1 |> Result.and_then fail |> Result.map (fn x -> x + 1) |> Result.map_error to_string) ),
+        test.case "flatten"                 $( test.eq! (Result.error :in) (Result.flatten (Result.ok (Result.error :in))) ),
+        test.case "both"                    $( test.eq! (Result.ok [1, 2]) (Result.both (Result.ok 2) (Result.ok 1)) ),
+
+        test.case "all, every one ok"       $( test.eq! (Result.ok [1, 2]) (Result.all [Result.ok 1, Result.ok 2]) ),
+        test.case "all, the first error wins"
+            $( test.eq! (Result.error :a) (Result.all [Result.ok 1, Result.error :a, Result.error :b]) ),
+        test.case "all of nothing"          $( test.eq! (Result.ok []) (Result.all []) ),
+        test.case "oks"                     $( test.eq! [1, 2] (Result.oks [Result.ok 1, Result.error :e, Result.ok 2]) ),
+        test.case "errors"                  $( test.eq! [:e] (Result.errors [Result.ok 1, Result.error :e]) ),
+
+        test.case "unwrap! raises the reason" $( test.raises! $( Result.unwrap! (Result.error :e) ) ),
+        test.case "unwrap! answers the value" $( test.eq! 5 (Result.unwrap! (Result.ok 5)) ),
+
+        test.case "Option.of"               $( test.eq! [Option.some 5, Option.none] [Option.of 5, Option.of ()] ),
+        test.case "Option.or_unit"          $( test.eq! [5, ()] [Option.or_unit (Option.some 5), Option.or_unit Option.none] ),
+        test.case "Option.map"              $( test.eq! (Option.some 6) (Option.map (fn x -> x * 2) (Option.some 3)) ),
+        test.case "Option.and_then"         $( test.eq! [Option.some 2, Option.none] [Option.and_then half (Option.some 4), Option.and_then half (Option.some 3)] ),
+        test.case "Option.filter"           $( test.eq! Option.none (Option.filter (fn x -> x > 5) (Option.some 3)) ),
+        test.case "Option.unwrap_or"        $( test.eq! 0 (Option.unwrap_or 0 Option.none) ),
+        test.case "Option.ok_or"            $( test.eq! (Result.error :missing) (Option.ok_or :missing Option.none) ),
+        test.case "Option.flatten"          $( test.eq! (Option.some 1) (Option.flatten (Option.some (Option.some 1))) ),
+        test.case "Option.all"              $( test.eq! Option.none (Option.all [Option.some 1, Option.none]) ),
+        test.case "Option.values"           $( test.eq! [1, 3] (Option.values [Option.some 1, Option.none, Option.some 3]) ),
+        test.case "Option.contains"         $( test.true! (Option.contains 3 (Option.some 3)) ),
+        test.case "Option.unwrap! raises"   $( test.raises! $( Option.unwrap! Option.none ) ),
+
+        test.case "let? chains options"     $( test.eq! [Option.some 3, Option.none] [quarter 12, quarter 6] ),
+        test.case "let? .. else answers the alternative"
+            $( test.eq! [Result.ok 7, Result.error :odd] [need 12, need 6] ),
+        test.case "let? takes a pattern"    $( test.eq! (Result.ok 12) (pair 3) ),
+
+        test.case "validate_ok keeps an error" $( test.eq! (Result.error :e) (validate_ok :integer (Result.error :e)) ),
+        test.case "ok_as"                   $( test.eq! (Result.ok 1) (ok_as :integer 1) ),
+        test.case "the short spellings"
+            $( test.eq! [Result.ok 2, Result.error :e, Result.error ":e"]
+                        [map (fn x -> x + 1) (ok 1), and_then double (err :e), map_err to_string (err :e)] ),
+    ];
+}

@@ -13,7 +13,6 @@
 // (`a | b`) has no equivalent in the others and is passed to Debian as it is.
 
 import std.list;
-import std.result;
 import std.str;
 
 /// `name`, and `op` and `version` when it constrains one; `op` is `""` when
@@ -62,12 +61,12 @@ let pacman d = Dep.name d + Dep.op d + Dep.version d;
 /// A whole list for Debian, where an alternative passes through untouched.
 let deb_list : [:string] -> Result :string :string;
 let deb_list ds = {
-    let one = fn d -> if str.contains_str "|" d { Result.ok (str.trim d) } else { result.map deb (parse d) };
-    result.map (fn xs -> str.join_str ", " xs) (result.all (list.map one ds))
+    let one = fn d -> if str.contains_str "|" d { Result.ok (str.trim d) } else { Result.map deb (parse d) };
+    Result.map (fn xs -> str.join_str ", " xs) (Result.all (list.map one ds))
 };
 
 let parse_all : [:string] -> Result [:any] :string;
-let parse_all ds = result.all (list.map parse ds);
+let parse_all ds = Result.all (list.map parse ds);
 
 when test {
     import std.test;
@@ -75,9 +74,9 @@ when test {
     let tests = [
         test.case "every spelling reads the same"
             $( test.eq! [Dep.make "libffi" ">=" "3.4", Dep.make "libffi" ">=" "3.4", Dep.make "libffi" ">=" "3.4", Dep.new "libc6"]
-                        (list.map (fn t -> result.or_else [] (parse t)) ["libffi >= 3.4", "libffi (>= 3.4)", "libffi>=3.4", " libc6 "]) ),
+                        (list.map (fn t -> Result.unwrap_or [] (parse t)) ["libffi >= 3.4", "libffi (>= 3.4)", "libffi>=3.4", " libc6 "]) ),
         test.case "Debian's strict operators"
-            $( test.eq! [Dep.make "a" ">" "1", Dep.make "a" "<" "2"] [result.or_else [] (parse "a (>> 1)"), result.or_else [] (parse "a << 2")] ),
+            $( test.eq! [Dep.make "a" ">" "1", Dep.make "a" "<" "2"] [Result.unwrap_or [] (parse "a (>> 1)"), Result.unwrap_or [] (parse "a << 2")] ),
         test.case "mistakes"
             $( test.eq! [:error, :error, :error] (list.map (fn t -> Result.tag (parse t)) ["", "a >=", "a => 2"]) ),
         test.case "each format's spelling"

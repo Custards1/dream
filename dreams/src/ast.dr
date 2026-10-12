@@ -364,6 +364,17 @@ let member_body m = m.[2];
 let member_span : [:any] -> Span;
 let member_span m = m.[3];
 
+/// `name : type` in a record or union body: the signature of the member of
+/// that name, said where the member is. It is a member of its own in the list,
+/// `[name, :sig, type, span]`, because the body's entries are kept in the
+/// order they were written and the generated module wants both, a `sig` and a
+/// `let`, in that order (`syntax.member_decls`).
+let member_sig : :string -> Expr -> Span -> [:any];
+let member_sig name t span = [name, :sig, t, span];
+/// Whether a member entry is a signature rather than a definition.
+let is_member_sig : [:any] -> :bool;
+let is_member_sig m = m.[1] == :sig;
+
 let record_d : :atom -> :string -> [[:any]] -> [[:any]] -> Span -> Decl;
 let record_d kind name fields members span = [:record, kind, name, fields, members, [], span];
 
@@ -497,6 +508,20 @@ let as_p inner name name_span span = [:as_p, inner, name, name_span, span];
 let record_p : Expr -> [Pattern] -> Span -> Pattern;
 let record_p ctor fields span = [:record_p, ctor, fields, span];
 
+/// What `let?` carries on with: `Result.ok(inner)` or `Option.some(inner)`,
+/// whichever the value is. It is written only by the parser, for `let?` and
+/// `?`, and it is a pattern of its own rather than two arms because the arm's
+/// body is the rest of the block -- two arms would write it twice, and a chain
+/// of n steps 2^n times. The variants are the prelude's, by id, so a module
+/// with a `Result` of its own still chains the language's (`success_ids`).
+let success_p : Pattern -> Span -> Pattern;
+let success_p inner span = [:success_p, inner, span];
+
+/// The ids of the variants `success_p` matches: the prelude's `Result.ok`
+/// and `Option.some`. Both hold their value as their one field.
+let success_ids : [:string];
+let success_ids = ["std.prelude.Result.ok", "std.prelude.Option.some"];
+
 /// One `pattern => body`, with an optional guard checked after the pattern
 /// matched, so it can use what the pattern bound.
 let arm : Pattern -> Expr | :unit -> Expr -> Span -> Arm;
@@ -622,9 +647,7 @@ let rec show e =
                               d => "(" + label + " = " + show d + ")",
                           }
                       }) fields
-                    + list.map (fn m ->
-                      "(" + member_name m + " " + show_params (member_params m)
-                          + " = " + show (member_body m) + ")") members) + ")",
+                    + list.map show_member members) + ")",
         [:list, xs, _]      => "(list " + show_all xs + ")",
         [:array, xs, _]     => "(array " + show_all xs + ")",
         [:map, pairs, _]    => "(map " + show_pairs pairs + ")",
@@ -644,9 +667,7 @@ let rec show e =
                   + str.join_str "" (list.map (fn f ->
                         " " + list.nth 0 f + match list.nth 2 f { () => "", t => " : " + show t })
                         (variant_fields v)) + ")") variants
-                + list.map (fn m ->
-                  "(" + member_name m + " " + show_params (member_params m)
-                      + " = " + show (member_body m) + ")") members) + ")",
+                + list.map show_member members) + ")",
         [:foreign_decl, n, lib, entries, _] =>
             "(foreign " + n + (match lib { () => "", l => " " + show l })
             + str.join_str "" (list.map (fn e -> " " + match e {
@@ -699,6 +720,11 @@ let show_pairs pairs =
     str.join_str " " (list.map (fn kv -> "[" + show (list.nth 0 kv) + " " + show (list.nth 1 kv) + "]") pairs)
 ;
 
+let show_member m =
+    if is_member_sig m { "(sig " + member_name m + " " + show (member_body m) + ")" }
+    else { "(" + member_name m + " " + show_params (member_params m) + " = " + show (member_body m) + ")" }
+;
+
 let show_arms arms = str.join_str " " (list.map (fn a -> show_arm a) arms)
 ;
 
@@ -721,6 +747,7 @@ let rec show_pattern p =
             "%{" + str.join_str " " (list.map (fn kv -> show (list.nth 0 kv) + " => "
                                                         + show_pattern (list.nth 1 kv)) pairs) + "}",
         [:as_p, inner, n, _, _] => "(" + show_pattern inner + " as " + n + ")",
+        [:success_p, inner, _] => "(success " + show_pattern inner + ")",
         [:record_p, ctor, fields, _] =>
             show ctor + (if list.is_empty fields { "" }
                          else { "(" + str.join_str ", " (list.map show_pattern fields) + ")" }),

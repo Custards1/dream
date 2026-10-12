@@ -120,13 +120,13 @@ let compile_with flags source = match parse_with flags source {
 
 /// The pattern compiled, or `[:error, why]`: for patterns that arrive at run
 /// time.
-let parse : :string -> result.Of Regex :string;
+let parse : :string -> Result Regex :string;
 let parse source = parse_with [] source;
 
 /// Parse regular-expression syntax and apply explicit flags, returning a result.
-let parse_with : [Flag] -> :string -> result.Of Regex :string;
+let parse_with : [Flag] -> :string -> Result Regex :string;
 let parse_with flags source = match p.run regex_syntax source {
-    Result.error(e) => result.error ("column " + to_string (p.Error.column e) + ": " + p.Error.message e),
+    Result.error(e) => Result.error ("column " + to_string (p.Error.column e) + ": " + p.Error.message e),
     Result.ok(tree) => {
         let numbered = number_groups tree 1;
         let ast = numbered.[0];
@@ -144,10 +144,10 @@ let parse_with flags source = match p.run regex_syntax source {
                 // finds where a match starts from where it ends; its groups
                 // are of no interest there.
                 let backwards = encode (emit (reversed ast) 0 initial + [#[:match]]) 1 "" () "";
-                result.ok (Regex.make source groups (group_names ast %{}) prefix starts
+                Result.ok (Regex.make source groups (group_names ast %{}) prefix starts
                                       (encode program groups prefix starts backwards) (encode whole groups "" () ""))
             },
-            why => result.error why,
+            why => Result.error why,
         }
     },
 };
@@ -895,7 +895,7 @@ when test {
         test.case "lookaround is refused"    $( test.true! (str.contains_str "lookaround is not supported" (or_empty (problem "a(?=b)"))) ),
         test.case "backreferences are refused" $( test.true! (str.contains_str "backreferences" (or_empty (problem "(a)\\1"))) ),
         test.case "a backwards range is refused" $( test.true! (problem "[z-a]" != ()) ),
-        test.case "parse is a result"        $( test.eq! [true, true] [result.is_ok (parse "a+"), result.is_error (parse "a{2,1}")] ),
+        test.case "parse is a result"        $( test.eq! [true, true] [Result.is_ok (parse "a+"), Result.is_error (parse "a{2,1}")] ),
         test.case "compile-time compiling"   $( test.eq! "abc" (group 0 (find compiled_at_build "xxabcxx")) ),
         test.case "inside a parser"          $( test.eq! (Result.ok ["key", "42"])
                                                    (p.run (p.seq [token (r "[a-z]+"), p.then (token (r "\\d+")) (p.text "=")]) "key=42") ),

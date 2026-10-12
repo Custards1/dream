@@ -3,28 +3,27 @@
 // binary.uint/sint writers instead reject a value that does not fit.
 // Results use the same error shape as std.binary.
 import std.binary as binary;
-import std.result;
 
 /// Test whether a word width is an integer between 1 and 524288 bits.
 priv let valid width = type_of width == :integer && width >= 1 && width <= 524288;
 /// Construct an error result for an invalid fixed-width word operation.
-priv let fail message = result.error (binary.problem :invalid_argument 0 message);
+priv let fail message = Result.error (binary.problem :invalid_argument 0 message);
 /// Return the bit mask covering the requested word width.
 priv let mask width = (1 << width) - 1;
 /// Validate the word width and normalize the integer to that unsigned width.
 priv let check width n = if not (valid width) { fail "word width must be 1..524288 bits" }
     else if type_of n != :integer { fail "expected an integer" }
-    else { result.ok (n & mask width) };
+    else { Result.ok (n & mask width) };
 
 /// The low width bits, as a non-negative integer. Negative inputs wrap too.
 let unsigned width n = check width n;
 /// The low width bits, interpreted as two's complement.
-let signed width n = result.map (fn v -> if v & (1 << (width - 1)) == 0 { v } else { v - (1 << width) }) (check width n);
+let signed width n = Result.map (fn v -> if v & (1 << (width - 1)) == 0 { v } else { v - (1 << width) }) (check width n);
 
 /// Counts wrap modulo width. Negative counts rotate in the other direction.
 let rotate_left width count n =
     if type_of count != :integer { fail "rotation count must be an integer" }
-    else { result.map (fn v -> {
+    else { Result.map (fn v -> {
         let k = ((count % width) + width) % width;
         ((v << k) | (v >> (width - k))) & mask width
     }) (check width n) };
@@ -43,7 +42,7 @@ let replace offset width field n =
         fail "invalid field offset or width"
     } else if type_of n != :integer || type_of field != :integer { fail "expected integer field and word" }
     else if field < 0 || field > mask width { fail "replacement does not fit the field" }
-    else { result.ok ((n & ~(mask width << offset)) | (field << offset)) };
+    else { Result.ok ((n & ~(mask width << offset)) | (field << offset)) };
 
 /// Count set bits in a validated fixed-width word.
 ///
@@ -55,24 +54,24 @@ let replace offset width field n =
 ///     console.print! (word.popcount 8 15)
 /// };
 /// ```
-let popcount width n = result.map (fn v -> {
+let popcount width n = Result.map (fn v -> {
     let rec go !x !count = if x == 0 { count } else { go (x & (x - 1)) (count + 1) };
     go v 0
 }) (check width n);
 
 /// Reverse the bits of a validated fixed-width word.
-let reverse width n = result.map (fn v -> {
+let reverse width n = Result.map (fn v -> {
     let rec go !i !x !acc = if i == width { acc } else { go (i + 1) (x >> 1) ((acc << 1) | (x & 1)) };
     go 0 v 0
 }) (check width n);
 
 /// Count zero bits before the first set bit within the word width.
-let leading_zeros width n = result.map (fn v -> {
+let leading_zeros width n = Result.map (fn v -> {
     let rec go !i = if i == width || v & (1 << (width - i - 1)) != 0 { i } else { go (i + 1) };
     go 0
 }) (check width n);
 /// Count zero bits after the last set bit within the word width.
-let trailing_zeros width n = result.map (fn v -> {
+let trailing_zeros width n = Result.map (fn v -> {
     let rec go !i !x = if i == width || x & 1 != 0 { i } else { go (i + 1) (x >> 1) };
     go 0 v
 }) (check width n);

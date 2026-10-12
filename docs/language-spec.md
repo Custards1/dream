@@ -739,8 +739,10 @@ to take apart (`let (x as y) = v`).
 ### `let?`: errors as values
 
 A pure function that can fail answers `Result.ok value` or
-`Result.error reason`, the union every module has from the prelude
-([§11](#the-prelude)). A chain of such steps is written with `let?`:
+`Result.error reason`, and one that may find nothing answers
+`Option.some value` or `Option.none`: the two unions every module has from
+the prelude ([§11](#the-prelude)). A chain of such steps is written with
+`let?`:
 
 ```dream
 let number s = if s == "x" { Result.error "not a number" } else { Result.ok 2 };
@@ -761,13 +763,49 @@ ratio "x" "b"                   // Result.error("not a number")
 match e { Result.ok(v) => { let p = v; rest }, other => other }
 ```
 
-An `[:ok, v]` list is not a result, and `let?` passes it on like any other
-value that is not `Result.ok`.
+where the arm matches `Result.ok(v)` and `Option.some(v)` alike, so the
+same `let?` chains options. `p` may be a pattern, and every value that is
+not an ok or a some -- an error, a `none` -- is the block's answer as it
+stands, the same value and not a copy. The checker types `p` as what the
+result or option holds, and reports a `let?` on a value of any other declared
+type.
 
-so `p` may be a pattern, and every value that is not an ok is passed on
-unchanged, as `std.result` and `macros.with_ok` pass it. `let?` binds one
-value with no parameters, `rec` or signature, and must be followed by the
-statements it guards.
+`let? p = e else alt; rest` answers `alt` instead of passing the failure on,
+which is how a value that is not there becomes an error worth reporting:
+
+```dream
+let port config = {
+    let? text = Option.of config.["port" else ()] else Result.error :no_port;
+    num.parse_int text |> Option.of |> Option.ok_or :bad_port
+};
+```
+
+An `[:ok, v]` list is not a result, and `let?` passes it on like any other
+value. `let?` binds one value with no parameters, `rec` or signature, and
+must be followed by the statements it guards.
+
+What to do with a result or an option is a member of its union, each taking
+the value last so that a chain reads in order through `|>`:
+
+| `Result` | `Option` | |
+|---|---|---|
+| `map f`, `map_error f` | `map f` | change what it holds |
+| `and_then f` | `and_then f` | the next step, which may fail |
+| `or_else f`, `otherwise r` | `otherwise o`, `filter p` | recover, or choose |
+| `unwrap_or d`, `unwrap_or_else f` | `unwrap_or d`, `unwrap_or_else f` | the way out |
+| `unwrap!`, `expect! m` | `unwrap!`, `expect! m` | raise when there is none |
+| `flatten`, `both r` | `flatten`, `both o`, `contains v` | |
+| `to_option`, `reason` | `ok_or e`, `of v`, `or_unit` | between the two, and `()` |
+| `all`, `oks`, `errors` | `all`, `values` | lists of them |
+| `is_ok`, `is_error`, `tag` | `is_some`, `is_none` | |
+
+```dream
+read path |> Result.and_then parse |> Result.map_error describe
+```
+
+`std.result` spells the same things shorter for a module that imports it --
+`result.ok`, `result.err`, `result.map` -- each a wrapper the compiler
+replaces with the member it names.
 
 ---
 
@@ -1120,7 +1158,7 @@ union Shape {
     }
 }
 
-union Option a { some(value : a), none }
+union Pair a { both(left : a, right : a), neither }
 
 Shape.circle 1.0                 // Shape.circle(1)
 Shape.empty                      // Shape.empty
@@ -1141,7 +1179,9 @@ The declaration makes a module `Shape` (a constructor per variant, the
 members, `Shape.type`, and a signature for each constructor) and a global
 `Shape` holding the description, so `Shape` is a type wherever a type is
 written. A field's type is optional. Parameters after the name make the
-union generic. `union struct` is accepted and means the same: it once chose
+union generic. A member may be given a signature in the body, written as a
+`let` signature is but without the `let`: `area : Shape -> :float` on the
+line before `area self = ..`. `union struct` is accepted and means the same: it once chose
 arrays to back the variants.
 
 ### Constructor patterns
@@ -1233,12 +1273,13 @@ be passed around, but `std` and `std.list` alone cannot.
 ### The prelude
 
 A few names are in scope in every module without an import: the public
-names of `std.prelude`, which today is the union `Result` (§7). Each is bound
-as `import std.prelude.{Result}` would bind it, and looked for last -- a
+names of `std.prelude`, which today are the unions `Result` and `Option`
+(§7). Each is bound as `import std.prelude.{Result}` would bind it, and
+looked for last -- a
 module's own `Result`, one it imports, and one it is lent by an enclosing
 module all win, and taking the name is shadowing, not a clash. The prelude
 is for names the language itself answers in: `let?` means "carry on when
-this is `Result.ok`", in modules that import nothing. A program compiled
+this is `Result.ok` or `Option.some`", in modules that import nothing. A program compiled
 with no standard library on its search path has no prelude.
 
 ### Packages

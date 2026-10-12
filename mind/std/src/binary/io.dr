@@ -3,13 +3,12 @@
 // Callbacks allow files, sockets, TLS or test readers without a new IO type.
 import std.binary as binary;
 import std.io;
-import std.result;
 import std.str;
 import std.list;
 import std.streams;
 
 /// Construct an I/O error result with the requested transfer context.
-priv let failure kind offset message = result.error (binary.problem kind (offset * 8) message);
+priv let failure kind offset message = Result.error (binary.problem kind (offset * 8) message);
 
 /// Read exactly count bytes. The callback accepts a maximum count and returns
 /// up to that many bytes; empty means EOF. Chunks are joined once. Exceptions
@@ -17,7 +16,7 @@ priv let failure kind offset message = result.error (binary.problem kind (offset
 let read_exact_with! count source! =
     if type_of count != :integer || count < 0 { failure :invalid_argument 0 "read size must be non-negative" }
     else {
-        let rec go! !at parts = if at == count { result.ok (str.concat_all (list.reverse parts)) }
+        let rec go! !at parts = if at == count { Result.ok (str.concat_all (list.reverse parts)) }
             else { match try! { let chunk = source! (count - at); strict! chunk; Result.ok chunk } catch e { Result.error e } {
                 Result.error(e) => failure :io_error at (to_string e),
                 Result.ok(chunk) => if type_of chunk != :string { failure :io_error at "reader returned a non-string" }
@@ -30,7 +29,7 @@ let read_exact_with! count source! =
 
 /// Read exactly `count` bytes using `source!`, then decode them with `codec`.
 let read_with! codec count source! = match read_exact_with! count source! {
-    Result.error(e) => result.error e,
+    Result.error(e) => Result.error e,
     Result.ok(data) => binary.decode codec data,
 };
 
@@ -38,10 +37,10 @@ let read_with! codec count source! = match read_exact_with! count source! {
 /// Short writes are handled by std.streams. IO failure may have written a
 /// prefix: the caller owns recovery and must not blindly retry the message.
 let write_with! codec value sink! = match binary.encode codec value {
-    Result.error(e) => result.error e,
+    Result.error(e) => Result.error e,
     Result.ok(data) => try! {
         streams.write_all_with! sink! data
-        result.ok ()
+        Result.ok ()
     } catch e { failure :io_error 0 (to_string e) },
 };
 

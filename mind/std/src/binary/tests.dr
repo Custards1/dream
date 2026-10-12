@@ -5,7 +5,6 @@ import std.binary.io as bio;
 import std.agent;
 import std.crypto;
 import std.list;
-import std.result;
 import std.str;
 import std.wire;
 
@@ -13,12 +12,12 @@ when test {
     import std.test;
 
     let value : :any -> :any;
-    let value r = result.or_else :failed r;
+    let value r = Result.unwrap_or :failed r;
     let kind r = match r { Result.error(e) => e.[:kind], _ => :ok };
     let path r = match r { Result.error(e) => e.[:path], _ => [] };
     let offset r = match r { Result.error(e) => [e.[:offset], e.[:bit_offset]], _ => [] };
-    let hex c v = result.map crypto.hex (b.encode c v);
-    let trip c v = result.and_then (b.decode c) (b.encode c v);
+    let hex c v = Result.map crypto.hex (b.encode c v);
+    let trip c v = Result.and_then (b.decode c) (b.encode c v);
     let packet = b.record [[:magic, b.magic "DB"], [:id, b.u32be], [:data, b.blob b.u16le 1024]];
     let message = %{ :magic => (), :id => 4294967295, :data => "a\0b" };
     let packed = comp b.encode (b.tuple [b.u16be, b.uvarint]) [258, 300];
@@ -67,8 +66,8 @@ when test {
         test.case "builders are reusable values"
             $( {
                 let base = value (b.write b.u8 1 b.builder);
-                test.eq! (Result.ok "0102") (result.map crypto.hex (result.and_then b.finish (b.write b.u8 2 base)))
-                test.eq! (Result.ok "0103") (result.map crypto.hex (result.and_then b.finish (b.write b.u8 3 base)))
+                test.eq! (Result.ok "0102") (Result.map crypto.hex (Result.and_then b.finish (b.write b.u8 2 base)))
+                test.eq! (Result.ok "0103") (Result.map crypto.hex (Result.and_then b.finish (b.write b.u8 3 base)))
             } ),
         test.case "patch preserves the surrounding bytes"
             $( test.eq! (Result.ok (str.of_bytes [97, 98, 1, 2, 101, 102])) (b.patch b.u16be 2 258 "abcdef") ),
@@ -93,7 +92,7 @@ when test {
                 [hex b.f16be 1.0, hex b.f32le 1.0, hex b.f64be 1.0] ),
         test.case "IEEE signed zero is preserved"
             $( test.eq! (Result.ok "80000000")
-                (result.and_then (b.encode b.f32be) (b.decode b.f32be (str.of_bytes [128, 0, 0, 0])) |> result.map crypto.hex) ),
+                (Result.and_then (b.encode b.f32be) (b.decode b.f32be (str.of_bytes [128, 0, 0, 0])) |> Result.map crypto.hex) ),
         test.case "binary16 smallest subnormal"
             $( test.eq! (Result.ok 0.000000059604644775390625) (b.decode b.f16be (str.of_bytes [0, 1])) ),
         test.case "binary16 rounds ties to even"

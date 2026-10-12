@@ -37,7 +37,6 @@ import std.map;
 import std.num;
 import std.os;
 import std.path;
-import std.result;
 import std.str;
 
 import pack.glob;
@@ -230,7 +229,7 @@ let epoch! modified = match os.env! "SOURCE_DATE_EPOCH" {
 };
 
 let links_of : Spec -> Result [Item] :string;
-let links_of sp = result.all (list.map (fn [dest, target] -> {
+let links_of sp = Result.all (list.map (fn [dest, target] -> {
     let? path = dest_path sp dest;
     match spec.text_of target {
         "" => Result.error ("[ship.links] \"" + dest + "\": say what it points to"),
@@ -247,7 +246,7 @@ let sections sp name = spec.entries sp name + spec.entries sp (name + "." + plat
 /// Everything the manifest installs, found on disk and checked.
 let collect! : Spec -> Result Layout :string;
 let collect! sp = {
-    let? sources = result.all (list.map source_of (sections sp "ship.files"));
+    let? sources = Result.all (list.map source_of (sections sp "ship.files"));
     let? expanded = all! (list.map (fn s -> expand! sp s) sources);
     let? links = links_of sp;
     let found = list.concat expanded;
@@ -331,9 +330,9 @@ when test {
                          Result.tag (parse_mode "9")] ),
         test.case "an entry is a path or a table"
             $( test.eq! [Result.ok ["bin/x", "x", (), [], false], Result.ok ["etc/y", "y", 384, ["*.o"], true], :error]
-                        [result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
+                        [Result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
                                     (source_of ["bin/x", "x"]),
-                         result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
+                         Result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
                                     (source_of ["etc/y", %{ "src" => "y", "mode" => "600", "exclude" => "*.o", "config" => true }]),
                          Result.tag (source_of ["z", %{ "mode" => "600" }])] ),
         test.case "destinations are under the prefix unless absolute"

@@ -27,7 +27,6 @@
 import std.array;
 import std.list;
 import std.map;
-import std.result;
 import std.str;
 
 // --- the tables -------------------------------------------------------------------------
@@ -184,35 +183,35 @@ let decoder max = Decoder.make [] 0 max max;
 /// A header block decoded: `[:ok, [headers, decoder]]`, each header a
 /// `[name, value]` pair in order, or `[:error, why]` -- which in HTTP/2 is a
 /// connection error, since the two tables no longer agree.
-let decode : Decoder -> :string -> result.Of :any :string;
+let decode : Decoder -> :string -> Result :any :string;
 let decode d block = decode_from d block 0 [];
 
 /// Decode header representations from an offset, updating the dynamic table.
-priv let decode_from : Decoder -> :string -> :integer -> [[:string]] -> result.Of :any :string;
+priv let decode_from : Decoder -> :string -> :integer -> [[:string]] -> Result :any :string;
 priv let rec decode_from d s at acc =
-    if at >= len s { result.ok [list.reverse acc, d] }
+    if at >= len s { Result.ok [list.reverse acc, d] }
     else {
         let b = str.byte at s;
         if b >= 128 {
             match read_int s at 7 {
-                () => result.error "a header block cut short",
-                [0, _] => result.error "index 0 is not a header",
-                [i, next] => match entry d i { () => result.error ("no header at index " + to_string i), h => decode_from d s next (h :: acc) },
+                () => Result.error "a header block cut short",
+                [0, _] => Result.error "index 0 is not a header",
+                [i, next] => match entry d i { () => Result.error ("no header at index " + to_string i), h => decode_from d s next (h :: acc) },
             }
         } else if b >= 64 {
             match literal_field d s at 6 {
-                () => result.error "a malformed literal",
+                () => Result.error "a malformed literal",
                 [[name, value], next] => decode_from (add d name value) s next ([name, value] :: acc),
             }
         } else if b >= 32 {
             match read_int s at 5 {
-                () => result.error "a header block cut short",
-                [n, next] => if n > Decoder.max d { result.error "a table size larger than this end allowed" }
+                () => Result.error "a header block cut short",
+                [n, next] => if n > Decoder.max d { Result.error "a table size larger than this end allowed" }
                              else { decode_from (resize d n) s next acc },
             }
         } else {
             match literal_field d s at 4 {
-                () => result.error "a malformed literal",
+                () => Result.error "a malformed literal",
                 [h, next] => decode_from d s next (h :: acc),
             }
         }
@@ -312,7 +311,7 @@ when test {
             (decode_all (decoder 4096) vectors) ),
         test.case "what this encodes decodes" $( {
             let hs = [[":status", "200"], ["content-type", "text/html"], ["x-thing", "caf\u{e9}"], [":path", "/"]];
-            test.eq! (Result.ok hs) (result.map (fn [got, _] -> got) (decode (decoder 4096) (encode hs)))
+            test.eq! (Result.ok hs) (Result.map (fn [got, _] -> got) (decode (decoder 4096) (encode hs)))
         } ),
         test.case "static hits are one byte" $( test.eq! [1, 1] [len (encode [[":method", "GET"]]), len (encode [[":status", "404"]])] ),
         test.case "the table evicts its oldest" $( {
@@ -323,6 +322,6 @@ when test {
                 Result.error(why) => test.fail! why,
             }
         } ),
-        test.case "an index past the tables" $( test.true! (result.is_error (decode (decoder 4096) (write_int 128 7 70))) ),
+        test.case "an index past the tables" $( test.true! (Result.is_error (decode (decoder 4096) (write_int 128 7 70))) ),
     ];
 }

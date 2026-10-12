@@ -1583,6 +1583,15 @@ let rec bind_pattern k h p t = match p {
         list.fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (list.enumerate fields)
     },
     [:as_p, inner, n, _, _] => with_local n t (bind_pattern k h inner t),
+    // `let?`'s pattern: the value of whichever of `Result.ok` and
+    // `Option.some` the scrutinee may be.
+    [:success_p, inner, _] => {
+        let held = list.concat (list.map (fn m -> match m {
+            Ty.nominal(i, [v]) if list.contains i ast.success_ids => [v],
+            _ => [],
+        }) (flat_members k t));
+        bind_pattern k h inner (if list.is_empty held { :any } else { union_of held })
+    },
     [:cons_p, head, tail, _, _] => {
         let found = sequence_members k t :list [head] [()];
         let heads = union_of (list.map (fn m -> match m { [:seq, ts] => list.head ts, [:rep, e] => e, _ => :any }) found);
@@ -1605,6 +1614,7 @@ let rec resolved_pattern k h p = match p {
     [:record_p, ctor, fields, sp] =>
         [:ctor_p, constructor_named k h ctor, list.map (fn f -> resolved_pattern k h f) fields, sp],
     [:as_p, inner, n, ns, sp] => [:as_p, resolved_pattern k h inner, n, ns, sp],
+    [:success_p, inner, sp] => [:success_p, resolved_pattern k h inner, sp],
     [:cons_p, hd, tl, os, sp] => [:cons_p, resolved_pattern k h hd, resolved_pattern k h tl, os, sp],
     [:list_p, items, rest, sp] => [:list_p, list.map (fn i -> resolved_pattern k h i) items, rest, sp],
     [:array_p, items, rest, sp] => [:array_p, list.map (fn i -> resolved_pattern k h i) items, rest, sp],
@@ -1632,7 +1642,14 @@ let dead_arm k h st p ds = match st {
     Ty.named(shown, _, _) => {
         let ms = flat_members k st;
         if list.is_empty ms || list.any (fn m -> may_match k p m) ms { ds }
-        else { bad h (ast.span p) ("this arm can never match: a `" + shown + "` is not " + pattern_kind p) ds }
+        else {
+            match p {
+                [:success_p, _, _] =>
+                    bad h (ast.span p) ("`let?` takes apart a `Result` or an `Option`, and this is a `"
+                                        + shown + "`") ds,
+                _ => bad h (ast.span p) ("this arm can never match: a `" + shown + "` is not " + pattern_kind p) ds,
+            }
+        }
     },
     _ => ds,
 };
@@ -1958,6 +1975,10 @@ let rec covers p m = match p {
                              && list.all (fn pt -> covers (list.nth 0 pt) (list.nth 1 pt)) (list.zip fields ts),
         _ => false,
     },
+    [:success_p, inner, _] => match m {
+        Ty.nominal(i, [v]) => list.contains i ast.success_ids && covers inner v,
+        _ => false,
+    },
     _ => false,
 };
 
@@ -1987,6 +2008,13 @@ let rec may_match k p m = match p {
         Ty.nominal(i, ts) => id == () || (i == id && list.length ts == list.length fields
                                           && list.all (fn pt -> may_match k (list.nth 0 pt) (list.nth 1 pt))
                                                       (list.zip fields ts)),
+        Ty.tuple(_) => false, Ty.list_of(_) => false, Ty.array_t(_) => false, Ty.array_of(_) => false,
+        Ty.map_of(_, _) => false, Ty.record(_) => false, Ty.lit(_, _) => false,
+        _ => true,
+    },
+    [:success_p, inner, _] => match peel k m 8 {
+        Ty.nominal(i, [v]) => list.contains i ast.success_ids && may_match k inner v,
+        Ty.nominal(_, _) => false,
         Ty.tuple(_) => false, Ty.list_of(_) => false, Ty.array_t(_) => false, Ty.array_of(_) => false,
         Ty.map_of(_, _) => false, Ty.record(_) => false, Ty.lit(_, _) => false,
         _ => true,

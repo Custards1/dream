@@ -18,7 +18,6 @@
 import std.cli;
 import std.file;
 import std.list;
-import std.result;
 import std.str;
 
 import pack.arch;
@@ -59,7 +58,7 @@ let package_body sp lay = {
 };
 
 let names : Spec -> :string -> Result [:string] :string;
-let names sp key = result.map (fn ds -> list.map deps.pacman ds) (deps.parse_all (spec.strings sp "arch" key));
+let names sp key = Result.map (fn ds -> list.map deps.pacman ds) (deps.parse_all (spec.strings sp "arch" key));
 
 let pkgbuild : Spec -> Layout -> [Asset] -> [:string] -> [:string] -> :bool -> :string;
 let pkgbuild sp lay assets depends conflicts installs =

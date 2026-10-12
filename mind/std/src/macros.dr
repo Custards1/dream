@@ -152,7 +152,7 @@ macro if_some binder value body absent = match binder {
 macro with_some binder value body = if_some binder value body unit;
 
 /// Bind the payload of `Result.ok value` in body; pass a non-ok result through.
-/// Body supplies the next result, as with std.result.and_then.
+/// Body supplies the next result, as with `Result.and_then`.
 macro with_ok binder result body = match binder {
     [:name, n, _] => {
         let saved = fresh "result" [binder, result, body];

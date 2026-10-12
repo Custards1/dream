@@ -43,7 +43,6 @@ import std.map;
 import std.net;
 import std.num;
 import std.proc;
-import std.result;
 import std.str;
 import std.streams;
 import std.tls;
@@ -120,17 +119,17 @@ priv let serve_session! on_open! protocol sock r = {
 
 /// Open a WebSocket to a `ws://` or `wss://` URL: `[:ok, socket]` or
 /// `[:error, e]`. Its messages are delivered to the calling process.
-let connect! : :string -> result.Of :map :error;
+let connect! : :string -> Result :map :error;
 let connect! address = connect_with! %{} address;
 
 /// The same, with `%{ :protocols => [..], :headers => [[name, value], ..],
 /// :tls => %{ .. } }`, each optional.
-let connect_with! : :map -> :string -> result.Of :map :error;
+let connect_with! : :map -> :string -> Result :map :error;
 let connect_with! config address = try! {
     let socket = open! config address;
     strict! socket
-    result.ok socket
-} catch e { result.error (if error.is_error e { e } else { error.new :error e }) };
+    Result.ok socket
+} catch e { Result.error (if error.is_error e { e } else { error.new :error e }) };
 
 /// Establish and validate a WebSocket connection using the configured HTTP handshake.
 priv let open! : :map -> :string -> :map;
@@ -412,7 +411,7 @@ when test {
             let got = http.get! (server.local_url s);
             server.stop! s
             settled! ()
-            test.eq! (Result.ok 400) (result.map http.status got)
+            test.eq! (Result.ok 400) (Result.map http.status got)
         } ),
         test.case "recv_within times out" $( {
             let quiet! socket = { recv! socket; () };
@@ -430,7 +429,7 @@ when test {
             let got = connect! ("ws://127.0.0.1:" + to_string (server.port s) + "/");
             server.stop! s
             settled! ()
-            test.eq! :handshake_refused (error.kind (result.reason () got))
+            test.eq! :handshake_refused (error.kind (Option.or_unit (Result.reason got)))
         } ),
     ];
 }

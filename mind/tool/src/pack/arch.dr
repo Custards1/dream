@@ -24,7 +24,6 @@ import std.file;
 import std.io;
 import std.list;
 import std.map;
-import std.result;
 import std.str;
 
 import pack.bytes;
@@ -50,7 +49,7 @@ let line : :string -> :string -> :string;
 let line key value = if str.is_empty value { "" } else { key + " = " + value + "\n" };
 
 let relation : Spec -> :string -> :string -> Result :string :string;
-let relation sp key label = result.map (fn ds -> str.concat_all (list.map (fn d -> line label (deps.pacman d)) ds))
+let relation sp key label = Result.map (fn ds -> str.concat_all (list.map (fn d -> line label (deps.pacman d)) ds))
                                        (deps.parse_all (spec.strings sp "arch" key));
 
 let pkginfo : Spec -> Layout -> Result :string :string;

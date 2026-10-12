@@ -8,7 +8,6 @@
 // response, and only a failure to get one is an error.
 import std.console;
 import std.error;
-import std.result;
 import std.str;
 import std.http;
 import std.http.server;
@@ -40,8 +39,8 @@ let main! = {
 
     console.print! (http.get_text! (base + "/?name=dream"))
     console.print! (http.get_json! (base + "/users/1"))
-    console.print! (http.get! (base + "/users/2") |> result.map http.status)
-    console.print! (http.get_text! (base + "/users/2") |> result.map_error error.kind)
+    console.print! (http.get! (base + "/users/2") |> Result.map http.status)
+    console.print! (http.get_text! (base + "/users/2") |> Result.map_error error.kind)
 
     // POST a JSON body; the 201 and its body come back.
     match http.post_json! (base + "/users") %{ "name" => "Grace" } {

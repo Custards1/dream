@@ -282,7 +282,7 @@ let parse_header cs = {
 /// `[table, section_name, section_map, rest]` threaded through the loop below.
 /// A section is collected into its own map and folded into the document when
 /// the next header arrives, so a key can never land in the wrong section.
-let parse_items : [:char] -> Document -> :string -> %{ :string => Value } -> result.Of Document :string;
+let parse_items : [:char] -> Document -> :string -> %{ :string => Value } -> Result Document :string;
 let rec parse_items cs table section current = match skip_blank cs {
     [] => Result.ok (table.[section => current]),
     ['[', ..rest] => match parse_header rest {
@@ -321,14 +321,14 @@ let rec parse_items cs table section current = match skip_blank cs {
 ///     console.print! (toml.parse "[package]\nname = \"hello\"\n")
 /// };
 /// ```
-let parse : :string -> result.Of Document :string;
+let parse : :string -> Result Document :string;
 let parse text = parse_items (str.chars text) (%{}) "" (%{});
 
 /// Test whether a parse result has the success tag.
-let ok : result.Of a e -> :bool;
-let ok r = result.is_ok r;
+let ok : Result a e -> :bool;
+let ok r = Result.is_ok r;
 /// Extract the payload from a parse result.
-let value : result.Of a e -> :any;
+let value : Result a e -> :any;
 let value r = match r { Result.ok(v) => v, Result.error(why) => why };
 
 /// Parse a document, returning `default` if parsing fails.
@@ -464,7 +464,7 @@ let format_name : :any -> :string;
 let format_name u = "toml";
 
 /// Decode a TOML document; equivalent to `parse` for the codec protocol.
-let decode : :string -> result.Of Document :string;
+let decode : :string -> Result Document :string;
 let decode text = parse text;
 
 /// A message is a document, not a value: a map is written as `key = value`
@@ -622,5 +622,5 @@ type Value = :string | :integer | :float | :bool
            | [Value] | %{ :string => Value };
 type Document = %{ :string => %{ :string => Value } };
 /// Parse text and validate a successful value against `description`.
-let parse_as : :any -> :string -> result.Of Document :any;
+let parse_as : :any -> :string -> Result Document :any;
 let parse_as description text = decode_as description text;

@@ -394,7 +394,6 @@ let release! lg = match Logger.sink lg { [:agent, pid] => { agent.stop! pid; () 
 
 when test {
     import std.test;
-    import std.result;
 
     let at_noon = time.to_instant (time.datetime 2026 10 4 12 0 0);
     let event l name msg fields = Event.make at_noon l name msg fields;

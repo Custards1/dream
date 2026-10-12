@@ -18,7 +18,7 @@
 //   `filter` -- is generic in the element, because there the union is right.
 // - **`()` is "nothing there", and the checker knows it.** `minimum` answers
 //   `()` for an empty list, and the default handed to `first_or`, `map.get`
-//   or `result.or_else` is `()` as often as not. So `()` fits any type
+//   or `Result.unwrap_or` is `()` as often as not. So `()` fits any type
 //   variable and never decides one (`solve` and `sub` in
 //   `dreams/src/typecheck.dr`): `minimum` is `[a] -> a` although its body can
 //   answer `()`, and `map.get () name ages` answers the map's value type

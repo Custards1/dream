@@ -49,7 +49,6 @@ import std.char;
 import std.list;
 import std.map;
 import std.num;
-import std.result;
 import std.str;
 
 // --- replies -----------------------------------------------------------------------
@@ -103,28 +102,28 @@ mapping Error {
 
 /// `[:ok, value]` when the parser reads the whole text, or `[:error, Error]`
 /// saying where and why it did not.
-let run : Parser a -> :string -> result.Of a :map;
+let run : Parser a -> :string -> Result a :map;
 let run parser text = match (skip end parser) text 0 {
-    #[:ok, v, _, _] => result.ok v,
-    #[:fail, problem] => result.error (error_of text problem),
+    #[:ok, v, _, _] => Result.ok v,
+    #[:fail, problem] => Result.error (error_of text problem),
 };
 
 /// `run`, with the error as a message: `line 2, column 5: expected digit,
 /// found "x"`.
-let run_text : Parser a -> :string -> result.Of a :string;
-let run_text parser text = result.map_error describe (run parser text);
+let run_text : Parser a -> :string -> Result a :string;
+let run_text parser text = Result.map_error describe (run parser text);
 
 /// The value and the offset after it, without requiring the parser to read
 /// everything: `[:ok, [value, next]]`.
-let run_prefix : Parser a -> :string -> :integer -> result.Of [a, :integer] :map;
+let run_prefix : Parser a -> :string -> :integer -> Result [a, :integer] :map;
 let run_prefix parser text at = match parser text at {
-    #[:ok, v, next, _] => result.ok [v, next],
-    #[:fail, problem] => result.error (error_of text problem),
+    #[:ok, v, next, _] => Result.ok [v, next],
+    #[:fail, problem] => Result.error (error_of text problem),
 };
 
 /// Whether the parser reads the whole text.
 let matches : Parser :any -> :string -> :bool;
-let matches parser text = result.is_ok (run parser text);
+let matches parser text = Result.is_ok (run parser text);
 
 /// Add source line, column and context to a parser problem.
 priv let error_of : :string -> Problem -> :map;
@@ -663,7 +662,7 @@ let where_ok accept name p s at = match p s at {
 
 /// `p`, whose value is a result: an `[:error, message]` fails the parse
 /// there with that message.
-let try_map : (a -> result.Of b :string) -> Parser a -> Parser b;
+let try_map : (a -> Result b :string) -> Parser a -> Parser b;
 let try_map f p s at = match p s at {
     #[:ok, v, next, pr] => match f v {
         Result.ok(v2) => ok v2 next pr,

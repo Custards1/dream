@@ -62,7 +62,6 @@ import std.list;
 import std.map;
 import std.net;
 import std.num;
-import std.result;
 import std.str;
 import std.streams;
 import std.time;
@@ -203,7 +202,7 @@ let is_success : :map -> :bool;
 let is_success resp = Response.status resp >= 200 && Response.status resp < 300;
 
 /// The body decoded as JSON.
-let body_json : :map -> result.Of :any :string;
+let body_json : :map -> Result :any :string;
 let body_json msg = json.decode (body msg);
 
 /// The body decoded as a form (`a=1&b=2`), the first value of each name.
@@ -228,9 +227,9 @@ let cookies req = list.fold (fn m pair -> {
 /// The response itself when it is 2xx, otherwise `[:error, e]` of kind
 /// `:status` carrying the response: for a pipeline that treats any other
 /// answer as a failure.
-let expect_ok : :map -> result.Of :map :error;
-let expect_ok resp = if is_success resp { result.ok resp }
-                     else { result.error (error.new :status (to_string (Response.status resp) + " " + reason (Response.status resp) + " from " + Response.url resp)) };
+let expect_ok : :map -> Result :map :error;
+let expect_ok resp = if is_success resp { Result.ok resp }
+                     else { Result.error (error.new :status (to_string (Response.status resp) + " " + reason (Response.status resp) + " from " + Response.url resp)) };
 
 // --- building responses ---------------------------------------------------------------
 
@@ -694,12 +693,12 @@ let close_client! : :map -> :unit;
 let close_client! c = match Client.pool c { () => (), pid => connections.close! pid };
 
 /// Send a request through a client: `[:ok, response]` or `[:error, e]`.
-let call! : :map -> :map -> result.Of :map :error;
+let call! : :map -> :map -> Result :map :error;
 let call! c req = run! c req ();
 
 /// Send a request and read the response: `[:ok, response]` or `[:error, e]`.
 /// One connection, closed after; see `call!` for keeping them.
-let send! : :map -> result.Of :map :error;
+let send! : :map -> Result :map :error;
 let send! req = run! (Client.new ()) req ();
 
 /// Send a request and hand the body to `on_piece!` as it arrives, a piece at
@@ -707,11 +706,11 @@ let send! req = run! (Client.new ()) req ();
 /// act on as it comes (a log being followed, events from a server). Answers
 /// the response with an empty body. `on_piece!` runs in the process doing
 /// the request, so what it does must not depend on being in the caller's.
-let stream! : :map -> (:string -> :any) -> result.Of :map :error;
+let stream! : :map -> (:string -> :any) -> Result :map :error;
 let stream! req on_piece! = run! (Client.new ()) req (sink_step! on_piece!);
 
 /// `stream!` through a client.
-let stream_with! : :map -> :map -> (:string -> :any) -> result.Of :map :error;
+let stream_with! : :map -> :map -> (:string -> :any) -> Result :map :error;
 let stream_with! c req on_piece! = run! c req (sink_step! on_piece!);
 
 /// Deliver a response-body chunk to the supplied sink.
@@ -719,15 +718,15 @@ priv let sink_step! : (:string -> :any) -> :unit -> :string -> :unit;
 priv let sink_step! on_piece! acc piece = { on_piece! piece; () };
 
 /// Execute a configured HTTP exchange with connection and body handling.
-priv let run! : :map -> :map -> :any -> result.Of :map :error;
+priv let run! : :map -> :map -> :any -> Result :map :error;
 priv let run! c req0 sink = {
     let req = with_client_defaults c req0;
     let opts = Request.options req;
     let timeout = opts.[:timeout else default_timeout];
     match time.within! timeout (follow! c req (opts.[:redirects else 10]) sink) {
-        Result.ok(resp) => result.ok resp,
-        Result.error(:timeout) => result.error (error.new :timeout ("no response from " + Request.url req + " within " + time.format_duration timeout)),
-        Result.error(e) => result.error (if error.is_error e { e } else { error.new :error e }),
+        Result.ok(resp) => Result.ok resp,
+        Result.error(:timeout) => Result.error (error.new :timeout ("no response from " + Request.url req + " within " + time.format_duration timeout)),
+        Result.error(e) => Result.error (if error.is_error e { e } else { error.new :error e }),
     }
 };
 
@@ -756,54 +755,54 @@ priv let with_client_defaults c req = {
 };
 
 /// Send an HTTP GET request to an address.
-let get! : :string -> result.Of :map :error;
+let get! : :string -> Result :map :error;
 let get! address = send! (request "GET" address);
 
 /// Send an HTTP HEAD request to an address.
-let head! : :string -> result.Of :map :error;
+let head! : :string -> Result :map :error;
 let head! address = send! (request "HEAD" address);
 
 /// Send an HTTP DELETE request to an address.
-let delete! : :string -> result.Of :map :error;
+let delete! : :string -> Result :map :error;
 let delete! address = send! (request "DELETE" address);
 
 /// POST a body as it is; set a content type with `request` and `with_header`
 /// when it matters.
-let post! : :string -> :string -> result.Of :map :error;
+let post! : :string -> :string -> Result :map :error;
 let post! address text_body = send! (request "POST" address |> with_body text_body);
 
 /// Encode a value as JSON and send it in an HTTP POST request.
-let post_json! : :string -> :any -> result.Of :map :error;
+let post_json! : :string -> :any -> Result :map :error;
 let post_json! address value = send! (request "POST" address |> with_json value);
 
 /// Form-encode name/value pairs and send them in an HTTP POST request.
-let post_form! : :string -> :any -> result.Of :map :error;
+let post_form! : :string -> :any -> Result :map :error;
 let post_form! address pairs = send! (request "POST" address |> with_form pairs);
 
 /// Encode a value as JSON and send it in an HTTP PUT request.
-let put_json! : :string -> :any -> result.Of :map :error;
+let put_json! : :string -> :any -> Result :map :error;
 let put_json! address value = send! (request "PUT" address |> with_json value);
 
 /// The body of a 2xx response, or an error -- including for any other status.
-let get_text! : :string -> result.Of :string :error;
+let get_text! : :string -> Result :string :error;
 let get_text! address = {
     let? resp = get! address;
     let? good = expect_ok resp;
-    result.ok (body good)
+    Result.ok (body good)
 };
 
 /// The body of a 2xx response decoded as JSON, or an error.
-let get_json! : :string -> result.Of :any :error;
+let get_json! : :string -> Result :any :error;
 let get_json! address = {
     let? text_body = get_text! address;
-    result.map_error (fn why -> error.new :bad_json why) (json.decode text_body)
+    Result.map_error (fn why -> error.new :bad_json why) (json.decode text_body)
 };
 
 /// Save the body of a 2xx response to a file, a piece at a time, so a file of
 /// any size costs no more memory than one piece: `[:ok, bytes written]`. A
 /// response that is not 2xx is an error of kind `:status`, and the file is
 /// left as it was.
-let download! : :string -> :string -> result.Of :integer :error;
+let download! : :string -> :string -> Result :integer :error;
 let download! address path = {
     let partial = path + ".part";
     let h = io.open! partial :write;
@@ -814,9 +813,9 @@ let download! address path = {
             io.rename! partial path
             let size = match io.stat! path { () => 0, [n, _, _] => n };
             strict! size
-            result.ok size
-        } else { io.remove! partial; expect_ok resp |> result.map (fn _ -> 0) },
-        Result.error(e) => { try! { io.remove! partial } catch ignored { () }; result.error e },
+            Result.ok size
+        } else { io.remove! partial; expect_ok resp |> Result.map (fn _ -> 0) },
+        Result.error(e) => { try! { io.remove! partial } catch ignored { () }; Result.error e },
     }
 };
 
@@ -1029,16 +1028,16 @@ when test {
             (encode_response (respond 200 "hi") true) ),
         test.case "no length where there can be no body" $( test.eq! "HTTP/1.1 204 No Content\r\n\r\n" (encode_response no_content false) ),
         test.case "canonical names" $( test.eq! ["Content-Type", "X-Request-Id", "Etag"] [canonical "content-type", canonical "x-request-id", canonical "etag"] ),
-        test.case "expect_ok" $( test.eq! [true, :status] [result.is_ok (expect_ok (text "")),
-                                                        error.kind (result.reason () (expect_ok (status_only 500)))] ),
+        test.case "expect_ok" $( test.eq! [true, :status] [Result.is_ok (expect_ok (text "")),
+                                                        error.kind (Option.or_unit (Result.reason (expect_ok (status_only 500))))] ),
         test.case "reasons" $( test.eq! ["Not Found", "I'm a teapot", "Client Error"] [reason 404, reason 418, reason 499] ),
-        test.case "a bad URL is an error" $( test.eq! :bad_url (error.kind (result.reason () (get! "not a url"))) ),
+        test.case "a bad URL is an error" $( test.eq! :bad_url (error.kind (Option.or_unit (Result.reason (get! "not a url")))) ),
         test.case "a refused connection is an error" $( {
             // A port that was just free: listen, note it, close.
             let l = net.listen! 0;
             let port = net.port! l;
             io.close! l
-            test.eq! :connection_refused (error.kind (result.reason () (get! ("http://127.0.0.1:" + to_string port + "/"))))
+            test.eq! :connection_refused (error.kind (Option.or_unit (Result.reason (get! ("http://127.0.0.1:" + to_string port + "/")))))
         } ),
     ];
 }

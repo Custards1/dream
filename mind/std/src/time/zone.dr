@@ -172,16 +172,16 @@ priv let rule_day y [day, seconds] = {
 // function from a byte offset to `[value, next]`, or `()` when it is not there.
 
 /// The rule a TZ string writes, or `[:error, why]`.
-let parse_rule : :string -> result.Of Rule :string;
+let parse_rule : :string -> Result Rule :string;
 let parse_rule s = {
-    let fail = result.error ("not a POSIX TZ rule: " + s);
+    let fail = Result.error ("not a POSIX TZ rule: " + s);
     match tz_name s 0 {
         () => fail,
         [std_name, i] => match tz_offset s i {
             () => fail,
             [std_west, i2] => {
                 let standard = Period.make (0 - std_west) false std_name;
-                if i2 >= len s { result.ok (Rule.make standard () () ()) }
+                if i2 >= len s { Result.ok (Rule.make standard () () ()) }
                 else {
                     match tz_name s i2 {
                         () => fail,
@@ -198,7 +198,7 @@ let parse_rule s = {
                                         else { "" };
                             match str.split "," rules {
                                 [a, b] => match [tz_change a, tz_change b] {
-                                    [Result.ok(start), Result.ok(end)] => result.ok (Rule.make standard daylight start end),
+                                    [Result.ok(start), Result.ok(end)] => Result.ok (Rule.make standard daylight start end),
                                     _ => fail,
                                 },
                                 _ => fail,
@@ -258,7 +258,7 @@ priv let digits s i = {
 };
 
 /// One `date[/time]` of a rule: `[day, seconds]`, the time defaulting to 2am.
-priv let tz_change : :string -> result.Of :any :string;
+priv let tz_change : :string -> Result :any :string;
 priv let tz_change text = {
     let [day_text, time_text] = match str.split "/" text {
         [d] => [d, "2"],
@@ -274,16 +274,16 @@ priv let tz_change text = {
         74 => match num.parse_int (str.slice 1 (len day_text) day_text) { () => (), n => [:j, n] },
         _ => match num.parse_int day_text { () => (), n => [:n, n] },
     };
-    if day == () || seconds == () { result.error ("not a rule date: " + text) }
-    else { result.ok [day, seconds] }
+    if day == () || seconds == () { Result.error ("not a rule date: " + text) }
+    else { Result.ok [day, seconds] }
 };
 
 // --- TZif ----------------------------------------------------------------------------
 
 /// A zone from the bytes of a TZif file.
-let of_tzif : :string -> :string -> result.Of Zone :string;
+let of_tzif : :string -> :string -> Result Zone :string;
 let of_tzif name bytes =
-    if str.slice 0 4 bytes != "TZif" { result.error (name + " is not a TZif file") }
+    if str.slice 0 4 bytes != "TZif" { Result.error (name + " is not a TZif file") }
     else {
         let version = str.byte 4 bytes;
         let v1 = header bytes 0;
@@ -308,7 +308,7 @@ priv let block_size [isut, isstd, leap, times, types, chars] width =
     times * width + times + types * 6 + chars + leap * (width + 4) + isstd + isut;
 
 /// Decode a TZif data block into a time-zone result.
-priv let read_block : :string -> :string -> [:integer] -> :integer -> :integer -> result.Of Zone :string;
+priv let read_block : :string -> :string -> [:integer] -> :integer -> :integer -> Result Zone :string;
 priv let read_block name bytes counts at width = {
     let [isut, isstd, leap, times, types, chars] = counts;
     let idx_at = at + times * width;
@@ -332,8 +332,8 @@ priv let read_block name bytes counts at width = {
         let stop = str.upto "\n" (end + 1) bytes;
         match parse_rule (str.slice (end + 1) (stop - end - 1) bytes) { Result.ok(r) => r, _ => () }
     } else { () };
-    if types == 0 { result.error (name + " has no local time types") }
-    else { result.ok (Zone.make name transitions initial rule) }
+    if types == 0 { Result.error (name + " has no local time types") }
+    else { Result.ok (Zone.make name transitions initial rule) }
 };
 
 /// Read a big-endian unsigned 32-bit value from TZif data.
@@ -363,17 +363,17 @@ let search_dirs! () = {
 
 /// The zone of an IANA name (`"Europe/London"`), read from this machine's
 /// database. `"UTC"` and `"Z"` need no database.
-let load! : :string -> result.Of Zone :string;
+let load! : :string -> Result Zone :string;
 let load! name =
-    if name == "UTC" || name == "Z" || name == "Etc/UTC" { result.ok utc }
+    if name == "UTC" || name == "Z" || name == "Etc/UTC" { Result.ok utc }
     else if str.contains_str ".." name || str.starts_with "/" name || name == "" {
-        result.error ("not a zone name: " + name)
+        Result.error ("not a zone name: " + name)
     } else { load_from! name (search_dirs! ()) };
 
 /// Search the candidate zoneinfo directories for a named time zone.
-priv let load_from! : :string -> [:string] -> result.Of Zone :string;
+priv let load_from! : :string -> [:string] -> Result Zone :string;
 priv let rec load_from! name dirs = match dirs {
-    [] => result.error ("no time zone called " + name + " on this machine"),
+    [] => Result.error ("no time zone called " + name + " on this machine"),
     [dir, ..rest] => match file.read! (dir + "/" + name) {
         () => load_from! name rest,
         bytes => of_tzif name bytes,
@@ -419,7 +419,7 @@ priv let localtime! () = {
 priv let from_file_or_utc! : :string -> :string -> Zone;
 priv let from_file_or_utc! name path = match file.read! path {
     () => utc,
-    bytes => result.or_else utc (of_tzif name bytes),
+    bytes => Result.unwrap_or utc (of_tzif name bytes),
 };
 
 when test {
@@ -428,10 +428,10 @@ when test {
     let denver = parse_rule "MST7MDT,M3.2.0,M11.1.0";
     let sydney = parse_rule "AEST-10AEDT,M10.1.0,M4.1.0/3";
     let at y m d h = calendar.days_from_civil y m d * 86400 + h * 3600;
-    let off r t = Period.offset (rule_period (result.or_else () r) t);
+    let off r t = Period.offset (rule_period (Result.unwrap_or () r) t);
 
     let tests = [
-        test.case "a rule parses"           $( test.true! (result.is_ok denver) ),
+        test.case "a rule parses"           $( test.true! (Result.is_ok denver) ),
         test.case "winter in Denver"        $( test.eq! (0 - 25200) (off denver (at 2025 1 15 12)) ),
         test.case "summer in Denver"        $( test.eq! (0 - 21600) (off denver (at 2025 7 15 12)) ),
         test.case "the change is at 2am local"
@@ -440,26 +440,26 @@ when test {
         test.case "a rule with no daylight time"
             $( test.eq! 19800 (off (parse_rule "IST-5:30") (at 2025 7 1 0)) ),
         test.case "a quoted name"
-            $( test.eq! [true, 10800] [result.is_ok (parse_rule "<+03>-3"), off (parse_rule "<+03>-3") 0] ),
+            $( test.eq! [true, 10800] [Result.is_ok (parse_rule "<+03>-3"), off (parse_rule "<+03>-3") 0] ),
         test.case "abbreviations"
-            $( test.eq! ["MST", "MDT"] [Period.abbrev (rule_period (result.or_else () denver) (at 2025 1 1 0)),
-                                       Period.abbrev (rule_period (result.or_else () denver) (at 2025 7 1 0))] ),
-        test.case "nonsense is refused"     $( test.true! (result.is_error (parse_rule "7")) ),
+            $( test.eq! ["MST", "MDT"] [Period.abbrev (rule_period (Result.unwrap_or () denver) (at 2025 1 1 0)),
+                                       Period.abbrev (rule_period (Result.unwrap_or () denver) (at 2025 7 1 0))] ),
+        test.case "nonsense is refused"     $( test.true! (Result.is_error (parse_rule "7")) ),
         test.case "UTC needs no database"   $( test.eq! (Result.ok utc) (load! "UTC") ),
-        test.case "paths are not names"     $( test.true! (result.is_error (load! "../../etc/passwd")) ),
+        test.case "paths are not names"     $( test.true! (Result.is_error (load! "../../etc/passwd")) ),
         test.case "a fixed zone"            $( test.eq! 3600 (offset_at (fixed 3600 "X") 0) ),
         test.case "a skipped local time moves forward" $( {
-            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (result.or_else () denver);
+            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (Result.unwrap_or () denver);
             // 02:30 on 2025-03-09 never happened in Denver; 03:30 MDT did.
             test.eq! (at 2025 3 9 9 + 1800) (local_to_utc z (at 2025 3 9 2 + 1800))
         } ),
         test.case "a repeated local time takes the first" $( {
-            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (result.or_else () denver);
+            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (Result.unwrap_or () denver);
             // 01:30 on 2025-11-02 happened twice; the first was MDT, 07:30 UTC.
             test.eq! (at 2025 11 2 7 + 1800) (local_to_utc z (at 2025 11 2 1 + 1800))
         } ),
         test.case "an ordinary local time"  $( {
-            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (result.or_else () denver);
+            let z = Zone.make "D" #[] (Period.make (0 - 25200) false "MST") (Result.unwrap_or () denver);
             test.eq! (at 2025 7 1 18) (local_to_utc z (at 2025 7 1 12))
         } ),
     ];

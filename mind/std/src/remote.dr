@@ -79,7 +79,6 @@ import std.error;
 import std.io;
 import std.list;
 import std.net;
-import std.result;
 import std.server;
 import std.streams;
 import std.wire;
@@ -286,15 +285,15 @@ let close! conn = io.close! conn;
 /// Every way this can go wrong is a value, because most of them are not the
 /// program's fault: the connection ended, the reply did not decode, the handler
 /// raised. `call!` is the same thing for a caller that would rather not check.
-let try_call! : :any -> :any -> result.Of :any :any;
+let try_call! : :any -> :any -> Result :any :any;
 let try_call! conn request = {
     streams.write_all! conn (wire.frame [:call, request])
     match next! conn {
-        () => result.error "the connection ended before a reply arrived",
-        Result.error(why) => result.error ("cannot read the reply: " + to_string why),
-        Result.ok(Result.ok(value)) => result.ok value,
-        Result.ok(Result.error(why)) => result.error why,
-        Result.ok(other) => result.error ("not a reply: " + to_string other),
+        () => Result.error "the connection ended before a reply arrived",
+        Result.error(why) => Result.error ("cannot read the reply: " + to_string why),
+        Result.ok(Result.ok(value)) => Result.ok value,
+        Result.ok(Result.error(why)) => Result.error why,
+        Result.ok(other) => Result.error ("not a reply: " + to_string other),
     }
 };
 
@@ -475,7 +474,7 @@ when test {
             $( test.true! (with_store! (fn port -> {
                    let c = here! port;
                    close! c
-                   result.is_error (try! { try_call! c :keys } catch e { result.error e })
+                   Result.is_error (try! { try_call! c :keys } catch e { Result.error e })
                })) ),
 
         // --- a server that is replaced underneath the listener ------------------
@@ -524,7 +523,7 @@ when test {
                    close! c
                    stop_serving! l
                    registry.stop! reg
-                   test.true! (result.is_error r)
+                   test.true! (Result.is_error r)
                } ),
     ];
 }
