@@ -122,11 +122,21 @@ public:
     /// Compile now, regardless of temperature. Returns nullptr on failure.
     CompiledFn compile(uint32_t func_index, std::string* error);
 
+    /// A direct call from compiled code to `func_index` found no body to call
+    /// (see "Direct calls" in jit.cpp). Counted; the call that makes the count
+    /// the threshold asks for one.
+    void direct_miss(uint32_t func_index);
+
     /// What `precompile` did.
     struct Precompiled {
         uint32_t compiled = 0;
         uint32_t refused = 0;
         double ms = 0;
+        /// Bodies published for direct calls, and how many of them were
+        /// compiled for another set than callers expected (see "Direct calls"
+        /// in jit.cpp).
+        uint32_t direct = 0;
+        uint32_t disagreed = 0;
     };
     /// Compile every function the tier can take, on `threads` threads, before
     /// the program starts: `--precompile`. Each answer goes straight into the
@@ -140,6 +150,8 @@ public:
     void set_threads(unsigned n);
     uint32_t threshold() const;
     uint64_t compiled_count() const;
+    /// Bodies published for direct calls.
+    uint32_t direct_count() const;
     /// Human-readable IR for one function, for `--dump-jit`.
     std::string dump_ir(uint32_t func_index);
 
@@ -176,6 +188,8 @@ private:
     /// Compile one function, from any thread; see "Several compile threads"
     /// in jit.cpp.
     CompiledFn compile_one(uint32_t func_index, std::string* error);
+    /// Compile `func_index`'s body for direct calls, and publish it.
+    bool compile_export(uint32_t func_index);
     /// The queued function with the most entries counted, taken off the
     /// queue. Caller holds the queue's lock.
     uint32_t take_hottest();

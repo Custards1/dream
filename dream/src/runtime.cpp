@@ -5,6 +5,8 @@
 #include "os.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -135,6 +137,21 @@ void Runtime::print_profile() const {
 
 void dbg_dump_thunks();
 
+namespace {
+int64_t wall_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+/// The process's CPU, every thread of it: `std::clock` is that on every
+/// POSIX system, which is where this line is read.
+int64_t cpu_now_ns() { return int64_t(double(std::clock()) * 1e9 / CLOCKS_PER_SEC); }
+}  // namespace
+
+void Runtime::mark_run_start() {
+    run_wall_ns_ = wall_now_ns();
+    run_cpu_ns_ = cpu_now_ns();
+}
+
 void Runtime::print_stats() const {
     dbg_dump_thunks();
     if (!stats_) return;
@@ -184,6 +201,14 @@ void Runtime::print_stats() const {
                  double(major_ns + minor_ns) / 1e6, double(major_ns) / 1e6,
                  double(minor_ns) / 1e6, static_cast<unsigned long long>(rounds),
                  static_cast<unsigned long long>(concurrent), double(concurrent_ns) / 1e6);
+    // What the program cost, and nothing before it. The CPU is the whole
+    // process's -- compile threads and parallel marking included -- because
+    // that is what the machine paid.
+    if (run_wall_ns_) {
+        std::fprintf(stderr, "; run: %.0f ms wall, %.0f ms CPU\n",
+                     double(wall_now_ns() - run_wall_ns_) / 1e6,
+                     double(cpu_now_ns() - run_cpu_ns_) / 1e6);
+    }
 
     // Where the bytes went, by object kind. A lazy language's garbage is mostly
     // thunks and frames, and the share of each is what says whether the next
@@ -264,8 +289,9 @@ void Runtime::print_stats() const {
     // printed for the runs worth measuring. Whether a change to the tier
     // *widened* it is exactly the question a self-compile is asked.
     if (jit_) {
-        std::fprintf(stderr, "; %llu functions compiled\n",
-                     static_cast<unsigned long long>(jit_->compiled_count()));
+        std::fprintf(stderr, "; %llu functions compiled, %u callable directly\n",
+                     static_cast<unsigned long long>(jit_->compiled_count()),
+                     jit_->direct_count());
     }
 }
 

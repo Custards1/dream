@@ -1,0 +1,52 @@
+// Interpreter/JIT parity for direct calls: a call to a global function that is
+// not a peer of its caller's compile, made through the table of published
+// bodies when the callee has one and by the machine when not (see "Direct
+// calls" in dream/src/jit.cpp). `wide` calls more helpers than one compile
+// admits as peers, so the last of them are direct; with `--jit-threshold 1`
+// the first call that misses has the body compiled, and every later call
+// takes it.
+import std.console;
+import std.list;
+
+let h0 x = x + 1;
+let h1 x = x * 2;
+let h2 x = x - 3;
+let h3 x = x * x;
+let h4 x = x + 10;
+let h5 x = x % 7;
+let h6 x = x + x;
+let h7 x = x - 1;
+let h8 x = x * 3 + 1;
+// Strict in `x`, lazy in `y`: only an `x` that is odd reads `y`.
+let h9 x y = if x % 2 == 0 { x } else { x + y };
+// Raises for a zero.
+let h10 x = 100 / x;
+
+/// A divisor of zero, named: a division by a literal zero is a compiler
+/// warning, right everywhere but where the error is the point.
+let nothing = 0;
+
+let wide x = h0 x + h1 x + h2 x + h3 x + h4 x + h5 x + h6 x + h7 x + h8 x + h9 x (1 / nothing) + h10 (x % 5 + 1);
+
+// An even `x` never forces the division by zero it is handed.
+let rec total !acc i n = if i >= n { acc } else { total (acc + wide (i * 2)) (i + 1) n };
+
+// The same helper reached with an odd `x`: the suspension is forced, and raises.
+let odd x = h0 x + h1 x + h2 x + h3 x + h4 x + h5 x + h6 x + h7 x + h8 x + h9 (x * 2 + 1) (1 / nothing);
+
+// An error raised inside a direct callee.
+let zero x = h0 x + h1 x + h2 x + h3 x + h4 x + h5 x + h6 x + h7 x + h8 x + h10 (x - x);
+
+// Recursion through a direct call, deeper than compiled code's machine-stack
+// budget: the call is handed back, and the interpreter finishes it.
+let rec down n = h0 n + h1 n + h2 n + h3 n + h4 n + h5 n + h6 n + h7 n + h8 n * 0 + across n;
+let across n = if n <= 0 { 0 } else { 1 + down (n - 1) };
+
+let main! = {
+    console.print! (total 0 0 2000)
+    console.print! (try! { odd 3 } catch e { e })
+    console.print! (try! { zero 3 } catch e { e })
+    console.print! (list.sum (list.map wide (list.range 0 300 |> list.map (fn i -> i * 2))))
+    console.print! (down 100)
+    console.print! (down 100000)
+}

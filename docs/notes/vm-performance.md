@@ -1570,3 +1570,55 @@ because nothing reports it. What the experiment did buy is a target: the
 memory win comes from what suspensions *retain*, not from how many are made,
 and that can be had without changing what any program means. The switch stays
 in the compiler so this can be measured again.
+
+## Direct calls, and where a precompiled run's calls actually come from
+
+2026-10-11. `--precompile` compiles every function first, and a self-compile
+still ran in about the same CPU as the interpreter alone. Frames were 40% of
+what it allocated, and only a call between two functions of one compile -- a
+peer, at most eight a module -- avoided one. So the first thing built was a way
+for any compiled function to call any other without a frame: "Direct calls" in
+dream/src/jit.cpp. A function publishes its body as a peer in a table by
+function index, beside the set of arguments it takes evaluated, and a call that
+is not to a peer of its own compile reads the slot: a body published for the
+set the caller assumed is called with the arguments in registers, and anything
+else is the machine's call it always was.
+
+**It is correct, and on a self-compile it buys nothing.** Same binary,
+`DREAM_JIT_DIRECT=0` against the default, interleaved: 2.21 s against 2.22 s
+of run, the image byte-identical, allocation unchanged to three figures. What
+was counted -- temporarily, by call site -- says why:
+
+| a precompiled self-compile | count |
+|---|---|
+| function entries, compiled | 9.7 M |
+| function entries, interpreted | 6.4 M |
+| -- of them because `force_nest` was past 256 | **6.0 M** |
+| frames made by interpreted code's calls | 16.1 M |
+| frames made for compiled code's suspensions | 3.7 M |
+| thunks made | 42 M |
+| calls compiled code handed to the machine | 3.4 M |
+| calls compiled code made directly | 0.5 M |
+
+Compiled code calling compiled code is rare. Almost every call starts in the
+interpreter -- in a thunk's body, which is never compiled, or in a function
+entered past `kMaxForceNestForCompiled`. That bound is the larger surprise.
+Interpreted code nests forces three or four deep; precompiled code reaches the
+256 bound constantly, at 4.5 MB of machine stack (17 KB a level -- a compiled
+body with its peers inlined has a large frame), and past it every function is
+interpreted. Two thirds of the interpreted entries are that, and none of it is
+a function the tier refused.
+
+**A published body has to be paid for.** Most functions are compiled in the
+loop shape, which reads its frame and is not a body of its arguments, so
+publishing one is a second compile -- 200 to 500 ms of LLVM for the larger
+functions here. Compiling it beside every function made `fib`'s compile 11.5 ->
+18 ms and the benchmark 38 -> 45 ms; asking for it on the 32nd miss made a
+self-compile spend 4.5 s of CPU during the run on 23 of them. So a recursive
+root publishes the body it already has, for nothing, and any other is compiled
+once ten thousand direct calls have found no body (`kExportMisses`).
+
+What this says about the next steps: a thunk compiled code makes should have a
+compiled body (most calls are made from one), and the nesting bound wants to
+be a measure of the machine stack rather than a count -- which is only
+affordable once a collection does not scan that stack word by word.

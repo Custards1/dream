@@ -616,7 +616,19 @@ std::pair<uint32_t, uint32_t> cons_parts(const Image& img, const Node& n) {
 using SlotSet = uint64_t;  // one bit per slot; functions with >64 slots are skipped
 
 /// How a call is made; see `Analyzer::check_apply`.
-enum class CallKind : uint8_t { Self, Known, Native, Peer, Closure, Refused };
+enum class CallKind : uint8_t { Self, Known, Native, Peer, Direct, Closure, Refused };
+
+/// A call to another global function that is not a peer of this compile, made
+/// through the table of compiled bodies when the callee has published one and
+/// through the machine when it has not. See "Direct calls".
+struct DirectSite {
+    uint32_t gi = 0;
+    /// The arguments evaluated before the call, one bit each: the callee's
+    /// published strictness, as it stood when this caller was analysed.
+    uint32_t mask = 0;
+    /// The callee's body answers a raw double.
+    bool ret_dbl = false;
+};
 
 struct Analysis {
     bool compilable = false;
@@ -694,6 +706,8 @@ struct Analysis {
     /// Nodes in evaluated positions that are suspended and forced on the spot
     /// rather than written out. See "What the interpreter evaluates".
     std::unordered_set<uint32_t> interpreted;
+    /// The `CallKind::Direct` calls, by node.
+    std::unordered_map<uint32_t, DirectSite> direct;
 };
 
 /// How many arguments a call handed to the machine may have. The helper takes
@@ -711,6 +725,136 @@ bool peer_admits(PeerSet& peers, uint32_t gi, int depth);
 /// The type of a call to peer `gi` whose arguments in `float_args` are known to
 /// be floats. Also a free function, for the same reason.
 Ty peer_call_ty(const PeerSet& peers, uint32_t gi, SlotSet float_args);
+
+// Direct calls
+//
+// A peer is emitted into its caller's module, so a compile can afford only a
+// few of them (`kMaxPeers`), and every other call to a global function used to
+// be handed to the machine: a heap frame, a nested interpreter loop on the C++
+// stack, and the callee's compiled entry unpacking that frame again. With every
+// function compiled (`--precompile`) that was most of what compiled code did --
+// frames were 40% of what a self-compile allocated, compiled or not.
+//
+// So every function the tier can write as a peer also publishes the body it
+// would be as one, in a table indexed by function (`DirectTable`), and a call
+// that is not to a peer of its own compile reads the callee's slot: when a body
+// is there the call is a machine call with the arguments in registers, exactly
+// a peer call through a pointer; when not -- the callee is not compiled yet, or
+// never will be -- it is the machine call it always was. Nothing about which
+// arguments are evaluated changes between the two, so neither does what the
+// program means.
+//
+// The one thing a caller must agree with the callee about is which arguments
+// arrive evaluated: the body assumes its eager parameters are values. That set
+// is the callee's analysis as a peer, which depends on what *its* compile could
+// admit, so the caller does not assume it. It asks for the callee's analysis as
+// the callee's own compile will make it -- the same procedure, `direct_sig`, a
+// fresh `PeerSet` with the callee admitted first -- and remembers the answer,
+// and the body is published beside the set it was compiled for. A call site
+// compares the two and makes the machine call when they differ, so a caller
+// and callee that came to different conclusions cost speed and nothing else.
+//
+// A direct callee's strictness is not counted towards its caller's (see
+// `strict_of`), although its eager arguments are evaluated. Counting it would
+// make a function's published set depend on its callees' sets, which are made
+// in whatever order the compile threads reach them, and the comparison above
+// would then fail for reasons of timing. Not counting it is the answer the tier
+// gave before there were direct calls, when the machine made every such call.
+
+/// A callee's peer analysis, as far as a caller needs it.
+struct DirectSig {
+    bool ok = false;
+    uint32_t eager = 0;
+    bool ret_dbl = false;
+};
+
+/// One function's slot in the table: the body, and the word that says which
+/// arguments it takes evaluated and whether it answers a double. Written once,
+/// by the compile that made the body, word first; a call site reads the body
+/// and then the word, so a body it sees is one whose word it can see too.
+struct DirectEntry {
+    std::atomic<void*> fn{nullptr};
+    std::atomic<uint64_t> sig{0};
+};
+static_assert(sizeof(DirectEntry) == 16, "the emitter indexes the table by 16-byte entries");
+
+/// The word a slot holds, and a call site expects. Bit 33 is set in every word
+/// a body is published with, so an empty slot matches nothing.
+inline uint64_t direct_sig_word(uint32_t eager, bool ret_dbl) {
+    return uint64_t(eager) | (uint64_t(ret_dbl) << 32) | (uint64_t(1) << 33);
+}
+
+/// The published bodies, and the callees' analyses callers have asked for.
+class DirectTable {
+public:
+    explicit DirectTable(size_t n)
+        : entries_(new DirectEntry[n ? n : 1]), misses_(new std::atomic<uint32_t>[n ? n : 1]), n_(n) {
+        for (size_t i = 0; i < n; ++i) misses_[i].store(0, std::memory_order_relaxed);
+    }
+
+    DirectEntry* entry(uint32_t fi) { return &entries_[fi]; }
+    size_t size() const { return n_; }
+
+    bool find(uint32_t gi, DirectSig* out) {
+        std::lock_guard<std::mutex> g(mutex_);
+        auto it = sigs_.find(gi);
+        if (it == sigs_.end()) return false;
+        *out = it->second;
+        return true;
+    }
+    /// Remember `sig` for `gi` unless an answer is there already, and answer
+    /// whichever is kept: every caller of `gi` assumes the same set.
+    DirectSig keep(uint32_t gi, DirectSig sig) {
+        std::lock_guard<std::mutex> g(mutex_);
+        return sigs_.emplace(gi, sig).first->second;
+    }
+    /// The first body published for `fi` stays: a call site may already have
+    /// read it. Answers whether this one was.
+    bool publish(uint32_t fi, void* fn, uint64_t word) {
+        std::lock_guard<std::mutex> g(mutex_);
+        DirectEntry& e = entries_[fi];
+        if (e.fn.load(std::memory_order_relaxed)) return false;
+        e.sig.store(word, std::memory_order_relaxed);
+        e.fn.store(fn, std::memory_order_release);
+        return true;
+    }
+    bool published(uint32_t fi) const { return entries_[fi].fn.load(std::memory_order_acquire); }
+
+    /// A direct call to `fi` found no body. True on exactly the miss that
+    /// makes the count `threshold`, which is when its body is asked for, and
+    /// once only.
+    bool note_miss(uint32_t fi, uint32_t threshold) {
+        const uint32_t n = misses_[fi].fetch_add(1, std::memory_order_relaxed) + 1;
+        return n == std::max(1u, threshold);
+    }
+
+private:
+    std::unique_ptr<DirectEntry[]> entries_;
+    std::unique_ptr<std::atomic<uint32_t>[]> misses_;
+    size_t n_;
+    std::mutex mutex_;
+    std::unordered_map<uint32_t, DirectSig> sigs_;
+};
+
+/// What a direct call to `gi` may assume: its analysis as a peer, made the way
+/// its own compile will make it. Remembered in the table `peers` was made with.
+DirectSig direct_sig(PeerSet& peers, uint32_t gi);
+
+/// How many direct calls must find no body for a function before its body is
+/// compiled for them.
+///
+/// Far more than the entries that make a function hot, because of what each
+/// side is worth. A body for direct calls is a compile of its own -- the
+/// function and its peers, 200 to 500 ms of LLVM on a self-compile's larger
+/// functions -- and what it saves is the frame and the nested machine loop of
+/// one call, a microsecond or less. With the count at the JIT's threshold, a
+/// precompiled self-compile asked for 23 of them during the run and spent
+/// 4.5 s of CPU on them, for 0.5 M calls that took the fast path and no time
+/// anyone could measure. Ten thousand calls is roughly where one repays.
+constexpr uint32_t kExportMisses = 10000;
+
+/// A direct call found no body for `gi`: `Jit::direct_miss`, for compiled code.
+void dream_jit_direct_miss(Process* p, uint32_t gi);
 
 class Analyzer {
 public:
@@ -813,6 +957,7 @@ public:
         a.eager = eager_;
         a.nested_calls = nested_calls_;
         a.kinds = kinds_;
+        a.direct = direct_;
         a.compilable = true;
         a.strict_params = strict;
         a.recurses = recurses_;
@@ -1061,9 +1206,25 @@ private:
         // peer is admitted depends on how full the compile already is and
         // asking twice could answer twice.
         auto known = kinds_.find(idx);
-        const CallKind kind = known != kinds_.end() ? known->second : classify(n, depth);
+        CallKind kind = known != kinds_.end() ? known->second : classify(idx, n, depth);
         kinds_[idx] = kind;
         if (kind == CallKind::Refused) return false;
+        if (kind == CallKind::Direct) {
+            // Made by the machine when the callee has no body published, so it
+            // is a closure call as well, and it is refused where one is. An
+            // argument the callee's set evaluates that this tier cannot write
+            // makes it one outright: its arguments are then all lazy.
+            if ((n.flags & F_IMPURE) || n.c > kMaxApplyArgs) return false;
+            nested_calls_ = true;
+            const uint32_t mask = direct_[idx].mask;
+            bool written = true;
+            for (uint32_t i = 0; i < n.c && written; ++i) {
+                if ((mask >> i) & 1) written = check(img_.kid(n.b + i), depth + 1);
+            }
+            if (written) return check(n.a, depth + 1);
+            direct_.erase(idx);
+            kind = kinds_[idx] = CallKind::Closure;
+        }
         if (kind == CallKind::Closure) {
             if ((n.flags & F_IMPURE) || n.c > kMaxApplyArgs) return false;
             nested_calls_ = true;
@@ -1073,7 +1234,7 @@ private:
             const uint32_t gi = peer_target(n);
             calls_.push_back(gi);
         }
-        const uint32_t mask = check_mask(n, kind);
+        const uint32_t mask = check_mask(idx, n, kind);
         for (uint32_t i = 0; i < n.c; ++i) {
             if (i < 32 && !((mask >> i) & 1)) continue;
             if (!check(img_.kid(n.b + i), depth + 1)) return false;
@@ -1083,7 +1244,7 @@ private:
 
     /// Which shape a call is. Asked once per node, by `check`, which is the
     /// one walk allowed to decide a peer.
-    CallKind classify(const Node& n, int depth) {
+    CallKind classify(uint32_t idx, const Node& n, int depth) {
         if (is_self_call(n)) return CallKind::Self;
         const bool direct = is_primitive(Op(n.op));
         if (known_native(rt_, img_, n.a, n.c, direct) != KnownNative::None) return CallKind::Known;
@@ -1093,6 +1254,13 @@ private:
         if (direct) return CallKind::Refused;
         const uint32_t gi = peer_target(n);
         if (gi != kNoFunc && peers_ && peer_admits(*peers_, gi, peer_depth_)) return CallKind::Peer;
+        if (gi != kNoFunc && peers_ && n.c <= 32) {
+            const DirectSig sig = direct_sig(*peers_, gi);
+            if (sig.ok) {
+                direct_[idx] = DirectSite{gi, sig.eager, sig.ret_dbl};
+                return CallKind::Direct;
+            }
+        }
         return CallKind::Closure;
     }
 
@@ -1107,18 +1275,18 @@ private:
     /// The arguments `check` must be able to write: every one that may be
     /// evaluated. For a peer still being decided -- a mutual recursion -- that
     /// is not known yet, so all of them.
-    uint32_t check_mask(const Node& n, CallKind kind) const {
+    uint32_t check_mask(uint32_t idx, const Node& n, CallKind kind) const {
         if (kind == CallKind::Peer) {
             const Analysis* m = peer_member(*peers_, peer_target(n));
             return m ? uint32_t(m->eager) : ~uint32_t(0);
         }
-        return eval_mask(n, kind);
+        return eval_mask(idx, n, kind);
     }
 
     /// The arguments compiled code evaluates before making this call, one bit
     /// per position. What strictness may count as forced and what the emitter
     /// evaluates are both this, which is what keeps them the same set.
-    uint32_t eval_mask(const Node& n, CallKind kind) const {
+    uint32_t eval_mask(uint32_t idx, const Node& n, CallKind kind) const {
         switch (kind) {
             case CallKind::Self:
                 return uint32_t(eager_ & ~carried_);
@@ -1132,6 +1300,10 @@ private:
                 // caller's strictness. The emitter reads the final answer.
                 const Analysis* m = peer_member(*peers_, peer_target(n));
                 return m ? uint32_t(m->eager) : 0;
+            }
+            case CallKind::Direct: {
+                auto found = direct_.find(idx);
+                return found == direct_.end() ? 0 : found->second.mask;
             }
             default:
                 return 0;
@@ -1392,10 +1564,16 @@ private:
                 // A carried argument is moved, not evaluated, so it forces
                 // nothing; `eval_mask` leaves it out for that reason. A closure
                 // call forces its callee and nothing else.
+                //
+                // A direct call's arguments are evaluated but not counted: see
+                // "Direct calls" for why a callee's set must not feed its
+                // caller's.
                 const CallKind kind = kind_at(node);
-                if (kind == CallKind::Closure) return strict_of(n.a, depth + 1);
+                if (kind == CallKind::Closure || kind == CallKind::Direct) {
+                    return strict_of(n.a, depth + 1);
+                }
                 if (kind == CallKind::Refused) return 0;
-                const uint32_t mask = eval_mask(n, kind);
+                const uint32_t mask = eval_mask(node, n, kind);
                 SlotSet s = 0;
                 for (uint32_t i = 0; i < n.c && i < 32; ++i) {
                     if ((mask >> i) & 1) s |= strict_of(img_.kid(n.b + i), depth + 1);
@@ -1552,7 +1730,7 @@ private:
                     force_order(n.a, depth + 1, out);
                     return false;
                 }
-                const uint32_t mask = kind == CallKind::Refused ? 0 : eval_mask(n, kind);
+                const uint32_t mask = kind == CallKind::Refused ? 0 : eval_mask(idx, n, kind);
                 for (uint32_t i = 0; i < n.c && i < 32; ++i) {
                     if (!((mask >> i) & 1)) continue;
                     if (!force_order(img_.kid(n.b + i), depth + 1, out)) return false;
@@ -1745,7 +1923,7 @@ private:
             return;
         }
         // A peer still being decided may evaluate any of them.
-        const uint32_t mask = kind == CallKind::Refused ? 0 : check_mask(n, kind);
+        const uint32_t mask = kind == CallKind::Refused ? 0 : check_mask(idx, n, kind);
         for (uint32_t i = 0; i < n.c && i < 32; ++i) {
             if ((mask >> i) & 1) collect_calls(img_.kid(n.b + i), depth + 1);
         }
@@ -1776,6 +1954,8 @@ private:
     std::vector<uint8_t> bind_inline_;
     /// How each call `check` reached is made. See `check_apply`.
     std::unordered_map<uint32_t, CallKind> kinds_;
+    /// The direct calls among them; see `classify`.
+    std::unordered_map<uint32_t, DirectSite> direct_;
     /// The two shapes of step found by `collect_calls`: an `e + f ..` in
     /// result position, and a `let` of a self call read as the answer.
     std::unordered_set<uint32_t> steps_;
@@ -1832,7 +2012,10 @@ public:
                 // whatever the body computed.
                 const CallKind kind = kind_at(idx);
                 if (kind == CallKind::Self) return (n.flags & F_TAIL) ? Ty::Unknown : Ty::Any;
-                if (kind == CallKind::Closure || kind == CallKind::Refused) return Ty::Any;
+                if (kind == CallKind::Closure || kind == CallKind::Refused ||
+                    kind == CallKind::Direct) {
+                    return Ty::Any;
+                }
                 if (peers_ && kind == CallKind::Peer) {
                     const uint32_t gi = peer_target(n);
                     if (gi != kNoFunc) {
@@ -1921,9 +2104,22 @@ public:
 /// is what catches it, rather than an argument about which cases can happen.
 class PeerSet {
   public:
-    PeerSet(Runtime& rt, const Image& img) : rt_(rt), img_(img) {}
+    PeerSet(Runtime& rt, const Image& img, DirectTable* table)
+        : rt_(rt), img_(img), table_(table) {}
 
     bool admit(uint32_t gi, int depth);
+
+    /// Admit `gi` as a peer of itself, first, so that its body as a peer is
+    /// emitted beside it and can be published (see "Direct calls"). Answers
+    /// whether it can be.
+    bool admit_export(uint32_t gi) {
+        if (gi >= img_.func_count()) return false;
+        const FuncRec& f = img_.func(gi);
+        // A capture is read out of the frame's closure, which a direct call has
+        // none of; a global function has none anyway. Masks are 32 bits wide.
+        if (f.n_captures != 0 || f.arity == 0 || f.arity > 32) return false;
+        return admit(gi, 0) && sound_members();
+    }
 
     /// Every call every member makes, and every call the root makes, is to a
     /// member. False means the optimistic answer above was taken somewhere and
@@ -1932,6 +2128,9 @@ class PeerSet {
         for (uint32_t gi : root.calls) {
             if (!members.count(gi)) return false;
         }
+        return sound_members();
+    }
+    bool sound_members() const {
         for (const auto& entry : members) {
             for (uint32_t gi : entry.second.calls) {
                 if (!members.count(gi)) return false;
@@ -1943,10 +2142,15 @@ class PeerSet {
     /// Admitted functions, by image function index.
     std::unordered_map<uint32_t, Analysis> members;
 
+    Runtime& rt() const { return rt_; }
+    const Image& img() const { return img_; }
+    DirectTable* table() const { return table_; }
+
   private:
     enum class State : uint8_t { Deciding, Yes, No };
     Runtime& rt_;
     const Image& img_;
+    DirectTable* table_;
     std::unordered_map<uint32_t, State> state_;
 };
 
@@ -1993,6 +2197,38 @@ bool PeerSet::admit(uint32_t gi, int depth) {
 }
 
 bool peer_admits(PeerSet& peers, uint32_t gi, int depth) { return peers.admit(gi, depth); }
+
+/// How many callees' analyses one thread may be making inside one another.
+/// Asking for a callee's set analyses the callee, which asks for *its*
+/// callees', and so on down the call graph on the compile thread's stack. Past
+/// this the call is left to the machine -- a cost in speed at that site only.
+constexpr size_t kMaxDirectNesting = 6;
+
+DirectSig direct_sig(PeerSet& peers, uint32_t gi) {
+    DirectTable* table = peers.table();
+    if (!table) return {};
+    DirectSig found;
+    if (table->find(gi, &found)) return found;
+    // A callee whose analysis this thread is already making -- a recursion
+    // through calls that are not peers -- is answered "not direct", and so is
+    // one past the nesting bound. Neither answer is remembered.
+    thread_local std::vector<uint32_t> deciding;
+    if (deciding.size() >= kMaxDirectNesting ||
+        std::find(deciding.begin(), deciding.end(), gi) != deciding.end()) {
+        return {};
+    }
+    deciding.push_back(gi);
+    DirectSig sig;
+    PeerSet own(peers.rt(), peers.img(), table);
+    if (own.admit_export(gi)) {
+        const Analysis& a = own.members.at(gi);
+        sig.ok = true;
+        sig.eager = uint32_t(a.eager);
+        sig.ret_dbl = a.ret_dbl;
+    }
+    deciding.pop_back();
+    return table->keep(gi, sig);
+}
 
 const Analysis* peer_member(const PeerSet& peers, uint32_t gi) {
     auto found = peers.members.find(gi);
@@ -2069,10 +2305,12 @@ public:
           ret_dbl_(preset && a.ret_dbl), eager_(a.eager), bind_inline_(a.bind_inline),
           bind_memo_(a.bind_memo), accumulate_(a.accumulate), steps_(a.steps),
           let_steps_(a.let_steps), cons_steps_(a.cons_steps),
-          kinds_(a.kinds), interp_(a.interpreted), nested_calls_(a.nested_calls), peers_(peers),
+          kinds_(a.kinds), direct_(a.direct), interp_(a.interpreted), nested_calls_(a.nested_calls), peers_(peers),
           preset_(preset), b_(ctx) {}
 
     llvm::Function* emit(const std::string& name);
+    /// The table a direct call reads; see "Direct calls".
+    void set_table(DirectTable* table) { table_ = table; }
 
 private:
     /// A value in hand, in one of the two representations of "Representation"
@@ -2149,6 +2387,10 @@ private:
     JV self_call(const Node& n);
     /// Anything else that can be applied, handed to the machine.
     JV closure_call(const Node& n);
+    /// A call to a global function through the table of compiled bodies.
+    JV direct_call(uint32_t idx, const Node& n);
+    /// The machine's call of `f` with `args` in hand, its answer forced.
+    JV machine_call(llvm::Value* f, llvm::Value* items, uint32_t argc);
 
     // --- data ---------------------------------------------------------------
     JV list_is_empty(const Node& n);
@@ -2338,6 +2580,9 @@ private:
     std::vector<llvm::Value*> memo_;
     /// How each call is made, as the analysis decided it.
     const std::unordered_map<uint32_t, CallKind> kinds_;
+    /// The direct calls among them, and the table they read.
+    const std::unordered_map<uint32_t, DirectSite> direct_;
+    DirectTable* table_ = nullptr;
     /// See "What the interpreter evaluates".
     const std::unordered_set<uint32_t> interp_;
     const bool nested_calls_;
@@ -2984,10 +3229,15 @@ llvm::Value* Emitter::snapshot() {
     // and what the profiler names the frame by. The root's is in the frame the
     // interpreter entered it with; a peer has no frame of its own, and a global
     // function has no captures, so it goes without.
+    //
+    // A root written as a body of its arguments is in the same position past
+    // depth zero: the frame it was handed is its outermost invocation's, or --
+    // when it was called directly -- some other function's altogether.
     llvm::Value* closure = i64(UNIT);
     if (!preset_) {
         llvm::Value* at = b_.CreateIntToPtr(b_.CreateAdd(frame_, i64(8)), ptr_);
         closure = b_.CreateLoad(i64_, at);
+        if (depth_) closure = b_.CreateSelect(b_.CreateICmpEQ(depth_, i32c(0)), closure, i64(UNIT));
     }
     llvm::Value* made = b_.CreateCall(
         rt_snapshot_, {proc_, closure, i32c(int(f_.slots)), vals, bind_table_});
@@ -4522,6 +4772,8 @@ Emitter::JV Emitter::apply(uint32_t idx, const Node& n) {
         }
         case CallKind::Self:
             return self_call(n);
+        case CallKind::Direct:
+            return direct_call(idx, n);
         case CallKind::Closure:
             return closure_call(n);
         default:
@@ -4554,8 +4806,12 @@ Emitter::JV Emitter::closure_call(const Node& n) {
     llvm::Value* items = lazy_array(n.b, n.c);
     if (failed_) return none();
     spend_reduction();
+    return machine_call(f, items, n.c);
+}
+
+Emitter::JV Emitter::machine_call(llvm::Value* f, llvm::Value* items, uint32_t argc) {
     llvm::Value* out = entry_alloca(i64_, "applied");
-    llvm::Value* st = guarded(rt_apply_, {proc_, f, i32c(int(n.c)), items, out});
+    llvm::Value* st = guarded(rt_apply_, {proc_, f, i32c(int(argc)), items, out});
     llvm::Value* v = b_.CreateLoad(i64_, out);
     auto* cont = bb("apply.ok");
     auto* raise_bb = bb("apply.raise");
@@ -4585,6 +4841,84 @@ Emitter::JV Emitter::closure_call(const Node& n) {
 /// heuristic and not a wrong answer: the root is run by the interpreter, which
 /// enters the peer through `enter_function` in its own right, and *that* entry
 /// deoptimizes the peer. It corrects itself after one call.
+/// A saturated call to a global function that is not a peer of this compile.
+/// See "Direct calls".
+///
+/// The arguments are made first, as for a peer: the ones the callee's set says
+/// it evaluates are evaluated, the others are in lazy positions. Then the
+/// callee's slot is read. A body published for the same set is called with
+/// them in registers, one frame deeper on this compile's depth, as a peer would
+/// be. Anything else -- no body yet, or one compiled for another set -- is the
+/// machine's call with the same arguments, which is what this call was before
+/// there was a table.
+Emitter::JV Emitter::direct_call(uint32_t idx, const Node& n) {
+    auto found = direct_.find(idx);
+    if (found == direct_.end() || !table_) {
+        failed_ = true;
+        return none();
+    }
+    const DirectSite site = found->second;
+    std::vector<JV> args(n.c);
+    for (uint32_t i = 0; i < n.c; ++i) {
+        const bool eager = (site.mask >> i) & 1;
+        args[i] = eager ? node(img_.kid(n.b + i)) : lazy(img_.kid(n.b + i));
+        if (failed_ || !args[i].v) return none();
+    }
+    spend_reduction();
+    std::vector<llvm::Value*> boxed(n.c);
+    for (uint32_t i = 0; i < n.c; ++i) boxed[i] = box(args[i]);
+
+    // The slot: the body, then the word it was published with.
+    const uint64_t at = reinterpret_cast<uint64_t>(table_->entry(site.gi));
+    auto* body_load = b_.CreateLoad(ptr_, b_.CreateIntToPtr(i64(at), ptr_), "direct.fn");
+    body_load->setAtomic(llvm::AtomicOrdering::Acquire);
+    body_load->setAlignment(llvm::Align(8));
+    llvm::Value* word = b_.CreateLoad(i64_, b_.CreateIntToPtr(i64(at + 8), ptr_), "direct.sig");
+    llvm::Value* ready =
+        b_.CreateICmpEQ(word, i64(direct_sig_word(site.mask, site.ret_dbl)));
+    auto* fast_bb = bb("direct.call");
+    auto* slow_bb = bb("direct.machine");
+    auto* done_bb = bb("direct.done");
+    // The word is read even when the body is null: it is then zero, which
+    // matches no set, and the one compare says both things.
+    b_.CreateCondBr(ready, fast_bb, slow_bb);
+
+    b_.SetInsertPoint(fast_bb);
+    std::vector<llvm::Value*> call{proc_, callee_depth(), frame_};
+    for (llvm::Value* v : boxed) call.push_back(v);
+    call.push_back(status_);
+    llvm::FunctionCallee callee(body_signature(ctx_, n.c, 0), body_load);
+    JV fast = take_call_status(guarded(callee, call), "direct", site.ret_dbl);
+    llvm::Value* fast_v = box(fast);
+    auto* fast_end = b_.GetInsertBlock();
+    b_.CreateBr(done_bb);
+
+    b_.SetInsertPoint(slow_bb);
+    // Counted, and at the threshold the callee's body is asked for; see
+    // `Jit::direct_miss`. A constant address and no symbol to resolve.
+    {
+        auto* miss_ty = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), {ptr_, i32_}, false);
+        llvm::Value* miss_fn = b_.CreateIntToPtr(
+            i64(reinterpret_cast<uint64_t>(&dream_jit_direct_miss)), ptr_);
+        b_.CreateCall(miss_ty, miss_fn, {proc_, i32c(int(site.gi))});
+    }
+    llvm::Value* items = entry_alloca(i64_, "direct.items", std::max(1u, n.c));
+    for (uint32_t i = 0; i < n.c; ++i) {
+        b_.CreateStore(boxed[i], b_.CreateGEP(i64_, items, {i64(i)}));
+    }
+    JV callee_v = node(n.a);
+    if (failed_ || !callee_v.v) return none();
+    JV slow = machine_call(box(callee_v), items, n.c);
+    auto* slow_end = b_.GetInsertBlock();
+    b_.CreateBr(done_bb);
+
+    b_.SetInsertPoint(done_bb);
+    auto* phi = b_.CreatePHI(i64_, 2);
+    phi->addIncoming(fast_v, fast_end);
+    phi->addIncoming(slow.v, slow_end);
+    return tag(phi);
+}
+
 Emitter::JV Emitter::take_call_status(llvm::Value* r, const char* what, bool dbl) {
     auto* ok_bb = bb((std::string(what) + ".ok").c_str());
     auto* out_bb = bb((std::string(what) + ".out").c_str());
@@ -5346,9 +5680,17 @@ Emitter::JV Emitter::recursive_call(const std::vector<JV>& args) {
 ///
 /// Answers the root's function, or null if anything in the closure could not be
 /// written, in which case the caller drops the module whole.
+/// What a compile publishes for direct calls: the root's body as a peer, by
+/// symbol, and the word it is published with. An empty name when it has none.
+struct DirectExport {
+    std::string name;
+    uint64_t word = 0;
+};
+
 llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime& rt,
-                             const Image& img, uint32_t func_index, const std::string& name) {
-    PeerSet peers(rt, img);
+                             const Image& img, uint32_t func_index, const std::string& name,
+                             DirectTable* table, DirectExport* ex) {
+    PeerSet peers(rt, img, table);
     Analysis root = Analyzer(rt, img, func_index, &peers, 0).run();
     // `DREAM_JIT_WHY` (see `Analyzer::why`) for the refusals made here.
     static const bool say = std::getenv("DREAM_JIT_WHY") != nullptr;
@@ -5386,17 +5728,84 @@ llvm::Function* emit_closure(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime&
     for (const auto& member : peers.members) {
         const PeerFn& pf = fns[member.first];
         Emitter generic(ctx, mod, rt, img, member.first, member.second, &fns, pf.generic);
+        generic.set_table(table);
         if (!generic.emit(pf.generic->getName().str())) return refuse("the emitter refused a function it calls");
         if (pf.typed) {
             Analysis t = member.second;
             t.float_slots = pf.typed_slots;
             t.ret_dbl = pf.typed_ret_dbl;
             Emitter typed(ctx, mod, rt, img, member.first, t, &fns, pf.typed);
+            typed.set_table(table);
             if (!typed.emit(pf.typed->getName().str())) return nullptr;
         }
     }
-    llvm::Function* f = Emitter(ctx, mod, rt, img, func_index, root, &fns).emit(name);
-    return f ? f : refuse("the emitter refused it");
+    Emitter root_emitter(ctx, mod, rt, img, func_index, root, &fns);
+    root_emitter.set_table(table);
+    llvm::Function* f = root_emitter.emit(name);
+    if (!f) return refuse("the emitter refused it");
+    // A root that recurses is already a body of its arguments, entered at depth
+    // zero by the interpreter and deeper by itself, and with every slot tagged
+    // it is the body a direct call wants. Offered for nothing: kept as a symbol
+    // of its own, which costs the optimizer an inlining it would have done.
+    // Whether its set is the one callers assume is `Jit::publish`'s to say.
+    const FuncRec& rf = img.func(func_index);
+    if (table && ex && root.recurses && !root.tail_self && !root.float_slots && !root.peel &&
+        rf.n_captures == 0 && rf.arity <= 32) {
+        if (llvm::Function* body = mod.getFunction(name + ".rec")) {
+            body->setLinkage(llvm::Function::ExternalLinkage);
+            ex->name = body->getName().str();
+            ex->word = direct_sig_word(uint32_t(root.eager), false);
+        }
+    }
+    return f;
+}
+
+/// Write `func_index`'s body as a peer -- the body a direct call makes -- and
+/// nothing else, under `name`. See "Direct calls": this is the compile a
+/// function gets when compiled code keeps calling it and finds no body.
+bool emit_export(llvm::LLVMContext& ctx, llvm::Module& mod, Runtime& rt, const Image& img,
+                 uint32_t func_index, const std::string& name, DirectTable* table,
+                 DirectExport* ex) {
+    PeerSet peers(rt, img, table);
+    if (!peers.admit_export(func_index)) return false;
+    PeerFns fns;
+    for (const auto& member : peers.members) {
+        const Analysis& a = member.second;
+        const uint32_t arity = img.func(member.first).arity;
+        PeerFn& pf = fns[member.first];
+        const bool root = member.first == func_index;
+        pf.generic = llvm::Function::Create(
+            body_signature(ctx, arity, 0),
+            root ? llvm::Function::ExternalLinkage : llvm::Function::InternalLinkage,
+            root ? name : "dream_peer_" + std::to_string(member.first), &mod);
+        pf.ret_dbl = a.ret_dbl;
+        pf.eager = a.eager;
+        if (a.typed_slots) {
+            pf.typed = llvm::Function::Create(
+                body_signature(ctx, arity, a.typed_slots), llvm::Function::InternalLinkage,
+                "dream_peer_" + std::to_string(member.first) + ".typed", &mod);
+            pf.typed_slots = a.typed_slots;
+            pf.typed_ret_dbl = a.typed_ret_dbl;
+        }
+    }
+    for (const auto& member : peers.members) {
+        const PeerFn& pf = fns[member.first];
+        Emitter generic(ctx, mod, rt, img, member.first, member.second, &fns, pf.generic);
+        generic.set_table(table);
+        if (!generic.emit(pf.generic->getName().str())) return false;
+        if (pf.typed) {
+            Analysis t = member.second;
+            t.float_slots = pf.typed_slots;
+            t.ret_dbl = pf.typed_ret_dbl;
+            Emitter typed(ctx, mod, rt, img, member.first, t, &fns, pf.typed);
+            typed.set_table(table);
+            if (!typed.emit(pf.typed->getName().str())) return false;
+        }
+    }
+    const Analysis& a = peers.members.at(func_index);
+    ex->name = name;
+    ex->word = direct_sig_word(uint32_t(a.eager), a.ret_dbl);
+    return true;
 }
 
 }  // namespace
@@ -5518,16 +5927,50 @@ struct Jit::Impl {
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     std::deque<uint32_t> queue;
+    /// Functions whose body direct calls have asked for (`direct_miss`), in
+    /// the order they asked. Taken before `queue`: each has compiled callers
+    /// waiting on it.
+    std::deque<uint32_t> exports;
     std::vector<std::thread> workers;
     unsigned threads = default_jit_threads();
     bool stopping = false;
+    /// The published bodies; see "Direct calls". Null under
+    /// `DREAM_JIT_DIRECT=0`, which is for measuring them.
+    std::unique_ptr<DirectTable> direct;
+    /// Bodies published, and how many of them for another set than the one
+    /// callers were told to expect -- each such call is the machine's.
+    std::atomic<uint32_t> direct_published{0};
+    std::atomic<uint32_t> direct_disagreed{0};
     /// CPU the compile threads have spent between them. See `jit_within_budget`.
     std::atomic<int64_t> jit_ns{0};
     const bool force_sync = std::getenv("DREAM_JIT_SYNC") != nullptr;
 
     bool ensure_jit(std::string* error);
     bool create_jit();
+    /// Start the compile threads, if they are not running. Caller holds
+    /// `queue_mutex`.
+    void start_workers(Jit* jit);
+    /// Publish a body for direct calls when its set is the one callers assume.
+    void publish_direct(uint32_t fi, void* body, uint64_t word);
 };
+
+void Jit::Impl::start_workers(Jit* jit) {
+    // The pool is started by the first function to get hot, all of it at
+    // once: a thread waiting on an empty queue costs nothing.
+    if (!workers.empty()) return;
+    for (unsigned i = 0; i < threads; ++i) workers.emplace_back([jit] { jit->compile_worker(); });
+}
+
+void Jit::Impl::publish_direct(uint32_t fi, void* body, uint64_t word) {
+    if (!direct) return;
+    PeerSet asking(rt, rt.image(), direct.get());
+    const DirectSig expected = direct_sig(asking, fi);
+    if (!expected.ok || word != direct_sig_word(expected.eager, expected.ret_dbl)) {
+        direct_disagreed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (direct->publish(fi, body, word)) direct_published.fetch_add(1, std::memory_order_relaxed);
+}
 
 bool Jit::Impl::ensure_jit(std::string* error) {
     std::call_once(jit_once, [this] { create_jit(); });
@@ -5615,6 +6058,8 @@ Jit::Jit(Runtime& rt) : impl_(std::make_unique<Impl>(rt)) {
     counts_ = std::vector<std::atomic<uint32_t>>(funcs);
     cached_ = std::vector<std::atomic<CompiledFn>>(funcs);
     bails_ = std::vector<std::atomic<uint8_t>>(funcs);
+    const char* direct = std::getenv("DREAM_JIT_DIRECT");
+    if (!direct || std::strcmp(direct, "0") != 0) impl_->direct = std::make_unique<DirectTable>(funcs);
     threshold_.store(impl_->threshold, std::memory_order_relaxed);
     rt.set_jit(this);
 }
@@ -5697,13 +6142,26 @@ void Jit::compile_worker() {
         }
     };
 #endif
+    uint32_t export_index = kNoFunc;
     for (;;) {
         uint32_t func_index = 0;
         {
             std::unique_lock<std::mutex> g(impl_->queue_mutex);
-            impl_->queue_cv.wait(g, [&] { return impl_->stopping || !impl_->queue.empty(); });
+            impl_->queue_cv.wait(g, [&] {
+                return impl_->stopping || !impl_->queue.empty() || !impl_->exports.empty();
+            });
             if (impl_->stopping) return;
-            func_index = take_hottest();
+            if (!impl_->exports.empty()) {
+                export_index = impl_->exports.front();
+                impl_->exports.pop_front();
+            } else {
+                func_index = take_hottest();
+            }
+        }
+        if (export_index != kNoFunc) {
+            compile_export(export_index);
+            export_index = kNoFunc;
+            continue;
         }
 #if defined(__linux__)
         set_idle(!jit_within_budget(impl_->jit_ns.load(std::memory_order_relaxed)));
@@ -5753,6 +6211,7 @@ void Jit::set_threshold(uint32_t calls) {
 }
 uint32_t Jit::threshold() const { return impl_->threshold; }
 uint64_t Jit::compiled_count() const { return impl_->compiled_count.load(); }
+uint32_t Jit::direct_count() const { return impl_->direct_published.load(); }
 
 CompiledFn Jit::on_enter(uint32_t func_index) {
     // Reached once per function: `tier` has counted the entries inline and
@@ -5772,13 +6231,7 @@ CompiledFn Jit::on_enter(uint32_t func_index) {
             std::lock_guard<std::mutex> g(impl_->queue_mutex);
             if (impl_->stopping) return nullptr;
             impl_->queue.push_back(func_index);
-            // The pool is started by the first function to get hot, all of
-            // it at once: a thread waiting on an empty queue costs nothing.
-            if (impl_->workers.empty()) {
-                for (unsigned i = 0; i < impl_->threads; ++i) {
-                    impl_->workers.emplace_back([this] { compile_worker(); });
-                }
-            }
+            impl_->start_workers(this);
         }
         impl_->queue_cv.notify_one();
         return nullptr;
@@ -5864,6 +6317,8 @@ Jit::Precompiled Jit::precompile(unsigned threads) {
     Precompiled out;
     out.compiled = compiled.load();
     out.refused = refused.load();
+    out.direct = impl_->direct_published.load();
+    out.disagreed = impl_->direct_disagreed.load();
     out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return out;
 }
@@ -5872,6 +6327,99 @@ void Jit::set_threads(unsigned n) {
     std::lock_guard<std::mutex> g(impl_->queue_mutex);
     // Only before the pool has started; it is started once, whole.
     if (impl_->workers.empty() && n > 0) impl_->threads = n;
+}
+
+namespace {
+
+size_t module_size(const llvm::Module& mod) {
+    size_t n = 0;
+    for (const llvm::Function& f : mod) {
+        for (const llvm::BasicBlock& b : f) n += b.size();
+    }
+    return n;
+}
+
+/// The standard O2 pipeline: without it the tag arithmetic and the repeated
+/// slot loads dominate, and the compiled loop is barely faster than the
+/// interpreter. A module still large after it is marked for the fast code
+/// generator (`SizedCompiler`).
+void optimize(llvm::Module& mod) {
+    llvm::PassBuilder pb;
+    llvm::LoopAnalysisManager lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager cgam;
+    llvm::ModuleAnalysisManager mam;
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+    auto mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+    mpm.run(mod, mam);
+    if (module_size(mod) > kFastCodegenInsts) {
+        mod.addModuleFlag(llvm::Module::Warning, "dream.fast", 1);
+    }
+}
+
+}  // namespace
+
+namespace {
+void dream_jit_direct_miss(Process* p, uint32_t gi) {
+    if (Jit* jit = p->runtime().jit()) jit->direct_miss(gi);
+}
+}  // namespace
+
+void Jit::direct_miss(uint32_t gi) {
+    DirectTable* table = impl_->direct.get();
+    if (!table || gi >= table->size()) return;
+    // A threshold of one is a test asking for every body at once; otherwise
+    // `kExportMisses`.
+    if (!table->note_miss(gi, impl_->threshold <= 1 ? 1 : kExportMisses)) return;
+    // The same choice `on_enter` makes: compiled where the program is when a
+    // threshold of one or `DREAM_JIT_SYNC` asks for that, which is what lets
+    // a test reach a direct call's compiled side; queued otherwise.
+    if (impl_->force_sync || impl_->threshold <= 1) {
+        compile_export(gi);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> g(impl_->queue_mutex);
+        if (impl_->stopping) return;
+        impl_->exports.push_back(gi);
+        impl_->start_workers(this);
+    }
+    impl_->queue_cv.notify_one();
+}
+
+bool Jit::compile_export(uint32_t gi) {
+    DirectTable* table = impl_->direct.get();
+    if (!table || table->published(gi) || !impl_->ensure_jit(nullptr)) return false;
+    const Image& img = impl_->rt.image();
+    auto ctx = std::make_unique<llvm::LLVMContext>();
+    auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);
+    mod->setDataLayout(impl_->lljit->getDataLayout());
+    const std::string name = "dream_direct_" + std::to_string(gi) + "_" +
+                             std::to_string(impl_->serial.fetch_add(1, std::memory_order_relaxed));
+    DirectExport ex;
+    if (!emit_export(*ctx, *mod, impl_->rt, img, gi, name, table, &ex)) return false;
+    optimize(*mod);
+    if (auto err = impl_->lljit->addIRModule(
+            llvm::orc::ThreadSafeModule(std::move(mod), std::move(ctx)))) {
+        llvm::consumeError(std::move(err));
+        return false;
+    }
+    auto body = impl_->lljit->lookup(ex.name);
+    if (!body) {
+        llvm::consumeError(body.takeError());
+        return false;
+    }
+    impl_->publish_direct(gi, body->toPtr<void*>(), ex.word);
+    static const bool trace = std::getenv("DREAM_JIT_TRACE") != nullptr;
+    if (trace) {
+        StringRef n = img.str(img.func(gi).name);
+        std::fprintf(stderr, "; jit fn#%u %.*s exported for direct calls\n", gi, int(n.len), n.data);
+    }
+    return true;
 }
 
 CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
@@ -5928,40 +6476,17 @@ CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
 
     std::string name = "dream_fn_" + std::to_string(func_index) + "_" +
                        std::to_string(impl_->serial.fetch_add(1, std::memory_order_relaxed));
-    if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index, name)) {
+    DirectExport ex;
+    if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index, name, impl_->direct.get(), &ex)) {
         if (error) *error = "not compilable by this tier";
         return nullptr;
     }
 
-    // Standard optimization pipeline: without it the tag arithmetic and the
-    // repeated slot loads dominate, and the compiled loop is barely faster
-    // than the interpreter.
-    auto instructions = [&] {
-        size_t n = 0;
-        for (const llvm::Function& f : *mod) {
-            for (const llvm::BasicBlock& b : f) n += b.size();
-        }
-        return n;
-    };
     trace.emitted = std::chrono::steady_clock::now();
-    trace.insts_in = instructions();
-    llvm::PassBuilder pb;
-    llvm::LoopAnalysisManager lam;
-    llvm::FunctionAnalysisManager fam;
-    llvm::CGSCCAnalysisManager cgam;
-    llvm::ModuleAnalysisManager mam;
-    pb.registerModuleAnalyses(mam);
-    pb.registerCGSCCAnalyses(cgam);
-    pb.registerFunctionAnalyses(fam);
-    pb.registerLoopAnalyses(lam);
-    pb.crossRegisterProxies(lam, fam, cgam, mam);
-    auto mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
-    mpm.run(*mod, mam);
+    trace.insts_in = module_size(*mod);
+    optimize(*mod);
     trace.optimized = std::chrono::steady_clock::now();
-    trace.insts_out = instructions();
-    if (trace.insts_out > kFastCodegenInsts) {
-        mod->addModuleFlag(llvm::Module::Warning, "dream.fast", 1);
-    }
+    trace.insts_out = module_size(*mod);
 
     if (auto err = impl_->lljit->addIRModule(
             llvm::orc::ThreadSafeModule(std::move(mod), std::move(ctx)))) {
@@ -5974,6 +6499,13 @@ CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
         return nullptr;
     }
     auto fn = sym->toPtr<CompiledFn>();
+    if (!ex.name.empty()) {
+        if (auto body = impl_->lljit->lookup(ex.name)) {
+            impl_->publish_direct(func_index, body->toPtr<void*>(), ex.word);
+        } else {
+            llvm::consumeError(body.takeError());
+        }
+    }
     {
         // Two compiles of one function can race only on the synchronous
         // path; the first to finish is the one every later caller gets.
@@ -5990,8 +6522,9 @@ std::string Jit::dump_ir(uint32_t func_index) {
     const Image& img = impl_->rt.image();
     auto ctx = std::make_unique<llvm::LLVMContext>();
     auto mod = std::make_unique<llvm::Module>("dream.jit", *ctx);
+    DirectExport ex;
     if (!emit_closure(*ctx, *mod, impl_->rt, img, func_index,
-                      "dream_fn_" + std::to_string(func_index))) {
+                      "dream_fn_" + std::to_string(func_index), impl_->direct.get(), &ex)) {
         return "; fn#" + std::to_string(func_index) +
                " is not compilable by this tier (it is interpreted)\n";
     }
