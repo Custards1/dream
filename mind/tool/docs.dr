@@ -1,0 +1,162 @@
+// `mind docs`: Markdown guides and documented Dream declarations, as an
+// offline site. No compiler, network request or project build script is run.
+import std.cli;
+import std.console;
+import std.file;
+import std.io;
+import std.json;
+import std.list;
+import std.os;
+import std.num;
+import std.vm;
+import documentation.examples;
+import std.str;
+import std.toml;
+import documentation.api;
+import documentation.markdown;
+import manifest;
+import util;
+
+let opts = [
+    cli.value "C" "dir" "DIR" "the project (default: here, or above)",
+    cli.value "o" "output" "DIR" "output directory (default: target/docs, relative to project)",
+    cli.value "" "guides" "DIR" "Markdown directory (default: docs, relative to project)",
+    cli.value "" "compiler" "PATH" "compiler for documentation examples",
+    cli.value "" "example-timeout" "MS" "run deadline per example (default: 10000 ms)",
+    cli.flag "" "no-api" "compile only Markdown guides",
+    cli.flag "h" "help" "show documentation options",
+];
+let usage = "mind docs -- compile guides and source API documentation\n\nusage: mind docs [options]\n\n"
+    + cli.options_help opts + "\n\nConfigure title, guides, output and api in [docs] in mind.toml.\n"
+    + "Write guides in Markdown and document public declarations with /// comments.\n"
+    + "Open target/docs/index.html in a browser, or host the directory anywhere.\n";
+let fail! why = {
+    console.error! ("mind docs: " + why)
+    os.exit! 1
+};
+let read! path = match file.read! path { () => fail! ("cannot read " + path), text => text };
+let rec each! f! xs = match xs {
+    [] => (),
+    [x, ..rest] => {
+        f! x
+        each! f! rest
+    },
+};
+let page url title body text = %{ :url => url, :title => title, :body => body, :text => text };
+let html_path path = str.slice 0 (len path - 3) path + ".html";
+let relative_root url = str.repeat (list.length (str.split "/" url) - 1) "../";
+let ignored path = list.any (fn p -> list.contains p ["target", "build", ".git", ".hg", ".svn", "node_modules", "tests", "examples"]) (str.split "/" path);
+let files! dir = if io.is_dir! dir { list.sort (list.filter (fn p -> not (ignored p)) (io.walk! dir)) } else { [] };
+let guide! ctx dir rel = {
+    let text = read! (util.join dir rel);
+    page ("guides/" + html_path rel) (markdown.title rel text) (examples.render! ctx text) text
+};
+let module_pages! ctx label dir rel = {
+    let text = read! (util.join dir rel);
+    console.error! ("documenting " + label + "/" + rel)
+    let entries = api.extract text;
+    let url = "api/" + label + "/" + html_path rel;
+    let source = "source/" + label + "/" + html_path rel;
+    let module = str.slice 0 (len rel - 3) rel;
+    let stem = if module == "mod" { "" } else if str.ends_with "/mod" module { str.slice 0 (len module - 4) module } else { module };
+    let name = label + (if stem == "" { "" } else { "." + markdown.replace "/" "." stem });
+    if list.is_empty entries { [] } else {
+        [page url name ("<h1>" + markdown.escape name + "</h1>" + api.render! ctx (relative_root url + source) entries)
+             (str.join_str "\n" (list.map (fn e -> e.[:name] + " " + e.[:signature] + " " + e.[:doc]) entries)),
+         page source (name + " source") ("<h1>" + markdown.escape name + " source</h1>" + api.source_html text) ""]
+    }
+};
+let package_pages! ctx m = {
+    let label = manifest.name m;
+    if label == "" || markdown.slug label != label { fail! "package names used in docs must contain only lowercase letters, digits, hyphens and underscores" }
+    let dir = manifest.src! m;
+    list.flat_map (fn rel -> module_pages! ctx.[:manifest => m] label dir rel) (list.filter (str.ends_with ".dr") (files! dir))
+};
+let api_pages! ctx m = {
+    let own = if manifest.is_package m { package_pages! ctx m } else { [] };
+    let children = list.flat_map (fn member -> match manifest.find! (util.join (manifest.root m) member) {
+        [:ok, child] => package_pages! ctx child,
+        [:error, why] => fail! why,
+    }) (manifest.members m);
+    list.append own children
+};
+let css = "
+:root{color-scheme:light dark;--bg:#fafaf8;--panel:#f0f1ed;--ink:#202923;--muted:#56625a;--link:#146649;--line:#d6ddd5}
+@media(prefers-color-scheme:dark){:root{--bg:#17201b;--panel:#202b24;--ink:#e4eae4;--muted:#b2bfb4;--link:#8adeb5;--line:#3c4c40}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.65 system-ui,sans-serif}a{color:var(--link);text-underline-offset:.2em}a:hover{text-decoration:underline}a:focus-visible,input:focus-visible{outline:3px solid var(--link);outline-offset:3px}.skip{position:absolute;top:-60px}.skip:focus{top:0;background:var(--bg);z-index:3}
+header{padding:1.1rem 2rem;border-bottom:1px solid var(--line);display:flex;gap:1rem;align-items:center;flex-wrap:wrap}header a{font-weight:750;text-decoration:none}header small{color:var(--muted)}.layout{display:grid;grid-template-columns:270px minmax(0,1fr);max-width:1450px;margin:auto}nav{padding:2rem 1.5rem;border-right:1px solid var(--line);overflow-wrap:anywhere}nav ul{list-style:none;padding:0}nav li{margin:.45rem 0}nav a{font-size:.9rem;text-decoration:none}nav a[aria-current]{font-weight:750}input{width:100%;font:inherit;padding:.55rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)}main{padding:2.5rem 4rem;min-width:0;max-width:1050px}h1{font-size:2.25rem;line-height:1.2}h2{margin-top:2.5rem}h3{margin-top:2rem}h1,h2,h3,h4,h5,h6,section,span[id]{scroll-margin-top:1rem}.anchor{color:inherit;text-decoration:none}code{font: .88em/1.6 ui-monospace,monospace;background:var(--panel);padding:.12em .3em;border-radius:3px}pre{padding:1rem;background:var(--panel);overflow:auto;border:1px solid var(--line);border-radius:7px}pre code{padding:0}.symbol{border-top:1px solid var(--line);padding-bottom:1rem}.source{font-size:.85rem;color:var(--muted)}.source-code span{display:block}.source-code span:target{background:var(--line)}.source-code a{display:inline-block;min-width:3rem;color:var(--muted);text-decoration:none}blockquote{border-left:3px solid var(--line);margin-left:0;padding-left:1.5rem;color:var(--muted)}.table{overflow:auto}table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--line);padding:.5rem .8rem;text-align:left}img{max-width:100%}#toc{font-size:.9rem;border-left:2px solid var(--line);padding-left:1rem}#toc a{display:block}#results a{display:block;margin:.7rem 0}footer{border-top:1px solid var(--line);padding-top:1rem;margin-top:3rem;color:var(--muted);font-size:.85rem}[hidden]{display:none!important}
+@media(max-width:800px){.layout{display:block}nav{border-right:0;border-bottom:1px solid var(--line);padding:1rem}nav ul{max-height:180px;overflow:auto}main{padding:1.5rem}header{padding:1rem}h1{font-size:1.8rem}}@media print{nav,header,#toc,.skip{display:none}.layout{display:block}main{max-width:none;padding:0}pre{white-space:pre-wrap}}
+";
+let javascript = "
+(function(){'use strict';
+const root=document.body.dataset.root,input=document.getElementById('search'),results=document.getElementById('results'),article=document.getElementById('article');
+input.addEventListener('input',function(){const q=this.value.trim().toLowerCase();results.replaceChildren();article.hidden=!!q;results.hidden=!q;if(!q)return;const terms=q.split(/\\s+/);const hits=window.mindDocs.filter(p=>terms.every(t=>(p.title+' '+p.text).toLowerCase().includes(t))).slice(0,60);const count=document.createElement('p');count.textContent=hits.length?hits.length+' matching pages':'No matching pages';results.append(count);for(const p of hits){const a=document.createElement('a');a.href=root+p.url;a.textContent=p.title;results.append(a);}});
+const headings=article.querySelectorAll('h2[id],h3[id]'),toc=document.getElementById('toc');if(headings.length>1){const label=document.createElement('strong');label.textContent='On this page';toc.append(label);for(const h of headings){const a=document.createElement('a');a.href='#'+h.id;a.textContent=h.textContent;toc.append(a);}}else toc.hidden=true;
+})();
+";
+let shell title version pages p = {
+    let root = relative_root p.[:url];
+    let nav = str.join_str "" (list.map (fn other -> "<li><a " + (if other.[:url] == p.[:url] { "aria-current=\"page\" " } else { "" })
+        + "href=\"" + markdown.escape (root + other.[:url]) + "\">" + markdown.escape other.[:title] + "</a></li>") pages);
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>"
+        + markdown.escape p.[:title] + " · " + markdown.escape title + "</title><link rel=\"stylesheet\" href=\"" + root + "assets/docs.css\"></head><body data-root=\"" + root + "\">"
+        + "<a class=\"skip\" href=\"#main\">Skip to content</a><header><a href=\"" + root + "index.html\">" + markdown.escape title + "</a><small>" + markdown.escape version + "</small></header>"
+        + "<div class=\"layout\"><nav aria-label=\"Documentation\"><label for=\"search\">Search documentation</label><input id=\"search\" type=\"search\" placeholder=\"Guides, functions, examples…\"><ul>" + nav + "</ul></nav>"
+        + "<main id=\"main\"><div id=\"results\" aria-live=\"polite\" hidden></div><article id=\"article\"><div id=\"toc\"></div>" + p.[:body] + "</article><footer>Built with mind docs · Works offline</footer></main></div>"
+        + "<script src=\"" + root + "assets/search.js\"></script><script src=\"" + root + "assets/docs.js\"></script></body></html>"
+};
+let write! out rel text = {
+    let path = util.join out rel;
+    file.mkdir_all! (file.parent path)
+    file.write! path text
+};
+let build! c m = {
+    let cfg = manifest.doc m;
+    let root = manifest.root m;
+    let title = toml.get (manifest.name m + " documentation") cfg "docs" "title";
+    let guide_dir = util.absolute! (util.join root (cli.get (toml.get "docs" cfg "docs" "guides") c "guides"));
+    let out = util.absolute! (util.join root (cli.get (toml.get "target/docs" cfg "docs" "output") c "output"));
+    let src = util.absolute! (manifest.src! m);
+    if out == util.absolute! root || out == guide_dir || out == src || str.starts_with (out + "/") guide_dir || str.starts_with (guide_dir + "/") out {
+        fail! "output must be separate from the project root and guide directory"
+    }
+    let guide_files = files! guide_dir;
+    let timeout = num.parse_int (cli.get (to_string (toml.get 10000 cfg "docs" "example-timeout")) c "example-timeout");
+    if timeout == () || timeout <= 0 { fail! "example-timeout must be a positive number of milliseconds" }
+    let scratch = util.join root ("target/docs-examples/" + file.scratch_suffix! () + "-" + to_string (vm.wall_ms! ()));
+    let ctx = examples.context m (cli.get () c "compiler") timeout scratch;
+    let guides = list.map (guide! ctx guide_dir) (list.filter (str.ends_with ".md") guide_files) |> strict!;
+    let apis = if cli.flag_set c "no-api" || toml.get true cfg "docs" "api" == false { [] } else { api_pages! ctx m };
+    let listed = list.append guides (list.filter (fn p -> str.starts_with "api/" p.[:url]) apis);
+    let overview = "<h1>" + markdown.escape title + "</h1><p>Browse the guides and API reference, or search for a function or topic.</p><ul>"
+        + str.join_str "" (list.map (fn p -> "<li><a href=\"" + markdown.escape p.[:url] + "\">" + markdown.escape p.[:title] + "</a></li>") listed) + "</ul>";
+    let index = page "index.html" "Overview" overview title;
+    let navigation = list.cons index listed;
+    let pages = list.cons index (list.append guides apis);
+    each! (fn p -> {
+        console.error! ("writing " + p.[:url])
+        write! out p.[:url] (shell title (manifest.version m) navigation p)
+    }) pages
+    // Copy local images and downloadable guide assets alongside their pages.
+    each! (fn rel -> {
+        let to = util.join out ("guides/" + rel);
+        file.mkdir_all! (file.parent to)
+        file.copy! (util.join guide_dir rel) to
+    }) (list.filter (fn rel -> not (str.ends_with ".md" rel)) guide_files)
+    write! out "assets/docs.css" css
+    write! out "assets/docs.js" javascript
+    let search = list.map (fn p -> %{ "title" => p.[:title], "url" => p.[:url], "text" => p.[:text] }) listed;
+    write! out "assets/search.js" ("window.mindDocs=" + json.write search + ";\n")
+    write! out "search-index.json" (json.write search)
+    file.remove_all! scratch
+    console.print! ("made " + util.join out "index.html" + " (" + to_string (list.length guides) + " guides, " + to_string (list.length listed - list.length guides) + " API modules)")
+};
+let run! args = match cli.parse opts args {
+    [:error, why] => fail! (why + "\n" + usage),
+    [:ok, c] => if cli.flag_set c "help" { console.print! usage }
+        else if cli.rest c != [] { fail! "unexpected arguments; try `mind docs --help`" }
+        else { match manifest.find! (util.absolute! (cli.get (os.cwd! ()) c "dir")) {
+            [:error, why] => fail! why,
+            [:ok, m] => build! c m,
+        } },
+};

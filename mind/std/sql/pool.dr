@@ -141,26 +141,36 @@ let start! open! size = {
     keeper.start! (keeper.State.new open! size)
 };
 
+/// Check out a database connection for a callback and return it even when the callback
+/// fails.
 let with! : :process -> (sql.Connection -> a) -> a;
 let with! pool work! = match keeper.call! pool [:work, work!] {
     [:ok, result] => result,
     [:error, e] => raise! e,
 };
 
+/// Return the pool's current connection and waiting-client statistics.
 let stats! : :process -> :map;
 let stats! pool = keeper.call! pool :stats;
+/// Wait for checked-out connections to return while shutting down the pool.
 let drain! : :process -> :integer;
 let drain! pool = keeper.call! pool :drain;
+/// Stop the pool and its managed connections.
 let stop! : :process -> :unit;
 let stop! pool = { keeper.stop! pool; () };
 
+/// Run a statement using a connection borrowed from the pool.
 let run! : :process -> sql.Runnable -> sql.Outcome;
 let run! pool query = with! pool (fn c -> sql.run! c query);
+/// Query rows using a connection borrowed from the pool.
 let query! : :process -> sql.Runnable -> [sql.Row];
 let query! pool query = with! pool (fn c -> sql.query! c query);
+/// Execute a statement for its effects using a borrowed connection.
 let exec! : :process -> sql.Runnable -> :map;
 let exec! pool query = with! pool (fn c -> sql.exec! c query);
+/// Return a query's first scalar value using a borrowed connection.
 let scalar! : :process -> sql.Runnable -> :any;
 let scalar! pool query = with! pool (fn c -> sql.scalar! c query);
+/// Run a callback in a transaction on one checked-out connection.
 let transaction! : :process -> (sql.Connection -> a) -> a;
 let transaction! pool work! = with! pool (fn c -> sql.transaction! c work!);

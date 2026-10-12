@@ -1,7 +1,7 @@
 #!/bin/sh
-# ship's packages, checked by the programs that install them.
+# Mind's packages, checked by the programs that install them.
 #
-# ship writes every format itself, so its own tests can only say that it
+# mind pack writes every format itself, so its own tests can only say that it
 # wrote what it meant to. Whether that is a package is dpkg's question, and
 # rpm's, and pacman's -- and they disagree with each other in ways no reading
 # of a specification predicts: dpkg's own tar reader refuses the pax records
@@ -12,11 +12,11 @@
 # has none of them; `nix-shell -p dpkg rpm pacman fakeroot ruby shellcheck`
 # has all of them.
 #
-#   dream=build-dream/bin/dream dreams=build/dreams.dream ship/tests/formats.sh
+#   dream=build-dream/bin/dream dreams=build/dreams.dream mind/tool/pack/tests/formats.sh
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/../.." && pwd)
+root=$(cd "$here/../../../.." && pwd)
 dream=${dream:-$root/build-dream/bin/dream}
 dreams=${dreams:-$root/build/dreams.dream}
 case $dream in /*) ;; *) dream=$root/$dream ;; esac
@@ -31,13 +31,13 @@ skip() { echo "  skip  $1"; }
 fail() { echo "  FAIL  $1"; failed=1; }
 has() { command -v "$1" >/dev/null 2>&1; }
 
-timeout 300 "$dream" "$dreams" -L "$root/mind" "$root/ship/main.dr" -o "$tmp/ship.dream" >/dev/null
-ship() { (cd "$here/fixture" && timeout 120 "$dream" "$tmp/ship.dream" "$@"); }
+timeout 300 "$dream" "$dreams" -L "$root/mind" "$root/mind/tool/main.dr" -o "$tmp/mind.dream" >/dev/null
+ship() { (cd "$here/fixture" && timeout 120 "$dream" "$tmp/mind.dream" pack "$@"); }
 
 # One time for every member, so two runs can be compared byte for byte.
 export SOURCE_DATE_EPOCH=1700000000
 
-echo "ship: every format, twice"
+echo "mind pack: every format, twice"
 ship all -q -o "$tmp/a" >/dev/null
 ship all -q -o "$tmp/b" >/dev/null
 for f in hello_1.2.0-2_all.deb hello-1.2.0-2.noarch.rpm hello-1.2.0.tar.gz hello.rb install.sh SHA256SUMS aur/PKGBUILD aur/.SRCINFO; do
@@ -52,7 +52,7 @@ if diff -r "$tmp/a" "$tmp/b" >/dev/null; then pass "the same inputs make the sam
 userns=false
 if has unshare && unshare -r true 2>/dev/null; then userns=true; fi
 
-echo "ship: dpkg"
+echo "mind pack: dpkg"
 deb=$tmp/a/hello_1.2.0-2_all.deb
 if has dpkg-deb && has dpkg; then
     dpkg-deb --info "$deb" >/dev/null && pass "dpkg-deb reads it" || fail "dpkg-deb --info"
@@ -67,7 +67,7 @@ if has dpkg-deb && has dpkg; then
     $d -P hello >/dev/null 2>&1 && [ ! -e "$r/usr/share/hello" ] && pass "dpkg purges it" || fail "dpkg -P"
 else skip "dpkg is not installed"; fi
 
-echo "ship: rpm"
+echo "mind pack: rpm"
 rpmf=$tmp/a/hello-1.2.0-2.noarch.rpm
 if has rpm; then
     out=$(rpm -K -v "$rpmf" 2>/dev/null)
@@ -91,7 +91,7 @@ if has rpm; then
     else skip "rpm install: no user namespace to be root in"; fi
 else skip "rpm is not installed"; fi
 
-echo "ship: pacman"
+echo "mind pack: pacman"
 if has pacman && [ -n "$arch_pkg" ]; then
     if $userns; then
         r=$tmp/pacman-root
@@ -107,7 +107,7 @@ if has pacman && [ -n "$arch_pkg" ]; then
     else skip "pacman install: no user namespace to be root in"; fi
 else skip "pacman is not installed"; fi
 
-echo "ship: the AUR"
+echo "mind pack: the AUR"
 if has makepkg; then
     conf=${MAKEPKG_CONF:-}
     [ -z "$conf" ] && [ -f /etc/makepkg.conf ] && conf=/etc/makepkg.conf
@@ -121,12 +121,12 @@ if has makepkg; then
     else skip "makepkg build: fakeroot is not installed"; fi
 else skip "makepkg is not installed"; fi
 
-echo "ship: Homebrew"
+echo "mind pack: Homebrew"
 if has ruby; then
     ruby -c "$tmp/a/hello.rb" >/dev/null 2>&1 && pass "the formula is Ruby" || fail "ruby -c"
 else skip "ruby is not installed"; fi
 
-echo "ship: install.sh"
+echo "mind pack: install.sh"
 if has shellcheck; then
     shellcheck -s sh "$tmp/a/install.sh" && pass "shellcheck has nothing to say" || fail "shellcheck"
 else skip "shellcheck is not installed"; fi
@@ -137,7 +137,7 @@ if PREFIX=$tmp/prefix2 sh "$tmp/a/install.sh" "$tmp/bad.tar.gz" >/dev/null 2>&1 
     fail "install.sh took a tarball that is not the one it was made for"
 else pass "it refuses a tarball that is not the one it was made for"; fi
 
-echo "ship: SHA256SUMS"
+echo "mind pack: SHA256SUMS"
 if has sha256sum; then
     (cd "$tmp/a" && sha256sum -c --quiet SHA256SUMS) && pass "sha256sum -c agrees" || fail "sha256sum -c"
 else skip "sha256sum is not installed"; fi

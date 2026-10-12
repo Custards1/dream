@@ -55,6 +55,7 @@ let as_rows logits y = {
 let mse : Loss;
 let mse = mse_using ad.sum;
 
+/// Construct mean squared error using the supplied sum operation.
 priv let mse_using : (:any -> :any) -> Loss;
 priv let mse_using sum pred y = { let d = ad.sub pred (target_like (ad.value pred) y); mean_using sum (ad.mul d d) };
 
@@ -62,6 +63,7 @@ priv let mse_using sum pred y = { let d = ad.sub pred (target_like (ad.value pre
 let mae : Loss;
 let mae = mae_using ad.sum;
 
+/// Construct mean absolute error using the supplied sum operation.
 priv let mae_using : (:any -> :any) -> Loss;
 priv let mae_using sum pred y = mean_using sum (ad.abs (ad.sub pred (target_like (ad.value pred) y)));
 
@@ -70,6 +72,7 @@ priv let mae_using sum pred y = mean_using sum (ad.abs (ad.sub pred (target_like
 let huber : :float -> Loss;
 let huber = huber_using ad.sum;
 
+/// Construct Huber loss with the supplied sum operation and transition threshold.
 priv let huber_using : (:any -> :any) -> :float -> Loss;
 priv let huber_using sum delta pred y = {
     let d = ad.sub pred (target_like (ad.value pred) y);
@@ -89,6 +92,7 @@ let cross_entropy logits y = cross_entropy_with 0.0 logits y;
 let cross_entropy_with : :float -> Loss;
 let cross_entropy_with = cross_entropy_using tensor.sum;
 
+/// Construct cross-entropy loss with the supplied sum operation and smoothing value.
 priv let cross_entropy_using : (:any -> :any) -> :float -> Loss;
 priv let cross_entropy_using sum eps logits y = {
     let z = ad.value logits;
@@ -106,6 +110,7 @@ priv let cross_entropy_using sum eps logits y = {
 let binary_cross_entropy : Loss;
 let binary_cross_entropy = binary_cross_entropy_using tensor.sum;
 
+/// Construct binary cross-entropy loss using the supplied sum operation.
 priv let binary_cross_entropy_using : (:any -> :any) -> Loss;
 priv let binary_cross_entropy_using sum logits y = {
     let z = ad.value logits;
@@ -121,6 +126,7 @@ priv let binary_cross_entropy_using sum logits y = {
 let nll : Loss;
 let nll = nll_using ad.sum;
 
+/// Construct negative log-likelihood loss using the supplied sum operation.
 priv let nll_using : (:any -> :any) -> Loss;
 priv let nll_using sum logp y = {
     let rows = as_rows (ad.value logp) y;
@@ -132,6 +138,7 @@ priv let nll_using sum logp y = {
 let hinge : Loss;
 let hinge = hinge_using ad.sum;
 
+/// Construct hinge loss using the supplied sum operation.
 priv let hinge_using : (:any -> :any) -> Loss;
 priv let hinge_using sum pred y = mean_using sum (ad.relu (ad.sub 1.0 (ad.mul pred (target_like (ad.value pred) y))));
 
@@ -163,11 +170,13 @@ let on_device name = match name {
     f => f,
 };
 
+/// Convert a gradient to the shape and representation of its target.
 priv let gradient_like : :tensor -> :any -> :any;
 priv let gradient_like like g = if type_of g == :tensor {
     tensor.reshape (tensor.shape like) (tensor.repeat (tensor.size like) g)
 } else { g };
 
+/// Compute a mean using an explicitly supplied sum operation.
 priv let mean_using : (:any -> :any) -> :any -> :any;
 priv let mean_using sum x = if type_of (ad.value x) == :tensor {
     ad.scale (1.0 / tensor.size (ad.value x)) (sum x)

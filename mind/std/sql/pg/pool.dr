@@ -134,6 +134,7 @@ let checkout! pool = match keeper.call! pool :checkout {
     },
 };
 
+/// Return a checked-out PostgreSQL connection to the pool.
 let checkin! : :process -> :any -> :any;
 let checkin! pool conn = keeper.cast! pool [:checkin, conn];
 
@@ -177,21 +178,27 @@ priv let settle! pool conn e =
 // The everyday case is one statement, and these are `std.sql.pg.db`'s functions of the
 // same names with the connection borrowed around them.
 
+/// Execute a query using a connection borrowed from the pool.
 let query! : :process -> :any -> :map;
 let query! pool q = with! pool (on_query! q);
 
+/// Return all query rows using a borrowed connection.
 let rows! : :process -> :any -> [:map];
 let rows! pool q = with! pool (on_rows! q);
 
+/// Require exactly one query row using a borrowed connection.
 let one! : :process -> :any -> :map;
 let one! pool q = with! pool (on_one! q);
 
+/// Return the first query row using a borrowed connection.
 let first! : :process -> :any -> :any;
 let first! pool q = with! pool (on_first! q);
 
+/// Return the first scalar query value using a borrowed connection.
 let scalar! : :process -> :any -> :any;
 let scalar! pool q = with! pool (on_scalar! q);
 
+/// Execute a statement for its effects using a borrowed connection.
 let exec! : :process -> :any -> :integer;
 let exec! pool q = with! pool (on_exec! q);
 
@@ -199,18 +206,25 @@ let exec! pool q = with! pool (on_exec! q);
 let transaction! : :process -> (:any -> a) -> a;
 let transaction! pool body! = with! pool (on_transaction! body!);
 
+/// Execute a query on the connection already checked out by a callback.
 priv let on_query! : :any -> :any -> :map;
 priv let on_query! q conn = db.query! conn q;
+/// Return all rows on the callback's checked-out connection.
 priv let on_rows! : :any -> :any -> [:map];
 priv let on_rows! q conn = db.rows! conn q;
+/// Require exactly one row on the callback's checked-out connection.
 priv let on_one! : :any -> :any -> :map;
 priv let on_one! q conn = db.one! conn q;
+/// Return the first row on the callback's checked-out connection.
 priv let on_first! : :any -> :any -> :any;
 priv let on_first! q conn = db.first! conn q;
+/// Return the first scalar value on the callback's checked-out connection.
 priv let on_scalar! : :any -> :any -> :any;
 priv let on_scalar! q conn = db.scalar! conn q;
+/// Execute a statement on the callback's checked-out connection.
 priv let on_exec! : :any -> :any -> :integer;
 priv let on_exec! q conn = db.exec! conn q;
+/// Run a transaction on the callback's checked-out connection.
 priv let on_transaction! : (:any -> a) -> :any -> a;
 priv let on_transaction! body! conn = db.transaction! conn body!;
 

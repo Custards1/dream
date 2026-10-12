@@ -34,16 +34,20 @@ let be width n = {
     str.of_bytes (list.reverse (le_bytes width u))
 };
 
+/// Compute 256 raised to a nonnegative exponent.
 priv let pow256 : :integer -> :integer;
 priv let rec pow256 n = if n <= 0 { 1 } else { 256 * pow256 (n - 1) };
 
+/// Encode an integer in the requested number of little-endian bytes.
 priv let le_bytes : :integer -> :integer -> [:integer];
 priv let rec le_bytes width n =
     if width <= 0 { [] } else { list.cons (n % 256) (le_bytes (width - 1) (n / 256)) };
 
+/// Encode an integer as two big-endian bytes.
 let be16 : :integer -> :string;
 let be16 n = be 2 n;
 
+/// Encode an integer as four big-endian bytes.
 let be32 : :integer -> :string;
 let be32 n = be 4 n;
 
@@ -105,6 +109,7 @@ let hex_value b = match b {
 let hex_encode : :string -> :string;
 let hex_encode s = str.concat_all (list.map hex_byte (to_list s));
 
+/// Encode a byte as two lowercase hexadecimal characters.
 priv let hex_byte : :integer -> :string;
 priv let hex_byte b = str.slice (b / 16) 1 hex_digits + str.slice (b % 16) 1 hex_digits;
 
@@ -119,6 +124,7 @@ let hex_decode s =
         if list.any (fn b -> b < 0) bytes { () } else { str.of_bytes bytes }
     };
 
+/// Decode a pair of hexadecimal characters into a byte.
 priv let pair_value : :integer -> :integer -> :integer;
 priv let pair_value hi lo = {
     let h = hex_value hi;
@@ -134,12 +140,15 @@ priv let pair_value hi lo = {
 priv let alphabet : :string;
 priv let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// Decode one Base64 character into its six-bit value.
 priv let sextet : :integer -> :string;
 priv let sextet n = str.slice n 1 alphabet;
 
+/// Encode bytes using the standard Base64 alphabet and padding.
 let base64_encode : :string -> :string;
 let base64_encode s = str.concat_all (base64_groups (to_list s));
 
+/// Encode consecutive three-byte groups as Base64 text.
 priv let base64_groups : [:integer] -> [:string];
 priv let rec base64_groups bytes = match bytes {
     [] => [],
@@ -196,10 +205,12 @@ let nibble_table : (:integer -> :integer -> :integer) -> #[:integer];
 let nibble_table bit_op =
     array.of_list (list.map (fn i -> nibble_by_bits bit_op (i / 16) (i % 16)) (list.range 0 256));
 
+/// Select a four-bit portion of an integer for hexadecimal output.
 priv let nibble_by_bits : (:integer -> :integer -> :integer) -> :integer -> :integer -> :integer;
 priv let nibble_by_bits bit_op a b =
     list.fold_strict (fn acc k -> acc + bit_op (a / pow2 k % 2) (b / pow2 k % 2) * pow2 k) 0 [0, 1, 2, 3];
 
+/// Compute two raised to a nonnegative exponent.
 priv let pow2 : :integer -> :integer;
 priv let rec pow2 k = if k <= 0 { 1 } else { 2 * pow2 (k - 1) };
 

@@ -115,6 +115,7 @@ let forward_state model params state x ctx = match Layer.apply_state model {
 let apply_state : Layer -> :any -> :any -> :any -> :any;
 let apply_state model params state x = ad.value (forward_state model params state x predicting).[0];
 
+/// Construct a layer that threads mutable model state through its forward pass.
 priv let stateful : Layer -> :any -> :any -> Layer;
 priv let stateful layer initialize run = Layer.set_apply_state run (Layer.set_init_state initialize layer);
 
@@ -158,6 +159,7 @@ let softmax = same_shape "softmax" ad.softmax;
 let log_softmax : Layer;
 let log_softmax = same_shape "log_softmax" ad.log_softmax;
 
+/// Construct a shape-preserving leaky-ReLU layer with negative slope `a`.
 let leaky_relu : :float -> Layer;
 let leaky_relu a = same_shape "leaky_relu" (ad.leaky_relu a);
 
@@ -286,6 +288,7 @@ let max_pool2d k = pool "max_pool2d" k ad.max_axis;
 let avg_pool2d : :integer -> Layer;
 let avg_pool2d k = pool "avg_pool2d" k ad.mean_axis;
 
+/// Construct a pooling layer using the supplied window size and pooling operation.
 priv let pool : :string -> :integer -> (:integer -> :any -> :any) -> Layer;
 priv let pool name k fold = Layer.new (name + " " + to_string k)
     (fn _ shape -> match shape { [h, w, c] => [%{}, [h / k, w / k, c]], _ => [%{}, shape] })
@@ -325,6 +328,7 @@ let dropout rate = Layer.new ("dropout " + to_string rate) (fn _ shape -> [%{}, 
 let layer_norm : Layer;
 let layer_norm = layer_norm_with 1.0e-5;
 
+/// Construct layer normalization with an explicit numerical-stability epsilon.
 let layer_norm_with : :float -> Layer;
 let layer_norm_with eps = Layer.new "layer_norm"
     (fn _ shape -> {

@@ -18,7 +18,7 @@ Dont forget about strict parameters, use them when needed
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
 | `mind/std/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/sql/pg/README.md](mind/std/sql/pg/README.md). | Dream |
-| `ship/` | `ship`, the packager: .deb, .rpm, Arch packages, tarballs, Homebrew formulas, PKGBUILDs and install scripts, every byte written in Dream. [ship/README.md](ship/README.md). | Dream |
+| `mind/tool/pack/` | `mind pack`, the packager: .deb, .rpm, Arch packages, tarballs, Homebrew formulas, PKGBUILDs and install scripts, every byte written in Dream. [mind/tool/PACKAGING.md](mind/tool/PACKAGING.md). | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
 | `editors/nvim/` | The Neovim plugin: starts `lucid`, plus syntax, indent and a filetype. | Lua, Vim |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
@@ -108,8 +108,8 @@ just dreams       # build/dreams.dream, the compiler
 just mind         # build/mind, the build tool
 just lucid        # build/lucid.dream, the language server
 just vm-pgo       # build-pgo/bin/dream, the VM trained on a self-compile
-just ship         # build/ship, the packager
-just package      # Dream itself as every package ship makes, into dist/
+just mind         # build/mind, including packaging and documentation
+just package      # Dream itself as every package mind pack makes, into dist/
 just mind-build vm  # the VM again, by the repository's own build.dr
 ```
 
@@ -193,7 +193,7 @@ The groups, and what each one is actually asking:
 | `test-lucid` | The language server's units: positions, framing, URIs, completion context |
 | `test-lucid-session` | One whole LSP conversation, against a running server |
 | `test-pg` | The PostgreSQL client's units, the SQL the compiler must refuse, and a live throwaway cluster (skipped without PostgreSQL) |
-| `test-ship` | `ship`'s units, then each package it makes installed, verified and removed by dpkg, rpm and pacman (each skipped without its tool) |
+| `test-pack` | Mind packaging's units, then each package it makes installed, verified and removed by dpkg, rpm and pacman (each skipped without its tool) |
 
 The `dreams/tests/*.sh` scripts run directly with no environment set; there is
 one left, `compile.sh`, and it needs only the VM and the seed.

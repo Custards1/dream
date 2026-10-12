@@ -75,6 +75,7 @@ let value x = match x { Var.ad_node(v, _) => v, _ => x };
 let stop : :any -> :any;
 let stop x = value x;
 
+/// Return a differentiation node's parent edges.
 priv let parents_of : :any -> [:any];
 priv let parents_of n = match n { Var.ad_node(_, ps) => ps, _ => [] };
 
@@ -88,6 +89,7 @@ priv let parents_of n = match n { Var.ad_node(_, ps) => ps, _ => [] };
 let node : :any -> [:any] -> :any;
 let node v links = node_of v (variable_links links);
 
+/// Wrap a value and parent edges as a differentiation node.
 priv let node_of : :any -> [:any] -> :any;
 priv let node_of v kept = match kept { [] => v, _ => Var.ad_node v kept };
 
@@ -106,6 +108,7 @@ priv let variable_links links = match links {
 let unbroadcast : :any -> :any -> :any;
 let unbroadcast g like = unbroadcast_kinds (type_of like) (type_of g) g like;
 
+/// Reduce a broadcast gradient back to the original operand's shape and kind.
 priv let unbroadcast_kinds : :atom -> :atom -> :any -> :any -> :any;
 priv let unbroadcast_kinds like_kind g_kind g like = match like_kind {
     :tensor => if g_kind != :tensor { tensor.fill_like like g }
@@ -189,27 +192,35 @@ let unary fwd bwd x = {
     }
 };
 
+/// Compute the elementwise exponential while recording its gradient rule.
 let exp : :any -> :any;
 let exp x = unary tensor.exp (fn g _ y -> g * y) x;
 
+/// Compute the elementwise natural logarithm while recording its gradient rule.
 let log : :any -> :any;
 let log x = unary tensor.log (fn g t _ -> g / t) x;
 
+/// Compute the elementwise square root while recording its gradient rule.
 let sqrt : :any -> :any;
 let sqrt x = unary tensor.sqrt (fn g _ y -> g * 0.5 / y) x;
 
+/// Compute the elementwise absolute value while recording its gradient rule.
 let abs : :any -> :any;
 let abs x = unary tensor.abs (fn g t _ -> g * tensor.sign t) x;
 
+/// Compute the elementwise sine while recording its gradient rule.
 let sin : :any -> :any;
 let sin x = unary tensor.sin (fn g t _ -> g * tensor.cos t) x;
 
+/// Compute the elementwise cosine while recording its gradient rule.
 let cos : :any -> :any;
 let cos x = unary tensor.cos (fn g t _ -> -g * tensor.sin t) x;
 
+/// Compute the elementwise hyperbolic tangent while recording its gradient rule.
 let tanh : :any -> :any;
 let tanh x = unary tensor.tanh (fn g _ y -> g * (1.0 - y * y)) x;
 
+/// Compute the elementwise logistic sigmoid while recording its gradient rule.
 let sigmoid : :any -> :any;
 let sigmoid x = unary tensor.sigmoid (fn g _ y -> g * y * (1.0 - y)) x;
 
@@ -549,9 +560,11 @@ priv let push_operands links !stack = match links {
 priv let accumulate : :any -> :any -> %{:any => :any} -> %{:any => :any};
 priv let accumulate p c grads = add_into p c grads.[p else ()] grads;
 
+/// Accumulate a gradient contribution under a node's identifier.
 priv let add_into : :any -> :any -> :any -> %{:any => :any} -> %{:any => :any};
 priv let add_into p c old grads = match old { () => store p c grads, _ => store p (old + c) grads };
 
+/// Store a computed gradient under a node's identifier.
 priv let store : :any -> :any -> %{:any => :any} -> %{:any => :any};
 priv let store p !total grads = grads.[p => total];
 
@@ -578,6 +591,7 @@ priv let flow_node n links grads = match links {
     _ => send_from n links grads.[n else ()] grads,
 };
 
+/// Propagate a node's accumulated gradient to its parents.
 priv let send_from : :any -> [:any] -> :any -> %{:any => :any} -> %{:any => :any};
 priv let send_from n links g grads = match g { () => grads, _ => map.remove n (send g links grads) };
 
@@ -592,6 +606,7 @@ let backward out seed = if is_var out { flow (topo out) (store out seed %{}) } e
 priv let grad_in : %{:any => :any} -> :any -> :any -> :any;
 priv let grad_in g p x = zero_if_none p g.[x else ()];
 
+/// Supply a zero gradient shaped like the original value when no gradient exists.
 priv let zero_if_none : :any -> :any -> :any;
 priv let zero_if_none p d = match d {
     () => if type_of p == :tensor { tensor.fill_like p 0.0 } else { 0.0 },
@@ -669,6 +684,7 @@ priv let bump path i delta t = match path {
 priv let rebuild : :any -> [[[:any], :any]] -> :any;
 priv let rebuild t pairs = list.fold (fn acc [path, x] -> replace path x acc) t pairs;
 
+/// Replace a value at the specified path in a parameter tree.
 priv let replace : [:any] -> :any -> :any -> :any;
 priv let replace path x t = match path {
     [] => x,

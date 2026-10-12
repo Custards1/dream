@@ -28,10 +28,10 @@ import std.io;
 import std.list;
 import std.str;
 
-import bytes;
-import item;
-import item.{Item};
-import out;
+import pack.bytes;
+import pack.item;
+import pack.item.{Item};
+import pack.out;
 
 /// Which records carry what ustar cannot: `:pax` everywhere but dpkg.
 type Style = :pax | :gnu;

@@ -40,15 +40,29 @@ type Version = [:integer, :integer, :integer, :string];
 
 type Comparison = :eq | :lt | :le | :gt | :ge;
 
+/// Construct a semantic version without a prerelease suffix.
+///
+/// ```dream
+/// import std.version;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (version.show (version.make 1 2 3))
+/// };
+/// ```
 let make : :integer -> :integer -> :integer -> Version;
 let make major minor patch = [major, minor, patch, ""];
 
+/// Return the major version number.
 let major : Version -> :integer;
 let major [n, _, _, _] = n;
+/// Return the minor version number.
 let minor : Version -> :integer;
 let minor [_, n, _, _] = n;
+/// Return the patch version number.
 let patch : Version -> :integer;
 let patch [_, _, n, _] = n;
+/// Return the prerelease suffix, or an empty string for a stable version.
 let pre : Version -> :string;
 let pre [_, _, _, p] = p;
 
@@ -87,6 +101,7 @@ let parse text = {
 let parse_or_unit : :string -> Version | :unit;
 let parse_or_unit text = match parse text { [:ok, v] => v, _ => () };
 
+/// Format a version as major.minor.patch with its optional prerelease suffix.
 let show : Version -> :string;
 let show v = to_string (major v) + "." + to_string (minor v) + "." + to_string (patch v)
              + (if str.is_empty (pre v) { "" } else { "-" + pre v });
@@ -168,6 +183,7 @@ let parse_requirement text =
         [[:ok, have], [:ok, more]] => [:ok, list.append have more],
     }) [:ok, any] (str.split "," text);
 
+/// Test a version against one operator-and-bound requirement.
 let holds : [Comparison, Version] -> Version -> :bool;
 let holds [op, bound] v = {
     let c = compare_versions v bound;

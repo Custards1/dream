@@ -8,11 +8,29 @@
 // past it.
 
 /// The code point: `code 'A'` is 65.
+///
+/// ```dream
+/// import std.char;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (char.code 'λ')
+/// };
+/// ```
 let code : :char -> :integer;
 let code c = _char_code c;
 
 /// The character with this code point. Raises on a surrogate (U+D800 to
 /// U+DFFF) or on anything past U+10FFFF, neither of which is a character.
+///
+/// ```dream
+/// import std.char;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (char.of_code 65)
+/// };
+/// ```
 let of_code : :integer -> :char;
 let of_code n = _char_of_code n;
 

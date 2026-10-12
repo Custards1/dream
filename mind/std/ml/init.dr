@@ -59,9 +59,11 @@ let truncated_normal sd seed shape = {
     (inside * folded + (1.0 - inside) * refill) * sd
 };
 
+/// Initialize a tensor of zeros with the requested shape; the seed is unused.
 let zeros : Init;
 let zeros seed shape = tensor.zeros shape;
 
+/// Initialize a tensor of ones with the requested shape; the seed is unused.
 let ones : Init;
 let ones seed shape = tensor.ones shape;
 
@@ -110,6 +112,7 @@ let orthogonal gain seed shape = match shape {
     _ => normal gain seed shape,
 };
 
+/// Orthonormalize vectors using Gram-Schmidt for orthogonal initialization.
 priv let gram_schmidt : [:tensor] -> [:tensor];
 priv let gram_schmidt vs = list.reverse (list.fold (fn done v -> {
     let w = list.fold (fn acc u -> acc - tensor.dot acc u * u) v done;

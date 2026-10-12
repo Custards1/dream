@@ -21,6 +21,7 @@ let out name = [:out, name];
 let file : :string -> :any;
 let file path = build.Input.file path;
 
+/// Test whether a command argument is a file or generated artifact input.
 let is_input : :any -> :bool;
 let is_input a = match a { build.Input.file(_) => true, build.Input.artifact(_, _) => true, _ => false };
 

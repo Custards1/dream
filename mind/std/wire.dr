@@ -67,26 +67,36 @@ import std.tensor;
 // number beside each name is what another program reads, so changing one is a
 // change to the format and should read like one.
 
+/// Wire-format discriminator for unit values.
 let tag_unit : :integer;
 let tag_unit   = 0;
+/// Wire-format discriminator for false values.
 let tag_false : :integer;
 let tag_false  = 1;
+/// Wire-format discriminator for true values.
 let tag_true : :integer;
 let tag_true   = 2;
+/// Wire-format discriminator for int values.
 let tag_int : :integer;
 let tag_int    = 3;
+/// Wire-format discriminator for float values.
 let tag_float : :integer;
 let tag_float  = 4;
 let tag_string : :integer;
 let tag_string = 5;
+/// Wire-format discriminator for atom values.
 let tag_atom : :integer;
 let tag_atom   = 6;
+/// Wire-format discriminator for char values.
 let tag_char : :integer;
 let tag_char   = 7;
+/// Wire-format discriminator for list values.
 let tag_list : :integer;
 let tag_list   = 8;
+/// Wire-format discriminator for array values.
 let tag_array : :integer;
 let tag_array  = 9;
+/// Wire-format discriminator for map values.
 let tag_map : :integer;
 let tag_map    = 10;
 let tag_bigint : :integer;
@@ -99,6 +109,7 @@ let width = 4;
 
 // --- writing ------------------------------------------------------------------
 
+/// Encode the low eight bits of an integer as one byte.
 priv let byte : :integer -> :string;
 priv let byte n = _str_le n 1;
 
@@ -116,9 +127,11 @@ priv let sequence : :integer -> [:string] -> :string;
 priv let sequence t pieces =
     _str_concat (_list_cons (byte t) (_list_cons (count (list.length pieces)) pieces));
 
+/// Encode the wire tag for `()`.
 let write_unit : :unit -> :string;
 let write_unit u = byte tag_unit;
 
+/// Encode a boolean using the corresponding wire tag.
 let write_bool : :bool -> :string;
 let write_bool b = byte (if b { tag_true } else { tag_false });
 
@@ -142,6 +155,7 @@ priv let big_width : :integer -> :integer -> :integer -> :integer;
 priv let rec big_width n !w !half =
     if n < half && n >= 0 - half { w } else { big_width n (w + 1) (half * 256) };
 
+/// Encode a floating-point value with its tag and binary payload.
 let write_float : :float -> :string;
 let write_float x = tagged tag_float (_float_bytes x);
 
@@ -165,6 +179,7 @@ let write_atom a = {
 let write_char : :char -> :string;
 let write_char c = tagged tag_char (_str_le (_char_code c) width);
 
+/// Encode already serialized list elements with a tag and element count.
 let write_list : [:string] -> :string;
 let write_list parts = sequence tag_list parts;
 
@@ -189,6 +204,7 @@ let write_tensor : :tensor -> :string;
 let write_tensor t = byte 12 + byte (tensor.rank t)
     + str.concat_all (list.map count (tensor.shape t)) + tensor.to_bytes t;
 
+/// Return the codec format name, `wire`.
 let format_name : :any -> :string;
 let format_name u = "wire";
 
@@ -217,6 +233,7 @@ priv let le_from : :string -> :integer -> :integer -> :integer -> :integer;
 priv let rec le_from buf at n acc =
     if n <= 0 { acc } else { le_from buf at (n - 1) (acc * 256 + _str_byte buf (at + n - 1)) };
 
+/// Read a little-endian integer of the requested byte width at an offset.
 priv let le : :string -> :integer -> :integer -> :integer;
 priv let le buf at n = le_from buf at n 0;
 
@@ -248,6 +265,7 @@ priv let rec complement buf at n acc =
     if n <= 0 { acc }
     else { complement buf at (n - 1) (acc * 256 + (255 - _str_byte buf (at + n - 1))) };
 
+/// Decode a floating-point payload and return the advanced offset.
 priv let read_float : :string -> :integer -> :any;
 priv let read_float buf at =
     if not (has buf at 8) { () } else { [_float_of_bytes (_str_slice buf at 8), at + 8] };
@@ -281,6 +299,7 @@ priv let read_atom buf at = match read_bytes buf at {
     },
 };
 
+/// Decode a Unicode character payload and return the advanced offset.
 priv let read_char : :string -> :integer -> :any;
 priv let read_char buf at =
     if not (has buf at width) { () }
@@ -319,6 +338,7 @@ priv let read_map buf at =
         }
     };
 
+/// Convert alternating decoded keys and values into a map.
 priv let map_of : [Value] -> %{ Value => Value };
 priv let rec map_of flat =
     if list.is_empty flat { %{} }
@@ -347,6 +367,7 @@ priv let rec read buf at = match _str_byte buf at {
     _  => (),
 };
 
+/// Decode a tensor's shape, element type and data payload.
 priv let read_tensor : :string -> :integer -> :any;
 priv let read_tensor buf at = {
     let rank = _str_byte buf at;

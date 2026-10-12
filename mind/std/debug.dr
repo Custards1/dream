@@ -42,6 +42,7 @@ let show_duration ns = match ns {
     _ => to_string (ns / 1000000000) + "." + pad2 ((ns % 1000000000) / 10000000) + "s",
 };
 
+/// Format a number with a leading zero when it is below ten.
 let pad2 : :integer -> :string;
 let pad2 n = if n < 10 { "0" + to_string n } else { to_string n };
 
@@ -74,6 +75,7 @@ let show_count n = {
 let now! : :unit -> %{ :atom => :integer };
 let now! () = vm.stats! ();
 
+/// Read a counter from a VM statistics map, defaulting to zero.
 let stat : %{ :atom => :integer } -> :atom -> :integer;
 let stat r key = r.[key else 0];
 
@@ -89,14 +91,19 @@ let since before after =
        :peak => stat after :peak_bytes,
        :live => stat after :live_bytes };
 
+/// Return the measured elapsed time, defaulting to zero.
 let elapsed : Measurement -> :integer;
 let elapsed d    = d.[:elapsed else 0];
+/// Return the measured allocation count, defaulting to zero.
 let allocated : Measurement -> :integer;
 let allocated d  = d.[:allocated else 0];
+/// Return the measured reduction count, defaulting to zero.
 let reductions : Measurement -> :integer;
 let reductions d = d.[:reductions else 0];
+/// Return the measured garbage-collection count, defaulting to zero.
 let collections : Measurement -> :integer;
 let collections d = d.[:collections else 0];
+/// Return the measured peak heap value, defaulting to zero.
 let peak : Measurement -> :integer;
 let peak d       = d.[:peak else 0];
 
@@ -130,6 +137,7 @@ let measure! label value = {
     value
 };
 
+/// Return the larger of two values.
 let max : :integer -> :integer -> :integer;
 let max a b = if a > b { a } else { b };
 

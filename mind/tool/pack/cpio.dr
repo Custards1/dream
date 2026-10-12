@@ -12,10 +12,10 @@
 import std.list;
 import std.str;
 
-import bytes;
-import item;
-import item.{Item};
-import out;
+import pack.bytes;
+import pack.item;
+import pack.item.{Item};
+import pack.out;
 
 /// The type bits `stat` puts above the permissions.
 let type_bits : Item -> :integer;

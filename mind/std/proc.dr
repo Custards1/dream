@@ -87,10 +87,20 @@ let outcome! p = try! {
     [:ok, value]
 } catch e { [:error, e] };
 
+/// Wait for all processes, returning each success or error outcome in input order.
 let outcomes! : [Process] -> [Outcome :any];
 let outcomes! ps = list.map (fn p -> outcome! p) ps |> strict!;
 
 /// Run these in parallel and answer their values, in order.
+///
+/// ```dream
+/// import std.proc;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (proc.parallel! [$( 20 + 1 ), $( 6 * 7 )])
+/// };
+/// ```
 let parallel! : [:any] -> [:any];
 let parallel! thunks = wait_all! (start_all! thunks);
 
@@ -115,18 +125,24 @@ let try_map! f xs = outcomes! (start_each! (fn x -> f x) xs);
 // out *its* answer: one that arrives after a `call_within!` gave up waiting
 // for it cannot be taken for the answer to the next call.
 
+/// Construct a request carrying the sender, body and reply correlation reference.
 let call_message : Process -> b -> :integer -> Call b;
 let call_message from body ref = [:call, from, body, ref];
 
+/// Test whether a list message starts with the call tag.
 let is_call : :any -> :bool;
 let is_call m = _list_is_empty m == false && list.nth 0 m == :call;
+/// Extract the requesting process from a call message.
 let call_from : :list -> Process;
 let call_from m = list.nth 1 m;
+/// Extract the request body from a call message.
 let call_body : :list -> :any;
 let call_body m = list.nth 2 m;
+/// Extract the reply correlation reference from a call message.
 let call_ref : :list -> :integer;
 let call_ref m = list.nth 3 m;
 
+/// Test whether a message is a reply with the requested reference.
 let is_reply_of : :integer -> :any -> :bool;
 let is_reply_of ref m = match m {
     [:reply, r, _] => r == ref,
@@ -155,6 +171,7 @@ let call! target body = match await_reply! target body forever {
 let call_within! : Process -> :any -> :integer -> ([:ok, :any] | :timeout);
 let call_within! target body ms = await_reply! target body (deadline_in! ms);
 
+/// Monitor a target, send a request, and wait for its reply or the deadline.
 priv let await_reply! : Process -> :any -> :integer -> ([:ok, :any] | :timeout);
 priv let await_reply! target body deadline = {
     let me = self! ();
@@ -197,6 +214,8 @@ let deadline_in! ms = vm.now_ns! () + ms * 1000000;
 let recv_until! : (:any -> :bool) -> :integer -> ([:ok, :any] | :timeout);
 let recv_until! wanted deadline = scan! wanted deadline 0;
 
+/// Search the mailbox for a matching message until the deadline, leaving other messages
+/// queued.
 priv let scan! : (:any -> :bool) -> :integer -> :integer -> ([:ok, :any] | :timeout);
 priv let rec scan! wanted deadline !at = match vm.mailbox_peek! at {
     [:ok, m] =>
@@ -249,6 +268,7 @@ let demonitor! p = {
     :ok
 };
 
+/// Test whether a monitor notification reports the end of the given process.
 let is_down_of : Process -> :any -> :bool;
 let is_down_of p m = match m {
     [:down, q, _] => q == p,
@@ -291,6 +311,7 @@ let rec serve! state handle! =
 let shutdown : :atom;
 let shutdown = :shutdown;
 
+/// Test whether a message is the standard shutdown request.
 let is_shutdown : :any -> :bool;
 let is_shutdown m = m == shutdown;
 

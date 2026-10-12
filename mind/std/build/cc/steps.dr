@@ -43,6 +43,7 @@ let c_for cxx = match [str.contains_str "clang++" cxx, str.contains_str "g++" cx
     _ => cxx,
 };
 
+/// Return the default C++ compiler command for the selected OS.
 let default_cxx : :atom -> :string;
 let default_cxx os = match os { :windows => "cl.exe", :macos => "clang++", _ => "c++" };
 
@@ -89,9 +90,11 @@ let with_toolchain ctx f = build.given (toolchain ctx) (fn said -> f (parse ctx 
 
 // --- where things go ------------------------------------------------------------------
 
+/// Return the toolchain's command-line family.
 let family : cc.Toolchain -> :atom;
 let family tc = cc.Toolchain.family tc;
 
+/// Return the toolchain's target operating system.
 let os_of : cc.Toolchain -> :atom;
 let os_of tc = cc.Toolchain.os tc;
 
@@ -118,6 +121,7 @@ let rec shared_used t =
         _ => shared_used u,
     }) (cc.uses t));
 
+/// Return the install subdirectory for runtime libraries: bin on Windows, lib elsewhere.
 let runtime_dir : cc.Toolchain -> :string;
 let runtime_dir tc = match os_of tc { :windows => "bin/", _ => "lib/" };
 

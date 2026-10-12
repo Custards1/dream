@@ -11,6 +11,7 @@ import std.list;
 import std.os;
 import std.str;
 
+/// Read a handle in 64 KiB chunks, joining the accumulated chunks at end of file.
 let read_chunks! : :any -> [:string] -> :string;
 let rec read_chunks! h acc = {
     let chunk = io.read! h 65536;
@@ -32,6 +33,16 @@ let read! path = {
 };
 
 /// Replace the file with `text`, making it if it is not there.
+///
+/// ```dream
+/// import std.file;
+/// import std.console;
+///
+/// let main! = {
+///     file.write! "greeting.txt" "hello from a file"
+///     console.print! (file.read! "greeting.txt")
+/// };
+/// ```
 let write! : :string -> :string -> :unit;
 let write! path text = {
     let h = io.open! path :write;

@@ -4,6 +4,7 @@ import std.sql;
 import std.sql.pg.driver;
 import std.sql.pg.db;
 
+/// Open a PostgreSQL connection using the supplied connection configuration.
 let open! : :any -> sql.Connection;
 let open! target = driver.open! target;
 

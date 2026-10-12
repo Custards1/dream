@@ -18,16 +18,16 @@
 import std.list;
 import std.str;
 
-import compress;
-import item;
-import item.{Item};
-import layout;
-import layout.Layout;
-import platform;
-import scratch;
-import spec;
-import spec.Spec;
-import tar;
+import pack.compress;
+import pack.item;
+import pack.item.{Item};
+import pack.layout;
+import pack.layout.Layout;
+import pack.platform;
+import pack.scratch;
+import pack.spec;
+import pack.spec.Spec;
+import pack.tar;
 
 /// The name for the system and machine given, or the one name of a package
 /// that runs anywhere.

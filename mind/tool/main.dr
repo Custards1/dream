@@ -30,6 +30,8 @@ import std.str;
 import std.toml;
 import std.vm;
 
+import pack.commands;
+import docs;
 import build;
 import config;
 import fetch;
@@ -90,6 +92,8 @@ let command_spec = [
     cli.command "tree"  "show the dependency tree" [],
     cli.command "info"  "show what this build would run, without running it" [],
     cli.command "options" "every package's options, and what this build sets them to" [],
+    cli.command "pack" "make release packages; mind pack help lists formats" [],
+    cli.command "docs" "compile Markdown guides and source API documentation" [],
     cli.command "clean" "remove target/" [],
     cli.command "help"  "this message" [],
 ];
@@ -822,8 +826,8 @@ let run_command! c theirs = {
     }
 };
 
-let main! =
-    match split_at_dashes (os.args! ()) {
+let normal_main! args =
+    match split_at_dashes args {
         [mine, theirs] =>
             match cli.commands opts command_spec mine {
                 [:error, why] => {
@@ -837,3 +841,25 @@ let main! =
                     else { run_command! c theirs },
             },
     };
+
+// Packaging owns --release (a revision) and -o (a directory). Route its
+// arguments before parsing build options, while preserving global -C DIR.
+let rec dispatch! original c args = match args {
+    ["help", "pack"] => commands.run! ["help"],
+    ["help", "docs"] => docs.run! ["--help"],
+    [cmd, ..rest] if cmd == "pack" || cmd == "docs" => {
+        let prefix = list.take (list.length original - list.length args) original;
+        let forwarded = list.append prefix rest;
+        if cmd == "pack" { commands.run! forwarded } else { docs.run! forwarded }
+    },
+    [a, ..rest] if str.starts_with "-" a && a != "--" =>
+        match cli.step opts c a rest {
+            [:ok, next, more] => dispatch! original next more,
+            _ => normal_main! original,
+        },
+    _ => normal_main! original,
+};
+let main! = {
+    let args = os.args! ();
+    dispatch! args (cli.parsed (%{}) []) args
+};

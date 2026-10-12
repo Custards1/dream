@@ -206,6 +206,7 @@ priv let tls_options! c mode = {
     }
 };
 
+/// Read a file needed for connection setup, reporting a database error when unavailable.
 priv let read_file! : :string -> :string -> :string;
 priv let read_file! path what = {
     let text = try! { file.read! path } catch e { () };
@@ -228,6 +229,7 @@ let close! conn = {
     quietly_close! (Conn.socket conn)
 };
 
+/// Close a connection handle while suppressing cleanup errors.
 priv let quietly_close! : :integer -> :unit;
 priv let quietly_close! sock = try! { io.close! sock } catch e { () };
 
@@ -249,6 +251,7 @@ let server_version conn = match parameter "server_version" conn {
     text => version_number text,
 };
 
+/// Convert a PostgreSQL server version string to its numeric representation.
 let version_number : :string -> :integer;
 let version_number text = {
     let numeric = str.slice 0 (str.span "0123456789." 0 text) text;
@@ -302,6 +305,7 @@ priv let rec authenticate! conn = match receive! conn {
     other => unexpected! "logging in" other,
 };
 
+/// Handle a password authentication request from the server.
 priv let password! : Conn -> :string;
 priv let password! conn = match config.Config.password (Conn.config conn) {
     () => errors.fail! :invalid_password "the server asks for a password, and the configuration has none",
@@ -326,6 +330,7 @@ priv let scram! conn = {
     }
 };
 
+/// Advance SCRAM/SASL authentication from the next server challenge.
 priv let sasl_step! : Conn -> :integer -> :string;
 priv let sasl_step! conn code = match receive! conn {
     wire.Message.authentication(c, data) if c == code => data,
@@ -347,6 +352,7 @@ priv let rec settle! conn params pid secret = match receive! conn {
 
 // --- the socket -------------------------------------------------------------------
 
+/// Write a complete protocol message to the connection.
 priv let write! : Conn -> :string -> :atom;
 priv let write! conn data = streams.write_all! (Conn.socket conn) data;
 
@@ -382,6 +388,7 @@ priv let lost e =
     if errors.is_postgres e { e }
     else { errors.caused :connection_failure ("the connection failed: " + error.describe e) e };
 
+/// Raise a protocol error for an unexpected server message.
 priv let unexpected! : :string -> :any -> :never;
 priv let unexpected! doing message =
     errors.fail! :protocol_violation ("unexpected " + to_string message + " while " + doing);
@@ -412,9 +419,11 @@ group Pending {
     done
 }
 
+/// Construct the state used to accumulate an in-flight query's results.
 priv let pending : [:any] -> Pending;
 priv let pending columns = Pending.make columns [] [] [] [] () [];
 
+/// Read server messages until the current command reaches its completion boundary.
 priv let collect! : Conn -> Pending -> [:map];
 priv let rec collect! conn !p = match receive! conn {
     wire.Message.row_description(cols) => collect! conn (Pending.set_columns cols p),
@@ -436,15 +445,19 @@ priv let rec collect! conn !p = match receive! conn {
     _ => collect! conn p,
 };
 
+/// Append a decoded row to the pending result state.
 priv let with_row : Pending -> [:any] -> Pending;
 priv let with_row p fields = forced Pending.set_raw (strict_cons fields (Pending.raw p)) p;
 
+/// Update pending results with COPY protocol data.
 priv let with_copy : Pending -> :string -> Pending;
 priv let with_copy p data = forced Pending.set_copy (strict_cons data (Pending.copy p)) p;
 
+/// Record a server notice in pending results.
 priv let with_notice : Pending -> :map -> Pending;
 priv let with_notice p fields = forced Pending.set_notices (strict_cons fields (Pending.notices p)) p;
 
+/// Record an asynchronous notification while processing query results.
 priv let with_notification : Pending -> :map -> Pending;
 priv let with_notification p n = forced Pending.set_notifications (strict_cons n (Pending.notifications p)) p;
 
@@ -489,6 +502,7 @@ priv let closed conn p tag = {
                  (strict_cons r (Pending.done p))
 };
 
+/// Finalize a pending command's accumulated results.
 priv let finish! : Conn -> Pending -> :atom -> [:map];
 priv let finish! conn p status = match Pending.failure p {
     () => {
@@ -500,10 +514,12 @@ priv let finish! conn p status = match Pending.failure p {
     e => raise! e,
 };
 
+/// Decode wire fields using their column type information.
 priv let decode_tuple : :map -> [:any] -> [:any] -> [:any];
 priv let decode_tuple decoders columns fields =
     list.map (fn [c, f] -> value.decode decoders (wire.Column.oid c) f) (list.zip columns fields);
 
+/// Associate decoded row values with their column names.
 priv let row_of : [:any] -> [:any] -> :map;
 priv let row_of columns tuple =
     list.fold_strict (fn m [c, v] -> m.[wire.Column.key c => v]) %{} (list.zip columns tuple);
@@ -538,6 +554,7 @@ let query_text! conn text vs = {
                     (pending []))
 };
 
+/// Require one result from a collection of command results.
 priv let only : [:map] -> :map;
 priv let only results = match results {
     [] => %{},
@@ -619,9 +636,11 @@ let fold! conn q batch f init = stream! conn q batch (fold_step! f) init;
 let each! : Conn -> sql.Query -> :integer -> (:map -> :any) -> :integer;
 let each! conn q batch handle! = stream! conn q batch (each_step! handle!) 0;
 
+/// Consume a result row through the caller's fold function.
 priv let fold_step! : (a -> :map -> a) -> a -> [:map] -> a;
 priv let fold_step! f acc rows = list.fold_strict f acc rows;
 
+/// Deliver one result row to the caller's row handler.
 priv let each_step! : (:map -> :any) -> :integer -> [:map] -> :integer;
 priv let rec each_step! handle! !n rows = match rows {
     [] => n,
@@ -654,6 +673,7 @@ let fold_text! conn text vs batch step! init = {
     portal! conn size step! init [] [] ()
 };
 
+/// Execute a portal and process its result messages.
 priv let portal! : Conn -> :integer -> (a -> [:any] -> [[:any]] -> a) -> a -> [:any] -> [:any] -> :any -> a;
 priv let rec portal! conn batch step! !acc columns raw failure = {
     let message = try! { receive! conn } catch e { raise! (lost e) };
@@ -681,6 +701,7 @@ priv let rec portal! conn batch step! !acc columns raw failure = {
 
 // Force callback work before asking for another batch. If it fails, close the
 // portal and drain to ReadyForQuery before rethrowing the original exception.
+/// Advance a portal's row stream or completion state.
 priv let portal_step! : Conn -> (a -> [:any] -> [[:any]] -> a) -> a -> [:any] -> [:any] -> a;
 priv let portal_step! conn step! acc columns raw = try! {
     let decoders = config.Config.decoders (Conn.config conn);
@@ -746,6 +767,7 @@ let transaction_with! conn options body! = {
 priv let rollback! : Conn -> :unit;
 priv let rollback! conn = try! { exec! conn "ROLLBACK"; () } catch e { () };
 
+/// Construct the BEGIN statement for transaction options.
 let begin_statement : :map -> :string;
 let begin_statement options = str.join_str " " (list.filter (fn s -> s != "") [
     "BEGIN",
@@ -809,6 +831,7 @@ let prepare_types! conn name text oids = {
     } catch e { raise! (lost e) }
 };
 
+/// Read the server's description of a prepared statement.
 priv let described! : Conn -> Prepared -> :any -> Prepared;
 priv let rec described! conn p failure = match receive! conn {
     wire.Message.parameter_description(oids) => described! conn (Prepared.set_parameters oids p) failure,
@@ -863,12 +886,14 @@ let copy_in! conn table columns rows = {
     }
 };
 
+/// Extract a command's affected-row count.
 priv let counted : :map -> :integer;
 priv let counted r = match Result.count r {
     () => 0,
     n => n,
 };
 
+/// Convert a name to its SQL identifier text.
 priv let to_string_name : :any -> :string;
 priv let to_string_name t = if type_of t == :atom { value.atom_name t } else { to_string t };
 
@@ -897,17 +922,20 @@ priv let rec send_rows! conn rows = match rows {
 let copy_line : [:any] -> :string;
 let copy_line row = str.join_str "\t" (list.map copy_field row) + "\n";
 
+/// Encode a value as a field of text-format COPY data.
 priv let copy_field : :any -> :string;
 priv let copy_field v = match value.encode v {
     () => "\\N",
     text => copy_escape text,
 };
 
+/// Escape special characters in a text-format COPY field.
 priv let copy_escape : :string -> :string;
 priv let copy_escape text =
     if str.upto "\\\t\n\r" 0 text >= len text { text }
     else { str.concat_all (list.map escape_char (str.chars text)) };
 
+/// Escape one character according to PostgreSQL text COPY rules.
 priv let escape_char : :char -> :string;
 priv let escape_char c = match c {
     '\\' => "\\\\",
@@ -929,6 +957,7 @@ let copy_fields line = {
     list.map (fn f -> if f == "\\N" { () } else { copy_unescape f }) (str.split "\t" body)
 };
 
+/// Decode PostgreSQL text COPY backslash escapes.
 priv let copy_unescape : :string -> :string;
 priv let copy_unescape f = {
     let at = str.find_from 0 "\\" f;
@@ -942,9 +971,11 @@ priv let copy_unescape f = {
 
 // --- LISTEN and NOTIFY -----------------------------------------------------------------
 
+/// Subscribe the connection to a notification channel.
 let listen! : Conn -> :string -> :unit;
 let listen! conn channel = { exec! conn (sql.raw ("LISTEN " + sql.quote_ident channel)); () };
 
+/// Unsubscribe the connection from a notification channel.
 let unlisten! : Conn -> :string -> :unit;
 let unlisten! conn channel = { exec! conn (sql.raw ("UNLISTEN " + sql.quote_ident channel)); () };
 
@@ -987,6 +1018,7 @@ let subscribe! target channels !to = {
 priv let forwarder! : Conn -> :process -> :process;
 priv let forwarder! conn !to = spawn! $( forward! conn to );
 
+/// Forward queued PostgreSQL notifications to the receiving process.
 priv let forward! : Conn -> :process -> :atom;
 priv let rec forward! conn to = {
     match attempt! next_notification! conn {

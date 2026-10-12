@@ -66,9 +66,12 @@ type Reply a = #[:ok, a, :integer, :any] | #[:fail, Problem];
 /// A parser: the text and the byte offset to start at, to a reply.
 type Parser a = :string -> :integer -> Reply a;
 
+/// Construct a successful parser reply with its value, ending offset and accumulated
+/// problem.
 priv let ok : a -> :integer -> :any -> Reply a;
 priv let ok value at problem = #[:ok, value, at, problem];
 
+/// Construct a failed parser reply at a byte offset with an expected value.
 priv let fail_at : :integer -> :any -> Reply :any;
 priv let fail_at at expected = #[:fail, #[at, [expected]]];
 
@@ -82,6 +85,7 @@ priv let merge a b = match [a, b] {
         if ia > ib { a } else if ib > ia { b } else { #[ia, ea + list.filter (fn e -> not (list.contains e ea)) eb] },
 };
 
+/// Extract the furthest problem recorded in a parser reply.
 priv let reply_problem : Reply :any -> :any;
 priv let reply_problem r = match r { #[:ok, _, _, p] => p, #[:fail, p] => p };
 
@@ -122,6 +126,7 @@ let run_prefix parser text at = match parser text at {
 let matches : Parser :any -> :string -> :bool;
 let matches parser text = result.is_ok (run parser text);
 
+/// Add source line, column and context to a parser problem.
 priv let error_of : :string -> Problem -> :map;
 priv let error_of text #[at, expectations] = {
     let [line, column] = line_col text at;
@@ -135,6 +140,7 @@ priv let error_of text #[at, expectations] = {
     Error.make at line column wanted found message
 };
 
+/// Format alternative expected tokens for a diagnostic.
 priv let one_of_text : [:string] -> :string;
 priv let one_of_text names = match names {
     [] => "something else",
@@ -171,10 +177,12 @@ let line_col text at = {
     [count_lines 0 1, str.length (str.slice start (at - start) text) + 1]
 };
 
+/// Find the byte offset of the start of the line containing an offset.
 priv let line_start : :string -> :integer -> :integer;
 priv let rec line_start text at =
     if at <= 0 { 0 } else if str.byte (at - 1) text == 10 { at } else { line_start text (at - 1) };
 
+/// Quote a token for use in a parser diagnostic.
 priv let quote : :string -> :string;
 priv let quote s = match s { "\n" => "a line break", "\t" => "a tab", "\"" => "'\"'", _ => "\"" + s + "\"" };
 
@@ -195,10 +203,12 @@ let char_at s at = {
     else { ['\u{FFFD}', 1] }
 };
 
+/// Pair a decoded Unicode code point with the offset after it.
 priv let decoded : :integer -> :integer -> [:any, :integer];
 priv let decoded code width =
     if (code >= 55296 && code <= 57343) || code > 1114111 { ['\u{FFFD}', 1] } else { [char.of_code code, width] };
 
+/// Convert a Unicode character to a one-character string.
 priv let char_text : :string -> :integer -> :string;
 priv let char_text s at = match char_at s at { () => "", [c, w] => str.slice at w s };
 
@@ -225,12 +235,15 @@ let char_in set s at = satisfy ("one of " + quote set) (fn c -> str.contains c s
 let char_not_in : :string -> Parser :char;
 let char_not_in set s at = satisfy ("anything but " + quote set) (fn c -> not (str.contains c set)) s at;
 
+/// Parse one ASCII digit.
 let digit : Parser :char;
 let digit s at = satisfy "digit" char.is_digit s at;
 
+/// Parse one letter accepted by `is_letter`.
 let letter : Parser :char;
 let letter s at = satisfy "letter" is_letter s at;
 
+/// Test whether a character is an ASCII letter.
 priv let is_letter : :char -> :bool;
 priv let is_letter c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || char.code c >= 128;
 
@@ -270,6 +283,7 @@ let take_while1 name keep s at = {
     if stop == at { fail_at at name } else { ok (str.slice at (stop - at) s) stop #[stop, [name]] }
 };
 
+/// Advance a byte offset while decoded characters satisfy a predicate.
 priv let while_chars : (:char -> :bool) -> :string -> :integer -> :integer;
 priv let rec while_chars keep s at = match char_at s at {
     [c, w] if keep c => while_chars keep s (at + w),
@@ -384,6 +398,7 @@ let quoted s at =
     if str.byte at s != 34 { fail_at at "a quoted string" }
     else { quoted_body s (at + 1) [] };
 
+/// Parse the body of a quoted string, collecting decoded pieces.
 priv let quoted_body : :string -> :integer -> [:string] -> Reply :string;
 priv let rec quoted_body s at acc = {
     let stop = str.upto "\"\\" at s;
@@ -404,11 +419,13 @@ priv let rec quoted_body s at acc = {
     }
 };
 
+/// Decode hexadecimal text, returning `()` for an invalid digit.
 priv let hex_value : :string -> :any;
 priv let hex_value h =
     if len h != 4 || str.span "0123456789abcdefABCDEF" 0 h != 4 { () }
     else { list.fold (fn acc c -> acc * 16 + hex_digit c) 0 (str.chars h) };
 
+/// Decode one hexadecimal character, returning -1 when invalid.
 priv let hex_digit : :char -> :integer;
 priv let hex_digit c = match c {
     _ if c >= '0' && c <= '9' => char.code c - 48,
@@ -447,6 +464,7 @@ let map2 f pa pb s at = match pa s at {
     #[:fail, pr] => #[:fail, pr],
 };
 
+/// Parse three values in order and combine them with `f`.
 let map3 : (a -> b -> c -> d) -> Parser a -> Parser b -> Parser c -> Parser d;
 let map3 f pa pb pc s at = map2 (fn g c -> g c) (map2 f pa pb) pc s at;
 
@@ -514,6 +532,7 @@ let default value p s at = or (succeed value) p s at;
 let many : Parser a -> Parser [a];
 let many p s at = many_from p s at [] ();
 
+/// Repeatedly apply a parser, collecting results and the furthest failure.
 priv let many_from : Parser a -> :string -> :integer -> [a] -> :any -> Reply [a];
 priv let rec many_from p s at acc pr = match p s at {
     #[:ok, v, next, pr2] if next > at => many_from p s next (v :: acc) (merge pr pr2),
@@ -590,6 +609,7 @@ let keyword w s at = lexeme (skip (not_followed_by (satisfy "letter" (fn c -> is
 let label : :string -> Parser a -> Parser a;
 let label name p s at = p s at |> relabel at name;
 
+/// Replace the expected-token label on a failure at the given offset.
 priv let relabel : :integer -> :string -> Reply :any -> Reply :any;
 priv let relabel at name r = match r {
     #[:fail, #[where, _]] if where == at => #[:fail, #[at, [name]]],
@@ -705,6 +725,7 @@ let chain_right op p s at = match p s at {
 let operators : Parser a -> [[:any]] -> Parser a;
 let operators atom table s at = (list.fold_right level atom table) s at;
 
+/// Build a parser for one operator-precedence level around its operand parser.
 priv let level : [:any] -> Parser :any -> Parser :any;
 priv let level [fixity, ops] tighter = {
     let op = choice (list.map (fn [sym, f] -> to f (symbol sym)) (longest_first ops));

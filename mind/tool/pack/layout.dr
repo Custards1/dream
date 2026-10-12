@@ -39,12 +39,12 @@ import std.os;
 import std.result;
 import std.str;
 
-import glob;
-import item;
-import item.{Item};
-import platform;
-import spec;
-import spec.Spec;
+import pack.glob;
+import pack.item;
+import pack.item.{Item};
+import pack.platform;
+import pack.spec;
+import pack.spec.Spec;
 
 mapping Layout {
     // Files and links, by path, sorted.

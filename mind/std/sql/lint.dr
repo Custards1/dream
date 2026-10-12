@@ -41,6 +41,7 @@ priv let specials = "'\"`-/$();{}";
 let scan : :string -> :bool -> [:any];
 let scan text braces = list.reverse (scan_from text braces 0 []);
 
+/// Scan SQL from an offset, tracking lexical context and statement boundaries.
 priv let scan_from : :string -> :bool -> :integer -> [:any] -> [:any];
 priv let rec scan_from text braces !at acc = {
     let stop = str.upto specials at text;
@@ -106,15 +107,19 @@ priv let quoted text braces stop q unclosed before = {
     else { scan_from text braces end (list.cons [:literal, str.slice stop (end - stop) text] before) }
 };
 
+/// Test whether a character is an ASCII decimal digit.
 priv let is_digit : :integer -> :bool;
 priv let is_digit b = b >= 48 && b <= 57;
 
+/// Test whether a character is an E prefix for an escaped SQL string.
 priv let is_e : :integer -> :bool;
 priv let is_e b = b == 69 || b == 101;
 
+/// Test whether a character can start a SQL identifier.
 priv let is_ident_start : :integer -> :bool;
 priv let is_ident_start b = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128;
 
+/// Test whether a character can continue a SQL identifier.
 priv let is_ident : :integer -> :bool;
 priv let is_ident b = is_ident_start b || is_digit b || b == 36;
 
@@ -160,6 +165,7 @@ priv let dollar_tag text at = {
     }
 };
 
+/// Find the end of a PostgreSQL dollar-quote tag.
 priv let tag_end : :string -> :integer -> :integer;
 priv let rec tag_end text !at = {
     let b = str.byte at text;
@@ -227,6 +233,7 @@ let lint_as whole tokens several positional = {
     }
 };
 
+/// Test whether a token is a SQL comment.
 priv let is_comment : :any -> :bool;
 priv let is_comment t = match t {
     [:literal, s] => str.starts_with "--" s || str.starts_with "/*" s,
@@ -259,6 +266,7 @@ priv let statements code several = {
     }
 };
 
+/// Split a script at statement boundaries outside strings and comments.
 priv let split_statements : [:any] -> [:any] -> [[:any]] -> [[:any]];
 priv let rec split_statements tokens current acc = match tokens {
     [] => list.reverse (list.cons (list.reverse current) acc),
@@ -266,6 +274,7 @@ priv let rec split_statements tokens current acc = match tokens {
     [t, ..rest] => split_statements rest (list.cons t current) acc,
 };
 
+/// Validate a statement's leading keyword and return its first problem.
 priv let first_word_problem : [:any] -> :any;
 priv let first_word_problem statement = match statement {
     [[:open], .._] => (),

@@ -106,6 +106,7 @@ let defaults = Options.new ();
 let serve! : :integer -> :any -> :map;
 let serve! port app = serve_with! (Options.set_port port defaults) app;
 
+/// Start an HTTP server using explicit listener and connection options.
 let serve_with! : :map -> :any -> :map;
 let serve_with! options app = {
     let listener = net.listen! (Options.port options);
@@ -132,6 +133,7 @@ let stop! s = { try! { io.close! (Server.listener s) } catch e { () }; () };
 let run! : :integer -> :any -> :any;
 let run! port app = { let s = serve! port app; join! (Server.acceptor s) };
 
+/// Accept incoming connections and dispatch their handlers.
 priv let accept_loop! : :any -> :any -> :map -> :atom;
 priv let rec accept_loop! listener handle options =
     match try! { let sock = net.accept! listener; [:ok, sock] } catch e { [:error, e] } {
@@ -144,6 +146,7 @@ priv let rec accept_loop! listener handle options =
         [:error, _] => :stopped,
     };
 
+/// Serve one accepted connection using the configured protocol options.
 priv let connection! : :any -> :any -> :map -> :unit;
 priv let connection! sock handle options = {
     let peer = try! { net.peer! sock } catch e { "" };
@@ -188,6 +191,7 @@ priv let rec watch! sock idle conn = match proc.recv_within! (time.to_millisecon
     },
 };
 
+/// Read and serve consecutive requests on an HTTP connection.
 priv let requests! : :any -> :any -> :any -> :map -> :string -> :any -> :unit;
 priv let rec requests! sock r handle options peer watchdog =
     // Forced inside the `try!`: a request is built lazily, and a malformed
@@ -242,6 +246,7 @@ priv let serve_h2! : :any -> :any -> :any -> :map -> :string -> :any -> :unit;
 priv let serve_h2! sock r handle options peer watchdog =
     h2.serve! sock r (respond_h2! handle options peer) (Options.max_body options) (still_going! watchdog);
 
+/// Adapt an application response to an HTTP/2 stream response.
 priv let respond_h2! : :any -> :map -> :string -> :map -> :map;
 priv let respond_h2! handle options peer req = {
     let with_peer = http.Request.set_peer peer req;
@@ -265,6 +270,7 @@ priv let send_response! sock req resp keep head watchdog = {
     }
 };
 
+/// Check that the connection's controlling process is still available.
 priv let still_going! : :any -> :unit -> :unit;
 priv let still_going! watchdog u = { send! watchdog :active; () };
 
@@ -337,6 +343,7 @@ priv let body_pull! b u = {
     }
 };
 
+/// Replace an absent string with an empty string.
 priv let or_empty : (:string | :unit) -> :string;
 priv let or_empty v = match v { () => "", t => t };
 
@@ -409,14 +416,19 @@ let router = Router.new ();
 let route : :string -> :string -> :any -> :map -> :map;
 let route method pattern handle r = Router.set_routes (Router.routes r + [[str.upper method, segments pattern, handle]]) r;
 
+/// Add a route for GET requests matching a path pattern.
 let get : :string -> :any -> :map -> :map;
 let get pattern handle r = route "GET" pattern handle r;
+/// Add a route for POST requests matching a path pattern.
 let post : :string -> :any -> :map -> :map;
 let post pattern handle r = route "POST" pattern handle r;
+/// Add a route for PUT requests matching a path pattern.
 let put : :string -> :any -> :map -> :map;
 let put pattern handle r = route "PUT" pattern handle r;
+/// Add a route for PATCH requests matching a path pattern.
 let patch : :string -> :any -> :map -> :map;
 let patch pattern handle r = route "PATCH" pattern handle r;
+/// Add a route for DELETE requests matching a path pattern.
 let delete : :string -> :any -> :map -> :map;
 let delete pattern handle r = route "DELETE" pattern handle r;
 /// A route for every method.
@@ -434,6 +446,7 @@ let mount prefix inner r = {
     Router.set_routes (Router.routes r + list.map (fn [m, segs, h] -> [m, pre + segs, h]) (Router.routes inner)) r
 };
 
+/// Split a request path into its routing segments.
 priv let segments : :string -> [:string];
 priv let segments path = list.filter (fn s -> s != "") (str.split "/" path);
 
@@ -516,6 +529,7 @@ let mime_type path = {
     }
 };
 
+/// Find the final occurrence of a substring, or -1 when absent.
 priv let last_index : :string -> :string -> :integer;
 priv let last_index needle s = {
     let rec go from best = { let at = str.find_from from needle s; if at < 0 { best } else { go (at + 1) at } };

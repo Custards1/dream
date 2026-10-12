@@ -132,6 +132,7 @@ let connect_with! config address = try! {
     result.ok socket
 } catch e { result.error (if error.is_error e { e } else { error.new :error e }) };
 
+/// Establish and validate a WebSocket connection using the configured HTTP handshake.
 priv let open! : :map -> :string -> :map;
 priv let open! config address = {
     let u = match url.parse address { [:ok, parsed] => parsed, [:error, why] => raise! (error.new :bad_url why) };
@@ -195,9 +196,11 @@ let recv_within! socket ms = {
 let is_from : :map -> :any -> :bool;
 let is_from socket from = from == Socket.reader socket;
 
+/// Send a WebSocket text message.
 let send_text! : :map -> :string -> :unit;
 let send_text! socket text = write_frame! socket 1 text;
 
+/// Send a WebSocket binary message.
 let send_binary! : :map -> :string -> :unit;
 let send_binary! socket bytes = write_frame! socket 2 bytes;
 
@@ -233,6 +236,7 @@ let close_with! socket code reason = {
     ()
 };
 
+/// Encode and write a frame with the given opcode and payload.
 priv let write_frame! : :map -> :integer -> :string -> :unit;
 priv let write_frame! socket opcode payload = {
     streams.write_all! (Socket.connection socket) (frame opcode payload (Socket.role socket == :client) (crypto.random_bytes! 4))
@@ -261,15 +265,19 @@ let mask key payload = {
     if n == 0 { "" } else { crypto.xor payload (str.slice 0 n (str.repeat (n / 4 + 1) key)) }
 };
 
+/// Encode an integer as two big-endian bytes.
 priv let be16 : :integer -> :string;
 priv let be16 n = str.of_bytes [n / 256 % 256, n % 256];
 
+/// Encode an integer as eight big-endian bytes.
 priv let be64 : :integer -> :string;
 priv let be64 n = str.of_bytes (list.map (fn k -> n / pow256 (7 - k) % 256) (list.range 0 8));
 
+/// Compute 256 raised to a nonnegative exponent.
 priv let pow256 : :integer -> :integer;
 priv let rec pow256 k = if k <= 0 { 1 } else { 256 * pow256 (k - 1) };
 
+/// Read a big-endian unsigned 16-bit value.
 priv let u16 : :string -> :integer;
 priv let u16 b = str.byte 0 b * 256 + str.byte 1 b;
 
@@ -331,6 +339,7 @@ priv let read_loop! sock r role owner = {
     go! r 0 [] 0
 };
 
+/// Convert an opcode and payload to the public WebSocket message representation.
 priv let message : :integer -> :string -> :any;
 priv let message op payload = if op == 2 { [:binary, payload] } else { [:text, payload] };
 

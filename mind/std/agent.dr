@@ -27,6 +27,7 @@ derive std.server;
 
 import std.list;
 
+/// Return the server implementation name, `agent`.
 let server_name : :any -> :string;
 let server_name u = "agent";
 
@@ -38,6 +39,7 @@ let server_name u = "agent";
 let init! : a -> a;
 let init! value = strict! value;
 
+/// Handle an agent read or update request and return the server reply and new state.
 let handle_call! : :any -> :any -> :any -> Action :any :any;
 let handle_call! request from state = match request {
     :value        => reply state state,
@@ -60,6 +62,7 @@ let handle_call! request from state = match request {
     _ => reply [:error, :unknown_request] state,
 };
 
+/// Apply an asynchronous agent update to its state.
 let handle_cast! : :any -> :any -> Action :any :any;
 let handle_cast! message state = match message {
     [:update, f] => noreply (strict! (f state)),
@@ -286,6 +289,7 @@ when test {
 
 import std.types;
 // Checking a state is an explicit boundary; ordinary updates stay generic.
+/// Read the agent's value and validate it against `description`.
 let value_as! : :any -> Handle -> :any;
 let value_as! description pid = types.check description (value! pid);
 

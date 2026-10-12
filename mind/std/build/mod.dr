@@ -78,12 +78,15 @@ let is_context v =
     types.accepts Context.type v
     && types.accepts Target.type (Context.target v) && types.accepts Target.type (Context.host v);
 
+/// Return the package version supplied to the build script.
 let version : :map -> :string;
 let version ctx = Context.version ctx;
 
+/// Return the package's root directory from the build context.
 let root : :map -> :string;
 let root ctx = Context.root ctx;
 
+/// Return the selected build profile.
 let profile : :map -> :string;
 let profile ctx = Context.profile ctx;
 
@@ -91,6 +94,7 @@ let profile ctx = Context.profile ctx;
 let option : :map -> :string -> :any;
 let option ctx name = (Context.options ctx).[name else ()];
 
+/// Return the target operating-system atom.
 let target_os : :map -> :atom;
 let target_os ctx = Target.os (Context.target ctx);
 
@@ -103,9 +107,11 @@ let shared_name ctx name = match Target.os (Context.target ctx) {
     _ => "lib" + name + ".so",
 };
 
+/// Add the executable suffix required by the target OS.
 let exe_name : :map -> :string -> :string;
 let exe_name ctx name = match Target.os (Context.target ctx) { :windows => name + ".exe", _ => name };
 
+/// Add the object-file suffix required by the target OS.
 let object_name : :map -> :string -> :string;
 let object_name ctx name = match Target.os (Context.target ctx) { :windows => name + ".obj", _ => name + ".o" };
 
@@ -126,6 +132,7 @@ union Input {
     artifact(step : :map, name : :string)
 }
 
+/// Describe a file input to a build step.
 let file : :string -> :any;
 let file p = Input.file p;
 
@@ -354,6 +361,7 @@ union Goal {
     effect(step : :map)
 }
 
+/// Describe a goal that materializes an input or artifact.
 let make : :any -> :any;
 let make i = Goal.make (input i);
 
@@ -362,12 +370,15 @@ let make i = Goal.make (input i);
 let place : :string -> :any -> :any;
 let place path i = Goal.place path (input i);
 
+/// Describe a goal that runs the named goals.
 let each : [:string] -> :any;
 let each names = Goal.each names;
 
+/// Describe an uncached goal whose purpose is its side effects.
 let effect : :map -> :any;
 let effect s = Goal.effect (uncached s);
 
+/// Add a named goal to a build plan, rejecting conflicting definitions.
 let goal : :string -> :any -> :map -> :map;
 let goal name g p = Plan.set_goals (claim "goal" name g (Plan.goals p)) p;
 
@@ -410,6 +421,7 @@ priv let claim kind name value table = match table.[name else ()] {
     _ => table.[name => [:conflict, kind, name]],
 };
 
+/// Combine build constraints, reporting incompatible values.
 priv let meet : :any -> :any -> :any;
 priv let meet a b = match [a, b] {
     [(), _] => b,
@@ -480,6 +492,7 @@ mapping Outcome {
     goals : %{:string => :string} = %{}
 }
 
+/// Test whether a value satisfies the build-outcome description.
 let is_outcome : :any -> :bool;
 let is_outcome v = types.accepts Outcome.type v;
 

@@ -18,6 +18,7 @@ import std.build.cc;
 import std.list;
 import std.str;
 
+/// Format a preprocessor value; an absent value becomes an empty string.
 let value_text v = match v { () => "", s if type_of s == :string => s, x => to_string x };
 
 /// The flags one setting adds when compiling a source in `lang`.

@@ -24,12 +24,33 @@ let floor_div a b = if a >= 0 { a / b } else { 0 - ((b - 1 - a) / b) };
 let floor_mod : :integer -> :integer -> :integer;
 let floor_mod a b = a - b * floor_div a b;
 
+/// Test the Gregorian rule: divisible by four, except centuries not divisible by 400.
+///
+/// ```dream
+/// import std.time.calendar;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (calendar.is_leap_year 2024)
+/// };
+/// ```
 let is_leap_year : :integer -> :bool;
 let is_leap_year y = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
 
+/// Return 366 for a leap year and 365 otherwise.
 let days_in_year : :integer -> :integer;
 let days_in_year y = if is_leap_year y { 366 } else { 365 };
 
+/// Return the number of days in a Gregorian month, accounting for leap-year February.
+///
+/// ```dream
+/// import std.time.calendar;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (calendar.days_in_month 2024 2)
+/// };
+/// ```
 let days_in_month : :integer -> :integer -> :integer;
 let days_in_month y m = match m {
     2 => if is_leap_year y { 29 } else { 28 },

@@ -16,13 +16,35 @@ import std.list;
 
 // --- making one ---------------------------------------------------------------
 
+/// Wrap a successful value as `[:ok, value]`.
+///
+/// ```dream
+/// import std.result;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (result.ok "ready")
+/// };
+/// ```
 let ok : a -> Of a e;
 let ok value = [:ok, value];
+/// Wrap a failure reason as `[:error, reason]`.
+///
+/// ```dream
+/// import std.result;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (result.error "not found")
+/// };
+/// ```
 let error : e -> Of a e;
 let error reason = [:error, reason];
 
+/// Test whether a result has the `:ok` tag.
 let is_ok : Of a e -> :bool;
 let is_ok r = list.nth 0 r == :ok;
+/// Test whether a result has the `:error` tag.
 let is_error : Of a e -> :bool;
 let is_error r = list.nth 0 r == :error;
 
@@ -42,6 +64,15 @@ let unwrap! r = if is_ok r { list.nth 1 r } else { raise! (list.nth 1 r) };
 // --- carrying on ----------------------------------------------------------------
 
 /// Change the value, leave an error alone.
+///
+/// ```dream
+/// import std.result;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (result.map (fn x -> x + 1) (result.ok 41))
+/// };
+/// ```
 let map : (a -> b) -> Of a e -> Of b e;
 let map f r = match r { [:ok, v] => ok (f v), [:error, why] => error why };
 
@@ -144,16 +175,20 @@ when test {
 
 import std.types;
 type Of value reason = [:ok, value] | [:error, reason];
+/// Validate both possible payload types of a result, raising on a mismatch.
 let check : :any -> :any -> Of a e -> Of a e;
 let check value reason outcome = types.check (Of value reason) outcome;
 // Validate a success while preserving an existing error unchanged.
+/// Validate a successful payload against `description`, retaining failures unchanged.
 let validate_ok : :any -> Of a e -> Of a (e | :error);
 let validate_ok description outcome = match outcome {
     [:ok, value] => types.validate description value,
     other => other,
 };
 
+/// Check a value against `description`, then wrap it as a successful result.
 let ok_as : :any -> a -> Of a e;
 let ok_as description value = ok (types.check description value);
+/// Check a reason against `description`, then wrap it as an error result.
 let error_as : :any -> e -> Of a e;
 let error_as description reason = error (types.check description reason);

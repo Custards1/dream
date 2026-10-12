@@ -70,6 +70,7 @@ let top_k k scores y = {
     tensor.sum (tensor.lt beaten (1.0 * k)) / n
 };
 
+/// Normalize metric input to a flat sequence of values.
 priv let as_flat : :any -> :tensor;
 priv let as_flat y = { let t = if type_of y == :tensor { y } else { tensor.of_list y }; tensor.reshape [tensor.size t] t };
 
@@ -135,6 +136,7 @@ let r2 pred y = {
     1.0 - tensor.sum (d * d) / tensor.sum (c * c)
 };
 
+/// Normalize target values to the representation expected for the prediction tensor.
 priv let target : :tensor -> :any -> :tensor;
 priv let target pred y = {
     let t = ops.like pred (if type_of y == :tensor { y } else { tensor.of_list y });

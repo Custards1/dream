@@ -17,7 +17,7 @@
 //
 // `pkgbuild` writes the other thing Arch users install from: a PKGBUILD for
 // the AUR that downloads a release tarball and lays it out, for a package
-// that is published that way instead (`ship pkgbuild`).
+// that is published that way instead (`mind pack pkgbuild`).
 
 import std.crypto;
 import std.file;
@@ -27,19 +27,19 @@ import std.map;
 import std.result;
 import std.str;
 
-import bytes;
-import compress;
-import deps;
-import item;
-import item.{Item};
-import layout;
-import layout.Layout;
-import out;
-import platform;
-import scratch;
-import spec;
-import spec.Spec;
-import tar;
+import pack.bytes;
+import pack.compress;
+import pack.deps;
+import pack.item;
+import pack.item.{Item};
+import pack.layout;
+import pack.layout.Layout;
+import pack.out;
+import pack.platform;
+import pack.scratch;
+import pack.spec;
+import pack.spec.Spec;
+import pack.tar;
 
 let file_name : Spec -> compress.Compression -> :string;
 let file_name sp c = Spec.name sp + "-" + spec.full_version sp + "-" + platform.pacman (Spec.arch sp) + ".pkg.tar"

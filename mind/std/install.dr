@@ -37,12 +37,14 @@ let image! : :string -> :string | :unit;
 let image! name = first_file! (list.flat_map (fn dir -> [dir + "/" + name, dir + "/" + name + ".dream"])
                                               (dirs! ()));
 
+/// Return the first search directory containing the named file, or `()` if absent.
 priv let first_dir_holding! : :string -> [:string] -> :string | :unit;
 priv let rec first_dir_holding! entry dirs = match dirs {
     [] => (),
     [dir, ..rest] => if io.exists! (dir + "/" + entry) { dir } else { first_dir_holding! entry rest },
 };
 
+/// Return the first existing file among the candidate paths, or `()` if absent.
 priv let first_file! : [:string] -> :string | :unit;
 priv let rec first_file! paths = match paths {
     [] => (),

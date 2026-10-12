@@ -1,20 +1,20 @@
-# ship
+# mind pack
 
-`ship` makes a program and its files into what each platform installs:
+`mind pack` makes a program and its files into what each platform installs:
 
 | Command | Makes | Installed with |
 |---|---|---|
-| `ship deb` | `NAME_VERSION-REL_ARCH.deb` | `apt install ./x.deb`, `dpkg -i` (Debian, Ubuntu, Mint, ...) |
-| `ship rpm` | `NAME-VERSION-REL.ARCH.rpm` | `dnf install ./x.rpm`, `zypper`, `rpm -i` (Fedora, RHEL, openSUSE, ...) |
-| `ship arch` | `NAME-VERSION-REL-ARCH.pkg.tar.zst` | `pacman -U` (Arch, Manjaro, ...) |
-| `ship tarball` | `NAME-VERSION-OS-ARCH.tar.gz` | unpacking it, or the three below |
-| `ship brew` | `NAME.rb`, a Homebrew formula | `brew install` from a tap, macOS and Linux |
-| `ship pkgbuild` | `aur/PKGBUILD`, `aur/.SRCINFO` | publishing `NAME-bin` on the AUR |
-| `ship installer` | `install.sh` | `curl -fsSL .../install.sh \| sh` |
-| `ship sums` | `SHA256SUMS` | `sha256sum -c SHA256SUMS` |
-| `ship all` | all of the above that this machine can make | |
+| `mind pack deb` | `NAME_VERSION-REL_ARCH.deb` | `apt install ./x.deb`, `dpkg -i` (Debian, Ubuntu, Mint, ...) |
+| `mind pack rpm` | `NAME-VERSION-REL.ARCH.rpm` | `dnf install ./x.rpm`, `zypper`, `rpm -i` (Fedora, RHEL, openSUSE, ...) |
+| `mind pack arch` | `NAME-VERSION-REL-ARCH.pkg.tar.zst` | `pacman -U` (Arch, Manjaro, ...) |
+| `mind pack tarball` | `NAME-VERSION-OS-ARCH.tar.gz` | unpacking it, or the three below |
+| `mind pack brew` | `NAME.rb`, a Homebrew formula | `brew install` from a tap, macOS and Linux |
+| `mind pack pkgbuild` | `aur/PKGBUILD`, `aur/.SRCINFO` | publishing `NAME-bin` on the AUR |
+| `mind pack installer` | `install.sh` | `curl -fsSL .../install.sh \| sh` |
+| `mind pack sums` | `SHA256SUMS` | `sha256sum -c SHA256SUMS` |
+| `mind pack all` | all of the above that this machine can make | |
 
-Every package is written by `ship` itself, including the tar, ar and cpio
+Every package is written by `mind pack` itself, including the tar, ar and cpio
 inside it, RPM's binary headers and signature, Debian's control files and
 pacman's `.MTREE`. Making a .deb needs no dpkg and making an RPM needs no
 rpmbuild, so any machine with a Dream VM can make all of them. The only
@@ -30,13 +30,14 @@ someone rebuilds that release.
 ## Starting
 
 ```
-ship init          # adds a [ship] section to mind.toml, filled in from [package]
-ship check         # reads it and every file it names, and says what is wrong
-ship files         # what every package will install, and from where
-ship all           # everything, into dist/
+mind pack init          # adds a [ship] section to mind.toml, filled in from [package]
+mind pack check         # reads it and every file it names, and says what is wrong
+mind pack files         # what every package will install, and from where
+mind pack all           # everything, into dist/
 ```
 
-`ship` reads `mind.toml` in the current directory (`-m PATH` names another),
+`mind pack` finds `mind.toml` here or above (`-C DIR` selects a project;
+`-m PATH` names a manifest explicitly),
 so a Dream project describes itself in one place. It takes the name and
 version from `[package]` when `[ship]` does not give them.
 
@@ -115,7 +116,7 @@ there (`.git`, `.hg`, `.svn`, `.DS_Store`). Patterns are read the way
 with a `/` is anchored at the directory being shipped. `*` and `?` match
 within one name, and `**` matches any number of whole names.
 
-A **mode** is octal (`"755"`, `"0o644"`). When the manifest gives none, `ship`
+A **mode** is octal (`"755"`, `"0o644"`). When the manifest gives none, `mind pack`
 works one out. A file in a `bin`, `sbin` or `libexec` directory is
 executable, and so are a script (`#!`) and a native program (ELF or Mach-O).
 A shared library (`.so`, `.so.N`, `.dylib`) and everything else are not.
@@ -200,9 +201,9 @@ steps:
 
 ```
 # on each machine (CI: one job per platform)
-ship tarball                 # and ship deb / rpm / arch on Linux
+mind pack tarball                 # and mind pack deb / rpm / arch on Linux
 # then, in one place, with every machine's dist/ gathered into one
-ship brew && ship pkgbuild && ship installer && ship sums
+mind pack brew && mind pack pkgbuild && mind pack installer && mind pack sums
 ```
 
 Dream's own release does exactly this (`.github/workflows/release.yml`).
@@ -210,11 +211,11 @@ Dream's own release does exactly this (`.github/workflows/release.yml`).
 ## Checking it
 
 ```
-just test-ship
+just test-pack
 ```
 
-That runs ship's unit tests, then `tests/formats.sh`, which makes every
-format from `tests/fixture` twice and checks the two runs are identical. It
+That runs Mind's packaging unit tests, then `pack/tests/formats.sh`, which makes every
+format from `pack/tests/fixture` twice and checks the two runs are identical. It
 then hands each package to the program that installs it: dpkg installs,
 verifies and purges the .deb; rpm checks the digests, installs, verifies and
 removes the RPM; pacman installs and `-Qkk`s the Arch package; makepkg builds

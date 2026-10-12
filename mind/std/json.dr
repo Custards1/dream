@@ -30,22 +30,27 @@ import std.str;
 
 // --- reading ----------------------------------------------------------------
 
+/// Test whether a character is whitespace recognized by this format.
 let is_ws : :char -> :bool;
 let is_ws c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
 
+/// Drop leading whitespace characters from the parser input.
 let skip_ws : [:char] -> [:char];
 let rec skip_ws cs = if list.is_empty cs { cs }
                      else if is_ws (list.head cs) { skip_ws (list.tail cs) }
                      else { cs };
 
+/// Test whether a character is an ASCII decimal digit.
 let is_digit : :char -> :bool;
 let is_digit c = c >= '0' && c <= '9';
 
 /// `[value, rest]`, the shape every parser below returns.
 let step : a -> [:char] -> [a, [:char]];
 let step value rest = [value, rest];
+/// Extract the parsed value from a parser step.
 let step_value : :list -> :any;
 let step_value s = list.head s;
+/// Extract the unconsumed input from a parser step.
 let step_rest : :list -> [:char];
 let step_rest s = list.head (list.tail s);
 
@@ -57,6 +62,7 @@ let rec starts cs word =
     else if list.head cs == list.head word { starts (list.tail cs) (list.tail word) }
     else { false };
 
+/// Drop `n` characters from the parser input.
 let drop_n : :integer -> [:char] -> [:char];
 let rec drop_n n cs = if n <= 0 { cs } else { drop_n (n - 1) (list.tail cs) };
 
@@ -71,6 +77,7 @@ let hex_value c = match c {
     _ => 0 - 1,
 };
 
+/// Decode the remaining hexadecimal digits of a Unicode escape into an accumulator.
 let hex4 : [:char] -> :integer -> :integer -> :any;
 let rec hex4 cs n acc =
     if n <= 0 { [acc, cs] }
@@ -154,6 +161,7 @@ let rec number_chars cs acc floaty =
         } else { [list.reverse acc, floaty, cs] }
     };
 
+/// Parse a numeric token, returning its value and unconsumed input or an error.
 let parse_number : [:char] -> :any;
 let parse_number cs = {
     let taken = number_chars cs [] false;
@@ -169,6 +177,7 @@ let parse_number cs = {
 
 // --- values -----------------------------------------------------------------
 
+/// Parse the next value, returning its value and unconsumed input or an error.
 let parse_value : [:char] -> :any;
 let rec parse_value cs = {
     let s = skip_ws cs;
@@ -187,6 +196,7 @@ let rec parse_value cs = {
     }
 };
 
+/// Parse object members into a map, enforcing separators and string keys.
 let parse_object : [:char] -> %{ :string => Value } -> :bool -> :any;
 let rec parse_object cs acc first = match skip_ws cs {
     [] => (),
@@ -207,6 +217,7 @@ let rec parse_object cs acc first = match skip_ws cs {
     },
 };
 
+/// Parse array elements in order, enforcing commas and the closing bracket.
 let parse_array : [:char] -> [Value] -> :bool -> :any;
 let rec parse_array cs acc first = match skip_ws cs {
     [] => (),
@@ -222,6 +233,15 @@ let rec parse_array cs acc first = match skip_ws cs {
 };
 
 /// `[:ok, value]`, or `[:error, message]`.
+///
+/// ```dream
+/// import std.json;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (json.parse "{\"answer\":42}")
+/// };
+/// ```
 let parse : :string -> result.Of :any :string;
 let parse text = {
     let r = parse_value (str.chars text);
@@ -233,8 +253,10 @@ let parse text = {
     }
 };
 
+/// Test whether a parse result has the success tag.
 let ok : result.Of a e -> :bool;
 let ok r = list.head r == :ok;
+/// Extract the payload from a parse result.
 let value : result.Of a e -> :any;
 let value r = list.nth 1 r;
 
@@ -259,6 +281,7 @@ let parse_or default text = {
 // array comes back a list. `std.wire` is the format for when that matters; the
 // tests at the foot of this file say exactly which values survive this one.
 
+/// Escape a character for inclusion inside a JSON string.
 let escape_char : :char -> :string;
 let escape_char c = match c {
     '"'  => "\\\"",
@@ -281,14 +304,17 @@ let escape_char c = match c {
     },
 };
 
+/// Escape a string and surround it with double quotes for this format.
 let quote : :string -> :string;
 let quote s = "\"" + str.join_str "" (list.map escape_char (str.chars s)) + "\"";
 
 // --- the holes std.codec declares --------------------------------------------
 
+/// Encode `()` as the JSON literal `null`.
 let write_unit : :unit -> :string;
 let write_unit u = "null";
 
+/// Encode a boolean using the format's true and false literals.
 let write_bool : :bool -> :string;
 let write_bool b = if b { "true" } else { "false" };
 
@@ -298,9 +324,11 @@ let write_bool b = if b { "true" } else { "false" };
 let write_int : :integer -> :string;
 let write_int n = to_string n;
 
+/// Encode a floating-point value in decimal notation.
 let write_float : :float -> :string;
 let write_float x = to_string x;
 
+/// Encode a string with the format's quoting and escaping rules.
 let write_string : :string -> :string;
 let write_string s = quote s;
 
@@ -310,6 +338,7 @@ let write_string s = quote s;
 let write_atom : :atom -> :string;
 let write_atom a = quote (atom_name a);
 
+/// Return an atom's name without its leading colon.
 priv let atom_name : :atom -> :string;
 priv let atom_name a = str.slice 1 (str.byte_length (to_string a)) (to_string a);
 
@@ -329,6 +358,7 @@ priv let key_text k = match type_of k {
     _       => to_string k,
 };
 
+/// Join already encoded elements into the format's array syntax.
 let write_list : [:string] -> :string;
 let write_list parts = "[" + str.join_str "," parts + "]";
 
@@ -341,6 +371,7 @@ let write_map pairs = {
     "{" + str.join_str "," (list.map entry pairs) + "}"
 };
 
+/// Return the format name used by the codec protocol.
 let format_name : :any -> :string;
 let format_name u = "json";
 
@@ -370,9 +401,11 @@ let rec write_indented depth v = match type_of v {
     _      => write v,
 };
 
+/// Produce the whitespace prefix for an indentation depth.
 priv let indent : :integer -> :string;
 priv let indent depth = str.repeat depth "  ";
 
+/// Format array elements on indented lines.
 priv let indented_items : :integer -> [:any] -> :string;
 priv let indented_items depth items =
     if list.is_empty items { "[]" }
@@ -381,6 +414,7 @@ priv let indented_items depth items =
         "[\n" + str.join_str ",\n" (list.map one items) + "\n" + indent depth + "]"
     };
 
+/// Format object members on indented lines.
 priv let indented_members : :integer -> :map -> :string;
 priv let indented_members depth v = {
     let entries = map_entries v;
@@ -392,6 +426,16 @@ priv let indented_members depth v = {
     }
 };
 
+/// Format a value as indented JSON starting at depth zero.
+///
+/// ```dream
+/// import std.json;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (json.pretty (%{ "answer" => 42 }))
+/// };
+/// ```
 let pretty : :any -> :string;
 let pretty v = write_indented 0 v;
 
@@ -519,5 +563,6 @@ when test {
 // These describe decoded JSON, whose object keys are always strings.
 type Value = :unit | :bool | :integer | :float | :string
            | [Value] | %{ :string => Value };
+/// Parse text and validate a successful value against `description`.
 let parse_as : :any -> :string -> result.Of :any :any;
 let parse_as description text = decode_as description text;

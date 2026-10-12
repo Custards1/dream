@@ -135,6 +135,7 @@ let typed type_oid text = #[:pg_typed, type_oid, text];
 let json : :any -> #[:any];
 let json v = typed oid.json (js.write v);
 
+/// Wrap a value for transmission as PostgreSQL JSONB.
 let jsonb : :any -> #[:any];
 let jsonb v = typed oid.jsonb (js.write v);
 
@@ -142,6 +143,7 @@ let jsonb v = typed oid.jsonb (js.write v);
 let bytea : :string -> #[:any];
 let bytea raw = typed oid.bytea ("\\x" + bytes.hex_encode raw);
 
+/// Test whether a value carries an explicit PostgreSQL type wrapper.
 let is_typed : :any -> :bool;
 let is_typed v = type_of v == :array && len v == 3 && v.[0] == :pg_typed;
 
@@ -191,6 +193,7 @@ let atom_name a = { let t = to_string a; str.slice 1 (len t - 1) t };
 let array_literal : [:any] -> :string;
 let array_literal items = "{" + str.join_str "," (list.map array_element items) + "}";
 
+/// Encode one array element using its PostgreSQL text representation.
 priv let array_element : :any -> :string;
 priv let array_element v = match type_of v {
     :unit => "NULL",
@@ -202,10 +205,12 @@ priv let array_element v = match type_of v {
     _ => quote_element (encode v),
 };
 
+/// Quote an array element when PostgreSQL array syntax requires it.
 priv let quote_element : :string -> :string;
 priv let quote_element text =
     "\"" + str.concat_all (list.map escape_element (str.chars text)) + "\"";
 
+/// Escape quotes and backslashes within a PostgreSQL array element.
 priv let escape_element : :char -> :string;
 priv let escape_element c = match c {
     '"' => "\\\"",
@@ -226,6 +231,7 @@ let decode decoders type_oid text = match text {
     },
 };
 
+/// Decode a PostgreSQL value using its built-in type OID.
 priv let decode_builtin : %{:integer => :any} -> :integer -> :string -> :any;
 priv let decode_builtin decoders type_oid text = match type_oid {
     16 => text == "t",
@@ -254,12 +260,14 @@ let exact_integer text = match num.parse_int text {
     _ => text,
 };
 
+/// Parse PostgreSQL floating-point text, including special values.
 priv let float_of : :string -> :any;
 priv let float_of text = match num.parse_float text {
     () => text,
     x => x,
 };
 
+/// Decode PostgreSQL JSON text into a Dream value.
 priv let json_of : :string -> :any;
 priv let json_of text = match js.parse text {
     [:ok, v] => v,

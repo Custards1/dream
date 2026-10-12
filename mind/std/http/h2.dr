@@ -73,12 +73,15 @@ priv let our_window = 1048576;
 let frame : :integer -> :integer -> :integer -> :string -> :string;
 let frame kind flags id payload = be 3 (len payload) + str.of_bytes [kind, flags] + be 4 id + payload;
 
+/// Encode an integer using the requested number of big-endian bytes.
 priv let be : :integer -> :integer -> :string;
 priv let be width n = str.of_bytes (list.map (fn k -> n / pow256 (width - 1 - k) % 256) (list.range 0 width));
 
+/// Compute 256 raised to a nonnegative exponent.
 priv let pow256 : :integer -> :integer;
 priv let rec pow256 k = if k <= 0 { 1 } else { 256 * pow256 (k - 1) };
 
+/// Read an unsigned big-endian integer from a byte string.
 priv let uint : :string -> :integer -> :integer -> :integer;
 priv let uint s at width = list.fold (fn acc k -> acc * 256 + str.byte (at + k) s) 0 (list.range 0 width);
 
@@ -99,6 +102,7 @@ let read_frame! r max = match try! { let got = rd.read_exact! r 9; strict! got; 
 priv let settings_payload : [[:integer]] -> :string;
 priv let settings_payload pairs = str.concat_all (list.map (fn [k, v] -> be 2 k + be 4 v) pairs);
 
+/// Test whether a bit flag is set in a frame's flags field.
 priv let has_flag : :integer -> :integer -> :bool;
 priv let has_flag flags bit = flags / bit % 2 == 1;
 
@@ -114,6 +118,7 @@ priv let unpadded kind flags payload = {
 
 // --- the reader --------------------------------------------------------------------------
 
+/// Read HTTP/2 frames and forward them to the coordinating process.
 priv let read_loop! : :any -> :process -> :unit;
 priv let rec read_loop! r coordinator = match try! { let f = read_frame! r 16777215; strict! f; [:ok, f] } catch e { [:error, e] } {
     [:ok, ()] => { send! coordinator [:h2_closed, "the connection ended"]; () },
@@ -165,15 +170,19 @@ mapping Stream {
     head_sent : :bool = false
 }
 
+/// Write bytes through the connection's serialized output path.
 priv let write! : :map -> :string -> :unit;
 priv let write! c bytes = { try! { streams.write_all! (Conn.socket c) bytes; () } catch e { () } };
 
+/// Look up a stream's state by its identifier.
 priv let stream_of : :map -> :integer -> :map;
 priv let stream_of c id = (Conn.streams c).[id else Stream.new () |> Stream.set_window (Conn.initial_window c)];
 
+/// Insert or replace stream state under its identifier.
 priv let put_stream : :map -> :integer -> :map -> :map;
 priv let put_stream c id s = Conn.set_streams ((Conn.streams c).[id => s]) c;
 
+/// Remove completed stream state from a connection.
 priv let drop_stream : :map -> :integer -> :map;
 priv let drop_stream c id = Conn.set_streams (map.remove id (Conn.streams c)) c;
 
@@ -204,6 +213,7 @@ let serve! sock r respond! max_body progress! = {
 let open! : :any -> :process;
 let open! sock = spawn! $( client_main! sock );
 
+/// Start the client's HTTP/2 connection coordinator.
 priv let client_main! : :any -> :unit;
 priv let client_main! sock = {
     let me = self! ();
@@ -222,6 +232,7 @@ let shutdown! coordinator = { send! coordinator [:h2_shutdown]; () };
 
 // --- the coordinator ----------------------------------------------------------------------
 
+/// Process stream requests, received frames and connection lifecycle events.
 priv let coordinate! : :map -> :unit;
 priv let rec coordinate! c =
     if Conn.closing c && map.is_empty (Conn.streams c) { () }
@@ -324,6 +335,7 @@ priv let on_frame! c kind flags id payload = {
     }
 };
 
+/// Apply a peer's SETTINGS payload to connection and stream limits.
 priv let apply_settings : :map -> :string -> :integer -> :map;
 priv let rec apply_settings c p at =
     if at + 6 > len p { c }
@@ -344,6 +356,7 @@ priv let rec apply_settings c p at =
         apply_settings c2 p (at + 6)
     };
 
+/// Process incoming DATA, updating stream content and flow-control windows.
 priv let on_data! : :map -> :integer -> :integer -> :string -> :map;
 priv let on_data! c flags id payload = {
     let body = match unpadded data_frame flags payload { () => raise! (error.new :protocol "bad padding"), b => b };
@@ -449,6 +462,7 @@ priv let handle! coordinator id respond! req = {
 priv let connection_specific : [:string];
 priv let connection_specific = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "host"];
 
+/// Build an application request from HTTP/2 headers and body.
 priv let request_of : [[:string]] -> :string -> :map;
 priv let request_of headers body = {
     let pseudo k = match list.filter (fn [n, _] -> n == k) headers { [[_, v], .._] => v, _ => "" };
@@ -463,12 +477,14 @@ priv let request_of headers body = {
        :headers => with_host, :body => body, :version => "HTTP/2" }
 };
 
+/// Build an application response from HTTP/2 headers and body.
 priv let response_of : [[:string]] -> :string -> :map;
 priv let response_of headers body = {
     let status = match list.filter (fn [k, _] -> k == ":status") headers { [[_, v], .._] => match num.parse_int v { () => 0, n => n }, _ => 0 };
     %{ :status => status, :headers => list.filter (fn [n, _] -> not (str.starts_with ":" n)) headers, :body => body }
 };
 
+/// Filter and normalize headers for HTTP/2 transmission.
 priv let header_list : [[:string]] -> [[:string]];
 priv let header_list hs = list.filter (fn [n, _] -> not (list.contains n connection_specific)) (list.map (fn [n, v] -> [str.lower n, v]) hs);
 
@@ -489,6 +505,7 @@ priv let header_frames c id hs end_stream = {
     }
 };
 
+/// Send response headers and optionally mark the stream complete.
 priv let send_head! : :map -> :integer -> :map -> :bool -> :map;
 priv let send_head! c id resp end_stream = {
     let code = resp.[:status else 200];
@@ -497,6 +514,7 @@ priv let send_head! c id resp end_stream = {
     if end_stream { drop_stream c id } else { put_stream c id (Stream.set_head_sent true (stream_of c id)) }
 };
 
+/// Send a complete response on a stream.
 priv let respond_whole! : :map -> :integer -> :map -> :map;
 priv let respond_whole! c id resp = {
     let body = resp.[:body else ""];
@@ -519,6 +537,7 @@ priv let queue! c id piece end = match (Conn.streams c).[id else ()] {
 priv let flush! : :map -> :map;
 priv let flush! c = list.fold (fn cc id -> flush_stream! cc id) c (map.keys (Conn.streams c));
 
+/// Send buffered stream data up to the available flow-control window.
 priv let flush_stream! : :map -> :integer -> :map;
 priv let rec flush_stream! c id = match (Conn.streams c).[id else ()] {
     () => c,

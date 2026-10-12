@@ -51,6 +51,7 @@ let step opt grads state params = (Optimizer.update opt) grads state params;
 let rate : :any -> :integer -> :float;
 let rate lr t = rate_of (type_of lr) lr t;
 
+/// Resolve a fixed learning rate or a schedule for the current optimization step.
 priv let rate_of : :atom -> :any -> :integer -> :float;
 priv let rate_of kind lr t = match kind { :float => lr, :integer => 1.0 * lr, _ => 1.0 * lr t };
 
@@ -135,6 +136,7 @@ let adam_with lr opts = {
 let rmsprop : :any -> Optimizer;
 let rmsprop lr = rmsprop_with lr %{};
 
+/// Construct RMSProp with explicit learning rate and optimizer options.
 let rmsprop_with : :any -> %{:atom => :any} -> Optimizer;
 let rmsprop_with lr opts = {
     let rho = 1.0 * opts.[:rho else 0.9];
@@ -161,6 +163,7 @@ let adagrad lr = Optimizer.make "adagrad"
         [tree.map3 (fn p g sq -> p - a * g / (sqrt_of sq + 1.0e-10)) params grads s, %{"t" => t + 1, "s" => s}]
     });
 
+/// Compute a square root for the numeric representation used by optimizer state.
 priv let sqrt_of : :any -> :any;
 priv let sqrt_of x = if type_of x == :tensor { tensor.sqrt x } else { math.sqrt x };
 
