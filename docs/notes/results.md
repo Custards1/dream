@@ -98,3 +98,31 @@ The parsers' own steps, `[:ok, item, rest]` (`parser.dr`, `lexer.dr`,
 `std.parse`, `mind`'s condition parser): three elements, internal, never a
 result anyone outside sees. Where one leaves as a result it is converted
 (`parser.parse_expression`, `lexer.lex`, `fmt.format`).
+
+## Option, and one `let?` for both
+
+2026-10-12. `Option a` (`some(value)`, `none`) joined `Result` in the prelude,
+and what to do with either is a member of its union with a signature
+(`Result.map`, `Option.flatten`, ...). A union body may now sign a member
+(`map : (a -> b) -> Result a e -> Result b e` on the line before it), which
+is what lets the checker type a chain through the members; the seed could
+not parse that, so the reseed was two steps again: C1 from a copy whose
+prelude had its signatures stripped, then the real tree.
+
+`let?` chains both. Unfolding it to two arms, `Result.ok(x)` and
+`Option.some(x)`, would write the rest of the block twice per step -- 2^n for
+a chain of n -- so it unfolds to one arm with a pattern of its own,
+`ast.success_p`, which matches either variant *by id*
+(`ast.success_ids`): a module with a `Result` of its own still chains the
+prelude's. Scope binds through it, lowering tests the two ids and reads field
+0, and the checker binds the payload to whatever the scrutinee's `ok`/`some`
+holds and reports a `let?` on any other declared type. `let? x = e else alt;`
+answers `alt` instead of passing the failure on.
+
+`std.result`'s functions became the prelude's members at their call sites
+(`result.or_else d r` is `Result.unwrap_or d r`; `result.reason d r` answers
+an `Option` now), and `std.result` keeps short spellings -- `result.ok`,
+`result.err`, `result.map` -- as wrappers, which compile to the member call.
+
+The library's own "nothing there" is still `()` (`list.find`, `map` lookups
+with `else ()`); `Option.of` and `Option.or_unit` cross between the two.

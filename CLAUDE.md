@@ -331,14 +331,20 @@ The lessons that keep coming back:
   `std` uses it wherever an accumulator could grow (`list.fold_strict`,
   `list.sum`, the folds of `std.seq` and `std.map`).
 - Errors are values: a function that can fail answers `Result.ok v` or
-  `Result.error r`, the union in `std.prelude` that every module has
+  `Result.error r`, and one that may find nothing `Option.some v` or
+  `Option.none` -- the unions in `std.prelude` that every module has
   without an import ("The prelude" in docs/language-spec.md; `modules.with_prelude!`
   loads it, `scope.lend_prelude` lends it, and a module's own name wins).
-  `raise!`/`try!` are for what is not an answer, and a wait that runs out
-  is `Result.error :timeout`. `let? x = e;` in a block is one step of a
-  chain: on `Result.ok v` it binds `v` and goes on, and anything else is the
-  block's answer. The parser unfolds it to a `match` (`unfold_let_try`),
-  and an `[:ok, v]` list is not a result to it. A native answers a result as the record too
+  What to do with one is a typed member: `Result.map f r`,
+  `Option.unwrap_or d o`, `|>`-friendly; `std.result` has short wrappers
+  (`result.ok`, `result.err`). `raise!`/`try!` are for what is not an
+  answer, and a wait that runs out is `Result.error :timeout`. `let? x = e;`
+  in a block is one step of a chain: on `Result.ok v` or `Option.some v`
+  it binds `v` and goes on, and anything else is the block's answer (or
+  `alt`'s, with `let? x = e else alt;`). The parser unfolds it to a `match`
+  on `ast.success_p` (`unfold_let_try`), and an `[:ok, v]` list is not a
+  result to it. Most of the library still says "nothing there" with `()`;
+  `Option.of`/`Option.or_unit` cross over. A native answers a result as the record too
   (`make_result`). Changing what a native answers needs a staged reseed,
   because the seed runs on the new VM (docs/notes/results.md). The compiler
   also warns about an accumulator nothing forces (`dreams/src/lint.dr`).
