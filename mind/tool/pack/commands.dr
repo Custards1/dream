@@ -30,7 +30,6 @@ import std.toml;
 import manifest;
 import util;
 
-<<<<<<< HEAD:mind/tool/pack/commands.dr
 import pack.arch;
 import pack.aur;
 import pack.brew;
@@ -46,26 +45,8 @@ import pack.scratch;
 import pack.spec;
 import pack.spec.Spec;
 import pack.sums;
+import pack.item;
 import pack.tarball;
-=======
-import arch;
-import aur;
-import brew;
-import bytes;
-import compress;
-import deb;
-import installer;
-import item;
-import layout;
-import layout.Layout;
-import release;
-import rpm;
-import scratch;
-import spec;
-import spec.Spec;
-import sums;
-import tarball;
->>>>>>> main:ship/main.dr
 
 let version : :string = "0.1.0";
 
