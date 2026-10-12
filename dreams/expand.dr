@@ -203,10 +203,10 @@ let macro_target reference = match reference {
 let macro_definition l reference = {
     match macro_target reference {
         () => (),
-        [mi, name] => list.first_or () (list.filter (fn item -> match item {
+        [mi, name] => list.find (fn item -> match item {
             [:macro, n, _, _, _] => n == name,
             _ => false,
-        }) (modules.module_items (modules.module_at l mi))),
+        }) (modules.module_items (modules.module_at l mi)),
     }
 };
 

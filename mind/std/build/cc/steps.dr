@@ -37,9 +37,9 @@ import std.str;
 /// The C compiler that goes with a C++ one: `g++-14` has `gcc-14`.
 let c_for : :string -> :string;
 let c_for cxx = match [str.contains_str "clang++" cxx, str.contains_str "g++" cxx, str.contains_str "c++" cxx] {
-    [true, _, _] => str.join_str "clang" (str.split "clang++" cxx),
-    [_, true, _] => str.join_str "gcc" (str.split "g++" cxx),
-    [_, _, true] => str.join_str "cc" (str.split "c++" cxx),
+    [true, _, _] => str.replace "clang++" "clang" cxx,
+    [_, true, _] => str.replace "g++" "gcc" cxx,
+    [_, _, true] => str.replace "c++" "cc" cxx,
     _ => cxx,
 };
 
@@ -75,7 +75,7 @@ let parse : :map -> :string -> cc.Toolchain;
 let parse ctx said = {
     let [c, cxx] = compilers ctx;
     let os = build.Target.os (build.Context.target ctx);
-    let first = str.trim (list.first_or "" (str.split "\n" said));
+    let first = str.trim (list.first_or "" (str.lines said));
     match [str.ends_with "cl.exe" cxx || str.contains_str "Microsoft" said, str.contains_str "clang" said] {
         [true, _] => cc.Toolchain.set_version first cc.msvc,
         [_, true] => cc.Toolchain.make :clang :gnu os c cxx "ar" "" first "",

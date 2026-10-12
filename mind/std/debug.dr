@@ -27,6 +27,7 @@
 import std.console;
 
 import std.list;
+import std.num;
 import std.str;
 import std.vm;
 
@@ -132,14 +133,10 @@ let measure! label value = {
     let before = now! ();
     let value = strict! value;
     let after = now! ();
-    console.error! ("  " + label + str.repeat (max 1 (22 - str.byte_length label)) " "
+    console.error! ("  " + label + str.repeat (num.max 1 (22 - str.byte_length label)) " "
                     + show (since before after))
     value
 };
-
-/// Return the larger of two values.
-let max : :integer -> :integer -> :integer;
-let max a b = if a > b { a } else { b };
 
 /// The same, without printing: `[value, reading]`, for a caller collecting its
 /// own report.
@@ -163,9 +160,9 @@ let bench! label n f = {
     let value = go! n ();
     let after = now! ();
     let d = since before after;
-    console.error! ("  " + label + str.repeat (max 1 (22 - str.byte_length label)) " "
+    console.error! ("  " + label + str.repeat (num.max 1 (22 - str.byte_length label)) " "
                     + show_count n + " x "
-                    + show_duration (elapsed d / max 1 n) + "  total " + show d)
+                    + show_duration (elapsed d / num.max 1 n) + "  total " + show d)
     value
 };
 
@@ -194,9 +191,9 @@ let checkpoint! : :string -> :any -> %{ :atom => :integer };
 let checkpoint! label before = {
     let after = now! ();
     match before {
-        () => console.error! ("  " + label + str.repeat (max 1 (22 - str.byte_length label)) " "
+        () => console.error! ("  " + label + str.repeat (num.max 1 (22 - str.byte_length label)) " "
                               + "start"),
-        b => console.error! ("  " + label + str.repeat (max 1 (22 - str.byte_length label)) " "
+        b => console.error! ("  " + label + str.repeat (num.max 1 (22 - str.byte_length label)) " "
                              + show (since b after)),
     }
     after

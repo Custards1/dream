@@ -102,6 +102,13 @@ let names = [
     "_record_id",      // the atom naming what a record is
     "_record_fields",  // its fields, as an array
     "_record_of",      // one, from an id and its fields
+    "_pow",            // number -> number -> number, exact for integers
+    // String walks the machine does in one step, each of which was a list of
+    // characters built and thrown away; see "--- strings" in std.str.
+    "_str_char_count",
+    "_str_ascii_case",
+    "_str_span_back",
+    "_str_rfind",
 
 ];
 
@@ -195,6 +202,11 @@ let signatures = %{
     "_record_id" => "value -> atom, or () when it is no record",
     "_record_fields" => "record -> array of its fields, unforced",
     "_record_of" => "atom -> bool -> array -> record; the bool says it is a variant",
+    "_pow" => "number -> number -> number; exact for two integers, raising for a negative exponent",
+    "_str_char_count" => "string -> integer, its characters",
+    "_str_ascii_case" => "string -> upper:bool -> string, ASCII letters only",
+    "_str_span_back" => "string|bigstr -> until:integer -> set:string -> integer",
+    "_str_rfind" => "haystack:string -> needle:string -> from:integer -> integer",
 
 };
 
@@ -239,6 +251,11 @@ let wrappers = %{
     "_data_at" => "payload.at i",
     "_sort_keyed" => "list.sort_on key xs",
     "_error_trace!" => "error.trace! e",
+    "_pow" => "num.pow base exponent",
+    "_str_char_count" => "str.length s",
+    "_str_ascii_case" => "str.upper s",
+    "_str_span_back" => "str.span_back set until s",
+    "_str_rfind" => "str.find_last_from from needle s",
 };
 
 /// The `std` call a primitive is written as, or `()`.

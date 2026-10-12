@@ -513,7 +513,7 @@ let files! dir req = {
 /// The content type of a file, by its extension.
 let mime_type : :string -> :string;
 let mime_type path = {
-    let dot = last_index "." path;
+    let dot = str.find_last "." path;
     let ext = if dot < 0 { "" } else { str.lower (str.slice (dot + 1) (len path) path) };
     match ext {
         "html" => "text/html; charset=utf-8", "htm" => "text/html; charset=utf-8",
@@ -527,13 +527,6 @@ let mime_type path = {
         "zip" => "application/zip", "gz" => "application/gzip", "tar" => "application/x-tar",
         _ => "application/octet-stream",
     }
-};
-
-/// Find the final occurrence of a substring, or -1 when absent.
-priv let last_index : :string -> :string -> :integer;
-priv let last_index needle s = {
-    let rec go from best = { let at = str.find_from from needle s; if at < 0 { best } else { go (at + 1) at } };
-    go 0 (0 - 1)
 };
 
 // --- middleware -------------------------------------------------------------------------------

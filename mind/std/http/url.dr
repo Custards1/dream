@@ -90,7 +90,7 @@ priv let is_scheme s = {
 /// `user:password@host:port`, with `[..]` around an IPv6 host.
 priv let parse_authority : :string -> result.Of [:any] :string;
 priv let parse_authority a = {
-    let at = last_index "@" a;
+    let at = str.find_last "@" a;
     let userinfo = if at >= 0 { str.slice 0 at a } else { "" };
     let hostport = if at >= 0 { str.slice (at + 1) (len a - at - 1) a } else { a };
     let ucolon = str.find ":" userinfo;
@@ -113,13 +113,6 @@ priv let parse_authority a = {
             _ => result.error ("not a port: " + port_text),
         }
     }
-};
-
-/// Find the final occurrence of a substring, or -1 when absent.
-priv let last_index : :string -> :string -> :integer;
-priv let last_index needle s = {
-    let rec go from best = { let at = str.find_from from needle s; if at < 0 { best } else { go (at + 1) at } };
-    go 0 (0 - 1)
 };
 
 /// The URL written out again.
@@ -190,7 +183,7 @@ let resolve base reference = match parse reference {
 priv let merge_paths : Url -> :string -> :string;
 priv let merge_paths base path =
     if Url.has_authority base && Url.path base == "" { "/" + path }
-    else { str.slice 0 (last_index "/" (Url.path base) + 1) (Url.path base) + path };
+    else { str.slice 0 (str.find_last "/" (Url.path base) + 1) (Url.path base) + path };
 
 /// A path with its `.` and `..` segments taken out.
 let remove_dots : :string -> :string;

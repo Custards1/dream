@@ -77,10 +77,7 @@ let number s =
 
 /// The text before the first `sep`, and after it (`""` when there is none).
 let split_at : :string -> :string -> [:string];
-let split_at sep s = match str.find sep s {
-    i if i >= 0 => [str.slice 0 i s, str.slice (i + 1) (str.byte_length s - i - 1) s],
-    _ => [s, ""],
-};
+let split_at sep s = match str.split_once sep s { () => [s, ""], parts => parts };
 
 /// `[:ok, version]` or `[:error, why]`.
 let parse : :string -> [:ok, Version] | [:error, :string];

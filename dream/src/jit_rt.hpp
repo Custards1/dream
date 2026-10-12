@@ -135,6 +135,12 @@ int dream_rt_get(dream::Process* p, dream::Value c, dream::Value k, int32_t has_
 int dream_rt_set(dream::Process* p, dream::Value c, dream::Value k, dream::Value v,
                  dream::Value* out);
 
+/// `SetMany`: `count` pairs, `pairs[2i]` a key and `pairs[2i + 1]` its value,
+/// applied to `c` in order -- a record or an array copied once. 1 with the
+/// new container, or 0 with the error the chain of `Set`s would have raised.
+int dream_rt_set_many(dream::Process* p, dream::Value c, uint32_t count, const dream::Value* pairs,
+                      dream::Value* out);
+
 /// `thunk_for`'s read of `c.[k]`: the element, unforced, when it is already in
 /// hand -- an array in range, or within the part of a list already built -- and
 /// zero where `thunk_for` would have suspended the read. Forces nothing.

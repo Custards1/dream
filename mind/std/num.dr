@@ -6,6 +6,13 @@
 // meant to write. A call of one compiles to the primitive itself (see
 // "wrappers" in dreams/scope.dr), and the JIT recognises `to_float` and
 // `to_int` there exactly as it did when they were written bare.
+//
+// The rest of the file is what a program kept writing for itself: an exact
+// `pow`, `abs`, `min` and `max`, division that rounds down, `gcd`, and
+// integers written and read in another base.
+
+import std.list;
+import std.char;
 
 /// The same number as a float. A float is answered as it is.
 let to_float : (:integer | :float) -> :float;
@@ -58,6 +65,175 @@ let float_bytes x = _float_bytes x;
 let float_of_bytes : :string -> :float;
 let float_of_bytes s = _float_of_bytes s;
 
+// --- powers ---------------------------------------------------------------
+
+/// `base` to the power `exponent`, by repeated multiplication: an integer
+/// base answers the exact integer -- a bignum once it outgrows a fixnum -- so
+/// `pow 2 100` is `1267650600228229401496703205376`, not a float near it, and
+/// a float base answers a float. The answer is the base's kind, which is why
+/// an integer to a negative power raises: the fraction is `pow 2.0 (0 - 1)`.
+/// For a fractional exponent, `math.pow`.
+///
+/// The machine squares (`_pow`); every package used to write the loop of `*`
+/// again, and it was a call per factor.
+///
+/// ```dream
+/// import std.num;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (num.pow 2 64)
+/// };
+/// ```
+let pow : n -> :integer -> n;
+let pow base exponent = _pow base exponent;
+
+// --- signs and bounds -------------------------------------------------------
+//
+// Each answers a number of the kind it was given: `abs` of an integer is an
+// integer and of a float a float, which is why these are written over a
+// variable and not over `:integer | :float`.
+
+/// The magnitude: `abs (0 - 3)` is `3`.
+let abs : n -> n;
+let abs n = if n < 0 { 0 - n } else { n };
+
+/// `-1`, `0` or `1`, as the number is below, at or above zero. An integer
+/// either way, so it can multiply anything.
+let sign : (:integer | :float) -> :integer;
+let sign n = if n < 0 { 0 - 1 } else if n > 0 { 1 } else { 0 };
+
+/// The smaller of two, the first when they are equal.
+let min : n -> n -> n;
+let min a b = if b < a { b } else { a };
+
+/// The larger of two, the first when they are equal.
+let max : n -> n -> n;
+let max a b = if b > a { b } else { a };
+
+/// `n` held within `low` and `high`, both included: `clamp 0 10 12` is `10`.
+/// The number comes last so `list.map (num.clamp 0 255) xs` reads as it should.
+let clamp : n -> n -> n -> n;
+let clamp low high n = if n < low { low } else if n > high { high } else { n };
+
+// --- integer division -------------------------------------------------------
+//
+// `/` and `%` on integers truncate toward zero, as C does: `(0 - 7) / 2` is
+// `-3` and `(0 - 7) % 2` is `-1`. That is the right answer for a byte count
+// and the wrong one for anything that wraps -- a day of the week, a bucket,
+// a ring buffer's slot -- where `-1` must mean the last one. These round
+// toward negative infinity instead, so the remainder takes the divisor's sign
+// and `modulo (0 - 1) 7` is `6`.
+
+/// The quotient rounded down: `div_floor (0 - 7) 2` is `-4`.
+let div_floor : :integer -> :integer -> :integer;
+let div_floor a b = {
+    let q = a / b;
+    if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+};
+
+/// The remainder that goes with `div_floor`: zero or of the divisor's sign.
+let modulo : :integer -> :integer -> :integer;
+let modulo a b = {
+    let r = a % b;
+    if r != 0 && ((r < 0) != (b < 0)) { r + b } else { r }
+};
+
+/// Test whether an integer is divisible by two.
+let is_even : :integer -> :bool;
+let is_even n = n % 2 == 0;
+
+/// Test whether an integer leaves a remainder when divided by two.
+let is_odd : :integer -> :bool;
+let is_odd n = n % 2 != 0;
+
+/// The greatest common divisor, never negative; `gcd 0 0` is `0`.
+let gcd : :integer -> :integer -> :integer;
+let gcd a b = euclid (abs a) (abs b);
+
+/// Euclid's algorithm on two numbers already made non-negative.
+priv let euclid : :integer -> :integer -> :integer;
+priv let rec euclid !a !b = if b == 0 { a } else { euclid b (a % b) };
+
+/// The least common multiple, never negative; `0` when either is.
+let lcm : :integer -> :integer -> :integer;
+let lcm a b = if a == 0 || b == 0 { 0 } else { abs (a / gcd a b * b) };
+
+// --- floats to integers -----------------------------------------------------
+//
+// `to_int` truncates and `math.floor` rounds down. These are the other two
+// directions, and each answers an integer, as `floor` does.
+
+/// The least integer not below `x`.
+let ceil : (:integer | :float) -> :integer;
+let ceil x = {
+    let t = _to_int x;
+    if x > t { t + 1 } else { t }
+};
+
+/// The nearest integer, a half rounding away from zero: `round 2.5` is `3` and
+/// `round (0.0 - 2.5)` is `-3`.
+let round : (:integer | :float) -> :integer;
+let round x = {
+    let t = _to_int x;
+    if x == t { t } else if x < 0 { 0 - _to_int (0.5 - x) } else { _to_int (x + 0.5) }
+};
+
+// --- written in another base ------------------------------------------------
+
+priv let digit_chars : :string;
+priv let digit_chars = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// `n` written in `base`, from 2 to 36, lowercase and with a `-` for a negative
+/// number and no prefix: `to_base 16 255` is `"ff"`.
+/// Any other base raises `:type_error`, as a `where` refinement does.
+let to_base : :integer -> :integer -> :string;
+let to_base base n = {
+    let b = type_assert (base >= 2 && base <= 36) "a base from 2 to 36" base;
+    if n < 0 { "-" + _str_concat (base_digits b (0 - n) []) }
+    else if n == 0 { "0" }
+    else { _str_concat (base_digits b n []) }
+};
+
+/// The digits of a positive `n` in `base`, most significant first, in front of `acc`.
+priv let base_digits : :integer -> :integer -> [:string] -> [:string];
+priv let rec base_digits base !n !acc =
+    if n == 0 { acc }
+    else { base_digits base (n / base) (_list_cons (_str_slice digit_chars (n % base) 1) acc) };
+
+/// `n` in lowercase hexadecimal, at least `width` digits, zeros in front:
+/// `hex 4 255` is `"00ff"`. What a byte dump or an escape wants.
+let hex : :integer -> :integer -> :string;
+let hex width n = {
+    let digits = to_base 16 n;
+    let short = width - len digits;
+    if short > 0 { _str_concat (list.replicate short "0") + digits } else { digits }
+};
+
+/// The integer `text` writes in `base`, from 2 to 36, either case, an optional
+/// sign in front -- or `()` for text that is not one. No prefix: the caller
+/// that accepts `0x` strips it, because only the caller knows whether it may.
+let parse_base : :integer -> :string -> (:integer | :unit);
+let parse_base base text = {
+    let cs = _str_chars text;
+    let digits = match cs { ['-', ..rest] => rest, ['+', ..rest] => rest, _ => cs };
+    let negative = match cs { ['-', .._] => true, _ => false };
+    let rec go !acc ds = match ds {
+        [] => acc,
+        [d, ..rest] => match char.digit_value d {
+            () => (),
+            v => if v >= base { () } else { go (acc * base + v) rest },
+        },
+    };
+    if base < 2 || base > 36 || list.is_empty digits { () }
+    else {
+        match go 0 digits {
+            () => (),
+            v => if negative { 0 - v } else { v },
+        }
+    }
+};
+
 when test {
     import std.test;
 
@@ -68,5 +244,51 @@ when test {
         test.case "a float numeral"      $( test.eq! [2.5, ()] [parse_float "2.5", parse_float "x"] ),
         test.case "eight bytes and back" $( test.eq! [8, 1.5] [len (float_bytes 1.5),
                                                               float_of_bytes (float_bytes 1.5)] ),
+
+        test.case "an integer power is exact"
+            $( test.eq! [1, 1024, 1267650600228229401496703205376, 0 - 27]
+                        [pow 7 0, pow 2 10, pow 2 100, pow (0 - 3) 3] ),
+        test.case "a bignum to a power"
+            $( test.eq! (pow 2 200) (pow (pow 2 100) 2) ),
+        test.case "a float base is a float"
+            $( test.eq! [0.5, 6.25, 1.0] [pow 2.0 (0 - 1), pow 2.5 2, pow 3.0 0] ),
+        test.case "an integer to a negative power raises"
+            $( test.raises! $( strict! (pow 2 (0 - 1)) ) ),
+        test.case "a huge exponent of 1 and -1"
+            $( test.eq! [1, 0 - 1, 1] [pow 1 (pow 2 70), pow (0 - 1) (pow 2 70 + 1), pow (0 - 1) (pow 2 70)] ),
+        test.case "a huge exponent of anything else raises"
+            $( test.raises! $( strict! (pow 2 (pow 2 70)) ) ),
+
+        test.case "abs"                  $( test.eq! [3, 3, 2.5] [abs (0 - 3), abs 3, abs (0.0 - 2.5)] ),
+        test.case "sign"                 $( test.eq! [0 - 1, 0, 1] [sign (0 - 4), sign 0, sign 0.5] ),
+        test.case "min and max"          $( test.eq! [1, 2, 1.5] [min 1 2, max 1 2, min 2 1.5] ),
+        test.case "clamp"                $( test.eq! [0, 5, 10] [clamp 0 10 (0 - 3), clamp 0 10 5, clamp 0 10 12] ),
+
+        test.case "div_floor"            $( test.eq! [3, 0 - 4, 0 - 4, 3] [div_floor 7 2, div_floor (0 - 7) 2,
+                                                                         div_floor 7 (0 - 2), div_floor (0 - 7) (0 - 2)] ),
+        test.case "modulo takes the divisor's sign"
+            $( test.eq! [1, 1, 0 - 1, 0 - 1, 0] [modulo 7 2, modulo (0 - 7) 2, modulo 7 (0 - 2),
+                                                 modulo (0 - 7) (0 - 2), modulo (0 - 6) 3] ),
+        test.case "div_floor and modulo agree"
+            $( test.true! (list.all (fn [a, b] -> div_floor a b * b + modulo a b == a)
+                                    [[7, 3], [0 - 7, 3], [7, 0 - 3], [0 - 7, 0 - 3], [0, 5]]) ),
+        test.case "even and odd"         $( test.eq! [true, false, true] [is_even 4, is_even (0 - 3), is_odd (0 - 3)] ),
+        test.case "gcd"                  $( test.eq! [6, 6, 5, 0] [gcd 12 18, gcd (0 - 12) 18, gcd 0 5, gcd 0 0] ),
+        test.case "lcm"                  $( test.eq! [36, 0, 12] [lcm 12 18, lcm 0 3, lcm (0 - 4) 6] ),
+
+        test.case "ceil"                 $( test.eq! [3, 0 - 2, 2] [ceil 2.1, ceil (0.0 - 2.9), ceil 2] ),
+        test.case "round"                $( test.eq! [3, 2, 0 - 3, 0 - 2] [round 2.5, round 2.4,
+                                                                         round (0.0 - 2.5), round (0.0 - 2.4)] ),
+
+        test.case "to_base"              $( test.eq! ["ff", "101", "0", "-z"] [to_base 16 255, to_base 2 5,
+                                                                              to_base 10 0, to_base 36 (0 - 35)] ),
+        test.case "to_base of a bignum"  $( test.eq! ("1" + _str_concat (list.replicate 25 "0")) (to_base 16 (pow 2 100)) ),
+        test.case "to_base refuses base 1" $( test.raises! $( strict! (to_base 1 5) ) ),
+        test.case "hex pads"             $( test.eq! ["00ff", "1234"] [hex 4 255, hex 2 4660] ),
+        test.case "parse_base"           $( test.eq! [255, 255, 0 - 5, (), (), ()]
+                                                     [parse_base 16 "ff", parse_base 16 "FF", parse_base 2 "-101",
+                                                      parse_base 2 "102", parse_base 16 "", parse_base 16 "-"] ),
+        test.case "parse_base round trip"
+            $( test.eq! (pow 3 50) (parse_base 7 (to_base 7 (pow 3 50))) ),
     ];
 }

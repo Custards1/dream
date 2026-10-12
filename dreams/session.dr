@@ -75,7 +75,7 @@ let write_file! path text =
 /// names it is telling the reader about the REPL rather than about their
 /// program. The line and column are worth keeping -- they point into the
 /// session as `:list` prints it -- so only the path is replaced.
-let as_session path text = str.join_str "session" (str.split path text);
+let as_session path text = str.replace path "session" text;
 
 // --- what is carried ---------------------------------------------------------------
 //

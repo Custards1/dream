@@ -195,6 +195,10 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
             std::snprintf(buf, sizeof buf, "/%u", n.b);
             out += buf;
             break;
+        case Op::SetMany:
+            std::snprintf(buf, sizeof buf, "/%u", n.c);
+            out += buf;
+            break;
         case Op::Bind:
             std::snprintf(buf, sizeof buf, " $%u", n.a);
             out += buf;
@@ -252,6 +256,10 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
             dump_node(img, n.a, depth + 1, out);
             dump_node(img, n.b, depth + 1, out);
             if (n.c != NO_NODE) dump_node(img, n.c, depth + 1, out);
+            break;
+        case Op::SetMany:
+            dump_node(img, n.a, depth + 1, out);
+            dump_kids(img, n.b, n.c * 2, depth + 1, out);
             break;
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:

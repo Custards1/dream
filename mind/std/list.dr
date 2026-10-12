@@ -291,6 +291,156 @@ let flat_map f xs = concat (map f xs);
 let enumerate : [a] -> [[:integer, a]];
 let enumerate xs = zip (from 0) xs;
 
+/// `f` applied to corresponding elements, stopping when either list ends:
+/// `zip_with (fn a b -> a + b) xs ys` without the pairs `zip` would build.
+let zip_with : (a -> b -> c) -> [a] -> [b] -> [c];
+let rec zip_with f xs ys =
+    if _list_is_empty xs { [] }
+    else if _list_is_empty ys { [] }
+    else { _list_cons (f (xs.[0]) (ys.[0])) (zip_with f (_list_tail xs) (_list_tail ys)) };
+
+/// The firsts and the seconds of a list of pairs: `zip` undone.
+let unzip : [[a, b]] -> [[a], [b]];
+let unzip ps = [map (fn p -> p.[0]) ps, map (fn p -> p.[1]) ps];
+
+/// The running fold: `init`, then each accumulator `fold` would pass through,
+/// so `scan (fn a b -> a + b) 0 [1, 2, 3]` is `[0, 1, 3, 6]` and its last is
+/// what `fold` answers. Lazy in the spine, so it runs over an endless list;
+/// each accumulator is forced as the cell after it is asked for, which is
+/// what keeps a long scan from becoming a chain of suspended additions.
+let scan : (b -> a -> b) -> b -> [a] -> [b];
+let rec scan f !acc xs =
+    _list_cons acc (if _list_is_empty xs { [] } else { scan f (f acc (xs.[0])) (_list_tail xs) });
+
+/// The endless list `x, f x, f (f x), ..`. Each value is forced before the
+/// next is made, for the reason `scan` gives.
+let iterate : (a -> a) -> a -> [a];
+let rec iterate f !x = _list_cons x (iterate f (f x));
+
+/// The list's elements over and over, without end; the empty list for an empty
+/// one, which has nothing to repeat.
+///
+/// Not `xs + cycle xs`: `+` forces both sides before it looks at either, so
+/// that recursion never answers a first cell.
+let cycle : [a] -> [a];
+let cycle xs = if _list_is_empty xs { [] } else { cycle_through xs xs };
+
+/// The rest of `xs`, then `whole` again from its start, without end.
+priv let cycle_through : [a] -> [a] -> [a];
+priv let rec cycle_through whole xs =
+    if _list_is_empty xs { cycle_through whole whole }
+    else { _list_cons (xs.[0]) (cycle_through whole (_list_tail xs)) };
+
+/// `sep` between each pair of elements: `intersperse 0 [1, 2, 3]` is
+/// `[1, 0, 2, 0, 3]`.
+let intersperse : a -> [a] -> [a];
+let intersperse sep xs =
+    if _list_is_empty xs { [] } else { _list_cons (xs.[0]) (before_each sep (_list_tail xs)) };
+
+/// Each element of `xs` with `sep` in front of it.
+priv let before_each : a -> [a] -> [a];
+priv let rec before_each sep xs =
+    if _list_is_empty xs { [] }
+    else { _list_cons sep (_list_cons (xs.[0]) (before_each sep (_list_tail xs))) };
+
+/// The list cut into runs of `n`, the last one shorter when `n` does not
+/// divide the length: `chunks 2 [1, 2, 3]` is `[[1, 2], [3]]`. An `n` below
+/// one is taken as one, since a chunk of nothing would never get anywhere.
+/// Lazy, so a stream can be read in batches.
+let chunks : :integer -> [a] -> [[a]];
+let rec chunks n xs =
+    if _list_is_empty xs { [] }
+    else {
+        let k = if n < 1 { 1 } else { n };
+        _list_cons (take k xs) (chunks k (drop k xs))
+    };
+
+/// Every run of `n` consecutive elements, overlapping, in order:
+/// `windows 2 [1, 2, 3]` is `[[1, 2], [2, 3]]` -- the shape of a difference
+/// between neighbours or a moving average. Empty for an `n` below one or a
+/// list shorter than `n`.
+let windows : :integer -> [a] -> [[a]];
+let rec windows n xs = {
+    let w = take n xs;
+    if n < 1 || len w < n { [] } else { _list_cons w (windows n (_list_tail xs)) }
+};
+
+/// `[take n xs, drop n xs]`.
+let split_at : :integer -> [a] -> [[a], [a]];
+let split_at n xs = [take n xs, drop n xs];
+
+/// `[take_while keep xs, drop_while keep xs]`: the leading run that satisfies
+/// `keep`, and everything from the first element that does not.
+let split_while : (a -> :bool) -> [a] -> [[a], [a]];
+let split_while keep xs = [take_while keep xs, drop_while keep xs];
+
+/// `f` of each element, keeping only what is not `()` -- a `map` and a
+/// `filter` in one walk, for the many functions in this library and outside it
+/// that answer `()` for "nothing here".
+let filter_map : (a -> b) -> [a] -> [b];
+let rec filter_map f xs =
+    if _list_is_empty xs { [] }
+    else {
+        let y = f (xs.[0]);
+        let rest = filter_map f (_list_tail xs);
+        if y == () { rest } else { _list_cons y rest }
+    };
+
+/// The list without its `()` elements: what a list literal of optional parts
+/// -- `[a, if b { c } else { () }, d]` -- or a `map` of a function that may
+/// find nothing wants before it is used.
+let compact : [a] -> [a];
+let compact xs = filter (fn x -> x != ()) xs;
+
+/// The first element for each `key`, in order. The keys are kept in a map, so
+/// this is linear where `unique` is quadratic -- and a key is compared as a
+/// map compares it: by value for numbers, strings, atoms and the other flat
+/// types, by identity for anything else. Key on something flat.
+let unique_on : (a -> k) -> [a] -> [a];
+let unique_on key xs = unique_on_from %{} key xs;
+
+/// `unique_on`, with the keys already seen.
+priv let unique_on_from : %{ k => :bool } -> (a -> k) -> [a] -> [a];
+priv let rec unique_on_from seen key xs =
+    if _list_is_empty xs { [] }
+    else {
+        let x = xs.[0];
+        let k = key x;
+        if _map_has seen k { unique_on_from seen key (_list_tail xs) }
+        else { _list_cons x (unique_on_from (seen.[k => true]) key (_list_tail xs)) }
+    };
+
+/// Rows made columns: `transpose [[1, 2], [3, 4]]` is `[[1, 3], [2, 4]]`. A
+/// short row ends the result where it ends, as `zip` does.
+let transpose : [[a]] -> [[a]];
+let rec transpose rows =
+    if _list_is_empty rows || any (fn r -> _list_is_empty r) rows { [] }
+    else { _list_cons (map (fn r -> r.[0]) rows) (transpose (map (fn r -> _list_tail r) rows)) };
+
+/// The last `n` elements, or all of them when there are fewer. Walks the
+/// spine to find its length.
+let take_last : :integer -> [a] -> [a];
+let take_last n xs = drop (len xs - n) xs;
+
+/// All but the last `n` elements. Walks the spine to find its length.
+let drop_last : :integer -> [a] -> [a];
+let drop_last n xs = take (len xs - n) xs;
+
+/// The list without the element at `i`; as it was when there is none there.
+let remove_at : :integer -> [a] -> [a];
+let rec remove_at i xs =
+    if i < 0 || _list_is_empty xs { xs }
+    else if i == 0 { _list_tail xs }
+    else { _list_cons (xs.[0]) (remove_at (i - 1) (_list_tail xs)) };
+
+/// The list with `x` placed at index `i`, the elements from there on moved
+/// one along. An `i` past the end puts `x` at the end; one below zero, at the
+/// front.
+let insert_at : :integer -> a -> [a] -> [a];
+let rec insert_at i x xs =
+    if i <= 0 || _list_is_empty xs { _list_cons x xs }
+    else { _list_cons (xs.[0]) (insert_at (i - 1) x (_list_tail xs)) };
+
 // --- asking -----------------------------------------------------------------
 
 /// Test whether any element satisfies `pred`; stop at the first match.
@@ -314,6 +464,33 @@ let contains x xs = any (fn y -> y == x) xs;
 /// Count elements satisfying `pred`.
 let count : (a -> :bool) -> [a] -> :integer;
 let count pred xs = fold_strict (fn acc x -> if pred x { acc + 1 } else { acc }) 0 xs;
+
+/// The first element satisfying `pred`, or `()` when none does. Stops at the
+/// first match, so it finds one in an endless list.
+let find : (a -> :bool) -> [a] -> a;
+let rec find pred xs =
+    if _list_is_empty xs { () }
+    else if pred (xs.[0]) { xs.[0] }
+    else { find pred (_list_tail xs) };
+
+/// The index of the first element satisfying `pred`, or -1.
+let find_index : (a -> :bool) -> [a] -> :integer;
+let find_index pred xs = find_index_from 0 pred xs;
+
+/// `find_index`, counting positions from `i`.
+priv let find_index_from : :integer -> (a -> :bool) -> [a] -> :integer;
+priv let rec find_index_from !i pred xs =
+    if _list_is_empty xs { 0 - 1 }
+    else if pred (xs.[0]) { i }
+    else { find_index_from (i + 1) pred (_list_tail xs) };
+
+/// Test whether `xs` begins with the elements of `prefix`, in order.
+let starts_with : [a] -> [a] -> :bool;
+let rec starts_with prefix xs =
+    if _list_is_empty prefix { true }
+    else if _list_is_empty xs { false }
+    else if prefix.[0] == xs.[0] { starts_with (_list_tail prefix) (_list_tail xs) }
+    else { false };
 
 /// Search for `x`, counting positions from `i`; return -1 when absent.
 let index_of_from : :integer -> a -> [a] -> :integer;
@@ -369,6 +546,30 @@ let maximum : [a] -> a;
 let maximum xs =
     if _list_is_empty xs { () }
     else { min_by_from (xs.[0]) (fn a b -> compare a b > 0) (_list_tail xs) };
+
+/// The element whose `key` is smallest, the first of any that tie, or `()` for
+/// an empty list. `key` is asked once per element.
+let minimum_on : (a -> b) -> [a] -> a;
+let minimum_on key xs =
+    if _list_is_empty xs { () }
+    else { best_on (fn a b -> compare a b < 0) key (xs.[0]) (key (xs.[0])) (_list_tail xs) };
+
+/// The element whose `key` is largest, the first of any that tie, or `()`.
+let maximum_on : (a -> b) -> [a] -> a;
+let maximum_on key xs =
+    if _list_is_empty xs { () }
+    else { best_on (fn a b -> compare a b > 0) key (xs.[0]) (key (xs.[0])) (_list_tail xs) };
+
+/// The element `better` ranks first by key, given the best so far and its key.
+priv let best_on : (b -> b -> :bool) -> (a -> b) -> a -> b -> [a] -> a;
+priv let rec best_on better key best !best_key xs =
+    if _list_is_empty xs { best }
+    else {
+        let x = xs.[0];
+        let k = key x;
+        if better k best_key { best_on better key x k (_list_tail xs) }
+        else { best_on better key best best_key (_list_tail xs) }
+    };
 
 /// The elements that satisfy `pred`, then those that do not.
 let partition : (a -> :bool) -> [a] -> [[a], [a]];
@@ -535,6 +736,39 @@ when test {
         test.case "concat"              $( test.eq! [1, 2, 3] (concat [[1], [], [2, 3]]) ),
         test.case "flat_map"            $( test.eq! [1, 1, 2, 2] (flat_map (fn x -> [x, x]) [1, 2]) ),
         test.case "enumerate"           $( test.eq! [[0, :a], [1, :b]] (enumerate [:a, :b]) ),
+        test.case "zip_with"            $( test.eq! [11, 22] (zip_with (fn a b -> a + b) [1, 2, 3] [10, 20]) ),
+        test.case "unzip"               $( test.eq! [[1, 2], [:a, :b]] (unzip [[1, :a], [2, :b]]) ),
+        test.case "scan"                $( test.eq! [0, 1, 3, 6] (scan (fn a b -> a + b) 0 [1, 2, 3]) ),
+        test.case "scan of empty"       $( test.eq! [7] (scan (fn a b -> a + b) 7 []) ),
+        test.case "scan's last is fold's answer"
+            $( test.eq! (fold_strict (fn a b -> a + b) 0 (range 0 200000))
+                        (last (scan (fn a b -> a + b) 0 (range 0 200000))) ),
+        test.case "scan over an infinite list" $( test.eq! [0, 0, 1, 3] (take 4 (scan (fn a b -> a + b) 0 (from 0))) ),
+        test.case "iterate"             $( test.eq! [1, 2, 4, 8] (take 4 (iterate (fn x -> x * 2) 1)) ),
+        test.case "cycle"               $( test.eq! [1, 2, 1, 2, 1] (take 5 (cycle [1, 2])) ),
+        test.case "cycle of empty"      $( test.empty! (cycle []) ),
+        test.case "intersperse"         $( test.eq! [1, 0, 2, 0, 3] (intersperse 0 [1, 2, 3]) ),
+        test.case "intersperse short"   $( test.eq! [[], [1]] [intersperse 0 [], intersperse 0 [1]] ),
+        test.case "chunks"              $( test.eq! [[1, 2], [3, 4], [5]] (chunks 2 [1, 2, 3, 4, 5]) ),
+        test.case "chunks of nothing"   $( test.empty! (chunks 3 []) ),
+        test.case "chunks below one"    $( test.eq! [[1], [2]] (chunks 0 [1, 2]) ),
+        test.case "chunks of an infinite list" $( test.eq! [[0, 1], [2, 3]] (take 2 (chunks 2 (from 0))) ),
+        test.case "windows"             $( test.eq! [[1, 2], [2, 3]] (windows 2 [1, 2, 3]) ),
+        test.case "windows too wide"    $( test.eq! [[], []] [windows 4 [1, 2, 3], windows 0 [1]] ),
+        test.case "split_at"            $( test.eq! [[1], [2, 3]] (split_at 1 [1, 2, 3]) ),
+        test.case "split_while"         $( test.eq! [[1, 2], [3, 1]] (split_while (fn x -> x < 3) [1, 2, 3, 1]) ),
+        test.case "filter_map"          $( test.eq! [20, 40] (filter_map (fn x -> if x % 2 == 0 { x * 10 } else { () }) [1, 2, 3, 4]) ),
+        test.case "compact"             $( test.eq! [1, 2] (compact [(), 1, (), 2]) ),
+        test.case "unique_on"           $( test.eq! [[1, :a], [2, :b]] (unique_on (fn p -> head p) [[1, :a], [2, :b], [1, :c]]) ),
+        test.case "transpose"           $( test.eq! [[1, 3], [2, 4]] (transpose [[1, 2], [3, 4]]) ),
+        test.case "transpose of ragged rows" $( test.eq! [[1, 3]] (transpose [[1, 2], [3]]) ),
+        test.case "transpose of nothing" $( test.empty! (transpose []) ),
+        test.case "take_last"           $( test.eq! [[2, 3], [1, 2, 3]] [take_last 2 [1, 2, 3], take_last 9 [1, 2, 3]] ),
+        test.case "drop_last"           $( test.eq! [[1], []] [drop_last 2 [1, 2, 3], drop_last 9 [1, 2, 3]] ),
+        test.case "remove_at"           $( test.eq! [[1, 3], [1, 2, 3], [1, 2, 3]]
+                                                    [remove_at 1 [1, 2, 3], remove_at 5 [1, 2, 3], remove_at (0 - 1) [1, 2, 3]] ),
+        test.case "insert_at"           $( test.eq! [[1, 9, 2], [9, 1, 2], [1, 2, 9]]
+                                                    [insert_at 1 9 [1, 2], insert_at 0 9 [1, 2], insert_at 7 9 [1, 2]] ),
 
         test.case "any"                 $( test.true! (any (fn x -> x > 2) [1, 3]) ),
         test.case "any on empty"        $( test.false! (any (fn x -> true) []) ),
@@ -544,6 +778,15 @@ when test {
         test.case "count"               $( test.eq! 2 (count (fn x -> x > 1) [1, 2, 3]) ),
         test.case "index_of"            $( test.eq! 1 (index_of :b [:a, :b]) ),
         test.case "index_of missing"    $( test.eq! (0 - 1) (index_of :z [:a]) ),
+        test.case "find"                $( test.eq! [3, ()] [find (fn x -> x > 2) [1, 3, 4], find (fn x -> x > 9) [1]] ),
+        test.case "find in an infinite list" $( test.eq! 10 (find (fn x -> x * x > 90) (from 0)) ),
+        test.case "find_index"          $( test.eq! [1, 0 - 1] [find_index (fn x -> x > 2) [1, 3], find_index (fn x -> x > 9) [1]] ),
+        test.case "starts_with"         $( test.eq! [true, true, false, false]
+                                                    [starts_with [1, 2] [1, 2, 3], starts_with [] [1],
+                                                     starts_with [1, 3] [1, 2, 3], starts_with [1, 2] [1]] ),
+        test.case "minimum_on"          $( test.eq! "a" (minimum_on (fn s -> len s) ["abc", "a", "b"]) ),
+        test.case "maximum_on"          $( test.eq! "abc" (maximum_on (fn s -> len s) ["a", "abc", "xyz"]) ),
+        test.case "minimum_on of empty" $( test.eq! () (minimum_on (fn x -> x) []) ),
         test.case "sum"                 $( test.eq! 6 (sum [1, 2, 3]) ),
         test.case "sum of empty"        $( test.eq! 0 (sum []) ),
         test.case "product"             $( test.eq! 24 (product [1, 2, 3, 4]) ),

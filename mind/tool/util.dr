@@ -16,7 +16,7 @@ import std.str;
 // Windows accepts both separators. Keep the platform query at runtime so
 // this compiler image can be copied unchanged between operating systems.
 let slashes p = match os.platform () {
-    :windows => str.join_str "/" (str.split "\\" p),
+    :windows => str.replace "\\" "/" p,
     _ => p,
 };
 

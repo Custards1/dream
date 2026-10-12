@@ -73,6 +73,14 @@ enum class Op : uint8_t {
     // literal's items are; `c` is the atom naming what it is, with
     // `RECORD_MAKE_VARIANT` set when that is a union's variant.
     RecordMake = 81,
+    // Several changes to one container at once: `a` is the container, `b` a
+    // kids offset and `c` a count of pairs, the kids `k0, v0, k1, v1, ..`.
+    // Every key is an int or atom constant, and each value is stored unforced,
+    // as `Set` stores one. It answers what the chain of `Set`s it replaces
+    // would -- a later key winning, the same error at the same key -- and
+    // copies a record or an array once rather than once per key: what a
+    // pipeline of setters (`p |> P.set_a 1 |> P.set_b 2`) is lowered to.
+    SetMany = 82,
     Count
 };
 

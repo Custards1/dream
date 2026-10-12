@@ -55,7 +55,7 @@ let file_name p = Program.name p + ".dream";
 
 /// The lines of a compile's output that are warnings.
 let warnings : [:string] -> :string;
-let warnings [log] = str.join_str "\n" (list.filter (fn l -> str.contains_str "warning:" l) (str.split "\n" log));
+let warnings [log] = str.join_str "\n" (list.filter (fn l -> str.contains_str "warning:" l) (str.lines log));
 
 /// The step that compiles the program.
 let image : Program -> :map;

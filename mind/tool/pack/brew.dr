@@ -49,14 +49,14 @@ import pack.spec.Spec;
 /// and `@` is spelled `AT`, as Homebrew spells `python@3.12`'s.
 let class_name : :string -> :string;
 let class_name name = {
-    let spelled = str.join_str "AT" (str.split "@" name);
-    let words = list.filter (fn w -> w != "") (str.split "-" (str.join_str "-" (str.split "_" (str.join_str "-" (str.split "." spelled)))));
-    str.concat_all (list.map (fn w -> str.upper (str.slice 0 1 w) + str.slice 1 (str.byte_length w - 1) w) words)
+    let spelled = str.replace "@" "AT" name;
+    let words = list.filter (fn w -> w != "") (str.split "-" (str.replace "_" "-" (str.replace "." "-" spelled)));
+    str.concat_all (list.map str.capitalize words)
 };
 
 /// A Ruby string literal, with what Ruby would read inside one escaped.
 let quote : :string -> :string;
-let quote s = "\"" + str.join_str "\\#{" (str.split "#{" (str.join_str "\\\"" (str.split "\"" (str.join_str "\\\\" (str.split "\\" s))))) + "\"";
+let quote s = "\"" + (s |> str.replace "\\" "\\\\" |> str.replace "\"" "\\\"" |> str.replace "#{" "\\#{") + "\"";
 
 let fetch : :string -> Asset -> :string;
 let fetch indent a = indent + "url " + quote (Asset.url a) + "\n" + indent + "sha256 " + quote (Asset.sha256 a) + "\n";

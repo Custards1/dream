@@ -40,6 +40,7 @@ const char* cont_kind_name(ContKind k) {
         case ContKind::SwitchOn: return "switch_on";
         case ContKind::SwitchKey: return "switch_key";
         case ContKind::EnterRetry: return "enter_retry";
+        case ContKind::SetManyStep: return "set_many_step";
     }
     return "?";
 }

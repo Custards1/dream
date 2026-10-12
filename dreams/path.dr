@@ -33,7 +33,7 @@ let separator = "/";
 // this compiler image can be copied unchanged between operating systems.
 let slashes : :string -> :string;
 let slashes p = match os.platform () {
-    :windows => str.join_str "/" (str.split "\\" p),
+    :windows => str.replace "\\" "/" p,
     _ => p,
 };
 
@@ -80,7 +80,7 @@ let dirname : :string -> :string;
 let dirname original = {
     let p = slashes original;
     let anchor = root p;
-    let at = last_index separator p 0 (0 - 1);
+    let at = str.find_last separator p;
     match at {
         _ if at < 0 => ".",
         _ if at < str.byte_length anchor => anchor,
@@ -125,25 +125,19 @@ let rec join_all base parts =
 // The dot has to be in the last segment to count: `../lib` has no extension,
 // and treating `.` and `..` as one is how a path walk loses a directory.
 
-/// Where `needle` last occurs in `p` at or after `from`, or `-1`. It hops from
-/// one occurrence to the next with `_str_find`, which the machine does, rather
-/// than reading a character at a time: loading a program asks this of every
-/// path it tries, and the character walk it replaces was a tenth of a warm
-/// build's loading.
-let last_index : :string -> :string -> :integer -> :integer -> :integer;
-let rec last_index needle p from best = match str.find_from from needle p {
-    at if at < 0 => best,
-    at => last_index needle p (at + 1) at,
-};
-
 /// The dot's offset, or `-1`. A leading dot names a hidden file rather than
 /// starting an extension, so `.gitignore` has none, and a dot before the last
 /// separator is in a directory's name, not the file's.
+///
+/// Both searches are `str.find_last`, one machine scan from the end: loading a
+/// program asks this of every path it tries, and the character walk it
+/// replaced, and then a hop from one forward `find` to the next, were each in
+/// turn a visible part of a warm build's loading.
 let dot_at : :string -> :integer;
 let dot_at original = {
     let p = slashes original;
-    let base_at = last_index separator p 0 (0 - 1) + 1;
-    let at = last_index "." p base_at (0 - 1);
+    let base_at = str.find_last separator p + 1;
+    let at = str.find_last "." p;
     if at <= base_at { 0 - 1 } else { at }
 };
 

@@ -153,7 +153,7 @@ let to_hours d = num.to_float d / 3600000000000.0;
 
 /// The magnitude of a duration.
 let abs : Duration -> Duration;
-let abs d = if d < 0 { 0 - d } else { d };
+let abs d = num.abs d;
 
 /// `d` rounded down to a multiple of `unit`, toward negative infinity: a
 /// timestamp floored to the minute is `floor_to time.minute t`.
@@ -555,10 +555,7 @@ priv let fraction nano =
 let pad : :integer -> :integer -> :string;
 let pad width n =
     if n < 0 { "-" + pad width (0 - n) }
-    else {
-        let digits = to_string n;
-        str.repeat (width - len digits) "0" + digits
-    };
+    else { str.pad_start width "0" (to_string n) };
 
 /// Format a year for date-time output.
 priv let year_text : :integer -> :string;
@@ -661,7 +658,7 @@ priv let expand_pattern : :string -> :string;
 priv let expand_pattern p =
     if str.find "%" p < 0 { p }
     else {
-        list.fold (fn acc [from, to] -> str.join_str to (str.split from acc)) p
+        list.fold (fn acc [from, to] -> str.replace from to acc) p
                   [["%%", "\u{1}"], ["%F", "%Y-%m-%d"], ["%T", "%H:%M:%S"], ["%R", "%H:%M"],
                    ["%D", "%m/%d/%y"], ["%r", "%I:%M:%S %p"], ["%c", "%a %b %e %H:%M:%S %Y"],
                    ["\u{1}", "%%"]]
@@ -903,7 +900,7 @@ let parse_iso text = {
             let frac = if str.byte after_clock rest == 46 || str.byte after_clock rest == 44 { ".%N" } else { "" };
             let date_part = str.slice 0 10 s;
             let pattern = "%Y-%m-%dT" + clock + frac + "%z";
-            let cleaned = date_part + "T" + str.join_str "." (str.split "," rest);
+            let cleaned = date_part + "T" + str.replace "," "." rest;
             match parse pattern cleaned {
                 [:error, why] => if parse_local_ok (date_part + "T" + rest) {
                                      result.error ("a time with no offset is not an instant: " + text)
@@ -922,7 +919,7 @@ priv let parse_local_ok s = list.any (fn p -> result.is_ok (parse p s)) ["%Y-%m-
 /// it: `parse_local denver "2026-07-04 09:00"`.
 let parse_local : Zone -> :string -> result.Of DateTime :string;
 let parse_local zone text = {
-    let s = str.join_str "T" (str.split " " (str.trim text));
+    let s = str.replace " " "T" (str.trim text);
     let patterns = ["%Y-%m-%dT%H:%M:%S.%N", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"];
     match list.filter result.is_ok (list.map (fn p -> parse p s) patterns) {
         [[:ok, dt], .._] => result.ok (localize zone dt),

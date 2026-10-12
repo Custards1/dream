@@ -24,6 +24,7 @@
 
 derive std.codec;
 
+import std.char;
 import std.list;
 import std.result;
 import std.str;
@@ -39,10 +40,6 @@ let skip_ws : [:char] -> [:char];
 let rec skip_ws cs = if list.is_empty cs { cs }
                      else if is_ws (list.head cs) { skip_ws (list.tail cs) }
                      else { cs };
-
-/// Test whether a character is an ASCII decimal digit.
-let is_digit : :char -> :bool;
-let is_digit c = c >= '0' && c <= '9';
 
 /// `[value, rest]`, the shape every parser below returns.
 let step : a -> [:char] -> [a, [:char]];
@@ -154,7 +151,7 @@ let rec number_chars cs acc floaty =
     if list.is_empty cs { [list.reverse acc, floaty, cs] }
     else {
         let c = list.head cs;
-        if is_digit c || c == '-' || c == '+' {
+        if char.is_digit c || c == '-' || c == '+' {
             number_chars (list.tail cs) (list.cons c acc) floaty
         } else if c == '.' || c == 'e' || c == 'E' {
             number_chars (list.tail cs) (list.cons c acc) true
@@ -190,7 +187,7 @@ let rec parse_value cs = {
             _ if starts s (str.chars "true") => step true (drop_n 4 s),
             _ if starts s (str.chars "false") => step false (drop_n 5 s),
             _ if starts s (str.chars "null") => step () (drop_n 4 s),
-            c if is_digit c || c == '-' => parse_number s,
+            c if char.is_digit c || c == '-' => parse_number s,
             _ => (),
         }
     }

@@ -330,9 +330,7 @@ priv let escaped s at = match p.char_at s at {
 
 /// Convert hexadecimal source text to an integer code point.
 priv let hex : :string -> :integer;
-priv let hex h = list.fold (fn acc c -> acc * 16 + (if c >= '0' && c <= '9' { char.code c - 48 }
-                                                    else if c >= 'a' && c <= 'f' { char.code c - 87 }
-                                                    else { char.code c - 55 })) 0 (str.chars h);
+priv let hex h = match num.parse_base 16 h { () => 0, v => v };
 
 priv let digit_items : [:any];
 priv let digit_items = [[:range, 48, 57]];
@@ -659,8 +657,8 @@ priv let complement ranges = {
 /// The other ASCII case of whatever letters the ranges cover.
 priv let fold_ranges : [[:integer]] -> [[:integer]];
 priv let fold_ranges ranges = list.flat_map (fn [lo, hi] -> {
-    let upper = [list.maximum [lo, 65], list.minimum [hi, 90]];
-    let lower = [list.maximum [lo, 97], list.minimum [hi, 122]];
+    let upper = [num.max lo 65, num.min hi 90];
+    let lower = [num.max lo 97, num.min hi 122];
     (if upper.[0] <= upper.[1] { [[upper.[0] + 32, upper.[1] + 32]] } else { [] })
         + (if lower.[0] <= lower.[1] { [[lower.[0] - 32, lower.[1] - 32]] } else { [] })
 }) ranges;

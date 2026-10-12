@@ -83,6 +83,10 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
         case Op::Block: case Op::MakeList: case Op::MakeArray: case Op::RecordMake:
             push_kids(n.a, n.b);
             break;
+        case Op::SetMany:
+            out.push_back(n.a);
+            push_kids(n.b, uint64_t(n.c) * 2);
+            break;
         case Op::MakeMap:
             push_kids(n.a, uint64_t(n.b) * 2);
             break;
@@ -201,6 +205,7 @@ const char* op_name(Op op) {
         case Op::MakeMap: return "map";
         case Op::Get: return "get";
         case Op::Set: return "set";
+        case Op::SetMany: return "set_many";
         case Op::SwitchHead: return "switch_head";
         case Op::SwitchAtom: return "switch_atom";
         default: return "<bad op>";
@@ -690,6 +695,17 @@ bool Image::validate(std::string& error) {
                 break;
             case Op::Set:
                 if (!node_ok(n.a) || !node_ok(n.b) || !node_ok(n.c)) return fail("bad set operand");
+                break;
+            case Op::SetMany:
+                if (!node_ok(n.a)) return fail("bad set_many container");
+                if (n.c == 0 || !kids_ok(n.b, uint64_t(n.c) * 2)) return fail("bad set_many pairs");
+                // The interpreter reads each key without forcing it.
+                for (uint32_t k = 0; k < n.c; ++k) {
+                    Op key = Op(nodes_[kids_[n.b + 2 * k]].op);
+                    if (key != Op::ConstInt && key != Op::ConstAtom) {
+                        return fail("set_many key is not an int or atom constant");
+                    }
+                }
                 break;
             default: break;
         }

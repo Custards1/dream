@@ -489,6 +489,7 @@ bool op_is_supported(Op op) {
         case Op::ConstStr: case Op::Global: case Op::Builtin:
         case Op::ListIsEmpty: case Op::ListTail: case Op::Cons:
         case Op::MakeList: case Op::MakeArray: case Op::RecordMake: case Op::Get: case Op::Set:
+        case Op::SetMany:
             return true;
         default:
             return false;
@@ -995,6 +996,9 @@ private:
             case Op::Set:
                 // The value is in a lazy position and needs nothing.
                 return check(n.a, depth + 1) && check(n.b, depth + 1);
+            case Op::SetMany:
+                // Every key is a constant and every value in a lazy position.
+                return check(n.a, depth + 1);
             case Op::Get:
                 return check(n.a, depth + 1) && check(n.b, depth + 1) &&
                        (n.c == NO_NODE || check(n.c, depth + 1));
@@ -1290,7 +1294,7 @@ private:
                        expand_cost(n.b, depth + 1, calls) +
                        (n.c == NO_NODE ? 0 : expand_cost(n.c, depth + 1, calls));
             case Op::Set: case Op::Cons: case Op::MakeList: case Op::MakeArray:
-            case Op::RecordMake:
+            case Op::RecordMake: case Op::SetMany:
                 // Each builds something, and building it twice is two of it
                 // where the program had one -- sharing lost, not just time.
                 *calls = true;
@@ -1370,6 +1374,9 @@ private:
                 // The container and the key; a `Get`'s default only sometimes,
                 // and a `Set`'s value never.
                 return strict_of(n.a, depth + 1) | strict_of(n.b, depth + 1);
+            case Op::SetMany:
+                // The container; the keys are constants and the values lazy.
+                return strict_of(n.a, depth + 1);
             case Op::Block: {
                 SlotSet s = 0;
                 for (uint32_t i = 0; i < n.b; ++i) {
@@ -1506,6 +1513,9 @@ private:
                 return false;
             case Op::Get: case Op::Set:
                 if (force_order(n.a, depth + 1, out)) force_order(n.b, depth + 1, out);
+                return false;
+            case Op::SetMany:
+                force_order(n.a, depth + 1, out);
                 return false;
             case Op::Global:
                 // Naming a global value forces it the first time, and that can
@@ -1725,6 +1735,9 @@ private:
             case Op::And: case Op::Or: case Op::Set:
                 collect_calls(n.a, depth + 1);
                 collect_calls(n.b, depth + 1);
+                return;
+            case Op::SetMany:
+                collect_calls(n.a, depth + 1);
                 return;
             case Op::Get:
                 collect_calls(n.a, depth + 1);
@@ -2155,6 +2168,7 @@ private:
     JV list_tail(const Node& n);
     JV get(const Node& n);
     JV set(const Node& n);
+    JV set_many(const Node& n);
     /// `n` values in lazy positions, laid out in memory for a helper.
     llvm::Value* lazy_array(uint32_t kids_off, uint32_t n);
 
@@ -2403,7 +2417,7 @@ private:
     llvm::FunctionCallee rt_force_, rt_arith_, rt_compare_, rt_float_, rt_arith_f_, rt_to_int_,
         rt_abs_, rt_floor_, rt_int_of_double_, rt_type_error_, rt_reduction_slot_,
         rt_frame_slots_, rt_native_, rt_builtin_, rt_switch_head_,
-        rt_get_, rt_set_, rt_cons_, rt_make_list_, rt_make_array_, rt_make_record_, rt_make_map_,
+        rt_get_, rt_set_, rt_set_many_, rt_cons_, rt_make_list_, rt_make_array_, rt_make_record_, rt_make_map_,
         rt_literal_str_,
         rt_global_, rt_snapshot_, rt_thunk_, rt_apply_, rt_peek_, rt_adopt_, rt_yield_frame_,
         rt_cons_after_, rt_set_tail_, rt_type_error_got_, rt_settle_;
@@ -2481,6 +2495,8 @@ void Emitter::declare_helpers() {
         "dream_rt_get", llvm::FunctionType::get(i32_, {ptr_, i64_, i64_, i32_, ptr_}, false));
     rt_set_ = mod_.getOrInsertFunction(
         "dream_rt_set", llvm::FunctionType::get(i32_, {ptr_, i64_, i64_, i64_, ptr_}, false));
+    rt_set_many_ = mod_.getOrInsertFunction(
+        "dream_rt_set_many", llvm::FunctionType::get(i32_, {ptr_, i64_, i32_, ptr_, ptr_}, false));
     rt_peek_ = mod_.getOrInsertFunction(
         "dream_rt_peek", llvm::FunctionType::get(i64_, {i64_, i64_}, false));
     rt_cons_ = mod_.getOrInsertFunction(
@@ -3175,6 +3191,10 @@ void Emitter::mark_refs(uint32_t idx, int depth) {
             mark_refs(n.b, depth + 1);
             mark_refs(n.c, depth + 1);
             return;
+        case Op::SetMany:
+            mark_refs(n.a, depth + 1);
+            run(n.b, 2 * n.c);
+            return;
         case Op::Apply: case Op::SwitchHead: case Op::SwitchAtom:
             mark_refs(n.a, depth + 1);
             run(n.b, n.c);
@@ -3579,6 +3599,27 @@ Emitter::JV Emitter::set(const Node& n) {
     return tag(r);
 }
 
+/// The pairs are one array, keys and values interleaved as the node's kids
+/// are: a key is a constant, which `lazy` answers as itself, and a value is in
+/// a lazy position, as a `Set`'s is. One call then makes the one copy.
+Emitter::JV Emitter::set_many(const Node& n) {
+    JV cv = node(n.a);
+    if (failed_ || !cv.v) return none();
+    llvm::Value* c = box(cv);
+    llvm::Value* pairs = lazy_array(n.b, 2 * n.c);
+    if (failed_) return none();
+    llvm::Value* out = entry_alloca(i64_, "set_many");
+    llvm::Value* ok = guarded(rt_set_many_, {proc_, c, i32c(int(n.c)), pairs, out});
+    llvm::Value* r = b_.CreateLoad(i64_, out);
+    auto* cont = bb("set_many.ok");
+    auto* raise_bb = bb("set_many.raise");
+    b_.CreateCondBr(b_.CreateICmpNE(ok, i32c(0)), cont, raise_bb);
+    b_.SetInsertPoint(raise_bb);
+    emit_raise(r);
+    b_.SetInsertPoint(cont);
+    return tag(r);
+}
+
 // ---------------------------------------------------------------------------
 // Crossing between the two representations
 // ---------------------------------------------------------------------------
@@ -3868,6 +3909,7 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
         case Op::ListTail: return list_tail(n);
         case Op::Get: return get(n);
         case Op::Set: return set(n);
+        case Op::SetMany: return set_many(n);
         case Op::Cons: case Op::MakeList: case Op::MakeArray: case Op::RecordMake:
             // Every part of these is in a lazy position, and so is the whole:
             // building one in place is the one way it is ever written.
@@ -5584,6 +5626,7 @@ bool Jit::Impl::create_jit() {
     add("dream_rt_builtin", reinterpret_cast<void*>(&dream_rt_builtin));
     add("dream_rt_get", reinterpret_cast<void*>(&dream_rt_get));
     add("dream_rt_set", reinterpret_cast<void*>(&dream_rt_set));
+    add("dream_rt_set_many", reinterpret_cast<void*>(&dream_rt_set_many));
     add("dream_rt_peek", reinterpret_cast<void*>(&dream_rt_peek));
     add("dream_rt_cons", reinterpret_cast<void*>(&dream_rt_cons));
     add("dream_rt_cons_after", reinterpret_cast<void*>(&dream_rt_cons_after));

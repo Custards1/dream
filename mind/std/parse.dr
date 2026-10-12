@@ -423,15 +423,7 @@ priv let rec quoted_body s at acc = {
 priv let hex_value : :string -> :any;
 priv let hex_value h =
     if len h != 4 || str.span "0123456789abcdefABCDEF" 0 h != 4 { () }
-    else { list.fold (fn acc c -> acc * 16 + hex_digit c) 0 (str.chars h) };
-
-/// Decode one hexadecimal character, returning -1 when invalid.
-priv let hex_digit : :char -> :integer;
-priv let hex_digit c = match c {
-    _ if c >= '0' && c <= '9' => char.code c - 48,
-    _ if c >= 'a' && c <= 'f' => char.code c - 87,
-    _ => char.code c - 55,
-};
+    else { num.parse_base 16 h };
 
 // --- combining --------------------------------------------------------------------------------
 
@@ -748,9 +740,8 @@ when test {
     let rec expr s at = operators (lexeme number |> or (parens (lazy (fn () -> expr))))
         [[:left, [["+", fn a b -> a + b], ["-", fn a b -> a - b]]],
          [:left, [["*", fn a b -> a * b], ["/", fn a b -> a / b]]],
-         [:right, [["^", fn a b -> pow a b]]],
+         [:right, [["^", fn a b -> num.pow a b]]],
          [:prefix, [["-", fn a -> 0 - a]]]] s at;
-    let rec pow a b = if b <= 0 { 1 } else { a * pow a (b - 1) };
     let calc t = run (then expr spaces) t;
     let message r = match r { [:error, e] => Error.message e, _ => "" };
     let where r = match r { [:error, e] => [Error.line e, Error.column e], _ => [] };

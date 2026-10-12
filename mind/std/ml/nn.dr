@@ -39,6 +39,7 @@
 import std.list;
 import std.math;
 import std.map;
+import std.num;
 import std.ml.ad;
 import std.ml.init as initial;
 import std.ml.ops;
@@ -657,8 +658,8 @@ let summary model shape = {
         [[Layer.name layer, to_string out, tree.size p] :: acc, out, i + 1]
     }) [[], shape, 0] layers).[0]);
     let total = list.fold_strict (fn !n [_, _, k] -> n + k) 0 rows;
-    let width = list.fold (fn w [name, _, _] -> if str.length name > w { str.length name } else { w }) 5 rows;
-    let pad s n = s + str.repeat (n - str.length s) " ";
+    let width = list.fold_strict (fn w [name, _, _] -> num.max w (str.length name)) 5 rows;
+    let pad s n = str.pad_end n " " s;
     let line [name, out, k] = "  " + pad name width + "  " + pad out 16 + "  " + to_string k;
     str.join_str "\n" (["  " + pad "layer" width + "  " + pad "output" 16 + "  params"]
         + list.map line rows

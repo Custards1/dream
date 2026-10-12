@@ -147,7 +147,7 @@ let overlay modules = match _map_pairs modules {
     [] => (),
     pairs => {
         let sorted = list.sort_on list.head pairs;
-        let file_of name = str.join_str "/" (str.split "." name) + ".dr";
+        let file_of name = str.replace "." "/" name + ".dr";
         build.step "modules" "modules" (list.map (fn [_, i] -> i) sorted)
             (list.map (fn [name, _] -> name) sorted) (list.map (fn [name, _] -> file_of name) sorted)
             (fn job -> list.map (fn [name, i] -> build.Op.copy (build.path job i) (file_of name)) sorted)
@@ -308,7 +308,7 @@ let depfile_reads text = {
         [_, '\t'] => [ended cur acc, [], false],
         _ => [acc, list.cons c cur, false],
     }) [[], [], false] (str.chars body);
-    list.map (fn n -> str.join_str "$" (str.split "$$" n)) (list.reverse (ended current names))
+    list.map (fn n -> str.replace "$$" "$" n) (list.reverse (ended current names))
 };
 
 /// The first line where two texts part, for a check's failure.
@@ -328,8 +328,7 @@ let first_difference wanted got = {
 /// What a program printed, as much of it as a person wants in a failure.
 let tail : :string -> :string;
 let tail text = {
-    let lines = str.split "\n" (str.trim text);
-    str.join_str "\n" (list.drop (list.length lines - 40) lines)
+    str.join_str "\n" (list.take_last 40 (str.lines (str.trim text)))
 };
 
 /// Convert a subprocess result into a build result, distinguishing timeouts.
@@ -496,7 +495,7 @@ let launch! : :map -> :map -> :map;
 let rec launch! ctx run = {
     let jobs = if build.Context.jobs ctx < 1 { 1 } else { build.Context.jobs ctx };
     let room = jobs - list.length (map.keys (Run.running run));
-    let next = if stopped run { () } else { list.first_or () (list.filter (fn sh -> ready run sh) (Run.waiting run)) };
+    let next = if stopped run { () } else { list.find (fn sh -> ready run sh) (Run.waiting run) };
     match next {
         () => run,
         _ if room <= 0 => run,

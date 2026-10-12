@@ -561,9 +561,8 @@ let rec find_decl items name =
 /// pattern parameters are read from the file where they were written.
 let signature_decl a mi name =
     match find_decl (source_items a mi) name {
-        () => list.first_or () (list.filter (fn oi ->
-                  find_decl [list.nth 1 oi] name != ())
-                  (list.reverse (list.head (scope.effective_items (source a) mi [])))),
+        () => list.find (fn oi -> find_decl [list.nth 1 oi] name != ())
+                  (list.reverse (list.head (scope.effective_items (source a) mi []))),
         d => [mi, d],
     };
 
@@ -639,8 +638,7 @@ let inherited_note a mi name =
 let record_of a mi = {
     let l = loader a;
     let full = modules.module_name (modules.module_at l mi);
-    list.first_or () (list.filter (fn r -> list.head r + "." + list.nth 2 r == full)
-                                  (modules.records l))
+    list.find (fn r -> list.head r + "." + list.nth 2 r == full) (modules.records l)
 };
 
 let record_owner r   = list.head r;
@@ -655,7 +653,7 @@ let record_span r    = list.nth 5 r;
 /// member could be called `set_thing` where no field `thing` exists, and the
 /// `set_` stem search would otherwise get there first and find nothing.
 let record_member r n =
-    list.first_or () (list.filter (fn m -> ast.member_name m == n) (record_members r));
+    list.find (fn m -> ast.member_name m == n) (record_members r);
 
 /// The keyword it was written with. `syntax.record` keeps the *representation*
 /// -- which collection the fields go into -- because that is what it builds
@@ -774,7 +772,7 @@ let entry_name e = list.nth 1 e;
 let entry_span e = list.last e;
 
 let foreign_entry f n =
-    list.first_or () (list.filter (fn e -> entry_name e == n) (foreign_entries f));
+    list.find (fn e -> entry_name e == n) (foreign_entries f);
 
 /// The text of the file a block was written in, which every span in it is an
 /// offset into. `""` if the owner cannot be found, which slices to nothing.
@@ -1129,8 +1127,8 @@ let definition_at a line character = match module_of a {
                                 _ => {
                                     let selected = match imp {
                                         [:import, _, _, names, _] if names != () =>
-                                            list.first_or () (list.filter (fn sel ->
-                                                list.head sel == dotted || list.nth 1 sel == dotted) names),
+                                            list.find (fn sel ->
+                                                list.head sel == dotted || list.nth 1 sel == dotted) names,
                                         _ => (),
                                     };
                                     match selected {

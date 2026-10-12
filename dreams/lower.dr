@@ -701,9 +701,7 @@ let rec lower_expr e l =
             let a = lower_expr container l;
             let b = lower_expr key (list.head a);
             let v = lower_expr value (list.head b);
-            let made = emit (ir.node :set (list.nth 1 a) (list.nth 1 b) (list.nth 1 v)) (list.head v);
-            [inherit (list.nth 1 made) [list.nth 1 a, list.nth 1 b, list.nth 1 v] (list.head made),
-             list.nth 1 made]
+            fuse_set (list.nth 1 a) (list.nth 1 b) (list.nth 1 v) (list.head v)
         },
 
         // What a top-level destructuring became in `scope`: the hidden global
@@ -713,6 +711,58 @@ let rec lower_expr e l =
 
         _ => emit_leaf :unit l,
     };
+
+/// `c.[k => v]`, given the three as nodes -- or, when `c` is itself a change at
+/// a constant key and `k` is a constant too, one `set_many` of every pair.
+///
+/// This is what a pipeline of setters comes to: `P.set_x` is a wrapper, so
+/// `p |> P.set_a 1 |> P.set_b 2` lowers to `set (set p 0 1) 1 2`, and each
+/// `set` copied the whole record for one field. The chain is fused here, as it
+/// is lowered, because only here are the inner node's parts still in hand to be
+/// laid out as one run of kids; the inner `set` is left behind unreached, and
+/// the optimizer drops it.
+///
+/// Fusing never costs more than it saves. A node is a function of the frame it
+/// is evaluated against, so an inner `set` some other expression wants as well
+/// is evaluated there on its own account either way; what is shared between two
+/// uses is a binding, which is a `local` and never fused through. The keys
+/// must be constants so that the order in which they are read, and which one
+/// raises, cannot differ from the chain's.
+let fuse_set : :integer -> :integer -> :integer -> Lowering -> [Lowering, :integer];
+let fuse_set c k v l = {
+    let p = prog l;
+    let inner = ir.node_at c p;
+    let earlier = if not (constant_key k p) { () } else {
+        match ir.node_op inner {
+            :set if constant_key (ir.node_b inner) p => [ir.node_b inner, ir.node_c inner],
+            :set_many => list.map (fn i -> (ir.kids p).[ir.node_b inner + i])
+                                  (list.range 0 (2 * ir.node_c inner)),
+            _ => (),
+        }
+    };
+    match earlier {
+        () => {
+            let made = emit (ir.node :set c k v) l;
+            [inherit (list.nth 1 made) [c, k, v] (list.head made), list.nth 1 made]
+        },
+        pairs => {
+            let base = ir.node_a inner;
+            let items = pairs + [k, v];
+            let placed = kids items l;
+            let made = emit (ir.node :set_many base (list.nth 1 placed) (list.length items / 2))
+                            (list.head placed);
+            [inherit (list.nth 1 made) (list.cons base items) (list.head made), list.nth 1 made]
+        },
+    }
+};
+
+/// Whether node `i` is a key `set_many` may hold: an int or atom constant.
+let constant_key : :integer -> ir.Program -> :bool;
+let constant_key i p = match ir.node_op (ir.node_at i p) {
+    :const_int => true,
+    :const_atom => true,
+    _ => false,
+};
 
 /// A nested function: lower its body, remember which node that was, and emit
 /// the instruction that builds the closure or thunk.

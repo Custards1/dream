@@ -87,6 +87,39 @@ let is_empty m = list.is_empty (_map_pairs m);
 let sorted_keys : %{ k => v } -> [k];
 let sorted_keys m = list.sort (keys m);
 
+/// The pairs ordered by key: what to print, write or compare when the trie's
+/// order would make the output differ from run to run.
+let sorted_pairs : %{ k => v } -> [[k, v]];
+let sorted_pairs m = list.sort_on (fn p -> list.nth 0 p) (_map_pairs m);
+
+// --- from a list ------------------------------------------------------------
+//
+// Three ways a list becomes a table, each a strict fold. A key is compared as
+// a map compares it -- by value for numbers, strings, atoms and the other
+// flat types, by identity for anything else -- so key on something flat: a
+// name, an id, an atom. Two equal lists are two keys.
+
+/// The elements under the key `key` gives each, every group in the order its
+/// elements came: `group_by (fn w -> str.length w) words`.
+let group_by : (a -> k) -> [a] -> %{ k => [a] };
+let group_by key xs =
+    map_values list.reverse
+        (list.fold_strict (fn m x -> update_strict [] (fn g -> _list_cons x g) (key x) m) empty xs);
+
+/// How many elements have each key: `count_by (fn x -> x) words` is a word count.
+let count_by : (a -> k) -> [a] -> %{ k => :integer };
+let count_by key xs =
+    list.fold_strict (fn m x -> update_strict 0 (fn n -> n + 1) (key x) m) empty xs;
+
+/// Each key with what `f` makes of it: a table computed from a list of names.
+let from_keys : (k -> v) -> [k] -> %{ k => v };
+let from_keys f ks = list.fold_strict (fn m k -> m.[k => (f k)]) empty ks;
+
+/// Each element under its key, a later one replacing an earlier one with the
+/// same key: a list of records made into a table by id.
+let index_by : (a -> k) -> [a] -> %{ k => a };
+let index_by key xs = list.fold_strict (fn m x -> m.[(key x) => x]) empty xs;
+
 // --- changing ---------------------------------------------------------------
 
 /// Return a map with `k` set to `v`, replacing any previous value.
@@ -178,6 +211,12 @@ let add x s = s.[x => true];
 let members : %{ a => :bool } -> [a];
 let members s = keys s;
 
+/// The keys of `m` that `other` has too, with `m`'s values: for sets, the
+/// members both hold. It walks `m` and asks `other`, so a caller who knows
+/// which is smaller passes that one last.
+let intersect : %{ k => w } -> %{ k => v } -> %{ k => v };
+let intersect other m = filter (fn k _ -> _map_has other k) m;
+
 // --- tests -------------------------------------------------------------------
 
 when test {
@@ -225,6 +264,17 @@ when test {
         test.case "add"                     $( test.true! (member :x (add :x (set_of []))) ),
         test.case "a pipe of puts"          $( test.eq! [1, 2] (list.map (fn k -> get 0 k (empty |> put :a 1 |> put :b 2)) [:a, :b]) ),
         test.case "members"                 $( test.eq! [1, 2] (list.sort (members (set_of [2, 1]))) ),
+        test.case "intersect"               $( test.eq! [2, 3] (sorted_keys (intersect (set_of [2, 3, 4]) (set_of [1, 2, 3]))) ),
+
+        test.case "sorted_pairs"            $( test.eq! [[:a, 1], [:b, 2]] (sorted_pairs m) ),
+        test.case "group_by keeps order"
+            $( test.eq! [[1, ["a", "b"]], [2, ["cd"]]] (sorted_pairs (group_by (fn s -> len s) ["a", "cd", "b"])) ),
+        test.case "group_by of nothing"     $( test.true! (is_empty (group_by (fn x -> x) [])) ),
+        test.case "from_keys"               $( test.eq! [["a", 1], ["bc", 2]] (sorted_pairs (from_keys (fn k -> len k) ["bc", "a"])) ),
+        test.case "count_by"                $( test.eq! [[:x, 2], [:y, 1]] (sorted_pairs (count_by (fn x -> x) [:x, :y, :x])) ),
+        test.case "index_by, the later winning"
+            $( test.eq! [[1, [1, :b]], [2, [2, :c]]]
+                        (sorted_pairs (index_by (fn r -> list.nth 0 r) [[1, :a], [2, :c], [1, :b]])) ),
     ];
 }
 

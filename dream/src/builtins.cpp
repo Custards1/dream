@@ -227,6 +227,72 @@ Value map_assoc(Heap& h, Value node, uint32_t shift, uint64_t hash, Value key, V
     return branch;
 }
 
+/// `map_assoc` for one of a batch of inserts. A branch in `owned` was made by
+/// an earlier insert of the same batch and nothing outside it has seen it yet,
+/// so it is changed where it stands instead of being copied again: the batch
+/// copies each branch on its keys' paths once, where a run of `map_assoc`s
+/// copied the root, and every shared branch, once per key.
+///
+/// Only branches are reused. A leaf chain is rebuilt as `map_assoc` rebuilds
+/// it, and a branch `map_split` makes is not recorded -- both are small, and a
+/// batch is a handful of a record's fields, not a bulk load.
+///
+/// The record of what is owned is a fixed array on the stack, not a vector:
+/// a batch is a handful of keys on a short path, and the heap allocation a
+/// vector makes cost more than the copies it saved -- a `mapping` pipeline
+/// measured 12% slower with one. A branch made after the array is full is
+/// simply not recorded, and copied again if it is met again, as before.
+struct OwnedBranches {
+    Obj* at[32];
+    uint32_t n = 0;
+    bool has(Obj* o) const {
+        for (uint32_t i = 0; i < n; ++i) if (at[i] == o) return true;
+        return false;
+    }
+    void add(Obj* o) { if (n < 32) at[n++] = o; }
+};
+
+Value map_assoc_owned(Heap& h, Value node, uint32_t shift, uint64_t hash, Value key, Value value,
+                      bool* added, OwnedBranches& owned) {
+    if (is_obj(node, ObjType::MapLeaf)) return map_assoc(h, node, shift, hash, key, value, added);
+    auto* m = static_cast<MapObj*>(as_obj(node));
+    const bool mine = owned.has(as_obj(node));
+    uint32_t bit = 1u << map_index(hash, shift);
+    if (mine && (m->bitmap & bit)) {
+        uint32_t at = map_slot_of(m->bitmap, bit);
+        Value grown = map_assoc_owned(h, m->slots()[at], shift + MAP_BITS, hash, key, value, added,
+                                      owned);
+        m = static_cast<MapObj*>(as_obj(node));
+        m->slots()[at] = grown;
+        if (*added) m->count += 1;
+        h.remember_if_old(m, grown);
+        return node;
+    }
+    if (!mine && (m->bitmap & bit)) {
+        // Copied once here, then owned: the child is inserted into below, and
+        // the copy points at whatever that answers.
+        uint32_t at = map_slot_of(m->bitmap, bit);
+        uint32_t slots = map_bit_count(m->bitmap);
+        Value branch = h.make_map_branch(slots);
+        auto* b = static_cast<MapObj*>(as_obj(branch));
+        m = static_cast<MapObj*>(as_obj(node));
+        b->bitmap = m->bitmap;
+        b->count = m->count;
+        for (uint32_t i = 0; i < slots; ++i) b->slots()[i] = m->slots()[i];
+        owned.add(as_obj(branch));
+        Value grown = map_assoc_owned(h, b->slots()[at], shift + MAP_BITS, hash, key, value, added,
+                                      owned);
+        b = static_cast<MapObj*>(as_obj(branch));
+        b->slots()[at] = grown;
+        if (*added) b->count += 1;
+        return branch;
+    }
+    // A new slot widens the branch, which is a new object either way.
+    Value branch = map_assoc(h, node, shift, hash, key, value, added);
+    owned.add(as_obj(branch));
+    return branch;
+}
+
 /// `node` without `key`. Answers NIL_SLOT when the node is left empty, so a
 /// parent can drop the slot rather than keep an empty branch forever.
 Value map_dissoc(Heap& h, Value node, uint32_t shift, uint64_t hash, Value key, bool* removed) {
@@ -285,6 +351,18 @@ Value map_insert(Process& p, Value map, Value key, Value value) {
     if (!is_obj(map, ObjType::Map)) return map;
     bool added = false;
     return map_assoc(p.heap(), map, 0, key_hash(key), resolve(key), value, &added);
+}
+
+Value map_insert_many(Process& p, Value map, uint32_t n, const Value* pairs) {
+    map = resolve(map);
+    if (!is_obj(map, ObjType::Map)) return map;
+    OwnedBranches owned;
+    for (uint32_t i = 0; i < n; ++i) {
+        bool added = false;
+        Value key = resolve(pairs[2 * i]);
+        map = map_assoc_owned(p.heap(), map, 0, key_hash(key), key, pairs[2 * i + 1], &added, owned);
+    }
+    return map;
 }
 
 Value map_erase(Process& p, Value map, Value key) {
@@ -2943,6 +3021,77 @@ NativeResult core_str_upto(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_fixnum(int64_t(i)));
 }
 
+/// `span` run backwards: the start of the run of bytes from `set` that ends at
+/// offset `until` (clamped to the length), or `until` itself when the byte
+/// before it is not one of them. `str.trim_end` is this and a slice, where it
+/// used to decode the string into a list of characters, reverse it, drop the
+/// spaces, reverse it again and encode what was left.
+NativeResult core_str_span_back(Process& p, Value, Value* args, uint32_t) {
+    Bytes text, set;
+    uint64_t i;
+    if (!scan_args(p, args, &text, &set, &i)) {
+        return type_fail(p, "str_span_back needs a string, an offset and a set of bytes");
+    }
+    if (i > text.len) i = text.len;
+    const ByteSet in(set);
+    while (i > 0 && in.has(uint8_t(text.data[i - 1]))) --i;
+    return NativeResult::ok(make_fixnum(int64_t(i)));
+}
+
+/// `str_find` from the other end: the greatest offset at or before `from` where
+/// `needle` starts, or -1. A file's extension and a path's last component are
+/// both "the last one", which in Dream was a loop of forward finds that
+/// rescanned everything after the first match.
+NativeResult core_str_rfind(Process& p, Value, Value* args, uint32_t) {
+    if (is_obj(resolve(args[0]), ObjType::BigStr) || is_obj(resolve(args[1]), ObjType::BigStr)) {
+        return bigstr_refused(p, "str_rfind");
+    }
+    StrObj* hay = as_string(args[0]);
+    StrObj* needle = as_string(args[1]);
+    Value from = resolve(args[2]);
+    if (!hay || !needle || !is_fixnum(from)) {
+        return type_fail(p, "str_rfind needs two strings and a start offset");
+    }
+    int64_t start = fixnum_value(from);
+    if (start < 0 || needle->len > hay->len) return NativeResult::ok(make_fixnum(-1));
+    const int64_t last = int64_t(hay->len - needle->len);
+    for (int64_t i = start < last ? start : last; i >= 0; --i) {
+        if (std::memcmp(hay->data() + i, needle->data(), needle->len) == 0) {
+            return NativeResult::ok(make_fixnum(i));
+        }
+    }
+    return NativeResult::ok(make_fixnum(-1));
+}
+
+/// The number of characters, decoded exactly as `str_chars` decodes them but
+/// without building the list -- `str.length` was a cons per character, all of
+/// it garbage the moment it was counted.
+NativeResult core_str_char_count(Process& p, Value, Value* args, uint32_t) {
+    if (is_obj(resolve(args[0]), ObjType::BigStr)) return bigstr_refused(p, "str_char_count");
+    StrObj* s = as_string(args[0]);
+    if (!s) return type_fail(p, "str_char_count needs a string");
+    int64_t n = 0;
+    for (uint32_t i = 0; i < s->len; ++n) utf8_next(s->data(), s->len, &i);
+    return NativeResult::ok(make_fixnum(n));
+}
+
+/// The string with its ASCII letters upper-cased (`upper` true) or lower-cased,
+/// every other byte -- the whole of any multi-byte character included -- left
+/// as it was. One copy, where `str.map upper_char` decoded, called a Dream
+/// function per character and encoded again.
+NativeResult core_str_ascii_case(Process& p, Value, Value* args, uint32_t) {
+    if (is_obj(resolve(args[0]), ObjType::BigStr)) return bigstr_refused(p, "str_ascii_case");
+    StrObj* s = as_string(args[0]);
+    Value upper = resolve(args[1]);
+    if (!s || !is_bool(upper)) return type_fail(p, "str_ascii_case needs a string and a bool");
+    const bool up = upper == TRUE_V;
+    std::string out(s->data(), s->len);
+    for (char& c : out) {
+        if (up ? (c >= 'a' && c <= 'z') : (c >= 'A' && c <= 'Z')) c = char(c ^ 0x20);
+    }
+    return NativeResult::ok(p.heap().make_string(out.data(), uint32_t(out.size())));
+}
+
 NativeResult core_str_byte(Process& p, Value, Value* args, uint32_t) {
     Bytes b;
     Value i = resolve(args[1]);
@@ -3057,6 +3206,53 @@ NativeResult core_float_of_bytes(Process& p, Value, Value* args, uint32_t) {
     double d;
     std::memcpy(&d, s->data(), 8);
     return NativeResult::ok(p.heap().make_float(d));
+}
+
+/// `_pow base exponent` -- `num.pow`. An integer to a power of zero or more is
+/// the exact integer, a bignum once it outgrows a fixnum, by repeated squaring:
+/// a Dream loop of `*` was a call per factor, and every package that wanted a
+/// power wrote that loop again. A float on either side is `std::pow`'s float,
+/// which is what `math.pow` answers for everything.
+///
+/// An integer to a negative power raises rather than answering a float: the
+/// answer's kind follows the base's, which is what lets `num.pow` say
+/// `n -> :integer -> n` and a caller holding integers keep integers. The
+/// fraction is a float base away.
+///
+/// An exponent past 64 bits is an answer only for a base of 0, 1 or -1; for any
+/// other the result would not fit in memory, and that is said rather than
+/// attempted. Allocation never collects (see heap.hpp), so the partial products
+/// can sit in C++ locals between multiplications.
+NativeResult core_pow(Process& p, Value, Value* args, uint32_t) {
+    Value base = resolve(args[0]);
+    Value exp = resolve(args[1]);
+    if (bigint::is_integer(base) && bigint::is_integer(exp)) {
+        if (bigint::compare(exp, make_fixnum(0)) < 0) {
+            return type_fail(p, "pow of an integer to a negative power is a fraction: use a float base");
+        }
+        Heap& h = p.heap();
+        uint64_t n;
+        if (!bigint::to_uint64(exp, &n)) {
+            if (base == make_fixnum(0) || base == make_fixnum(1)) return NativeResult::ok(base);
+            if (base == make_fixnum(-1)) {
+                bool odd = bigint::rem(h, exp, make_fixnum(2)) != make_fixnum(0);
+                return NativeResult::ok(make_fixnum(odd ? -1 : 1));
+            }
+            return type_fail(p, "pow of an exponent this large would not fit in memory");
+        }
+        Value acc = make_fixnum(1);
+        while (n != 0) {
+            if (n & 1) acc = bigint::mul(h, acc, base);
+            n >>= 1;
+            if (n != 0) base = bigint::mul(h, base, base);
+        }
+        return NativeResult::ok(acc);
+    }
+    double x, y;
+    Value err;
+    if (!math_arg(p, base, "pow", &x, &err) || !math_arg(p, exp, "pow", &y, &err))
+        return NativeResult::raise(err);
+    return NativeResult::ok(p.heap().make_float(std::pow(x, y)));
 }
 
 NativeResult core_to_int(Process& p, Value, Value* args, uint32_t) {
@@ -4284,6 +4480,11 @@ const BuiltinDef BUILTINS[] = {
     {"_record_id", 1, 0b1, core_record_id},
     {"_record_fields", 1, 0b1, core_record_fields},
     {"_record_of", 3, 0b111, core_record_of},
+    {"_pow", 2, 0b11, core_pow},
+    {"_str_char_count", 1, 0b1, core_str_char_count},
+    {"_str_ascii_case", 2, 0b11, core_str_ascii_case},
+    {"_str_span_back", 3, 0b111, core_str_span_back},
+    {"_str_rfind", 3, 0b111, core_str_rfind},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

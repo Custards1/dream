@@ -70,13 +70,18 @@ mod table {
     import std.map;
     import std.proc;
 
+    /// The name the registry's process is reported under.
     let server_name u = "registry";
 
+    /// Start with `names`, forced, and nothing monitored yet.
     let init! names = {
         strict! names;
         [names, []]
     };
 
+    /// `:value` answers the table, `[:get, f]` answers `f` of it, and
+    /// `[:get_and_update, f]` takes `[answer, next]` from `f` and keeps `next`,
+    /// monitoring whatever process it names for the first time.
     let handle_call! request from state = {
         let [names, watched] = state;
         match request {

@@ -24,7 +24,7 @@ import pack.spec.Spec;
 
 /// A shell single-quoted word.
 let quote : :string -> :string;
-let quote s = "'" + str.join_str "'\\''" (str.split "'" s) + "'";
+let quote s = "'" + str.replace "'" "'\\''" s + "'";
 
 /// The `case` arm choosing one tarball.
 let arm : Asset -> :string;

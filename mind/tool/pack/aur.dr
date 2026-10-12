@@ -35,7 +35,7 @@ let package_name sp = Spec.name sp + "-bin";
 
 /// A bash single-quoted word: everything as written, a `'` closed and reopened.
 let quote : :string -> :string;
-let quote s = "'" + str.join_str "'\\''" (str.split "'" s) + "'";
+let quote s = "'" + str.replace "'" "'\\''" s + "'";
 
 let array : [:string] -> :string;
 let array xs = "(" + str.join_str " " (list.map quote xs) + ")";

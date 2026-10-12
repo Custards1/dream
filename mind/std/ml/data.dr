@@ -192,7 +192,7 @@ let read_csv! path = match file.read! path {
 let parse_csv : :string -> [:ok, [[:any]]] | [:error, :string];
 let parse_csv text = {
     let lines = list.filter (fn [_, l] -> not (str.is_empty l))
-        (list.enumerate (list.map str.trim (str.split "\n" text)));
+        (list.enumerate (list.map str.trim (str.lines text)));
     let body = match lines {
         [[_, first], ..rest] => if is_header first { rest } else { lines },
         [] => [],

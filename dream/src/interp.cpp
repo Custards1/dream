@@ -1465,10 +1465,11 @@ void list_get(Process& p, uint32_t at, Value cur, uint32_t remaining, uint32_t i
 }
 
 /// Step `remaining` more cells down a list, keeping every cell passed on the
-/// value stack, and answer the list with the element at `index` replaced. The
-/// cells in front of it are new; everything behind it is shared, and so is
-/// every element but the one replaced.
-void list_set(Process& p, uint32_t at, Value cur, uint32_t remaining, uint32_t index, Value frame) {
+/// value stack, and answer the list with the element at `index` replaced by
+/// what `value_node` suspends to. The cells in front of it are new; everything
+/// behind it is shared, and so is every element but the one replaced.
+void list_set(Process& p, uint32_t value_node, Value cur, uint32_t remaining, uint32_t index,
+              Value frame) {
     for (;;) {
         cur = resolve(cur);
         const uint32_t walked = index - remaining;
@@ -1480,7 +1481,7 @@ void list_set(Process& p, uint32_t at, Value cur, uint32_t remaining, uint32_t i
             return;
         }
         if (remaining == 0) {
-            Value value = thunk_for(p, img_of(p).node(at).c, frame);
+            Value value = thunk_for(p, value_node, frame);
             Value out = p.heap().make_cons(value, static_cast<ConsObj*>(as_obj(cur))->tail);
             for (uint32_t i = 0; i < index; ++i) {
                 Value head = static_cast<ConsObj*>(as_obj(p.stack.back()))->head;
@@ -1494,7 +1495,7 @@ void list_set(Process& p, uint32_t at, Value cur, uint32_t remaining, uint32_t i
         --remaining;
         Value tail = resolve(static_cast<ConsObj*>(as_obj(cur))->tail);
         if (!is_whnf(tail)) {
-            push_cont(p, ContKind::SetWalk, remaining, at, index, frame);
+            push_cont(p, ContKind::SetWalk, remaining, value_node, index, frame);
             enter(p, tail);
             return;
         }
@@ -1586,10 +1587,11 @@ void container_get(Process& p, uint32_t at, Value container, Value key, Value fr
 
 /// `c.[k => v]`, with the container and the key in hand. The value is stored
 /// unforced, as a map literal's values are.
-void container_set(Process& p, uint32_t at, Value container, Value key, Value frame) {
+/// `c.[k => v]`, with the container and the key in hand and `value_node` the
+/// node `v` is: a `set`'s `c`, or one of a `set_many`'s values.
+void container_set(Process& p, uint32_t value_node, Value container, Value key, Value frame) {
     container = resolve(container);
     key = resolve(key);
-    const uint32_t value_node = img_of(p).node(at).c;
     if (is_obj(container, ObjType::Map)) {
         Value value = thunk_for(p, value_node, frame);
         ret(p, map_insert(p, container, key, value));
@@ -1662,7 +1664,99 @@ void container_set(Process& p, uint32_t at, Value container, Value key, Value fr
                                 "index " + std::to_string(k) + " is not a position in a list"));
         return;
     }
-    list_set(p, at, container, uint32_t(k), uint32_t(k), frame);
+    list_set(p, value_node, container, uint32_t(k), uint32_t(k), frame);
+}
+
+/// The key of a `set_many`'s pair `i`: a constant, which the loader checked
+/// (`SetMany` in image.cpp), so it is read rather than evaluated.
+Value set_many_key(Process& p, const uint32_t* kids, uint32_t i, Value frame) {
+    Value key = UNIT;
+    operand_value(p, img_of(p), kids[2 * i], frame, &key);
+    return resolve(key);
+}
+
+/// A `set_many`'s pairs from `from` on, applied to `container` in order.
+///
+/// A record or an array is copied once and every pair written into the copy,
+/// which is the point of the opcode: a chain of `set`s copied all n fields per
+/// key. The keys are all checked before anything is built, against the same
+/// messages `container_set` raises, so a bad key fails as the chain would have
+/// failed at it -- a pair before it changing nothing anyone could see. A map
+/// takes its pairs as one batch of inserts. Anything else -- a list, or a value
+/// `set` refuses -- goes through `container_set` a pair at a time, since a list
+/// is walked with continuations of its own, and the rest of the pairs wait in
+/// a `SetManyStep`.
+void set_many(Process& p, uint32_t at, Value container, uint32_t from, Value frame) {
+    const Image& img = img_of(p);
+    const Node& n = img.node(at);
+    const uint32_t* kids = img.kids_at(n.b);
+    container = resolve(container);
+    const bool record = is_obj(container, ObjType::Record);
+    if (record || is_obj(container, ObjType::Array)) {
+        const uint32_t len = record ? static_cast<RecordObj*>(as_obj(container))->len
+                                    : static_cast<ArrayObj*>(as_obj(container))->len;
+        for (uint32_t i = from; i < n.c; ++i) {
+            Value key = set_many_key(p, kids, i, frame);
+            if (!is_fixnum(key)) {
+                do_raise(p, type_error(p, record ? "a field of a record is changed by position, not " +
+                                                       describe(p, key)
+                                                 : "a position is an integer, not " + describe(p, key)));
+                return;
+            }
+            const int64_t k = fixnum_value(key);
+            if (k < 0 || k >= int64_t(len)) {
+                do_raise(p, raise_error(p, out_of_bounds_atom(p),
+                                        record ? "field " + std::to_string(k) + " is outside " +
+                                                     describe(p, container)
+                                               : "index " + std::to_string(k) +
+                                                     " is outside an array of " + std::to_string(len)));
+                return;
+            }
+        }
+        // Nothing here collects (allocation never does), so the source's
+        // items can be read after the copy is made.
+        Value out = record ? p.heap().make_record(static_cast<RecordObj*>(as_obj(container))->tag, len)
+                           : p.heap().make_array(len);
+        Value* dst = record ? static_cast<RecordObj*>(as_obj(out))->items()
+                            : static_cast<ArrayObj*>(as_obj(out))->items();
+        const Value* src = record ? static_cast<RecordObj*>(as_obj(container))->items()
+                                  : static_cast<ArrayObj*>(as_obj(container))->items();
+        Obj* holder = as_obj(out);
+        for (uint32_t i = 0; i < len; ++i) {
+            dst[i] = src[i];
+            p.heap().remember_if_old(holder, src[i]);
+        }
+        for (uint32_t i = from; i < n.c; ++i) {
+            const int64_t k = fixnum_value(set_many_key(p, kids, i, frame));
+            Value value = thunk_for(p, kids[2 * i + 1], frame);
+            dst[k] = value;
+            p.heap().remember_if_old(holder, value);
+        }
+        ret(p, out);
+        return;
+    }
+    if (is_obj(container, ObjType::Map)) {
+        // A `mapping`'s setters: one batch, which copies each branch on the
+        // keys' paths once (`map_insert_many`).
+        // The pairs on the stack while there are few, which is always for a
+        // pipeline of setters; a heap buffer costs more than the batch saves.
+        const uint32_t count = n.c - from;
+        Value small[32];
+        std::vector<Value> large;
+        Value* pairs = small;
+        if (count > 16) {
+            large.resize(2 * size_t(count));
+            pairs = large.data();
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            pairs[2 * i] = set_many_key(p, kids, from + i, frame);
+            pairs[2 * i + 1] = thunk_for(p, kids[2 * (from + i) + 1], frame);
+        }
+        ret(p, map_insert_many(p, container, count, pairs));
+        return;
+    }
+    if (from + 1 < n.c) push_cont(p, ContKind::SetManyStep, 0, at, from + 1, frame);
+    container_set(p, kids[2 * from + 1], container, set_many_key(p, kids, from, frame), frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -2255,7 +2349,17 @@ void step_eval(Process& p) {
                 return;
             }
             if (Op(n.op) == Op::Get) container_get(p, p.node, container, key, frame);
-            else container_set(p, p.node, container, key, frame);
+            else container_set(p, n.c, container, key, frame);
+            return;
+        }
+        case Op::SetMany: {
+            Value container;
+            if (!operand_value(p, img, n.a, frame, &container)) {
+                push_cont(p, ContKind::IndexKey, 0, p.node, 0, frame);
+                eval_node(p, n.a, frame);
+                return;
+            }
+            set_many(p, p.node, container, 0, frame);
             return;
         }
 
@@ -2437,6 +2541,10 @@ void step_return(Process& p, size_t floor) {
             Value container = p.result;
             Value key;
             const Node& idx = img_of(p).node(c.b);
+            if (Op(idx.op) == Op::SetMany) {
+                set_many(p, c.b, container, 0, c.v1);
+                return;
+            }
             if (!operand_value(p, img_of(p), idx.b, c.v1, &key)) {
                 // The container waits on the value stack, where the collector
                 // can see it, while the key is forced.
@@ -2446,7 +2554,7 @@ void step_return(Process& p, size_t floor) {
                 return;
             }
             if (Op(idx.op) == Op::Get) container_get(p, c.b, container, key, c.v1);
-            else container_set(p, c.b, container, key, c.v1);
+            else container_set(p, idx.c, container, key, c.v1);
             return;
         }
 
@@ -2456,10 +2564,14 @@ void step_return(Process& p, size_t floor) {
             if (Op(img_of(p).node(c.b).op) == Op::Get) {
                 container_get(p, c.b, container, p.result, c.v1);
             } else {
-                container_set(p, c.b, container, p.result, c.v1);
+                container_set(p, img_of(p).node(c.b).c, container, p.result, c.v1);
             }
             return;
         }
+
+        case ContKind::SetManyStep:
+            set_many(p, c.b, p.result, c.c, c.v1);
+            return;
 
         case ContKind::GetWalk:
             list_get(p, c.b, p.result, c.a, c.c, c.v1);
@@ -2537,7 +2649,7 @@ void locate_error(Process& p) {
             case ContKind::ClosureArgs:
             case ContKind::IndexKey: case ContKind::IndexApply: case ContKind::GetWalk:
             case ContKind::SetWalk: case ContKind::SwitchOn: case ContKind::SwitchKey:
-            case ContKind::EnterRetry: {
+            case ContKind::EnterRetry: case ContKind::SetManyStep: {
                 uint32_t at = frame_function(c.v1);
                 if (at != NO_NODE) note(int64_t(at) + 1);
                 break;

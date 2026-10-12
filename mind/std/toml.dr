@@ -30,7 +30,9 @@
 
 derive std.codec;
 
+import std.char;
 import std.list;
+import std.num;
 import std.result;
 import std.str;
 
@@ -39,14 +41,11 @@ import std.str;
 /// Test whether a character is whitespace recognized by this format.
 let is_ws : :char -> :bool;
 let is_ws c = c == ' ' || c == '\t';
-/// Test whether a character is an ASCII decimal digit.
-let is_digit : :char -> :bool;
-let is_digit c = c >= '0' && c <= '9';
 
 /// Test whether a character is allowed in a bare TOML key.
 let is_bare : :char -> :bool;
 let is_bare c =
-    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit c || c == '_' || c == '-';
+    char.is_alnum c || c == '_' || c == '-';
 
 /// Drop leading whitespace characters from the parser input.
 let skip_ws : [:char] -> [:char];
@@ -158,7 +157,7 @@ let rec literal_body cs acc = match cs {
 /// Collect a numeric token and record whether it contains floating-point syntax.
 let number_chars : [:char] -> [:char] -> :bool -> [[:char], :bool, [:char]];
 let rec number_chars cs acc floaty = match cs {
-    [c, ..rest] if is_digit c || c == '-' || c == '+' => number_chars rest (list.cons c acc) floaty,
+    [c, ..rest] if char.is_digit c || c == '-' || c == '+' => number_chars rest (list.cons c acc) floaty,
     [c, ..rest] if c == '.' || c == 'e' || c == 'E' => number_chars rest (list.cons c acc) true,
     ['_', ..rest] => number_chars rest acc floaty,               // 1_000 is 1000
     _ => [list.reverse acc, floaty, cs],
@@ -203,7 +202,7 @@ let rec parse_value cs = match skip_ws cs {
     s => match list.head s {
         _ if starts s (str.chars "true") => step true (drop_n 4 s),
         _ if starts s (str.chars "false") => step false (drop_n 5 s),
-        c if is_digit c || c == '-' || c == '+' => parse_number s,
+        c if char.is_digit c || c == '-' || c == '+' => parse_number s,
         _ => (),
     },
 };
@@ -375,10 +374,6 @@ let entries table name = _map_pairs (section table name);
 //   not a table is written before the first header, and so comes back inside
 //   `""`.
 
-/// Encode a hexadecimal digit using lowercase letters.
-priv let hex_digit : :integer -> :string;
-priv let hex_digit n = str.slice n 1 "0123456789abcdef";
-
 /// A basic string's escapes: the five TOML names, and `\u00XX` for any other
 /// control character, which a basic string may not hold as itself.
 let escape_char : :char -> :string;
@@ -390,7 +385,7 @@ let escape_char c = match c {
     '\r' => "\\r",
     _ => match _char_code c {
         code if code < 32 || code == 127 =>
-            "\\u00" + hex_digit ((code / 16) % 16) + hex_digit (code % 16),
+            "\\u00" + num.hex 2 (code % 256),
         _ => str.of_chars [c],
     },
 };

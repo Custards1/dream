@@ -16,7 +16,7 @@ let bump counts key = counts.[key => (counts.[key else 0] + 1)];
 let count_of counts key = counts.[key else 0];
 
 /// Tally every element of `xs`.
-let tally xs = list.fold bump empty xs;
+let tally xs = map.count_by (fn x -> x) xs;
 
 /// The tally as `[key, count]` pairs, commonest first. Ties are broken by key
 /// so the order is total -- otherwise the same input could report differently

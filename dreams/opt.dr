@@ -104,6 +104,8 @@ let node_edges = [
     /// `c` is the fallback, and absent when there is none.
     [:get, [0, 1, 2]],
     [:set, [0, 1, 2]],
+    /// `a` is the container; the pairs are a run.
+    [:set_many, [0]],
     /// `a` is the subject; the table is a run.
     [:switch_head, [0]], [:switch_atom, [0]],
 ];
@@ -147,6 +149,7 @@ let node_runs = [
     [:make_array, 0, 1, 1],
     [:record_make, 0, 1, 1],
     [:make_map, 0, 1, 2],
+    [:set_many, 1, 2, 2],
     [:switch_head, 1, 2, 1],
     [:switch_atom, 1, 2, 1],
 ];

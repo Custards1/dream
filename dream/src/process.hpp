@@ -53,13 +53,15 @@ enum class ContKind : uint8_t {
     IndexKey,    // b = the get/set node, v1 = frame; the container is the result
     IndexApply,  // b = the get/set node, v1 = frame; the container is on the value stack
     GetWalk,     // a = cells still to step over, b = the get node, c = the index, v1 = frame
-    SetWalk,     // a = cells still to step over, b = the set node, c = the index,
+    SetWalk,     // a = cells still to step over, b = the value's node, c = the index,
                  // v1 = frame; the cells stepped over so far are on the value stack
     SwitchOn,    // a = the switch node, v1 = frame; the result is its subject
     SwitchKey,   // a = the switch node, v1 = frame; the result is the key (a head)
     EnterRetry,  // a = function index, b = value-stack height, v1 = frame; re-enter
                  // a compiled call whose nested force was suspended (see
                  // `enter_function`)
+    SetManyStep, // b = the set_many node, c = the next pair, v1 = frame; the
+                 // result is the container with the pairs before it applied
 };
 
 struct Cont {

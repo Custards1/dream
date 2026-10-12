@@ -7,22 +7,15 @@
 // none of them is ever hot, since a field is written once per file.
 
 import std.list;
+import std.num;
 import std.str;
-
-priv let digit_chars : :string = "0123456789abcdef";
 
 /// `n` in `base`, at least `width` digits, zero-filled on the left. A number
 /// too wide for the field is answered whole, and the caller that has a field
 /// to fill checks the width (`fits`) -- truncating it would write a smaller
 /// number, which every reader would believe.
 let in_base : :integer -> :integer -> :integer -> :string;
-let in_base base width n = {
-    let rec spell !m acc = match m {
-        0 => acc,
-        _ => spell (m / base) (list.cons (str.slice (m % base) 1 digit_chars) acc),
-    };
-    pad_left width "0" (str.concat_all (spell n []))
-};
+let in_base base width n = pad_left width "0" (num.to_base base n);
 
 /// Whether `n` can be written in `width` digits of `base`.
 let fits : :integer -> :integer -> :integer -> :bool;

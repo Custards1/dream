@@ -3,8 +3,7 @@ import std.list;
 import std.str;
 import std.map;
 
-let replace old new text = str.join_str new (str.split old text);
-let escape text = text |> replace "&" "&amp;" |> replace "<" "&lt;" |> replace ">" "&gt;" |> replace "\"" "&quot;" |> replace "'" "&#39;";
+let escape text = text |> str.replace "&" "&amp;" |> str.replace "<" "&lt;" |> str.replace ">" "&gt;" |> str.replace "\"" "&quot;" |> str.replace "'" "&#39;";
 let tail n s = str.slice n (len s - n) s;
 let slug s = {
     let chars = str.chars (str.lower s);
@@ -135,8 +134,8 @@ let rec render_lines code_html lines seen = match lines {
         }
     },
 };
-let render_with code_html text = render_lines code_html (str.split "\n" (replace "\r\n" "\n" text)) (%{});
-let title fallback text = match list.first_or () (list.filter (fn l -> str.starts_with "# " l) (str.split "\n" text)) {
+let render_with code_html text = render_lines code_html (str.split "\n" (str.replace "\r\n" "\n" text)) (%{});
+let title fallback text = match list.find (fn l -> str.starts_with "# " l) (str.lines text) {
     () => fallback, line => str.trim (tail 2 line),
 };
 

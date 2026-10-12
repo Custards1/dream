@@ -394,7 +394,7 @@ let cmd_test! m o0 asked = {
                 console.print! ((if Result.passed r { "ok   " } else { "FAIL " }) + Result.name r
                                 + "  (" + seconds (Result.ms r) + ")")
                 if not (Result.passed r) {
-                    console.print! (str.join_str "\n" (list.map (fn l -> "    " + l) (str.split "\n" (str.trim (Result.output r)))))
+                    console.print! (str.indent "    " (str.trim (Result.output r)))
                 }
             }) results)
             let failed = list.length (list.filter (fn r -> not (Result.passed r)) results);
@@ -603,17 +603,11 @@ let add_spec! source c = {
 /// `.git` or the archive extension and without a `dream-` in front, which is
 /// how a repository of a Dream package is usually named and never how it is
 /// imported.
-let strip_suffix suffix s =
-    if str.ends_with suffix s { str.slice 0 (str.byte_length s - str.byte_length suffix) s } else { s };
-
-let strip_prefix prefix s =
-    if str.starts_with prefix s { str.slice (str.byte_length prefix) (str.byte_length s - str.byte_length prefix) s }
-    else { s };
 
 let guessed_name source =
-    strip_prefix "dream-"
-        (strip_suffix ".tgz" (strip_suffix ".tar.gz" (strip_suffix ".git"
-            (util.basename (strip_suffix "/" (list.head (manifest.split_ref source)))))));
+    str.trim_prefix "dream-"
+        (str.trim_suffix ".tgz" (str.trim_suffix ".tar.gz" (str.trim_suffix ".git"
+            (util.basename (str.trim_suffix "/" (list.head (manifest.split_ref source)))))));
 
 let add_name! source dir c =
     match cli.get () c "name" {

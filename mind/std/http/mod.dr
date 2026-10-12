@@ -522,11 +522,7 @@ let read_body! r headers until_close limit = {
 priv let hex_number : :string -> :integer;
 priv let hex_number t =
     if t == "" || str.span "0123456789abcdefABCDEF" 0 t != len t || len t > 15 { 0 - 1 }
-    else { list.fold (fn acc c -> acc * 16 + hex_digit c) 0 (str.chars t) };
-
-/// Decode one hexadecimal character to its numeric value.
-priv let hex_digit : :char -> :integer;
-priv let hex_digit c = { let k = _char_code c; if k <= 57 { k - 48 } else if k <= 70 { k - 55 } else { k - 87 } };
+    else { match num.parse_base 16 t { () => 0 - 1, v => v } };
 
 // --- streams ------------------------------------------------------------------------
 //
@@ -635,10 +631,7 @@ let encode_stream_head resp chunked = {
 /// `content-type` as `Content-Type`: how a header name is usually written,
 /// for peers that are fussier than the RFC lets them be.
 let canonical : :string -> :string;
-let canonical name = str.join_str "-" (list.map (fn part -> match str.chars part {
-    [] => "",
-    [c, ..rest] => str.of_chars (str.upper_char c :: rest),
-}) (str.split "-" name));
+let canonical name = str.join_str "-" (list.map str.capitalize (str.split "-" name));
 
 // --- the client --------------------------------------------------------------------------------
 //

@@ -202,6 +202,7 @@ lazy VM cannot work out for itself:
 | 79 | `shl` | left node | count node | — |
 | 80 | `shr` | left node | count node | — |
 | 81 | `record_make` | kids offset | field count | atom index, top bit set for a variant |
+| 82 | `set_many` | container node | kids offset | pair count |
 
 `record_make` builds a value of a declared `group`, `struct` or union variant
 (`RecordObj`): the fields in a lazy position, as `array`'s items are, and the
@@ -209,6 +210,14 @@ atom naming the declaration -- `app.Point`, or `app.Shape.circle` with
 `c`'s top bit set. Validation checks the kids and that the atom index is in
 the atom table. A part of a parallel build numbers atoms for itself, so the
 merge renumbers this operand as it does `atom`'s.
+
+`set_many` is a chain of `set`s at constant keys made one: its kids are
+`k0, v0, k1, v1, ..`, every key an `int` or `atom` node (validation refuses
+anything else, since the machine reads a key without evaluating it), every
+value stored unforced. It answers what the chain would -- a later key wins, and
+a bad key raises what that `set` would have -- but copies a record or an array
+once. A map takes the pairs as inserts and a list as `set`s, one at a time.
+The compiler emits it for a pipeline of setters, `p |> P.set_a 1 |> P.set_b 2`.
 
 
 `type_is` forces its subject to WHNF and compares its runtime type, answering a
@@ -516,6 +525,7 @@ Later appends: `_sort_keyed` (50), `_tensor_matmul` (51) and `_str_interp`
 `_mailbox_take!`, `_await_message!`, `_deadline_in!` (53-56), `_match_fail`
 (57) and `_error_trace!` (58). Then `_tensor_of_bytes` (59), and the record
 primitives `_record_is` (60), `_record_id` (61), `_record_fields` (62) and
-`_record_of` (63).
+`_record_of` (63). Then `_pow` (64), `num.pow`, and the string walks `_str_char_count` (65),
+`_str_ascii_case` (66), `_str_span_back` (67) and `_str_rfind` (68).
 
 Images importing the removed `std.core` or `std.native` modules must be recompiled.

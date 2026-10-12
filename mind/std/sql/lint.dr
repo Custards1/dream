@@ -259,7 +259,7 @@ priv let statements code several = {
         [_, _, .._] if not several =>
             "this is " + to_string (len pieces) + " statements, and a query is one;"
             + " several in one string are a script",
-        _ => match list.filter (fn p -> p != ()) (list.map first_word_problem pieces) {
+        _ => match list.filter_map first_word_problem pieces {
             [] => (),
             [message, .._] => message,
         },

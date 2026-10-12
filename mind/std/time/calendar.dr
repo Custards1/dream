@@ -14,15 +14,18 @@
 // **Dream's `/` and `%` truncate toward zero**, and calendar arithmetic wants
 // them to round toward negative infinity: the day before the epoch is day -1,
 // which is in the era before, not the one after. `floor_div` and `floor_mod`
-// are that, and nothing here divides any other way.
+// are that -- `num.div_floor` and `num.modulo` under the names this module
+// has always given them -- and nothing here divides any other way.
+
+import std.num;
 
 /// `a / b` rounded toward negative infinity, for `b > 0`.
 let floor_div : :integer -> :integer -> :integer;
-let floor_div a b = if a >= 0 { a / b } else { 0 - ((b - 1 - a) / b) };
+let floor_div a b = num.div_floor a b;
 
 /// The remainder that goes with `floor_div`: always in `0 .. b - 1`.
 let floor_mod : :integer -> :integer -> :integer;
-let floor_mod a b = a - b * floor_div a b;
+let floor_mod a b = num.modulo a b;
 
 /// Test the Gregorian rule: divisible by four, except centuries not divisible by 400.
 ///

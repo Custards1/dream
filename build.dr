@@ -138,10 +138,9 @@ let optimized ctx t = match build.profile ctx {
 /// not look; the repository's `nix-shell` supplies pkg-config and PIC libffi.
 let ffi : cc.Toolchain -> [:string] -> cc.Target -> cc.Target;
 let ffi tc [cflags, libs] t = {
-    let words text = list.filter (fn w -> not (str.is_empty w)) (str.split " " (str.trim text));
-    match words libs {
+    match str.words libs {
         [] => t |> cc.system "ffi",
-        found => t |> cc.flags_for :gnu (words cflags) |> link_libraries tc found,
+        found => t |> cc.flags_for :gnu (str.words cflags) |> link_libraries tc found,
     }
 };
 
@@ -154,11 +153,10 @@ let tls tc [cflags, libs] t = match cc.Toolchain.os tc {
     :windows => t |> cc.source "dream/src/tls_schannel.cpp"
                   |> cc.system "secur32" |> cc.system "crypt32" |> cc.system "ncrypt",
     _ => {
-        let words text = list.filter (fn w -> not (str.is_empty w)) (str.split " " (str.trim text));
         let with_source = cc.source "dream/src/tls_openssl.cpp" t;
-        match words libs {
+        match str.words libs {
             [] => with_source |> cc.system "ssl" |> cc.system "crypto",
-            found => with_source |> cc.flags_for :gnu (words cflags) |> cc.link_flags_for :gnu found,
+            found => with_source |> cc.flags_for :gnu (str.words cflags) |> cc.link_flags_for :gnu found,
         }
     },
 };
@@ -242,8 +240,6 @@ let unavailable why = build.given (build.artifact
     (build.step "configure" why [] [why] ["answer"]
         (fn job -> [build.Op.write "answer" why, build.Op.empty "answer" why])) "answer") (fn _ -> build.empty);
 
-let words : :string -> [:string];
-let words text = list.filter (fn w -> not (str.is_empty w)) (str.split " " (str.trim text));
 
 let ffi_probe : :string;
 let ffi_probe = "#define FFI_STATIC_BUILD\n#include <ffi.h>\nextern \"C\" void probe() { ffi_cif c; "
@@ -295,7 +291,7 @@ let dependencies ctx tc config libffi openssl dir = {
         else { with_llvm libffi }
     } else {
         let archive = str.trim dir + "/libffi.a";
-        build.given (probe.shared_link tc ffi_probe (words (list.head libffi)) [archive]) (fn works ->
+        build.given (probe.shared_link tc ffi_probe (str.words (list.head libffi)) [archive]) (fn works ->
             if works == "yes" { with_llvm [list.head libffi + (if cc.Toolchain.os tc == :windows { " -DFFI_STATIC_BUILD" } else { "" }), archive] }
             else if mode == "static" { unavailable "libffi.a cannot link into libdream; build libffi with --with-pic" }
             else { with_llvm libffi })

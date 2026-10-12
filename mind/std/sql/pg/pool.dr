@@ -47,9 +47,13 @@ mod keeper {
         waiting : [:any] = []
     }
 
+    /// The state arrives already built by `start!`.
     let init! : :any -> :any;
     let init! args = args;
 
+    /// `:checkout` hands over an idle connection, or permission to open one
+    /// while the pool is under its size, or queues the caller; `:stats` and
+    /// `:drain` answer the counts and the idle connections.
     let handle_call! : :any -> :any -> :any -> :any;
     let handle_call! request from state = match request {
         :checkout => match State.idle state {
@@ -82,9 +86,12 @@ mod keeper {
         _ => noreply state,
     };
 
+    /// Close the idle connections. Those checked out belong to their callers
+    /// until they come back, and there is nowhere for them to come back to.
     let terminate! : :any -> :any -> :any;
     let terminate! reason state = strict! (list.map (fn c -> db.close! c) (State.idle state));
 
+    /// The name the pool's process is reported under.
     let server_name : :any -> :string;
     let server_name u = "std.sql.pg.pool";
 }

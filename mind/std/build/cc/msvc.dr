@@ -86,14 +86,12 @@ let compile tc t [path, own] object = {
 /// nothing, and is dropped.
 let headers : :string -> :string -> [[:string], :string];
 let headers prefix output = {
-    let lines = str.split "\n" output;
-    let [found, rest] = list.fold (fn [hs, others] raw -> {
-        let line = if str.ends_with "\r" raw { str.slice 0 (str.byte_length raw - 1) raw } else { raw };
+    let [found, rest] = list.fold (fn [hs, others] line -> {
         if str.starts_with prefix line {
             let n = str.byte_length prefix;
             [list.cons (str.trim (str.slice n (str.byte_length line - n) line)) hs, others]
         } else { [hs, list.cons line others] }
-    }) [[], []] lines;
+    }) [[], []] (str.lines output);
     let shown = match list.reverse rest {
         [first, ..more] if str.ends_with ".c" first || str.ends_with ".cpp" first
                            || str.ends_with ".cc" first || str.ends_with ".cxx" first => more,
@@ -149,7 +147,7 @@ let def_file library dumped = {
         let line = str.trim raw;
         match str.split "|" line {
             [left, right] if str.contains_str " SECT" left && str.contains_str "External" left => {
-                let symbol = list.head (str.split " " (str.trim right));
+                let symbol = list.first_or "" (str.words right);
                 if symbol == "" || private_symbol symbol { [] }
                 else if str.contains_str "()" left { ["    " + symbol] }
                 else { ["    " + symbol + " DATA"] }
@@ -157,7 +155,7 @@ let def_file library dumped = {
             _ => [],
         }
     }) (str.split "\n" dumped);
-    str.join_str "\n" (list.concat [["LIBRARY " + library, "EXPORTS"], list.unique entries, [""]])
+    str.join_str "\n" (list.concat [["LIBRARY " + library, "EXPORTS"], list.unique_on (fn e -> e) entries, [""]])
 };
 
 when test {

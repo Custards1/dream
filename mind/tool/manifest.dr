@@ -254,9 +254,8 @@ let profile_configs m name = sections_under m ("profile." + name + ".config.");
 /// A 7-to-40-digit hex string is a commit, which `git clone --branch` cannot
 /// take; anything else after the `#` is a tag or a branch, which it can.
 let looks_like_rev r = {
-    let hex c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
     let n = str.byte_length r;
-    n >= 7 && n <= 40 && list.all hex (str.chars r)
+    n >= 7 && n <= 40 && str.span "0123456789abcdef" 0 r == n
 };
 
 let is_remote s = str.contains_str "://" s || str.starts_with "git@" s;

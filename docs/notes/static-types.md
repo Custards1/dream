@@ -562,3 +562,67 @@ sharing the checker 120 ms (sequential: evaluating every signature 31,
 finding unknown names 20, the rest small), the first check 155, the second
 check against inferred answers 140, ordering the results 23. Before the
 migration the same four were 70, 120, 120 and 21.
+
+## A pipeline of setters is one copy (2026-10-11)
+
+`P.set_x` is a wrapper -- its body is `record.[i => value]` -- so a call of it
+is already the `set` opcode, with no call. But a pipeline,
+`p |> Person.set_name "test" |> Person.set_age 23 |> Person.set_weight 2`, was
+three `set`s, and each forced the record, allocated a whole copy and copied
+every field to change one: k setters on an n-field record copied n×k slots and
+left k - 1 records as garbage the moment they were made.
+
+Lowering now fuses the chain (`lower.fuse_set`): a `set` at a constant key
+whose container is a `set` (or a `set_many`) at a constant key becomes one
+`set_many`, opcode 82, whose kids are the pairs in order. The VM copies a
+record or an array once and writes every pair into the copy; a map takes the
+pairs as inserts; a list, which is walked with continuations, takes them a
+`set` at a time (`SetManyStep`). The JIT writes it as one call of
+`dream_rt_set_many` with the pairs as a `lazy_array`, so a compiled loop over
+it suspends nothing.
+
+What makes it safe to do with no use count:
+
+- **A node is a function of its frame.** An intermediate record some other
+  expression also wants is a binding, a `local`, and a `local` is never fused
+  through. Two parents of one `set` *node* evaluate it each on its own, fused
+  or not, so fusing never makes more copies than there were.
+- **The keys are constants**, which the loader checks (`SetMany` in
+  image.cpp), so the order they are read in cannot differ from the chain's.
+  Every key is checked before the copy is made, against the messages
+  `container_set` raises, so a bad key raises at the same pair the chain
+  would have raised at -- the pairs before it changed nothing anyone saw.
+- **Values stay where they were**: each is stored unforced, as `set` stores
+  one, and a later key overwrites an earlier one as the second `set` did.
+
+`dream/tests/programs/set_many.dr` holds each of those against both tiers.
+
+Measured on 2M iterations, against one `make` of the same record:
+
+| | before | fused | one `make` |
+|---|---|---|---|
+| 3 setters, 3 fields, JIT | 88 ms, 242 MB | 51 ms, 82 MB | 30 ms, 82 MB |
+| 5 setters, 10 fields, JIT | 229 ms, 961 MB | 61 ms, 194 MB | -- |
+| 3 setters, interpreted | 349 ms | 321 ms | 241 ms |
+
+The allocation is a single record's, exactly as `make` allocates. The time
+left above `make` is the old record forced and its fields copied.
+
+A `mapping` is a map, and its setters fuse into the same opcode. The VM takes
+the pairs as one batch (`map_insert_many` in dream/src/builtins.cpp): a run of
+`map_insert`s path-copied the root and every branch on the way once per key,
+and the batch copies each once and then changes its own copies in place,
+since nothing outside the batch has seen them. Which branches are its own is a
+fixed array on the stack. The first version kept them in a `std::vector`, and
+with the pairs gathered into two more, the three heap allocations a call cost
+more than the copying saved: it was 12% *slower* than the chain, at half the
+allocation.
+
+| 4 setters, 12-field `mapping`, JIT | before | fused |
+|---|---|---|
+| 1M iterations | 146 ms, 609 MB | 98 ms, 274 MB |
+
+On a self-compile -- whose state is all `mapping`s built by setter pipelines --
+it is 1.6% less allocation (4.57 GB to 4.49 GB) and no time anyone can
+measure: 2.81 s against 2.79 s, inside the noise. The pipelines are there, but
+they are not where a compile spends its time.

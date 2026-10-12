@@ -13,6 +13,7 @@
 
 derive std.seq;
 import std.list;
+import std.char;
 
 // --- the hole std.seq declares ----------------------------------------------
 
@@ -34,9 +35,10 @@ let name s = "string";
 // --- size -------------------------------------------------------------------
 
 /// The number of characters. Decodes the whole string, because UTF-8 does not
-/// know its own character count without looking.
+/// know its own character count without looking -- but in the machine, and
+/// without building the list of characters `chars` would (`_str_char_count`).
 let length : :string -> :integer;
-let length s = list.length (_str_chars s);
+let length s = _str_char_count s;
 
 /// The number of bytes, which the runtime knows without decoding anything.
 /// For text that is all ASCII the two agree; for anything else they do not.
@@ -120,6 +122,12 @@ let span set from s = _str_span s from set;
 let upto : :string -> :integer -> (:string | :bigstr) -> :integer;
 let upto set from s = _str_upto s from set;
 
+/// Where the run of bytes from `set` that ends at byte offset `until` starts:
+/// `span` run backwards. `span_back " " (byte_length s) s` is where the
+/// trailing spaces begin, or the length when there are none.
+let span_back : :string -> :integer -> (:string | :bigstr) -> :integer;
+let span_back set until s = _str_span_back s until set;
+
 /// The byte offset of `needle` at or after byte offset `from`, or `-1`.
 let find_from : :integer -> :string -> :string -> :integer;
 let find_from from needle s = _str_find s needle from;
@@ -137,6 +145,15 @@ let find_from from needle s = _str_find s needle from;
 let find : :string -> :string -> :integer;
 let find needle s = _str_find s needle 0;
 
+/// The greatest byte offset at or before `from` where `needle` starts, or `-1`.
+let find_last_from : :integer -> :string -> :string -> :integer;
+let find_last_from from needle s = _str_rfind s needle from;
+
+/// The byte offset of the last occurrence of `needle`, or `-1`: the dot
+/// before a file's extension, the slash before a path's last component.
+let find_last : :string -> :string -> :integer;
+let find_last needle s = _str_rfind s needle (len s);
+
 /// Test whether `needle` occurs anywhere in the string.
 let contains_str : :string -> :string -> :bool;
 let contains_str needle s = _str_find s needle 0 >= 0;
@@ -149,6 +166,46 @@ let starts_with prefix s = _str_slice s 0 (len prefix) == prefix;
 let ends_with : :string -> (:string | :bigstr) -> :bool;
 let ends_with suffix s =
     _str_slice s (len s - len suffix) (len suffix) == suffix;
+
+/// What comes before and after the first `sep`, as `[before, after]`, or `()`
+/// when `sep` does not occur: `split_once "=" "k=v=w"` is `["k", "v=w"]`. The
+/// shape of every `key=value`, `name: value` and `host:port` a program reads.
+let split_once : :string -> :string -> ([:string, :string] | :unit);
+let split_once sep s = {
+    let at = _str_find s sep 0;
+    if at < 0 { () }
+    else { [_str_slice s 0 at, _str_slice s (at + len sep) (len s - at - len sep)] }
+};
+
+/// What comes before and after the *last* `sep`, or `()`:
+/// `split_last "." "a.tar.gz"` is `["a.tar", "gz"]`.
+let split_last : :string -> :string -> ([:string, :string] | :unit);
+let split_last sep s = {
+    let at = _str_rfind s sep (len s);
+    if at < 0 { () }
+    else { [_str_slice s 0 at, _str_slice s (at + len sep) (len s - at - len sep)] }
+};
+
+/// How many times `needle` occurs, not overlapping; `0` for an empty needle.
+let occurrences : :string -> :string -> :integer;
+let occurrences needle s = {
+    let step = len needle;
+    let rec go from !n = {
+        let at = _str_find s needle from;
+        if at < 0 { n } else { go (at + step) (n + 1) }
+    };
+    if step == 0 { 0 } else { go 0 0 }
+};
+
+/// `s` without `prefix` when it starts with one, and as it was otherwise.
+let trim_prefix : :string -> :string -> :string;
+let trim_prefix prefix s =
+    if starts_with prefix s { _str_slice s (len prefix) (len s - len prefix) } else { s };
+
+/// `s` without `suffix` when it ends with one, and as it was otherwise.
+let trim_suffix : :string -> :string -> :string;
+let trim_suffix suffix s =
+    if ends_with suffix s { _str_slice s 0 (len s - len suffix) } else { s };
 
 // --- building ---------------------------------------------------------------
 
@@ -214,6 +271,106 @@ let split sep s = {
     if seplen == 0 { [s] } else { go 0 }
 };
 
+/// The lines of the text, without their endings. A `\r` before a `\n` goes
+/// with the ending, and a final line ending ends the last line rather than
+/// starting an empty one -- so a file read whole and split here gives the
+/// lines an editor shows, whichever system wrote it.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.lines "one\r\ntwo\n")
+/// };
+/// ```
+let lines : :string -> [:string];
+let lines s = {
+    let n = len s;
+    let rec go i =
+        if i >= n { [] }
+        else {
+            let stop = _str_upto s i "\n";
+            let end = if stop > i && _str_byte s (stop - 1) == 13 { stop - 1 } else { stop };
+            _list_cons (_str_slice s i (end - i)) (go (stop + 1))
+        };
+    go 0
+};
+
+/// The runs of text between whitespace -- spaces, tabs and line endings --
+/// with none of it kept, and no empty words however the runs fall.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.words "  the quick\tbrown  ")
+/// };
+/// ```
+let words : :string -> [:string];
+let words s = {
+    let n = len s;
+    let rec go i = {
+        let start = _str_span s i whitespace;
+        if start >= n { [] }
+        else {
+            let stop = _str_upto s start whitespace;
+            _list_cons (_str_slice s start (stop - start)) (go stop)
+        }
+    };
+    go 0
+};
+
+/// Every occurrence of `old` replaced by `new`, left to right and not
+/// overlapping: `replace "ab" "x" "abab"` is `"xx"`. An empty `old` matches
+/// nowhere, so the string comes back as it was.
+///
+/// The pieces are collected and joined once (`concat_all`), so a replacement
+/// in a large text is linear rather than a copy of the text per match.
+///
+/// ```dream
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.replace "cat" "dog" "cat and cat")
+/// };
+/// ```
+let replace : :string -> :string -> :string -> :string;
+let replace old new s = {
+    let step = len old;
+    let rec go from !acc = {
+        let at = _str_find s old from;
+        if at < 0 { list.reverse (_list_cons (_str_slice s from (len s - from)) acc) }
+        else { go (at + step) (_list_cons new (_list_cons (_str_slice s from (at - from)) acc)) }
+    };
+    if step == 0 || _str_find s old 0 < 0 { s } else { _str_concat (go 0 []) }
+};
+
+/// Every line of `s` with `prefix` in front, joined by `\n` -- how a block of
+/// output is set under a heading. Lines as `lines` finds them, so a final line
+/// ending is not kept and does not make an indented empty line.
+let indent : :string -> :string -> :string;
+let indent prefix s = join_str "\n" (list.map (fn l -> prefix + l) (lines s));
+
+/// `s` with `fill` repeated in front until it is `width` characters long; a
+/// string already that long comes back as it was. `pad_start 3 "0" "7"` is
+/// `"007"`. `fill` is meant to be one character, and is counted as one.
+let pad_start : :integer -> :string -> :string -> :string;
+let pad_start width fill s = {
+    let short = width - length s;
+    if short <= 0 { s } else { repeat short fill + s }
+};
+
+/// `s` with `fill` repeated after it until it is `width` characters long: how
+/// a column of a table is lined up.
+let pad_end : :integer -> :string -> :string -> :string;
+let pad_end width fill s = {
+    let short = width - length s;
+    if short <= 0 { s } else { s + repeat short fill }
+};
+
 // --- transforming -----------------------------------------------------------
 
 /// Apply `f` to each Unicode character and join the resulting characters.
@@ -233,15 +390,14 @@ let reverse s = _str_of_chars (list.reverse (_str_chars s));
 // Only the ASCII range. Real Unicode case folding is a table this library does
 // not carry, and pretending otherwise would be worse than saying so.
 
-/// Convert an ASCII lowercase character to uppercase; leave other characters unchanged.
+/// Convert an ASCII lowercase character to uppercase; leave other characters
+/// unchanged. `char.upper`, under the name this module has always had for it.
 let upper_char : :char -> :char;
-let upper_char c =
-    if c >= 'a' && c <= 'z' { _char_of_code (_char_code c - 32) } else { c };
+let upper_char c = char.upper c;
 
 /// Convert an ASCII uppercase character to lowercase; leave other characters unchanged.
 let lower_char : :char -> :char;
-let lower_char c =
-    if c >= 'A' && c <= 'Z' { _char_of_code (_char_code c + 32) } else { c };
+let lower_char c = char.lower c;
 
 /// Convert ASCII lowercase letters to uppercase throughout the string.
 ///
@@ -254,26 +410,48 @@ let lower_char c =
 /// };
 /// ```
 let upper : :string -> :string;
-let upper s = map upper_char s;
+let upper s = _str_ascii_case s true;
 
 /// Convert ASCII uppercase letters to lowercase throughout the string.
 let lower : :string -> :string;
-let lower s = map lower_char s;
+let lower s = _str_ascii_case s false;
 
 // --- trimming ---------------------------------------------------------------
 
+// The trims are byte scans (`span`, `span_back`) and one slice. They were a
+// decode into a list of characters, a `drop_while`, and for `trim_end` two
+// reversals, before the string was encoded again: a cons per character to
+// remove two spaces. Every byte of the whitespace set is ASCII, so a scan
+// over bytes cannot stop inside a multi-byte character.
+
 /// Test for a space, tab, newline or carriage return.
 let is_space : :char -> :bool;
-let is_space c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
+let is_space c = char.is_space c;
+
+/// The bytes `is_space` answers true for, as a set for `span` and `upto`.
+let whitespace : :string;
+let whitespace = " \t\n\r";
+
+/// Test whether the string is empty or holds nothing but whitespace.
+let is_blank : :string -> :bool;
+let is_blank s = _str_span s 0 whitespace >= len s;
+
+/// The string with its first character upper-cased, ASCII only.
+let capitalize : :string -> :string;
+let capitalize s =
+    if _str_span s 0 "abcdefghijklmnopqrstuvwxyz" == 0 { s }
+    else { _str_ascii_case (_str_slice s 0 1) true + _str_slice s 1 (len s - 1) };
 
 /// Remove spaces, tabs and line endings from the start of the string.
 let trim_start : :string -> :string;
-let trim_start s = _str_of_chars (list.drop_while is_space (_str_chars s));
+let trim_start s = {
+    let start = _str_span s 0 whitespace;
+    _str_slice s start (len s - start)
+};
 
 /// Remove spaces, tabs and line endings from the end of the string.
 let trim_end : :string -> :string;
-let trim_end s =
-    _str_of_chars (list.reverse (list.drop_while is_space (list.reverse (_str_chars s))));
+let trim_end s = _str_slice s 0 (_str_span_back s (len s) whitespace);
 
 /// Remove spaces, tabs and line endings from both ends of the string.
 ///
@@ -286,7 +464,10 @@ let trim_end s =
 /// };
 /// ```
 let trim : :string -> :string;
-let trim s = trim_end (trim_start s);
+let trim s = {
+    let start = _str_span s 0 whitespace;
+    _str_slice s start (_str_span_back s (len s) whitespace - start)
+};
 
 // --- tests ------------------------------------------------------------------
 
@@ -371,6 +552,38 @@ when test {
         test.case "trim_start"       $( test.eq! "a  " (trim_start "  a  ") ),
         test.case "trim_end"         $( test.eq! "  a" (trim_end "  a  ") ),
         test.case "trim of blank"    $( test.eq! "" (trim "   ") ),
+        test.case "trim of empty"    $( test.eq! ["", "", ""] [trim "", trim_start "", trim_end ""] ),
+        test.case "trim keeps inner multibyte text" $( test.eq! "h\u{e9} \u{e9}" (trim "\t h\u{e9} \u{e9}\r\n") ),
+        test.case "trim_prefix"      $( test.eq! ["bar", "foobar"] [trim_prefix "foo" "foobar", trim_prefix "x" "foobar"] ),
+        test.case "trim_suffix"      $( test.eq! ["main", "main.dr"] [trim_suffix ".dr" "main.dr", trim_suffix ".x" "main.dr"] ),
+
+        // --- the byte scans backwards ---
+        test.case "span_back"        $( test.eq! [1, 4, 0] [span_back " " 4 "a   ", span_back " " 4 "abcd", span_back " " 9 "  "] ),
+        test.case "find_last"        $( test.eq! [3, 0 - 1, 0] [find_last "." "a.b.c", find_last "z" "abc", find_last "ab" "abc"] ),
+        test.case "find_last_from"   $( test.eq! [3, 1, 0 - 1] [find_last_from 3 "." "a.b.c", find_last_from 2 "." "a.b.c", find_last_from 0 "." "a.b.c"] ),
+
+        // --- lines, words, pieces ---
+        test.case "lines"            $( test.eq! ["a", "", "b"] (lines "a\n\nb") ),
+        test.case "lines drops a final ending" $( test.eq! ["a", "b"] (lines "a\r\nb\n") ),
+        test.case "lines of nothing" $( test.empty! (lines "") ),
+        test.case "lines of one ending" $( test.eq! [""] (lines "\n") ),
+        test.case "words"            $( test.eq! ["a", "bc", "d"] (words "  a bc\t\nd ") ),
+        test.case "words of blank"   $( test.empty! (words " \t ") ),
+        test.case "split_once"       $( test.eq! [["k", "v=w"], ()] [split_once "=" "k=v=w", split_once ":" "kv"] ),
+        test.case "split_once at the ends" $( test.eq! [["", "v"], ["k", ""]] [split_once "=" "=v", split_once "=" "k="] ),
+        test.case "replace"          $( test.eq! "dog and dog" (replace "cat" "dog" "cat and cat") ),
+        test.case "replace does not overlap" $( test.eq! "xa" (replace "aa" "x" "aaa") ),
+        test.case "replace nothing"  $( test.eq! ["abc", "abc"] [replace "z" "y" "abc", replace "" "y" "abc"] ),
+        test.case "replace with a longer text" $( test.eq! "<<a>><<a>>" (replace "a" "<<a>>" "aa") ),
+        test.case "split_last"       $( test.eq! [["a.tar", "gz"], ()] [split_last "." "a.tar.gz", split_last "." "abc"] ),
+        test.case "occurrences"      $( test.eq! [2, 1, 0, 0] [occurrences "ab" "abcab", occurrences "aa" "aaa",
+                                                              occurrences "x" "abc", occurrences "" "abc"] ),
+        test.case "indent"           $( test.eq! "  a\n  b" (indent "  " "a\nb\n") ),
+        test.case "is_blank"         $( test.eq! [true, true, false] [is_blank "", is_blank " \t\n", is_blank " x "] ),
+        test.case "capitalize"       $( test.eq! ["Hello", "Hello", "", "1a"] [capitalize "hello", capitalize "Hello",
+                                                                          capitalize "", capitalize "1a"] ),
+        test.case "pad_start"        $( test.eq! ["007", "1234"] [pad_start 3 "0" "7", pad_start 3 "0" "1234"] ),
+        test.case "pad_end counts characters" $( test.eq! "\u{e9}.." (pad_end 3 "." "\u{e9}") ),
     ];
 }
 

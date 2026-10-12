@@ -6,6 +6,7 @@ mod get {
     import std.array
     import std.error;
 
+    /// The left fold for collections of runtime type `kind`.
     let fold_from kind = match kind {
         :list => list.fold,
         :array => array.fold,
@@ -13,6 +14,7 @@ mod get {
         _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
     }
 
+    /// The map for collections of runtime type `kind`.
     let map_from kind = match kind {
         :list => list.map,
         :array => array.map,
@@ -20,19 +22,25 @@ mod get {
         _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
     }
 
+    /// Positional lookup for collections of runtime type `kind`: a string
+    /// answers its byte.
     let nth_from kind = match kind {
         :list => list.nth,
         :array => array.get,
         :string => str.byte,
         _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
     }
+    /// Reversal for collections of runtime type `kind`.
     let reverse_from kind = match kind {
         :list => list.reverse,
         :array => array.reverse,
         :string => str.reverse,
         _=> error.new :type_error ("std.dymanic needs a collection type, got: " + to_string kind)
     }
+    /// Apply `f`, one of the `_from` choosers, to the runtime type of `i`.
     let reflect f i = f (type_of i)
+    /// The chooser for the operation named `fa` -- `:fold`, `:map`, `:nth` or
+    /// `:reverse`.
     let from_dy fa = match fa {
         :fold => fold_from,
         :map => map_from,

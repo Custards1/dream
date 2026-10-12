@@ -409,7 +409,7 @@ let listing dir suffix =
 let given_files : :string -> :string -> ([:string] -> :map) -> :map;
 let given_files dir suffix f =
     given (listing dir suffix)
-          (fn text -> f (list.map (fn l -> dir + "/" + l) (list.filter (fn l -> not (str.is_empty l)) (str.split "\n" text))));
+          (fn text -> f (list.map (fn l -> dir + "/" + l) (list.filter (fn l -> not (str.is_empty l)) (str.lines text))));
 
 /// The table with `name => value` in it. A name already given to something
 /// else is marked as a conflict in the table itself, which is where

@@ -499,9 +499,12 @@ priv let answer_of! outcome = match outcome {
 mod server {
     derive std.server;
 
+    /// The name the server is reported under.
     let server_name : :any -> :string;
     let server_name u = "foreign library";
 
+    /// The server holds no state of its own; what it owns are the resources
+    /// made by the work it runs, and the VM releases those with the process.
     let init! : :any -> :any;
     let init! u = :serving;
 
@@ -517,6 +520,8 @@ mod server {
         reply answer state
     };
 
+    /// Run `work` and answer `[:ok, value]` with the value forced, or
+    /// `[:error, e]` for what it raised.
     let answer_here! : (:unit -> :any) -> :any;
     let answer_here! work = try! {
         // A statement, not an element: `[:ok, strict! x]` suspends the

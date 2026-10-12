@@ -443,6 +443,67 @@ int dream_rt_get(Process* p, Value c, Value k, int32_t has_default, Value* out) 
     }
 }
 
+int dream_rt_set_many(Process* p, Value c, uint32_t count, const Value* pairs, Value* out) {
+    PinsTheHeap pinned(*p);
+    c = resolve(c);
+    const bool record = is_obj(c, ObjType::Record);
+    if (record || is_obj(c, ObjType::Array)) {
+        const uint32_t len = record ? static_cast<RecordObj*>(as_obj(c))->len
+                                    : static_cast<ArrayObj*>(as_obj(c))->len;
+        // The messages `container_set` and `dream_rt_set` raise, at the key
+        // the chain of `Set`s would have raised them at.
+        for (uint32_t i = 0; i < count; ++i) {
+            Value k = resolve(pairs[2 * i]);
+            if (!is_fixnum(k)) {
+                *out = rt_type_error(*p, record ? "a field of a record is changed by position, not " +
+                                                      describe(*p, k)
+                                                : "a position is an integer, not " + describe(*p, k));
+                return 0;
+            }
+            const int64_t at = fixnum_value(k);
+            if (at < 0 || at >= int64_t(len)) {
+                *out = rt_out_of_bounds(*p, record ? "field " + std::to_string(at) + " is outside " +
+                                                         describe(*p, c)
+                                                   : "index " + std::to_string(at) +
+                                                         " is outside an array of " + std::to_string(len));
+                return 0;
+            }
+        }
+        Value copy = record ? p->heap().make_record(static_cast<RecordObj*>(as_obj(c))->tag, len)
+                            : p->heap().make_array(len);
+        Value* dst = record ? static_cast<RecordObj*>(as_obj(copy))->items()
+                            : static_cast<ArrayObj*>(as_obj(copy))->items();
+        const Value* src = record ? static_cast<RecordObj*>(as_obj(c))->items()
+                                  : static_cast<ArrayObj*>(as_obj(c))->items();
+        Obj* holder = as_obj(copy);
+        for (uint32_t i = 0; i < len; ++i) {
+            dst[i] = src[i];
+            p->heap().remember_if_old(holder, src[i]);
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            const Value v = pairs[2 * i + 1];
+            dst[fixnum_value(resolve(pairs[2 * i]))] = v;
+            p->heap().remember_if_old(holder, v);
+        }
+        *out = copy;
+        return 1;
+    }
+    if (is_obj(c, ObjType::Map)) {
+        *out = map_insert_many(*p, c, count, pairs);
+        return 1;
+    }
+    // A list, or something `Set` refuses: a pair at a time, which is `Set`
+    // exactly.
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!dream_rt_set(p, c, pairs[2 * i], pairs[2 * i + 1], &c)) {
+            *out = c;
+            return 0;
+        }
+    }
+    *out = c;
+    return 1;
+}
+
 int dream_rt_set(Process* p, Value c, Value k, Value v, Value* out) {
     PinsTheHeap pinned(*p);
     c = resolve(c);

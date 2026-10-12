@@ -386,7 +386,7 @@ let virtual_as_hole name v =
 /// The names a parameter list binds. A parameter may be `()`, a slot that binds
 /// nothing, which is what `let now! () = ..` uses.
 let param_names ps =
-    list.filter (fn n -> n != ()) (list.map (fn p -> ast.param_name p) ps);
+    list.filter_map (fn p -> ast.param_name p) ps;
 
 // --- resolving a module path ---------------------------------------------------
 
@@ -1024,8 +1024,8 @@ let declare_module l mi s0 = {
     let contracts = list.fold (fn acc oi -> match list.nth 1 oi {
         [:virtual, _, _, _, _, _] => {
             let v = list.nth 1 oi;
-            match list.first_or () (list.filter
-                (fn od -> decl_name (list.nth 1 od) == virtual_name v) (list.head filled)) {
+            match list.find
+                (fn od -> decl_name (list.nth 1 od) == virtual_name v) (list.head filled) {
                 () => acc,
                 od => check_virtual_impl l v od acc,
             }

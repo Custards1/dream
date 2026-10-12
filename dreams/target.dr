@@ -201,7 +201,7 @@ let parse_all specs = {
         [[:error, why], ..rest] => [:error, why],
         _ => {
             let said = list.map (fn r -> list.nth 1 r) parsed;
-            match [list.contains () said, list.filter (fn t -> t != ()) said] {
+            match [list.contains () said, list.compact said] {
                 [false, []] => [:ok, ()],
                 [true, []] => [:ok, :any],
                 [true, _] => [:error, "--target any cannot be given beside another target"],

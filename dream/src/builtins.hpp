@@ -56,6 +56,10 @@ uint32_t builtin_count();
 /// `map` with `key` set to `value`. The map handed in is unchanged and stays
 /// valid: what comes back shares all of it but the path to the new entry.
 Value map_insert(Process& p, Value map, Value key, Value value);
+/// `map` with `n` keys set, in order, a later one winning: what a run of
+/// `map_insert`s answers, with each branch on the way copied once rather than
+/// once per key. `pairs` is `k0, v0, k1, v1, ..`. `SetMany` on a map is this.
+Value map_insert_many(Process& p, Value map, uint32_t n, const Value* pairs);
 /// `map` without `key`, on the same terms.
 Value map_erase(Process& p, Value map, Value key);
 /// Every entry of a map, in the trie's order.

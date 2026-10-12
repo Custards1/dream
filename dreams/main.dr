@@ -172,14 +172,10 @@ let compile_options o =
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
 let show_modules! l = {
-    let width = list.fold (fn w m -> {
-        let n = str.byte_length (modules.module_name m);
-        if n > w { n } else { w }
-    }) 0 (modules.modules l);
+    let width = list.fold_strict (fn w m -> num.max w (str.byte_length (modules.module_name m)))
+                                 0 (modules.modules l);
     list.map (fn m ->
-        console.print! (modules.module_name m
-                        + str.repeat (width - str.byte_length (modules.module_name m) + 2) " "
-                        + modules.module_path m))
+        console.print! (str.pad_end (width + 2) " " (modules.module_name m) + modules.module_path m))
              (modules.modules l) |> strict!
     if list.is_empty (modules.natives l) { () }
     else { console.print! ("host: " + str.join_str ", " (modules.natives l)) }
@@ -560,10 +556,10 @@ let show_time! o file = {
                   ["lower", linked], ["types", checked], ["arena", built], ["share", shared],
                   ["emit", written]];
     let total = list.fold (fn n st -> n + own_of (list.nth 1 st)) 0 stages;
-    let pad n text = str.repeat (n - str.byte_length text) " " + text;
+    let pad n text = str.pad_start n " " text;
     let line! label ms walk = {
         let pct = if total <= 0 { 0 } else { ms * 100 / total };
-        console.print! (label + str.repeat (10 - str.byte_length label) " "
+        console.print! (str.pad_end 10 " " label
                         + pad 6 (to_string ms) + " ms  " + pad 3 (to_string pct) + "%"
                         + (match walk { () => "", w => "   (walk " + to_string w + " ms)" }))
     };
@@ -611,13 +607,13 @@ let show_macros! l = match modules.macro_meter l {
         let at k = phases.[k else [0, 0, 0, 0]];
         let ms r = list.nth 0 r / 1000000;
         let total = list.fold (fn n [k, _] -> n + ms (at k)) 0 rows;
-        let pad n text = str.repeat (n - str.byte_length text) " " + text;
+        let pad n text = str.pad_start n " " text;
         let millions n = to_string (n / 1000000) + "." + to_string (n % 1000000 / 100000);
         let plural n one = to_string n + " " + one + (if n == 1 { "" } else { "s" });
         let row! [k, label] = {
             let r = at k;
             let pct = if total <= 0 { 0 } else { ms r * 100 / total };
-            console.print! ("  " + label + str.repeat (9 - str.byte_length label) " "
+            console.print! ("  " + str.pad_end 9 " " label
                             + pad 6 (to_string (ms r)) + " ms  " + pad 3 (to_string pct) + "%"
                             + pad 9 (millions (list.nth 1 r)) + " M red"
                             + pad 7 (to_string (list.nth 2 r / 1048576)) + " MB")

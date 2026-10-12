@@ -191,7 +191,7 @@ let qualified names = raw (str.join_str "." (list.map quote_ident names));
 let quote_ident : :any -> :string;
 let quote_ident name = {
     let text = if type_of name == :atom { value.atom_name name } else { to_string name };
-    "\"" + str.join_str "\"\"" (str.split "\"" text) + "\""
+    "\"" + str.replace "\"" "\"\"" text + "\""
 };
 
 /// A table name as written: a string with a dot in it is a schema and a

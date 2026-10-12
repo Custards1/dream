@@ -115,6 +115,7 @@ The checker, compile-time contracts, and what a signature buys the JIT.
 - Compile-time contracts: a refinement run against a value the compiler has
 - What a signature buys the compiled code
 - Records are values of their own
+- A pipeline of setters is one copy
 
 ## [The language server](lucid.md)
 

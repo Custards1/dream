@@ -59,7 +59,7 @@ let module_pages! ctx label dir rel = {
     let source = "source/" + label + "/" + html_path rel;
     let module = str.slice 0 (len rel - 3) rel;
     let stem = if module == "mod" { "" } else if str.ends_with "/mod" module { str.slice 0 (len module - 4) module } else { module };
-    let name = label + (if stem == "" { "" } else { "." + markdown.replace "/" "." stem });
+    let name = label + (if stem == "" { "" } else { "." + str.replace "/" "." stem });
     if list.is_empty entries { [] } else {
         [page url name ("<h1>" + markdown.escape name + "</h1>" + api.render! ctx (relative_root url + source) entries)
              (str.join_str "\n" (list.map (fn e -> e.[:name] + " " + e.[:signature] + " " + e.[:doc]) entries)),

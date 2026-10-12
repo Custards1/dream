@@ -102,7 +102,7 @@ priv let parse_url text = {
     let query_at = str.find_from 0 "?" rest;
     let main = if query_at < 0 { rest } else { str.slice 0 query_at rest };
     let query = if query_at < 0 { "" } else { str.slice (query_at + 1) (len rest) rest };
-    let at = last_index "@" main;
+    let at = str.find_last "@" main;
     let userinfo = if at < 0 { "" } else { str.slice 0 at main };
     let location = if at < 0 { main } else { str.slice (at + 1) (len main) main };
     let slash = str.find_from 0 "/" location;
@@ -133,15 +133,6 @@ priv let split_hostport hp =
         let colon = str.find_from 0 ":" hp;
         if colon < 0 { [hp, ""] } else { [str.slice 0 colon hp, str.slice (colon + 1) (len hp) hp] }
     };
-
-/// Return the final occurrence of a delimiter, or -1 when absent.
-priv let last_index : :string -> :string -> :integer;
-priv let last_index needle s = last_from needle s (str.find_from 0 needle s) (-1);
-
-/// Search for the last delimiter starting at the supplied offset.
-priv let last_from : :string -> :string -> :integer -> :integer -> :integer;
-priv let rec last_from needle s at found =
-    if at < 0 { found } else { last_from needle s (str.find_from (at + 1) needle s) at };
 
 /// `%40` as `@`, and `+` left alone: a connection URL is not a form.
 let decode_percent : :string -> :string;

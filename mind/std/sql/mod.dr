@@ -69,6 +69,7 @@
 // `std.sql.sqlite` and `std.sql.pg` are the drivers there are.
 
 import std.atom;
+import std.crypto;
 import std.error;
 import std.json as json_codec;
 import std.list;
@@ -690,7 +691,7 @@ type Dialect = %{ :atom => :any };
 
 /// Escape a quote character by doubling each occurrence.
 priv let doubled : :string -> :string -> :string;
-priv let doubled quote s = str.join_str (quote + quote) (str.split quote s);
+priv let doubled quote s = str.replace quote (quote + quote) s;
 
 priv let ansi_types : %{ :atom => :string };
 priv let ansi_types = %{
@@ -777,7 +778,7 @@ let mysql = extend ansi %{
     :name => :mysql,
     :quote => fn name -> "`" + doubled "`" name + "`",
     // MySQL reads a backslash in a string as an escape unless told otherwise.
-    :string => fn s -> "'" + doubled "'" (str.join_str "\\\\" (str.split "\\" s)) + "'",
+    :string => fn s -> "'" + doubled "'" (str.replace "\\" "\\\\" s) + "'",
     :limit => :limit_offset, :no_limit => "18446744073709551615",
     :returning => :none, :upsert => :on_duplicate_key, :insert_ignore => "INSERT IGNORE INTO ",
     :identity => [:after_type, "AUTO_INCREMENT"], :recursive => "RECURSIVE ",
@@ -787,7 +788,7 @@ let mysql = extend ansi %{
     },
     :begin => "START TRANSACTION",
     // MySQL sets the level for the next transaction in a statement of its own.
-    :begin_with => fn options -> list.filter (fn x -> x != ()) [
+    :begin_with => fn options -> list.compact [
         match isolation_words options { "" => (), words => raw ("SET TRANSACTION " + words) },
         raw (match read_only_words options { "" => "START TRANSACTION", words => "START TRANSACTION " + words }),
     ],
@@ -812,7 +813,7 @@ let mssql = extend ansi %{
     :begin => "BEGIN TRANSACTION", :commit => "COMMIT TRANSACTION", :rollback => "ROLLBACK TRANSACTION",
     :begin_with => fn options -> match options.[:read_only else ()] {
         true => [unsupported "mssql has no read-only transaction"],
-        _ => list.filter (fn x -> x != ()) [
+        _ => list.compact [
             match isolation_words options { "" => (), words => raw ("SET TRANSACTION " + words) },
             raw "BEGIN TRANSACTION",
         ],
@@ -974,15 +975,9 @@ priv let float_text x = {
     else { t + ".0" }
 };
 
-priv let hex_digits : :string;
-priv let hex_digits = "0123456789ABCDEF";
-
 /// Format bytes as hexadecimal SQL literal content.
 priv let hex : :string -> :string;
-priv let hex bytes = str.concat_all (list.map (fn i -> {
-    let b = str.byte i bytes;
-    str.slice (b / 16) 1 hex_digits + str.slice (b % 16) 1 hex_digits
-}) (list.range 0 (len bytes)));
+priv let hex bytes = str.upper (crypto.hex bytes);
 
 // --- queries ------------------------------------------------------------------
 //
@@ -1278,7 +1273,7 @@ priv let query_sql d query = match query.[:kind] {
 
 /// The clauses of a statement that are there, with a space between each.
 priv let clauses : [:any] -> Sql;
-priv let clauses parts = join " " (list.filter (fn p -> p != ()) parts);
+priv let clauses parts = join " " (list.compact parts);
 
 /// Render an optional clause only when its value is present.
 priv let when_some : [:any] -> ([:any] -> :any) -> :any;
@@ -2003,7 +1998,7 @@ let execute! statement params = {
 /// Validate parameter values before handing them to the driver.
 priv let validate_params! : Connection -> [:any] -> :string -> :unit;
 priv let validate_params! c params text = {
-    let problems = list.filter (fn p -> p != ()) (list.map (value_problem_in (dialect_of c)) params);
+    let problems = list.filter_map (value_problem_in (dialect_of c)) params;
     if list.is_empty problems { () } else { fail! (str.join_str "; " problems) :parameters text }
 };
 

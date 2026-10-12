@@ -10,6 +10,7 @@
 // costs nothing at run time.
 import std.str;
 import std.list;
+import std.num;
 
 // --- the holes --------------------------------------------------------------
 
@@ -26,10 +27,10 @@ virtual let footer total = "";
 
 /// The widest key in `pairs`, so columns can line up.
 let width pairs =
-    list.fold (fn w p -> { let n = str.length (list.head p); if n > w { n } else { w } }) 0 pairs;
+    list.fold_strict (fn w p -> num.max w (str.length (list.head p))) 0 pairs;
 
 /// `label` padded out to `n` characters.
-let pad n label = label + str.repeat (n - str.length label) " ";
+let pad n label = str.pad_end n " " label;
 
 /// The body: one `row` per pair, in the order given.
 let body pairs = list.map (fn p -> row (list.head p) (list.nth 1 p)) pairs;

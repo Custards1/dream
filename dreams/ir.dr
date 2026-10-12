@@ -136,6 +136,13 @@ let ops = [
     /// union's variant. See `lower.lower_record`.
     [:record_make, 81, "record"],
 
+    /// Several changes to one container: `a` = container, `b` = kids offset,
+    /// `c` = pair count, the kids `k0, v0, k1, v1, ..` with every key an int
+    /// or atom constant. What a chain of `set`s with constant keys is lowered
+    /// to -- a pipeline of setters -- so a record is copied once rather than
+    /// once per key. See `lower.fuse_set`.
+    [:set_many, 82, "set_many"],
+
 ];
 
 /// `record_make`'s `c`: the top bit says the id names a variant.
@@ -641,6 +648,8 @@ let show_node img i n = {
                             + "]",
             :set         => to_string (node_a n) + "[" + to_string (node_b n) + " => "
                             + to_string (node_c n) + "]",
+            :set_many    => to_string (node_a n) + "[kids@" + to_string (node_b n)
+                            + "x" + to_string (node_c n) + "]",
             _ => str.join_str " " (list.filter (fn x -> x != "")
                      (list.map (fn e -> if is_node e { to_string e } else { "" })
                                [node_a n, node_b n, node_c n])),

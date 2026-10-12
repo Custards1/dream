@@ -94,6 +94,10 @@ Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions be
 | `_str_byte` | `str.byte i s` | `string\|bigstr → index:integer → integer` | The raw byte value (0–255) at byte `index`, or `-1` if out of range. |
 | `_str_span` | `str.span set from s` | `string\|bigstr → from:integer → set:string → integer` | The byte offset of the first byte at or after `from` that is **not** in `set`, or the string's byte length when there is none. `set` is read as the set of its bytes, so `_str_span s i " \t"` skips indentation and `_str_span s i digits` skips a number. A whole run of a byte class in one operation — the same walk written in Dream is a call and a comparison chain per byte, which is what a lexer spends its time on. |
 | `_str_upto` | `str.upto set from s` | `string\|bigstr → from:integer → set:string → integer` | The other way round: the offset of the first byte at or after `from` that **is** in `set`, or the byte length when there is none — so `_str_upto s i "\n"` is the end of the line whether or not the text ends with one. |
+| `_str_span_back` | `str.span_back set until s` | `string\|bigstr → until:integer → set:string → integer` | `_str_span` run backwards: the start of the run of bytes from `set` that ends at `until` (clamped to the length). `str.trim_end` is this and a slice. |
+| `_str_rfind` | `str.find_last_from from needle s` | `haystack:string → needle:string → from:integer → integer` | The greatest byte offset at or before `from` where `needle` starts, or `-1`. Raises `:type_error` on a bigstr. |
+| `_str_char_count` | `str.length s` | `string → integer` | The number of characters, decoded as `_str_chars` decodes them, without building the list. |
+| `_str_ascii_case` | `str.upper s` · `str.lower s` | `string → bool → string` | The string with ASCII letters upper-cased (`true`) or lower-cased (`false`); every other byte, all of a multi-byte character included, unchanged. |
 | `_str_concat` | `str.concat_all parts` | `list of string → string` | Joins the parts, copying each exactly once. Raises `:type_error` on a bigstr. |
 
 ### Chars
@@ -111,6 +115,7 @@ Strings are byte-indexed internally (UTF-8 storage). Offsets in the functions be
 | `_to_int` | `num.to_int x` | `integer\|float → integer` | Converts a number to `integer`. Truncates toward zero (like C cast). For floor-division behavior use `math.floor` first. |
 | `_parse_int` | `num.parse_int s` | `string → integer\|unit` | Parses a base-10 integer from a string. Returns `unit` on failure. The entire string must be a valid integer (trailing non-numeric characters cause failure). |
 | `_parse_float` | `num.parse_float s` | `string → float\|unit` | Parses a floating-point number from a string. Returns `unit` on failure. |
+| `_pow` | `num.pow base exponent` | `number → number → number` | Two integers, the exponent zero or more, answer the exact integer, a bignum when it grows past a fixnum (by repeated squaring). A float on either side answers the float `math.pow` does. Raises `:type_error` for an integer base and a negative integer exponent -- the answer's kind follows the base's -- and for an exponent past 64 bits unless the base is 0, 1 or -1. |
 
 ### Atoms
 

@@ -16,7 +16,7 @@ let is_separator c =
 /// lets several separators in a row collapse.
 let words text = {
     let cleaned = str.map (fn c -> if is_separator c { ' ' } else { c }) (str.lower text);
-    list.filter (fn w -> not (str.is_empty w)) (str.split " " cleaned)
+    str.words cleaned
 };
 
 /// Words of at least `n` characters -- a crude way to skip "the", "a", "of".

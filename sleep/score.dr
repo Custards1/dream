@@ -151,7 +151,7 @@ let hypnogram_with per stages = {
 };
 
 priv let pad : :string -> :string;
-priv let pad name = str.repeat (4 - str.length name) " " + name;
+priv let pad name = str.pad_start 4 " " name;
 
 priv let mark : Stage -> :string;
 priv let mark s = match s { Stage.wake => "^", Stage.rem => "=", Stage.n1 => "-", Stage.n2 => "_", Stage.n3 => "#" };

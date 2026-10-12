@@ -168,7 +168,7 @@ priv let script_module s = {
     // path is what follows the root.
     let from = str.byte_length (Scripted.root s) + 1;
     let rel = str.slice from (str.byte_length (Scripted.script s) - from - 3) (Scripted.script s);
-    str.join_str "." (str.split "/" rel)
+    str.replace "/" "." rel
 };
 
 priv let group_dir : :map -> [:map] -> :string;
@@ -399,7 +399,7 @@ let compile_args outcomes = {
     match clash {
         [[n, _, k], .._] => [:error, "two build scripts embed a payload called `" + n + "`, `" + k + "`'s and another's"],
         [] => {
-            let targets = list.filter (fn t -> t != ()) (list.map (fn [_, o] -> Outcome.target o) outcomes);
+            let targets = list.filter_map (fn [_, o] -> Outcome.target o) outcomes;
             [:ok, list.concat [
                 list.flat_map (fn [n, p, _] -> ["--payload", n + "=" + p]) payloads,
                 list.flat_map (fn [key, o] -> match Outcome.modules o {

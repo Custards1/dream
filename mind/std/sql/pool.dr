@@ -22,12 +22,20 @@ mod worker {
     import std.server;
 
     mapping State { opener, owner, connection = () }
+    /// The state arrives already built by the keeper: the opener, the keeper
+    /// itself, and no connection yet.
     let init! : :any -> :any;
     let init! state = state;
 
+    /// Close `conn` if there is one, ignoring a failure: it is only ever
+    /// called on a connection being given up on.
     let close_quietly! : :any -> :unit;
     let close_quietly! conn = if conn == () { () } else { try! { sql.close! conn } catch ignored { () } };
 
+    /// Run one piece of work on this worker's connection, opening it the first
+    /// time, and reset the session after. The answer goes straight to the
+    /// caller and the worker reports itself idle to its keeper; a connection
+    /// that cannot be reset is closed and opened afresh next time.
     let handle_cast! : :any -> :any -> :any;
     let handle_cast! request state = match request {
         [:work, work!, from] => {
@@ -69,6 +77,7 @@ mod worker {
         _ => noreply state,
     };
 
+    /// Close the connection, if one was ever opened.
     let terminate! : :any -> :any -> :any;
     let terminate! reason state = close_quietly! (State.connection state);
 }
@@ -81,9 +90,14 @@ mod keeper {
     import std.list;
 
     mapping State { opener, size : :integer, workers : [:any] = [], idle : [:any] = [], waiting : [:any] = [] }
+    /// The state arrives already built by `start!`.
     let init! : :any -> :any;
     let init! state = state;
 
+    /// `[:work, work!]` goes to an idle worker, to a new one while the pool is
+    /// under its size, or to the back of the queue; the worker answers the
+    /// caller itself. `:stats` answers the counts and `:drain` stops the idle
+    /// workers.
     let handle_call! : :any -> :any -> :any -> :any;
     let handle_call! request from state = match request {
         [:work, work!] => match State.idle state {
@@ -113,6 +127,7 @@ mod keeper {
         _ => reply [:error, :unknown_request] state,
     };
 
+    /// A worker that finished takes the oldest queued work, or goes idle.
     let handle_cast! : :any -> :any -> :any;
     let handle_cast! message state = match message {
         [:idle, w] => match State.waiting state {
@@ -125,6 +140,8 @@ mod keeper {
         _ => noreply state,
     };
 
+    /// Fail every queued caller with `:pool_closed`, then stop the workers --
+    /// each of which closes its own connection.
     let terminate! : :any -> :any -> :any;
     let terminate! reason state = {
         let failure = error.new :sql_error %{ :code => :pool_closed, :message => "the pool is stopping", :sql => "" };

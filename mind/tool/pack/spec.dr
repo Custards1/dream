@@ -177,7 +177,7 @@ let full_version sp = Spec.version sp + "-" + to_string (Spec.release sp);
 /// `template` with each `{key}` replaced by its value in `vars`; a key that
 /// is not there is left as written, so a mistake shows in the output.
 let fill : :string -> %{:string => :string} -> :string;
-let fill template vars = list.fold (fn acc [k, v] -> str.join_str v (str.split ("{" + k + "}") acc))
+let fill template vars = list.fold (fn acc [k, v] -> str.replace ("{" + k + "}") v acc)
                                    template (map.pairs vars);
 
 /// What a template may name.

@@ -356,6 +356,8 @@ let is_variant value = match record_id value {
     },
 };
 
+/// The name in a `[:named, name, inner]` description, or the description
+/// itself as a string.
 let name_of : Description -> :string;
 let rec name_of description = match description {
     [:named, name, _] => name,

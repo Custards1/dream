@@ -10,6 +10,7 @@ import std.file;
 import std.install;
 import std.io;
 import std.list;
+import std.num;
 import std.os;
 import std.str;
 import std.toml;
@@ -153,8 +154,8 @@ let cycle_message path abs name kind = {
         let [a, b] = pair;
         [list.nth 1 a, edge_words (list.nth 3 b), list.nth 1 b, list.nth 2 a]
     }) (list.zip from (list.append (list.tail from) [step_of abs name "" kind]));
-    let width f = list.fold (fn w l -> { let n = str.byte_length (f l); if n > w { n } else { w } }) 0 lines;
-    let pad n t = t + str.repeat (n - str.byte_length t) " ";
+    let width f = list.fold_strict (fn w l -> num.max w (str.byte_length (f l))) 0 lines;
+    let pad n t = str.pad_end n " " t;
     let w1 = width (fn l -> list.nth 0 l);
     let w2 = width (fn l -> list.nth 1 l);
     let w3 = width (fn l -> list.nth 2 l);
@@ -174,8 +175,7 @@ let conflict_message key seen d owner_key owner_at abs = {
     let line n src by = "  " + n + " (" + src + ", required by " + asker by + ")\n";
     let rev x = to_string (list.nth 1 (manifest.dep_rev x));
     if same_repo {
-        let w = { let a = str.byte_length (rev (node_dep seen)); let b = str.byte_length (rev d);
-                  if a > b { a } else { b } };
+        let w = num.max (str.byte_length (rev (node_dep seen))) (str.byte_length (rev d));
         let at r by where = "  " + r + str.repeat (w - str.byte_length r) " "
                             + "  required by " + asker by + " (" + where + ")\n";
         "two revisions of `" + key + "` (" + to_string (git_of d) + ") are required:\n"
@@ -283,7 +283,7 @@ let edge_on! owner owner_key d g =
                 let reads = list.fold (fn m n -> m.[n => option_read! owner g n]) (%{}) (config.names cond);
                 let option n = match reads.[n else ()] { () => (), r => [:ok, list.nth 2 r] };
                 let kept = g.[:reads => list.append (g.[:reads else []])
-                                                    (list.filter (fn r -> r != ()) (list.map (fn [_, r] -> r) (map.pairs reads)))];
+                                                    (list.compact (map.values reads))];
                 if config.holds option (g.[:settings else (%{})]) cond { [:on, kept] }
                 else { [:off, kept.[:off => list.cons [owner_key, manifest.dep_name d] (kept.[:off else []])]] }
             },
@@ -404,11 +404,9 @@ let check_node n =
 /// Every requirement on the package, the ones it misses marked, and whether
 /// any single version could have met them all -- which decides the advice.
 let version_message key text v n parsed = {
-    let width = list.fold (fn w p -> { let k = str.byte_length (asker (list.nth 1 (list.head p)));
-                                       if k > w { k } else { w } }) 0 parsed;
+    let width = list.fold_strict (fn w p -> num.max w (str.byte_length (asker (list.nth 1 (list.head p))))) 0 parsed;
     let reqs = list.map (fn p -> list.nth 1 (list.nth 1 p)) parsed;
-    let req_width = list.fold (fn w p -> { let k = str.byte_length (list.head (list.head p));
-                                           if k > w { k } else { w } }) 0 parsed;
+    let req_width = list.fold_strict (fn w p -> num.max w (str.byte_length (list.head (list.head p)))) 0 parsed;
     let together = list.all (fn a -> list.all (fn b -> version.compatible a b) reqs) reqs;
     "`" + key + "` is " + text + " (" + manifest.dep_source (node_dep n) + "), but\n"
     + str.join_str "\n" (list.map (fn p -> {
@@ -632,7 +630,7 @@ let settle_one m o packages at key pm addressed = {
         match list.unique (list.map (fn e -> config.shown (list.nth 1 e)) votes) {
             [_, _, .._] => {
                 let said_as e = list.head e + " = " + toml.encode_value (list.nth 1 e);
-                let width = list.fold (fn w e -> { let n = str.byte_length (said_as e); if n > w { n } else { w } }) 0 votes;
+                let width = list.fold_strict (fn w e -> num.max w (str.byte_length (said_as e))) 0 votes;
                 [who + " is configured two ways, and this project does not say which:\n"
                             + str.join_str "\n" (list.map (fn [n, v, from, sk] -> {
                                   let l = said_as [n, v];
