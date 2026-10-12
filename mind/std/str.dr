@@ -364,7 +364,12 @@ let replace old new s = {
 /// untouched.
 ///
 /// ```dream
-/// str.escape_bytes "\"\\" (fn b -> "\\" + str.of_bytes [b]) "say \"hi\""   // say \"hi\"
+/// import std.str;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (str.escape_bytes "\"\\" (fn b -> "\\" + str.of_bytes [b]) "say \"hi\"")
+/// };
 /// ```
 let escape_bytes : :string -> (:integer -> :string) -> :string -> :string;
 let escape_bytes set f s = {
@@ -399,6 +404,132 @@ let pad_end : :integer -> :string -> :string -> :string;
 let pad_end width fill s = {
     let short = width - length s;
     if short <= 0 { s } else { s + repeat short fill }
+};
+
+/// `s` with `fill` on both sides until it is `width` characters long, the odd
+/// one after: `center 7 "*" "abc"` is `"**abc**"`, and `center 6 "*" "abc"`
+/// is `"*abc**"`.
+let center : :integer -> :string -> :string -> :string;
+let center width fill s = {
+    let short = width - length s;
+    if short <= 0 { s }
+    else {
+        let before = short / 2;
+        repeat before fill + s + repeat (short - before) fill
+    }
+};
+
+/// `s` cut to at most `width` characters, the last of them `…` when anything
+/// was cut: `truncate 5 "hello world"` is `"hell…"`. Characters, never bytes,
+/// so a cut never splits one. A width below one answers `""`.
+let truncate : :integer -> :string -> :string;
+let truncate width s =
+    if length s <= width { s }
+    else if width < 1 { "" }
+    else { _str_slice s 0 (char_offset s (width - 1)) + "\u{2026}" };
+
+/// The bytes that continue a UTF-8 character rather than start one, as a set
+/// for `_str_span`.
+priv let continuation_bytes : :string;
+priv let continuation_bytes = _str_of_bytes (list.range 128 192);
+
+/// The byte offset of character `k` of `s`, or its length when there are
+/// fewer: a lead byte and the run of continuations after it, per character.
+priv let char_offset : :string -> :integer -> :integer;
+priv let char_offset s k = {
+    let n = len s;
+    let rec go !i !k = if k <= 0 || i >= n { i } else { go (_str_span s (i + 1) continuation_bytes) (k - 1) };
+    go 0 k
+};
+
+/// The longest start `a` and `b` share, ending on a character boundary:
+/// `common_prefix "interview" "internet"` is `"inter"`. Compared a byte at a
+/// time, then stepped back off any character the two only began alike.
+let common_prefix : :string -> :string -> :string;
+let common_prefix a b = {
+    let n = if len a < len b { len a } else { len b };
+    let i = same_bytes a b n 0;
+    let start = if i < len a && _str_byte a i >= 128 && _str_byte a i < 192 {
+        _str_span_back a i continuation_bytes - 1
+    } else { i };
+    _str_slice a 0 start
+};
+
+/// The first offset from `i`, below `n`, where `a` and `b` differ, or `n`.
+priv let same_bytes : :string -> :string -> :integer -> :integer -> :integer;
+priv let rec same_bytes a b n !i =
+    if i < n && _str_byte a i == _str_byte b i { same_bytes a b n (i + 1) } else { i };
+
+/// The edit distance between `a` and `b` (Levenshtein's): how many characters
+/// must be inserted, deleted or replaced to turn one into the other.
+/// `distance "kitten" "sitting"` is `3`. Time is the product of the two
+/// lengths and memory one row of the shorter, each row built strictly so that
+/// nothing is left suspended between rows.
+let distance : :string -> :string -> :integer;
+let distance a b =
+    if a == b { 0 }
+    else {
+        let [long, short] = if len a >= len b { [_str_chars a, _str_chars b] } else { [_str_chars b, _str_chars a] };
+        lev_rows short 1 (list.range 0 (len short + 1)) long
+    };
+
+/// One row per character of `long`, each from the row before; the answer is
+/// the last entry of the last row.
+priv let lev_rows : [:char] -> :integer -> [:integer] -> [:char] -> :integer;
+priv let rec lev_rows short !i !prev long =
+    if _list_is_empty long { list.last prev }
+    else { lev_rows short (i + 1) (lev_row (long.[0]) i (prev.[0]) (_list_tail prev) short [i]) (_list_tail long) };
+
+/// Row `i` for character `c`: `left` is the entry just made, `diag` and the
+/// head of `ups` the previous row's entries above-left and above.
+priv let lev_row : :char -> :integer -> :integer -> [:integer] -> [:char] -> [:integer] -> [:integer];
+priv let rec lev_row c !left !diag ups cbs !acc =
+    if _list_is_empty cbs { list.reverse acc }
+    else {
+        let up = ups.[0];
+        let replaced = if c == cbs.[0] { diag } else { diag + 1 };
+        let shifted = (if left < up { left } else { up }) + 1;
+        let here = if replaced < shifted { replaced } else { shifted };
+        lev_row c here up (_list_tail ups) (_list_tail cbs) (_list_cons here acc)
+    };
+
+/// The words of `s` laid out in lines of at most `width` characters, as many
+/// to a line as fit, joined by `\n`. A word longer than `width` has a line to
+/// itself rather than being broken. Whitespace in `s`, line endings included,
+/// only separates words: wrap a paragraph at a time to keep paragraphs.
+let wrap : :integer -> :string -> :string;
+let wrap width s = join_str "\n" (filled width (words s));
+
+/// The lines `wrap` lays `ws` out in, each as full as `width` allows.
+priv let filled : :integer -> [:string] -> [:string];
+priv let rec filled width ws =
+    if _list_is_empty ws { [] }
+    else {
+        let w = ws.[0];
+        let [line, rest] = fill_line width (length w) [w] (_list_tail ws);
+        _list_cons line (filled width rest)
+    };
+
+/// The line being filled, its pieces reversed in `acc`, and the words left.
+priv let fill_line : :integer -> :integer -> [:string] -> [:string] -> [:string, [:string]];
+priv let rec fill_line width !used !acc ws =
+    if _list_is_empty ws { [_str_concat (list.reverse acc), []] }
+    else {
+        let n = used + 1 + length (ws.[0]);
+        if n > width { [_str_concat (list.reverse acc), ws] }
+        else { fill_line width n (_list_cons (ws.[0]) (_list_cons " " acc)) (_list_tail ws) }
+    };
+
+/// `s` with the indentation its non-blank lines share taken off every line,
+/// and blank lines left empty -- how a block written indented in source is
+/// brought back to the margin. The margin is counted in bytes of spaces and
+/// tabs, so lines that mix the two must mix them alike.
+let dedent : :string -> :string;
+let dedent s = {
+    let ls = lines s;
+    let margin = list.minimum (list.filter_map (fn l -> if is_blank l { () } else { _str_span l 0 " \t" }) ls);
+    let cut = if margin == () { 0 } else { margin };
+    join_str "\n" (list.map (fn l -> if is_blank l { "" } else { _str_slice l cut (len l - cut) }) ls)
 };
 
 // --- transforming -----------------------------------------------------------
@@ -620,6 +751,29 @@ when test {
                                                                           capitalize "", capitalize "1a"] ),
         test.case "pad_start"        $( test.eq! ["007", "1234"] [pad_start 3 "0" "7", pad_start 3 "0" "1234"] ),
         test.case "pad_end counts characters" $( test.eq! "\u{e9}.." (pad_end 3 "." "\u{e9}") ),
+        test.case "center"           $( test.eq! ["**abc**", "*abc**", "abcd"] [center 7 "*" "abc", center 6 "*" "abc", center 2 "*" "abcd"] ),
+        test.case "truncate"         $( test.eq! ["hell\u{2026}", "hello", "", "\u{2026}"]
+                                                 [truncate 5 "hello world", truncate 5 "hello", truncate 0 "hello", truncate 1 "hello"] ),
+        test.case "truncate counts characters"
+            $( test.eq! "\u{e9}\u{e9}\u{2026}" (truncate 3 "\u{e9}\u{e9}\u{e9}\u{e9}") ),
+        test.case "common_prefix"    $( test.eq! ["inter", "", "abc", ""] [common_prefix "interview" "internet", common_prefix "a" "b",
+                                                                          common_prefix "abc" "abcdef", common_prefix "" "x"] ),
+        // U+00E9 and U+00E8 share their lead byte; the prefix must not keep it.
+        test.case "common_prefix keeps whole characters"
+            $( test.eq! "x" (common_prefix "x\u{e9}" "x\u{e8}") ),
+        test.case "distance"         $( test.eq! [3, 0, 3, 3, 1, 2] [distance "kitten" "sitting", distance "same" "same",
+                                                                    distance "" "abc", distance "abc" "", distance "flaw" "flaws",
+                                                                    distance "\u{e9}t\u{e9}" "ete"] ),
+        test.case "distance is symmetric"
+            $( test.eq! (distance "saturday" "sunday") (distance "sunday" "saturday") ),
+        test.case "distance on long strings"
+            $( test.eq! 500 (distance (repeat 1000 "a") (repeat 500 "a" + repeat 500 "b")) ),
+        test.case "wrap"             $( test.eq! "the quick\nbrown fox\njumps" (wrap 10 "the quick brown fox jumps") ),
+        test.case "wrap keeps a long word whole"
+            $( test.eq! "a\nextraordinarily\nb" (wrap 5 "a extraordinarily b") ),
+        test.case "wrap of nothing"  $( test.eq! "" (wrap 10 "  ") ),
+        test.case "dedent"           $( test.eq! "a\n  b\n\nc" (dedent "    a\n      b\n  \n    c") ),
+        test.case "dedent of flush text" $( test.eq! "a\nb" (dedent "a\nb") ),
     ];
 }
 

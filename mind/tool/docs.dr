@@ -22,7 +22,7 @@ let opts = [
     cli.value "o" "output" "DIR" "output directory (default: target/docs, relative to project)",
     cli.value "" "guides" "DIR" "Markdown directory (default: docs, relative to project)",
     cli.value "" "compiler" "PATH" "compiler for documentation examples",
-    cli.value "" "example-timeout" "MS" "run deadline per example (default: 10000 ms)",
+    cli.value "" "example-timeout" "MS" "compile and run deadline per example (default: 5000 ms)",
     cli.flag "" "no-api" "compile only Markdown guides",
     cli.flag "h" "help" "show documentation options",
 ];
@@ -35,13 +35,6 @@ let fail! why = {
     os.exit! 1
 };
 let read! path = match file.read! path { () => fail! ("cannot read " + path), text => text };
-let rec each! f! xs = match xs {
-    [] => (),
-    [x, ..rest] => {
-        f! x
-        each! f! rest
-    },
-};
 let page url title body text = %{ :url => url, :title => title, :body => body, :text => text };
 let html_path path = str.slice 0 (len path - 3) path + ".html";
 let relative_root url = str.repeat (list.length (str.split "/" url) - 1) "../";
@@ -121,7 +114,7 @@ let build! c m = {
         fail! "output must be separate from the project root and guide directory"
     }
     let guide_files = files! guide_dir;
-    let timeout = num.parse_int (cli.get (to_string (toml.get 10000 cfg "docs" "example-timeout")) c "example-timeout");
+    let timeout = num.parse_int (cli.get (to_string (toml.get 5000 cfg "docs" "example-timeout")) c "example-timeout");
     if timeout == () || timeout <= 0 { fail! "example-timeout must be a positive number of milliseconds" }
     let scratch = path.join root ("target/docs-examples/" + file.scratch_suffix! () + "-" + to_string (vm.wall_ms! ()));
     let ctx = examples.context m (cli.get () c "compiler") timeout scratch;
@@ -133,12 +126,12 @@ let build! c m = {
     let index = page "index.html" "Overview" overview title;
     let navigation = list.cons index listed;
     let pages = list.cons index (list.append guides apis);
-    each! (fn p -> {
+    list.each! (fn p -> {
         console.error! ("writing " + p.[:url])
         write! out p.[:url] (shell title (manifest.version m) navigation p)
     }) pages
     // Copy local images and downloadable guide assets alongside their pages.
-    each! (fn rel -> {
+    list.each! (fn rel -> {
         let to = path.join out ("guides/" + rel);
         file.mkdir_all! (file.parent to)
         file.copy! (path.join guide_dir rel) to

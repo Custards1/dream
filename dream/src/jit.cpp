@@ -732,6 +732,20 @@ public:
         // the most of the body: whatever the fixpoint below decides, everything
         // it leaves evaluated has been checked.
         eager_ = params;
+        // A body with an effect anywhere in it -- the compiler carries
+        // `F_IMPURE` up to the root from every node, lazy positions included --
+        // is not compiled at all. The checks below refuse an impure call this
+        // body makes, but not one it only *builds*: a lambda written inside an
+        // impure function and handed to a pure peer (`str.join_str ""
+        // (list.map (fn e -> .. run! e ..) es)`) sits in an argument nobody
+        // walks. Compiled code that parks is retried from the top, and the
+        // retry makes that lambda, and the thunks it is mapped into, afresh --
+        // so whatever ran before the park ran again, on every retry: `mind
+        // docs` started the same three example compiles until it was killed.
+        if (img_.node(f_.body).flags & F_IMPURE) {
+            why(img_.node(f_.body), "a body that performs an effect");
+            return a;
+        }
         if (!check(f_.body, 0)) return a;
 
         // A slot no parameter owns and no `let` bound holds state that lives in

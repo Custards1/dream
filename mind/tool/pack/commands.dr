@@ -111,7 +111,7 @@ let spec! c = {
         [:ok, sp] => match spec.problems sp {
             [] => {
                 if not (cli.flag_set c "quiet") {
-                    each! (fn w -> console.error! ("mind pack: warning: " + w)) (spec.warnings sp)
+                    list.each! (fn w -> console.error! ("mind pack: warning: " + w)) (spec.warnings sp)
                 }
                 sp
             },
@@ -124,17 +124,6 @@ let layout! : Spec -> Layout;
 let layout! sp = match layout.collect! sp {
     [:ok, lay] => lay,
     [:error, why] => fail! why,
-};
-
-/// `f!` on each of `xs`, in order. A fold would be a pure expression, which
-/// nothing evaluates when its value is not used.
-let each! : (:any -> :any) -> [:any] -> :unit;
-let rec each! f! xs = match xs {
-    [] => (),
-    [x, ..rest] => {
-        f! x
-        each! f! rest
-    },
 };
 
 let say! : :any -> :string -> :unit;
@@ -192,7 +181,7 @@ let cmd_check! c = {
 let cmd_files! c = {
     let sp = spec! c;
     let lay = layout! sp;
-    each! (fn i -> console.print! (match i {
+    list.each! (fn i -> console.print! (match i {
         item.Item.file(path, mode, source, size) => bytes.octal 4 mode + " " + bytes.pad_left 10 " " (to_string size) + "  /" + path + "  <- " + source,
         item.Item.link(path, target) => "link " + bytes.pad_left 10 " " "" + "  /" + path + "  -> " + target,
         _ => "",

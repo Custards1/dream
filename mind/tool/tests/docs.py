@@ -89,7 +89,9 @@ let main! = console.print! "guide output";
     assert 'mind pack' in invoke('help', 'pack')
     assert 'example-timeout' in invoke('help', 'docs')
     # Discovery from a subdirectory and a global compiler option must work.
-    out = invoke('--compiler', COMPILER, 'docs', '--example-timeout', '100', cwd=project / 'src')
+    # The deadline bounds each example's compile as well as its run, so it
+    # has to leave room for a compile; the endless example still runs out.
+    out = invoke('--compiler', COMPILER, 'docs', '--example-timeout', '2000', cwd=project / 'src')
     target = project / 'target/docs'
     assert (target / 'index.html').exists(), out
     api = (target / 'api/demo/lib.html').read_text()

@@ -53,14 +53,7 @@ let member! h epoch [ino, i] = {
 /// A whole archive onto `h`: each `[inode, item]`, then the trailer.
 let write! : :any -> :integer -> [[:integer, Item]] -> :unit;
 let write! h epoch members = {
-    let rec each! ms = match ms {
-        [] => (),
-        [m, ..rest] => {
-            member! h epoch m
-            each! rest
-        },
-    };
-    each! members
+    list.each! (member! h epoch) members
     out.write! h (header 0 0 1 0 0 "TRAILER!!!")
 };
 

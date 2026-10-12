@@ -92,6 +92,10 @@ let last xs = {
     if _list_is_empty xs { () } else { go xs }
 };
 
+/// The last element, or `default` for an empty list. Traverses the entire list.
+let last_or : a -> [a] -> a;
+let last_or default xs = if _list_is_empty xs { default } else { last xs };
+
 // --- building ---------------------------------------------------------------
 
 /// `xs` followed by `ys`.
@@ -127,6 +131,16 @@ let reverse xs = reverse_from [] xs;
 let range : :integer -> :integer -> [:integer];
 let rec range from until =
     if from >= until { [] } else { _list_cons from (range (from + 1) until) };
+
+/// `range` counting by `step`: `range_step 0 10 3` is `[0, 3, 6, 9]`, and a
+/// negative step counts down, `range_step 5 0 (0 - 2)` being `[5, 3, 1]`. The
+/// end is never included. A step of zero would never reach it, so it answers
+/// `[]` rather than an endless list of `from`.
+let range_step : :integer -> :integer -> :integer -> [:integer];
+let rec range_step from until step =
+    if step > 0 && from < until { _list_cons from (range_step (from + step) until step) }
+    else if step < 0 && from > until { _list_cons from (range_step (from + step) until step) }
+    else { [] };
 
 /// The infinite list `n, n+1, n+2, ...`. Only ever as long as it is used.
 let from : :integer -> [:integer];
@@ -441,6 +455,78 @@ let rec insert_at i x xs =
     if i <= 0 || _list_is_empty xs { _list_cons x xs }
     else { _list_cons (xs.[0]) (insert_at (i - 1) x (_list_tail xs)) };
 
+/// The list with the element at `i` replaced by `f` of it. An index out of
+/// range changes nothing. Lazy, like `remove_at`: the cells after `i` are the
+/// original's, shared rather than copied.
+let update_at : :integer -> (a -> a) -> [a] -> [a];
+let rec update_at i f xs =
+    if i < 0 || _list_is_empty xs { xs }
+    else if i == 0 { _list_cons (f (xs.[0])) (_list_tail xs) }
+    else { _list_cons (xs.[0]) (update_at (i - 1) f (_list_tail xs)) };
+
+/// The list turned left by `n`: `rotate 1 [1, 2, 3]` is `[2, 3, 1]`. A
+/// negative `n` turns it right, and any `n` is taken modulo the length, so
+/// the list is walked once to count it and the answer shares its tail.
+let rotate : :integer -> [a] -> [a];
+let rotate n xs = {
+    let size = len xs;
+    if size == 0 { xs }
+    else {
+        let r = n % size;
+        let k = if r < 0 { r + size } else { r };
+        if k == 0 { xs } else { drop k xs + take k xs }
+    }
+};
+
+/// Elements of `xs` and `ys` taken in turn, starting with `xs`; whatever is
+/// left of the longer one follows. Lazy in both, so either may be endless.
+let interleave : [a] -> [a] -> [a];
+let rec interleave xs ys =
+    if _list_is_empty xs { ys }
+    else { _list_cons (xs.[0]) (interleave ys (_list_tail xs)) };
+
+/// The list with each run of equal neighbours kept once: `dedup [1, 1, 2, 1]`
+/// is `[1, 2, 1]`. Only neighbours, so it is lazy and linear -- `unique` is
+/// the one that drops every repeat, and has to remember what it has seen.
+let dedup : [a] -> [a];
+let dedup xs = if _list_is_empty xs { [] } else { _list_cons (xs.[0]) (dedup_after (xs.[0]) (_list_tail xs)) };
+
+/// What follows `prev` in a deduplicated list: its neighbours equal to it dropped.
+priv let dedup_after : a -> [a] -> [a];
+priv let rec dedup_after prev xs =
+    if _list_is_empty xs { [] }
+    else {
+        let x = xs.[0];
+        if x == prev { dedup_after prev (_list_tail xs) }
+        else { _list_cons x (dedup_after x (_list_tail xs)) }
+    };
+
+/// The list cut into runs of neighbours that agree on `key`:
+/// `chunk_by (fn n -> n % 2) [1, 3, 2, 4, 5]` is `[[1, 3], [2, 4], [5]]`.
+/// Each run is gathered in one pass that asks `key` once per element; the
+/// list of runs is lazy, so the next run is not looked for until it is wanted.
+let chunk_by : (a -> k) -> [a] -> [[a]];
+let rec chunk_by key xs =
+    if _list_is_empty xs { [] }
+    else {
+        let x = xs.[0];
+        let [run, rest] = run_of key (key x) [x] (_list_tail xs);
+        _list_cons run (chunk_by key rest)
+    };
+
+/// The run `chunk_by` is gathering, reversed in `acc`, and what follows it.
+priv let run_of : (a -> k) -> k -> [a] -> [a] -> [[a], [a]];
+priv let rec run_of key k !acc xs =
+    if _list_is_empty xs { [reverse acc, []] }
+    else if key (xs.[0]) == k { run_of key k (_list_cons (xs.[0]) acc) (_list_tail xs) }
+    else { [reverse acc, xs] };
+
+/// Three lists zipped into triples, as long as the shortest.
+let zip3 : [a] -> [b] -> [c] -> [[a, b, c]];
+let rec zip3 xs ys zs =
+    if _list_is_empty xs || _list_is_empty ys || _list_is_empty zs { [] }
+    else { _list_cons [xs.[0], ys.[0], zs.[0]] (zip3 (_list_tail xs) (_list_tail ys) (_list_tail zs)) };
+
 // --- asking -----------------------------------------------------------------
 
 /// Test whether any element satisfies `pred`; stop at the first match.
@@ -457,6 +543,10 @@ let rec all pred xs =
     else if pred (xs.[0]) { all pred (_list_tail xs) }
     else { false };
 
+/// Test whether no element satisfies `pred`. Stops at the first that does.
+let none : (a -> :bool) -> [a] -> :bool;
+let none pred xs = not (any pred xs);
+
 /// Test whether any element equals `x`.
 let contains : a -> [a] -> :bool;
 let contains x xs = any (fn y -> y == x) xs;
@@ -472,6 +562,16 @@ let rec find pred xs =
     if _list_is_empty xs { () }
     else if pred (xs.[0]) { xs.[0] }
     else { find pred (_list_tail xs) };
+
+/// The first answer of `f` that is not `()`, or `()` when there is none --
+/// `find` and `map` in one walk that stops as soon as it has something.
+let find_map : (a -> b) -> [a] -> b;
+let rec find_map f xs =
+    if _list_is_empty xs { () }
+    else {
+        let y = f (xs.[0]);
+        if y == () { find_map f (_list_tail xs) } else { y }
+    };
 
 /// The index of the first element satisfying `pred`, or -1.
 let find_index : (a -> :bool) -> [a] -> :integer;
@@ -657,6 +757,31 @@ let sort_on key xs = {
     _sort_keyed (map key (_array_to_list items)) items
 };
 
+/// Test whether each element is no greater than the next, by `compare`.
+/// Stops at the first pair out of order.
+let is_sorted : [a] -> :bool;
+let is_sorted xs = _list_is_empty xs || sorted_after (xs.[0]) (_list_tail xs);
+
+/// Whether `xs` is in order and starts no lower than `prev`.
+priv let sorted_after : a -> [a] -> :bool;
+priv let rec sorted_after prev xs =
+    if _list_is_empty xs { true }
+    else if compare prev (xs.[0]) > 0 { false }
+    else { sorted_after (xs.[0]) (_list_tail xs) };
+
+// --- effects ----------------------------------------------------------------
+
+/// Run `f!` on each element in order, for what it does. The list is walked one
+/// cell at a time as it goes, so an endless list runs for ever rather than
+/// being built first. The answers are dropped; `map` keeps them.
+let each! : (a -> :any) -> [a] -> :unit;
+let rec each! f! xs =
+    if _list_is_empty xs { () }
+    else {
+        f! (xs.[0])
+        each! f! (_list_tail xs)
+    };
+
 // --- conversion -------------------------------------------------------------
 
 /// Materialize the list as an array in the same order.
@@ -816,6 +941,44 @@ when test {
         test.case "take_while on an infinite list" $( test.eq! [0, 1] (take_while (fn x -> x < 2) (from 0)) ),
         test.case "repeat is infinite"          $( test.eq! [:x, :x] (take 2 (repeat :x)) ),
         test.case "zip stops at the shorter"    $( test.eq! [[1, 0]] (zip [1] (from 0)) ),
+
+        test.case "last_or"             $( test.eq! [3, :none] [last_or :none [1, 2, 3], last_or :none []] ),
+        test.case "range_step up"       $( test.eq! [0, 3, 6, 9] (range_step 0 10 3) ),
+        test.case "range_step down"     $( test.eq! [5, 3, 1] (range_step 5 0 (0 - 2)) ),
+        test.case "range_step of zero"  $( test.empty! (range_step 0 5 0) ),
+        test.case "range_step past the end" $( test.empty! (range_step 5 0 1) ),
+        test.case "update_at"           $( test.eq! [1, 20, 3] (update_at 1 (fn x -> x * 10) [1, 2, 3]) ),
+        test.case "update_at out of range" $( test.eq! [[1, 2], [1, 2]] [update_at 5 (fn x -> 0) [1, 2], update_at (0 - 1) (fn x -> 0) [1, 2]] ),
+        test.case "update_at on an infinite list" $( test.eq! [0, 9, 2] (take 3 (update_at 1 (fn _ -> 9) (from 0))) ),
+        test.case "rotate"              $( test.eq! [[2, 3, 1], [3, 1, 2], [1, 2, 3], [2, 3, 1]]
+                                                    [rotate 1 [1, 2, 3], rotate (0 - 1) [1, 2, 3],
+                                                     rotate 3 [1, 2, 3], rotate 7 [1, 2, 3]] ),
+        test.case "rotate of empty"     $( test.empty! (rotate 2 []) ),
+        test.case "interleave"          $( test.eq! [1, :a, 2, :b, 3, 4] (interleave [1, 2, 3, 4] [:a, :b]) ),
+        test.case "interleave the shorter first" $( test.eq! [1, :a, :b, :c] (interleave [1] [:a, :b, :c]) ),
+        test.case "interleave infinite lists" $( test.eq! [0, 0, 1, 1] (take 4 (interleave (from 0) (from 0))) ),
+        test.case "dedup"               $( test.eq! [1, 2, 1, 3] (dedup [1, 1, 2, 2, 2, 1, 3, 3]) ),
+        test.case "dedup of empty"      $( test.empty! (dedup []) ),
+        test.case "dedup an infinite list" $( test.eq! [:x] (take 1 (dedup (repeat :x))) ),
+        test.case "chunk_by"            $( test.eq! [[1, 3], [2, 4], [5]] (chunk_by (fn n -> n % 2) [1, 3, 2, 4, 5]) ),
+        test.case "chunk_by of empty"   $( test.empty! (chunk_by (fn n -> n) []) ),
+        test.case "chunk_by is lazy in its runs"
+            $( test.eq! [[0, 1], [2, 3]] (take 2 (chunk_by (fn n -> n / 2) (from 0))) ),
+        test.case "zip3"                $( test.eq! [[1, :a, "x"], [2, :b, "y"]] (zip3 [1, 2, 3] [:a, :b] ["x", "y", "z"]) ),
+        test.case "none"                $( test.eq! [true, false, true] [none (fn x -> x > 3) [1, 2], none (fn x -> x > 1) [1, 2], none (fn x -> true) []] ),
+        test.case "find_map"            $( test.eq! [20, ()] [find_map (fn x -> if x > 1 { x * 10 } else { () }) [1, 2, 3],
+                                                             find_map (fn x -> ()) [1, 2]] ),
+        test.case "find_map stops early" $( test.eq! 3 (find_map (fn x -> if x == 3 { x } else { () }) (from 0)) ),
+        test.case "is_sorted"           $( test.eq! [true, true, true, false] [is_sorted [], is_sorted [1], is_sorted [1, 1, 2], is_sorted [2, 1]] ),
+        test.case "each! runs in order" $( {
+            let me = self! ();
+            each! (fn x -> send! me (x * 10)) [1, 2, 3]
+            let a = recv! ();
+            let b = recv! ();
+            let c = recv! ();
+            test.eq! [10, 20, 30] [a, b, c]
+        } ),
+        test.case "is_sorted stops at the first descent" $( test.false! (is_sorted (_list_cons 1 (_list_cons 0 (from 0)))) ),
     ];
 }
 

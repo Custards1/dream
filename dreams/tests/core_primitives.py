@@ -57,7 +57,9 @@ with tempfile.TemporaryDirectory(prefix='dream-primitives-') as directory:
     data = image.read_bytes()
     offset, length = section(data, b'NODE')
     nodes = list(struct.iter_unpack('<BBHIII', data[offset:offset + length]))
-    assert {n[0] for n in nodes if n[0] >= 47} == set(range(47, 74))
+    # Only the primitives' own range: the std a program reaches may use later
+    # opcodes of its own (`<<` and `>>` are 79 and 80), which are not this test's.
+    assert {n[0] for n in nodes if 47 <= n[0] < 47 + len(primitives)} == set(range(47, 47 + len(primitives)))
     for opcode, (_, arity) in enumerate(primitives, 47):
         assert all(n[5] == arity for n in nodes if n[0] == opcode)
     assert run(vm, '--no-jit', str(image)) == '0\n'

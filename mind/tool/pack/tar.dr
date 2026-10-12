@@ -169,14 +169,7 @@ let member! h style epoch i = {
 /// empty blocks that end one.
 let write! : :any -> Style -> :integer -> [Item] -> :unit;
 let write! h style epoch items = {
-    let rec each! xs = match xs {
-        [] => (),
-        [i, ..rest] => {
-            member! h style epoch i
-            each! rest
-        },
-    };
-    each! items
+    list.each! (member! h style epoch) items
     out.write! h (bytes.zeros 1024)
 };
 

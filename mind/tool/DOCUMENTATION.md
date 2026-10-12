@@ -24,7 +24,7 @@ title = "My library"
 guides = "docs"
 output = "target/docs"
 api = true
-example-timeout = 10000  # milliseconds per execution
+example-timeout = 5000   # milliseconds per example, compile and run each
 ```
 
 Write guides as `.md` files under `docs/`. Subdirectories and assets keep
@@ -64,9 +64,9 @@ compile, raise an error, exit unsuccessfully or time out **do not fail the
 documentation build**. This lets comments demonstrate incorrect usage too.
 A successful example that prints nothing is labeled “(no output)”.
 
-Use a `text` fence for a fragment that should only be displayed. Compilation
-has a 60-second deadline; execution defaults to 10 seconds and can be changed
-with `example-timeout`. Displayed output is limited to 32 KiB per phase.
+Use a `text` fence for a fragment that should only be displayed. Each example
+has a deadline, 5 seconds unless `example-timeout` says otherwise, which its
+compile and its run each get in full. Displayed output is limited to 32 KiB per phase.
 Examples run as ordinary local programs with the current user's access, so
 building docs executes the example code. Temporary example directories are
 removed after a successful documentation build.

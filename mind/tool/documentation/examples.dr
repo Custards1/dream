@@ -31,7 +31,10 @@ let run! ctx code = try! {
         [:error, why] => report "Build setup" (%{ :code => 1, :err => why }),
         [:ok, args] => {
             let cmd = build.compiler_command! (build.choose_compiler! m ctx.[:compiler]);
-            let compiled = os.exec_for! (list.head cmd) (list.append (list.nth 1 cmd) args) 60000;
+            // The example's deadline bounds its compile as well as its run:
+            // an example that cannot build in that time is as broken as one
+            // that cannot finish, and the page says so either way.
+            let compiled = os.exec_for! (list.head cmd) (list.append (list.nth 1 cmd) args) ctx.[:timeout];
             if compiled.[:code else 1] != 0 || compiled.[:timed_out else false] { report "Compile" compiled }
             else {
                 let vm = build.vm_command! ();
