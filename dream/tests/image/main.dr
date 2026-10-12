@@ -60,8 +60,8 @@ let main! = {
                            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
     console.print! (to_string (list.map (fn w -> join! w) workers))
 
-    console.print! (to_string (list.map (fn r -> match r { [:ok, _] => :ok, other => other })
+    console.print! (to_string (list.map (fn r -> match r { Result.ok(_) => :ok, other => other })
                                         [image.locate! (image.file "shapes.dream"),
                                          image.locate! (image.installed "shapes")]))
-    console.print! (to_string (match image.locate! (image.installed "absent") { [:error, _] => :absent, other => other }))
+    console.print! (to_string (match image.locate! (image.installed "absent") { Result.error(_) => :absent, other => other }))
 };

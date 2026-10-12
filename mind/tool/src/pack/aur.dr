@@ -58,7 +58,7 @@ let package_body sp lay = {
     + "}\n"
 };
 
-let names : Spec -> :string -> [:ok, [:string]] | [:error, :string];
+let names : Spec -> :string -> Result [:string] :string;
 let names sp key = result.map (fn ds -> list.map deps.pacman ds) (deps.parse_all (spec.strings sp "arch" key));
 
 let pkgbuild : Spec -> Layout -> [Asset] -> [:string] -> [:string] -> :bool -> :string;
@@ -101,14 +101,14 @@ let srcinfo sp lay assets depends conflicts installs = {
 };
 
 /// Write the AUR files into `dest/aur`, answering the PKGBUILD's path.
-let make! : Spec -> Layout -> :string -> [:ok, :string] | [:error, :string];
+let make! : Spec -> Layout -> :string -> Result :string :string;
 let make! sp lay dest = {
     let? assets = release.find! sp "aur" dest;
     let linux = release.on "linux" assets;
     let? depends = names sp "depends";
     let? conflicts = names sp "conflicts";
     match linux {
-        [] => [:error, "pkgbuild: no Linux tarballs of " + Spec.name sp + " in " + dest],
+        [] => Result.error ("pkgbuild: no Linux tarballs of " + Spec.name sp + " in " + dest),
         _ => {
             let dir = dest + "/aur";
             file.mkdir_all! dir
@@ -121,7 +121,7 @@ let make! sp lay dest = {
             };
             file.write! (dir + "/PKGBUILD") (pkgbuild sp lay linux depends conflicts installs)
             file.write! (dir + "/.SRCINFO") (srcinfo sp lay linux depends conflicts installs)
-            [:ok, dir + "/PKGBUILD"]
+            Result.ok (dir + "/PKGBUILD")
         },
     }
 };

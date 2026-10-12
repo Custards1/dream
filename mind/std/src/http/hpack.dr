@@ -295,8 +295,8 @@ when test {
     let decode_all d blocks = match blocks {
         [] => [],
         [[hex, want], ..rest] => match decode d (match crypto.unhex hex { () => "", b => b }) {
-            [:ok, [got, d2]] => (got == want) :: decode_all d2 rest,
-            [:error, why] => [why],
+            Result.ok([got, d2]) => (got == want) :: decode_all d2 rest,
+            Result.error(why) => [why],
         },
     };
 
@@ -312,15 +312,15 @@ when test {
             (decode_all (decoder 4096) vectors) ),
         test.case "what this encodes decodes" $( {
             let hs = [[":status", "200"], ["content-type", "text/html"], ["x-thing", "caf\u{e9}"], [":path", "/"]];
-            test.eq! [:ok, hs] (result.map (fn [got, _] -> got) (decode (decoder 4096) (encode hs)))
+            test.eq! (Result.ok hs) (result.map (fn [got, _] -> got) (decode (decoder 4096) (encode hs)))
         } ),
         test.case "static hits are one byte" $( test.eq! [1, 1] [len (encode [[":method", "GET"]]), len (encode [[":status", "404"]])] ),
         test.case "the table evicts its oldest" $( {
             let d = decoder 100;
             let block = str.of_bytes [64] + literal "aaaa" + literal (str.repeat 30 "x") + str.of_bytes [64] + literal "bbbb" + literal (str.repeat 30 "y");
             match decode d block {
-                [:ok, [_, d2]] => test.eq! [["bbbb", str.repeat 30 "y"]] (Decoder.table d2),
-                [:error, why] => test.fail! why,
+                Result.ok([_, d2]) => test.eq! [["bbbb", str.repeat 30 "y"]] (Decoder.table d2),
+                Result.error(why) => test.fail! why,
             }
         } ),
         test.case "an index past the tables" $( test.true! (result.is_error (decode (decoder 4096) (write_int 128 7 70))) ),

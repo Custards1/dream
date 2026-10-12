@@ -35,8 +35,8 @@ let date = comp regex.compile "(?<y>\\d{4})-(?<m>\\d\\d)-(?<d>\\d\\d)";
 let words = regex.compile "\\w+";
 
 let show r = match r {
-    [:ok, v] => to_string v,
-    [:error, e] => p.describe e,
+    Result.ok(v) => to_string v,
+    Result.error(e) => p.describe e,
 };
 
 let main! = {
@@ -46,7 +46,7 @@ let main! = {
     console.print! (show (p.run calculator "2 * (3 + 4) - -1"))
     console.print! (show (p.run calculator "2 * (3 + )"))
     match p.run calculator "1 + 2 * x" {
-        [:error, e] => console.print! (p.explain e "1 + 2 * x"),
+        Result.error(e) => console.print! (p.explain e "1 + 2 * x"),
         _ => (),
     }
 

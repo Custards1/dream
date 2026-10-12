@@ -21,7 +21,7 @@ The language's primitives are builtins spelled with a leading underscore --
 Everything else calls the function here that wraps each one (`list.cons`,
 `str.slice`, `payload.at`), which compiles to the same opcode; naming a
 primitive outside `std` is a warning. The same goes for shapes: a result is
-`[:ok, v]` or `[:error, why]` with `std.result` to handle it, a long-lived
+`Result.ok v` or `Result.error why` with `std.result` to handle it, a long-lived
 process is a `std.server`, an option parser is `std.cli`. A program that
 grows its own version of one of these is a program the next reader has to
 learn.
@@ -39,7 +39,7 @@ learn.
 | `char`, `atom`, `num` | characters and code points, atoms by name, numbers to and from text |
 | `seq` | the generic half: everything a container gets once it can `fold` |
 | `dynamic` | the sequence operations, choosing list, array or string at run time |
-| `result` | `[:ok, value]` and `[:error, reason]`, and what to do with them |
+| `result` | `Result.ok value` and `Result.error reason`, and what to do with them |
 | `error` | an error's kind and payload, and errors of your own |
 | `types` | optional type descriptions as values: `accepts`, `check`, `enforce` |
 

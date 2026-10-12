@@ -364,8 +364,8 @@ priv let tagged : :string -> Syntax -> Syntax;
 priv let tagged tag e = list_s [atom_s tag, e];
 
 /// Return a PostgreSQL SQL macro-expansion error.
-priv let invalid : :string -> [:error, :string];
-priv let invalid message = [:error, "sql.query: " + message];
+priv let invalid : :string -> Result a :string;
+priv let invalid message = Result.error ("sql.query: " + message);
 
 /// `expand sql.query "SELECT .. {name} .."`, or a list of SQL strings and
 /// values: a fragment whose placeholders are the values the names hold where

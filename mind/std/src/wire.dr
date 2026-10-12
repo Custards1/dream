@@ -435,14 +435,14 @@ when test {
             $( {
                 let t = tensor.random 19 [2, 3, 4] * 2.0;
                 test.eq! (write_tensor t) (encode t)
-                test.eq! [:ok, t] (decode (encode t))
-                test.eq! [:ok, t] (decode_by_hand (encode t))
+                test.eq! (Result.ok t) (decode (encode t))
+                test.eq! (Result.ok t) (decode_by_hand (encode t))
                 test.true! (trip [%{"weights" => t}])
             } ),
         test.case "malformed tensor shapes and payloads are refused"
             $( test.true! (list.all (fn bytes -> {
                 let native = decode bytes;
-                native.[0] == :error && (decode_by_hand bytes).[0] == :error
+                result.is_error native && result.is_error (decode_by_hand bytes)
             }) [byte 12, byte 12 + byte 0, byte 12 + byte 7,
                 byte 12 + byte 1 + count 0,
                 byte 12 + byte 2 + count 4294967295 + count 4294967295,
@@ -552,7 +552,7 @@ when test {
         test.case "a frame is longer than its body"
             $( test.eq! (len (encode 1) + 4) (len (frame 1)) ),
         test.case "one frame"
-            $( test.eq! [:ok, 42] (list.nth 0 (next_frame (frame 42))) ),
+            $( test.eq! (Result.ok 42) (list.nth 0 (next_frame (frame 42))) ),
         test.case "a frame leaves nothing over"
             $( test.eq! "" (list.nth 1 (next_frame (frame 42))) ),
         test.case "half a frame is not an answer"
@@ -560,11 +560,11 @@ when test {
         test.case "half a body is not an answer either"
             $( test.eq! () (next_frame (_str_slice (frame "hello") 0 8)) ),
         test.case "two frames come back in order"
-            $( test.eq! [[:ok, 1], [:ok, :two]] (list.nth 0 (frames (frame_all [1, :two]))) ),
+            $( test.eq! [Result.ok 1, Result.ok :two] (list.nth 0 (frames (frame_all [1, :two]))) ),
         test.case "a partial frame is left for later"
             $( test.eq! 3 (len (list.nth 1 (frames (frame 1 + _str_slice (frame 2) 0 3)))) ),
         test.case "a frame whose body is nonsense still says where the next one starts"
-            $( test.eq! [:ok, 9]
+            $( test.eq! (Result.ok 9)
                         (list.nth 1 (list.nth 0 (frames (_str_concat
                             [_str_le 1 4, _str_of_bytes [99], frame 9])))) ),
         test.case "nothing at all frames to nothing"

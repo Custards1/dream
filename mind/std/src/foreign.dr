@@ -16,7 +16,7 @@
 // which the compiler makes a module (`syntax.foreign_decl` in dreams): each
 // function bound with the `ffi.function` its C signature describes, and signed
 // with the Dream type that signature means on this side. The vocabulary it is
-// written in is `Arg` and `Result` below; docs/ffi.md is the whole of it.
+// written in is `Arg` and `Return` below; docs/ffi.md is the whole of it.
 //
 // What is left here is what a declaration cannot say.
 //
@@ -68,7 +68,7 @@ type Scalar = :bool | :i8 | :i16 | :i32 | :i64 | :u8 | :u16 | :u32 | :u64 | :f32
 /// copies it and then frees it with the named destructor. `:ptr` is a raw
 /// address, as an integer or `()` for null -- the escape hatch, and the one
 /// type here that checks nothing.
-type Result = :void | Scalar | :ptr | :cstr
+type Return = :void | Scalar | :ptr | :cstr
             | [:own, :string, :string]
             | [:borrow, :string]
             | [:cstr, :string];
@@ -87,7 +87,7 @@ type CallbackResult = Scalar | :void | :ptr;
 /// given somewhere to write, and the call answers `[result, out, ..]`.
 type Arg = Scalar | :ptr | :cstr | :bytes | :buffer
          | [:handle, :string]
-         | [:out, Result]
+         | [:out, Return]
          | [:callback, [CallbackArg], CallbackResult];
 
 /// Where a library is: a path the platform's loader understands, `()` for the
@@ -108,11 +108,11 @@ type Buffer = Handle "buffer";
 // Spelled as functions too, for a signature built rather than written.
 
 /// Describe an owned foreign handle with a tag and destructor.
-let own : :string -> :string -> Result;
+let own : :string -> :string -> Return;
 let own tag destructor = [:own, tag, destructor];
 
 /// Describe a borrowed foreign handle with the given tag.
-let borrow : :string -> Result;
+let borrow : :string -> Return;
 let borrow tag = [:borrow, tag];
 
 /// Describe a foreign handle accepted under the given tag.
@@ -120,7 +120,7 @@ let handle : :string -> Arg;
 let handle tag = [:handle, tag];
 
 /// Describe an output parameter whose pointee has type `t`.
-let out : Result -> Arg;
+let out : Return -> Arg;
 let out t = [:out, t];
 
 /// Describe a callback's argument and result types.
@@ -128,7 +128,7 @@ let callback : [CallbackArg] -> CallbackResult -> Arg;
 let callback args result = [:callback, args, result];
 
 /// A string C allocated and the caller must free.
-let taken : :string -> Result;
+let taken : :string -> Return;
 let taken destructor = [:cstr, destructor];
 
 // --- libraries and functions -------------------------------------------------------
@@ -181,7 +181,7 @@ let any_of libs = [:any, libs];
 /// account of what was looked for and where that using it would raise. It
 /// opens the library to find out, since a file that is there but built for
 /// another machine is not one this program can use.
-let locate! : Library -> [:ok, :string] | [:error, :string];
+let locate! : Library -> Result :string :string;
 let locate! lib = ffi.locate! lib;
 
 /// The search `system` makes, for a given platform and architecture.
@@ -246,13 +246,13 @@ let embedded name = [:payload, name];
 /// an `out`. Calling it is an effect, so bind it to a name that says so:
 /// `let puts! = foreign.function ..`. Nothing is loaded until the name is
 /// first used, and then once per VM.
-let function : Library -> :string -> [Arg] -> Result -> :any;
+let function : Library -> :string -> [Arg] -> Return -> :any;
 let function lib symbol args result = ffi.function lib symbol args result;
 
 /// The same, for a C function with no effects -- `sqrt`, `strlen` -- which a
 /// pure function may call. Only the program can know that it is pure, and a
 /// function that is not will be run lazily, perhaps twice, perhaps never.
-let pure_function : Library -> :string -> [Arg] -> Result -> :any;
+let pure_function : Library -> :string -> [Arg] -> Return -> :any;
 let pure_function lib symbol args result = ffi.pure_function lib symbol args result;
 
 // --- owning -------------------------------------------------------------------------
@@ -489,13 +489,13 @@ let stop! pid = server.stop! pid;
 let child! : :string -> :any;
 let child! name = server.child! name ();
 
-/// A server answers `[:ok, value]` or `[:error, e]`, so that a call which
+/// A server answers `Result.ok value` or `Result.error e`, so that a call which
 /// raised can be raised again in the process that asked -- where it is that
 /// process's error, and not the reason the server stopped.
 priv let answer_of! : :any -> :any;
 priv let answer_of! outcome = match outcome {
-    [:ok, value] => value,
-    [:error, e] => raise! e,
+    Result.ok(value) => value,
+    Result.error(e) => raise! e,
     other => raise! other,
 };
 
@@ -530,8 +530,8 @@ mod server {
         // A statement, not an element: `[:ok, strict! x]` suspends the
         // element like any other, and it would raise after `try!` returned.
         let value = strict! (work ());
-        [:ok, value]
-    } catch e { [:error, e] };
+        Result.ok value
+    } catch e { Result.error e };
 
     // `terminate!` is left as the default. The resources go with the process,
     // released by the VM as it finishes -- which also covers a server that

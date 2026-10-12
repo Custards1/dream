@@ -238,11 +238,11 @@ let error! message fields = at! (default! ()) :error message fields;
 let timed! : Logger -> Level -> :string -> :map -> a -> a;
 let timed! lg l message fields value = {
     let start = time.monotonic! ();
-    let outcome = try! { strict! value; [:ok, value] } catch e { [:error, e] };
+    let outcome = try! { strict! value; Result.ok value } catch e { Result.error e };
     let took = time.monotonic! () - start;
     match outcome {
-        [:ok, v] => { at! lg l message fields.[:took => time.format_duration took]; v },
-        [:error, e] => {
+        Result.ok(v) => { at! lg l message fields.[:took => time.format_duration took]; v },
+        Result.error(e) => {
             at! lg :error message fields.[:took => time.format_duration took].[:error => e]
             raise! e
         },
@@ -406,8 +406,8 @@ when test {
             (str.contains_str "\u{1b}[33mWARN \u{1b}[0m" (render new (event :warn "" "x" %{}) true)) ),
         test.case "logfmt" $( test.eq! "time=2026-10-04T12:00:00Z level=info logger=http msg=\"GET /\" status=200"
             (render (format :logfmt new) (event :info "http" "GET /" %{ :status => 200 }) false) ),
-        test.case "JSON" $( test.eq! [:ok, %{ "time" => "2026-10-04T12:00:00Z", "level" => "error", "logger" => "app",
-                                             "msg" => "failed", "kind" => "timeout", "tries" => [1, 2] }]
+        test.case "JSON" $( test.eq! (Result.ok %{ "time" => "2026-10-04T12:00:00Z", "level" => "error", "logger" => "app",
+                                             "msg" => "failed", "kind" => "timeout", "tries" => [1, 2] })
             (json.decode (render (format :json new) (event :error "app" "failed" %{ :kind => :timeout, :tries => [1, 2] }) false)) ),
         test.case "an error field is described" $( test.true!
             (str.contains_str "error=" (render new (event :error "" "x" %{ :error => _error_new :not_found "f.txt" }) false)) ),

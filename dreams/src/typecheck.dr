@@ -1602,15 +1602,8 @@ let rec bind_pattern k h p t = match p {
 /// arm covers have the pattern and a type and nothing to resolve a name
 /// with, so a `match` asks once, here, for all of them.
 let rec resolved_pattern k h p = match p {
-    [:record_p, ctor, fields, sp] => {
-        let at = match ctor { [:name, _, s] => s, [:field, _, _, s] => s, _ => () };
-        let id = match scope.resolution (res k) (Here.mi h) (Here.source h) at {
-            scope.Meaning.global(_, _, g) => constructor_id k g,
-            scope.Meaning.member(scope.Ref.dream(_), _, g) => constructor_id k g,
-            _ => (),
-        };
-        [:ctor_p, id, list.map (fn f -> resolved_pattern k h f) fields, sp]
-    },
+    [:record_p, ctor, fields, sp] =>
+        [:ctor_p, constructor_named k h ctor, list.map (fn f -> resolved_pattern k h f) fields, sp],
     [:as_p, inner, n, ns, sp] => [:as_p, resolved_pattern k h inner, n, ns, sp],
     [:cons_p, hd, tl, os, sp] => [:cons_p, resolved_pattern k h hd, resolved_pattern k h tl, os, sp],
     [:list_p, items, rest, sp] => [:list_p, list.map (fn i -> resolved_pattern k h i) items, rest, sp],
@@ -1658,6 +1651,17 @@ let pattern_kind p = match p {
     [:literal, e, _] => "`" + show (literal_type e) + "`",
     [:as_p, inner, _, _, _] => pattern_kind inner,
     _ => "what this pattern takes apart",
+};
+
+/// The id a constructor written as `ctor` -- a name or a dotted path --
+/// stamps on what it makes, or `()` when it names no constructor.
+let constructor_named k h ctor = {
+    let at = match ctor { [:name, _, s] => s, [:field, _, _, s] => s, _ => () };
+    match scope.resolution (res k) (Here.mi h) (Here.source h) at {
+        scope.Meaning.global(_, _, g) => constructor_id k g,
+        scope.Meaning.member(scope.Ref.dream(_), _, g) => constructor_id k g,
+        _ => (),
+    }
 };
 
 /// The id the constructor global `g` stamps on what it makes, from the

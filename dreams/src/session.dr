@@ -228,7 +228,7 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
     let ds = list.append (list.append (modules.diags l) (scope.diags state1))
                          (list.append (scope.r_diags r1) (lower.l_diags low1));
     if diag.error_count ds > 0 {
-        [:error, as_session source (diag.render_all (modules.files l) ds)]
+        Result.error (as_session source (diag.render_all (modules.files l) ds))
     }
     else {
         let deps_recs =
@@ -237,8 +237,8 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
                 list.nth 1 lmb
             }
             else { pre_modules pre };
-        [:ok, engine l state1 r1 low1 base_next (pre_root_from pre) funcs1 globals1
-                    imports1 deps_recs base_text]
+        Result.ok (engine l state1 r1 low1 base_next (pre_root_from pre) funcs1 globals1
+                    imports1 deps_recs base_text)
     }
 };
 
@@ -264,7 +264,7 @@ let rec main_step! l mi main_item en source image = {
     let ds = list.append (list.append (modules.diags l) (scope.diags state2))
                          (list.append (scope.r_diags r2) (lower.l_diags low2));
     if diag.error_count ds > 0 {
-        [:error, as_session source (diag.render_all (modules.files l) ds)]
+        Result.error (as_session source (diag.render_all (modules.files l) ds))
     }
     else {
         finalize! l mi en low2 r2 funcs2 globals2 source image
@@ -291,8 +291,8 @@ let finalize! l mi en low2 r2 funcs2 globals2 source image = {
             |> ir.Program.set_entry (lower.find_entry l r2)
             |> ir.Program.set_module_name (list.nth 1 named)
             |> ir.Program.set_source_name (list.nth 1 sourced);
-    if write_file! image (emit.to_binary (ir.finish p)) { [:ok, image] }
-    else { [:error, "dreams: cannot write " + image] }
+    if write_file! image (emit.to_binary (ir.finish p)) { Result.ok image }
+    else { Result.error ("dreams: cannot write " + image) }
 };
 
 /// A first entry, or one whose header changed. The whole text is loaded and
@@ -321,11 +321,11 @@ let boot! roots cfg source image text base_text engine base = {
     let pre_ = pre scope.state r0 low0 (scope.next_global state_deps) [] [] [] [] true;
     match compile_slice! l mi state1 pre_ (list.length slice)
                          base_text source {
-        [:error, msg] => [[:error, msg], engine, base],
-        [:ok, en] =>
+        Result.error(msg) => [Result.error msg, engine, base],
+        Result.ok(en) =>
             match main_step! l mi main_item en source image {
-                [:error, msg] => [[:error, msg], engine, base],
-                [:ok, img] => [[:ok, img], en, engine_base en],
+                Result.error(msg) => [Result.error msg, engine, base],
+                Result.ok(img) => [Result.ok img, en, engine_base en],
             },
     }
 };
@@ -344,11 +344,11 @@ let proceed! source image items engine base_text base = {
                     (engine_imports engine) (engine_modules engine) false;
     match compile_slice! l mi state1 pre_
                          (base + list.length slice) base_text source {
-        [:error, msg] => [[:error, msg], engine, base],
-        [:ok, en] =>
+        Result.error(msg) => [Result.error msg, engine, base],
+        Result.ok(en) =>
             match main_step! l mi main_item en source image {
-                [:error, msg] => [[:error, msg], engine, base],
-                [:ok, img] => [[:ok, img], en, engine_base en],
+                Result.error(msg) => [Result.error msg, engine, base],
+                Result.ok(img) => [Result.ok img, en, engine_base en],
             },
     }
 };
@@ -359,9 +359,9 @@ let proceed! source image items engine base_text base = {
 let fresh_build! roots cfg source image text engine base = {
     let b = compile.build! (expansion.expand! (modules.load! source roots cfg false))
                            compile.scratch;
-    if not (compile.ok b) { [[:error, as_session source (compile.rendered b)], engine, base] }
-    else if write_file! image (compile.bytes b) { [[:ok, image], (), 0] }
-    else { [[:error, "dreams: cannot write " + image], engine, base] }
+    if not (compile.ok b) { [Result.error (as_session source (compile.rendered b)), engine, base] }
+    else if write_file! image (compile.bytes b) { [Result.ok image, (), 0] }
+    else { [Result.error ("dreams: cannot write " + image), engine, base] }
 };
 
 /// Compile the session as it now stands, with `text` (the whole program) and
@@ -371,7 +371,7 @@ let fresh_build! roots cfg source image text engine base = {
 /// unchanged so the session they stand for is unchanged too.
 let compile! roots cfg source image text base_text engine base =
     match write_file! source text {
-        false => [[:error, "dreams: cannot write " + source], engine, base],
+        false => [Result.error ("dreams: cannot write " + source), engine, base],
         true =>
             match route text base_text engine base {
                 Route.reboot => boot! roots cfg source image text base_text engine base,

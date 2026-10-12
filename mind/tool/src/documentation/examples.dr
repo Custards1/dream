@@ -83,8 +83,8 @@ let run! ctx code = try! {
     let m = ctx.[:manifest];
     let opts = map.merge build.options (%{ :entry => entry, :output => image, :compiler => ctx.[:compiler] });
     match build.compile_args! m opts {
-        [:error, why] => [report "Build setup" (%{ :code => 1, :err => why }), false],
-        [:ok, args] => {
+        Result.error(why) => [report "Build setup" (%{ :code => 1, :err => why }), false],
+        Result.ok(args) => {
             let cmd = build.compiler_command! (build.choose_compiler! m ctx.[:compiler]);
             // The example's deadline bounds its compile as well as its run:
             // an example that cannot build in that time is as broken as one

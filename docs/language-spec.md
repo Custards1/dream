@@ -738,29 +738,33 @@ to take apart (`let (x as y) = v`).
 
 ### `let?`: errors as values
 
-A pure function that can fail answers `[:ok, value]` or `[:error, reason]`.
-A chain of such steps is written with `let?`:
+A pure function that can fail answers `Result.ok value` or
+`Result.error reason`, the union every module has from the prelude
+([§11](#the-prelude)). A chain of such steps is written with `let?`:
 
 ```dream
-let number s = if s == "x" { [:error, "not a number"] } else { [:ok, 2] };
+let number s = if s == "x" { Result.error "not a number" } else { Result.ok 2 };
 
 let ratio a b = {
-    let? x = number a;          // [:ok, x] binds x and goes on;
+    let? x = number a;          // Result.ok(x) binds x and goes on;
     let? y = number b;          // anything else is the block's answer
-    [:ok, x + y]
+    Result.ok (x + y)
 };
 
-ratio "a" "b"                   // [:ok, 4]
-ratio "x" "b"                   // [:error, "not a number"]
+ratio "a" "b"                   // Result.ok(4)
+ratio "x" "b"                   // Result.error("not a number")
 ```
 
-`let? p = e; rest` means exactly
+`let? p = e; rest` means
 
 ```dream
-match e { [:ok, v] => { let p = v; rest }, other => other }
+match e { Result.ok(v) => { let p = v; rest }, other => other }
 ```
 
-so `p` may be a pattern, and every value that is not `[:ok, _]` is passed on
+An `[:ok, v]` list is not a result, and `let?` passes it on like any other
+value that is not `Result.ok`.
+
+so `p` may be a pattern, and every value that is not an ok is passed on
 unchanged, as `std.result` and `macros.with_ok` pass it. `let?` binds one
 value with no parameters, `rec` or signature, and must be followed by the
 statements it guards.
@@ -853,7 +857,7 @@ a value is checked, never how it is represented.
 type Port      = :integer where fn n -> n >= 1 && n <= 65535;
 type Ints      = [:integer];
 type Pair a    = [a, a];
-type Outcome v = [:ok, v] | [:error, :string];
+type Outcome v = Result v :string;
 ```
 
 `type Name params = description` is a `let` whose value is the description,
@@ -1129,7 +1133,7 @@ types.check Shape s              // the union's name is its description
 Every variant is a record whose id names the union and the variant --
 `app.Shape.circle` -- with or without fields. It is equal to no list, array or
 atom, so a tag can never collide with data that merely looks like it: the
-`[:ok, value]` a function returns is not an `Outcome.ok`, and `:empty` is not
+`[:ok, value]` a list holds is not an `Outcome.ok`, and `:empty` is not
 `Shape.empty`. A variant with no fields is a key by value in a map, as an atom
 is.
 
@@ -1225,6 +1229,17 @@ A member import resolves exactly as `path.name` would, purity included. A
 member the module does not export is an error that lists what it does
 export. A package import binds a namespace, not a value: `std.list.map` can
 be passed around, but `std` and `std.list` alone cannot.
+
+### The prelude
+
+A few names are in scope in every module without an import: the public
+names of `std.prelude`, which today is the union `Result` (§7). Each is bound
+as `import std.prelude.{Result}` would bind it, and looked for last -- a
+module's own `Result`, one it imports, and one it is lent by an enclosing
+module all win, and taking the name is shadowing, not a clash. The prelude
+is for names the language itself answers in: `let?` means "carry on when
+this is `Result.ok`", in modules that import nothing. A program compiled
+with no standard library on its search path has no prelude.
 
 ### Packages
 
@@ -1379,7 +1394,7 @@ on a handful of `std.vm` natives:
 | | |
 |---|---|
 | `proc.recv_where! wanted` | the first message `wanted` accepts; the others stay where they were, in order |
-| `proc.recv_within! ms` | `[:ok, message]`, or `:timeout` after `ms` milliseconds |
+| `proc.recv_within! ms` | `Result.ok message`, or `Result.error :timeout` after `ms` milliseconds |
 | `proc.monitor! p` | be sent `[:down, p, outcome]` when `p` ends, without waiting for it |
 | `proc.kill! p reason` | end `p` as a failure of kind `:killed`; it cannot catch it |
 | `proc.sleep! ms` | wait |
@@ -1388,8 +1403,8 @@ on a handful of `std.vm` natives:
 let w = spawn! $( worker! () );
 proc.monitor! w
 match proc.recv_where_within! (fn m -> proc.is_down_of w m) 1000 {
-    [:ok, [:down, _, outcome]] => outcome,
-    :timeout => { proc.kill! w :too_slow; :gave_up },
+    Result.ok([:down, _, outcome]) => outcome,
+    Result.error(:timeout) => { proc.kill! w :too_slow; :gave_up },
 }
 ```
 
@@ -1500,7 +1515,7 @@ uses ordinary functions, imports and `match` to read and build it.
   `expand twice x + 1` is `(expand twice x) + 1`.
 - Expansion is outside-in. Arguments are not expanded first, and what a macro
   answers is expanded again, to a depth of 64.
-- A macro answering `[:error, "message"]` reports that message at the call.
+- A macro answering `Result.error "message"` reports that message at the call.
 - Macros are not hygienic. Names in the answer resolve where the macro is
   called, and the imports generated code needs must be in the caller.
 - Expansion runs on the embedded VM, as `comp!` does, and ordinary purity
@@ -1557,7 +1572,7 @@ for; `from system "name" "0"` holds it to one ABI version), `from embedded
 ```dream
 image fmt from installed "formatter" {
     pretty : :string -> :string
-    check! : :string -> [:ok, :string] | [:error, :string] = formatter.lint.check!
+    check! : :string -> Result :string :string = formatter.lint.check!
 }
 
 fmt.pretty source

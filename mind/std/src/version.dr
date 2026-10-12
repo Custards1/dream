@@ -80,23 +80,23 @@ let split_at : :string -> :string -> [:string];
 let split_at sep s = match str.split_once sep s { () => [s, ""], parts => parts };
 
 /// `[:ok, version]` or `[:error, why]`.
-let parse : :string -> [:ok, Version] | [:error, :string];
+let parse : :string -> Result Version :string;
 let parse text = {
     let t = str.trim text;
     let bare = if str.starts_with "v" t { str.slice 1 (str.byte_length t - 1) t } else { t };
     let [core, rest] = split_at "-" (list.head (split_at "+" bare));
     let parts = list.map number (str.split "." core);
     match parts {
-        [ma] if ma != () => [:ok, [ma, 0, 0, rest]],
-        [ma, mi] if ma != () && mi != () => [:ok, [ma, mi, 0, rest]],
-        [ma, mi, pa] if ma != () && mi != () && pa != () => [:ok, [ma, mi, pa, rest]],
-        _ => [:error, "`" + text + "` is not a version; write MAJOR.MINOR.PATCH, as in 1.4.0"],
+        [ma] if ma != () => Result.ok [ma, 0, 0, rest],
+        [ma, mi] if ma != () && mi != () => Result.ok [ma, mi, 0, rest],
+        [ma, mi, pa] if ma != () && mi != () && pa != () => Result.ok [ma, mi, pa, rest],
+        _ => Result.error ("`" + text + "` is not a version; write MAJOR.MINOR.PATCH, as in 1.4.0"),
     }
 };
 
 /// The version, or `()` when the text is not one.
 let parse_or_unit : :string -> Version | :unit;
-let parse_or_unit text = match parse text { [:ok, v] => v, _ => () };
+let parse_or_unit text = match parse text { Result.ok(v) => v, _ => () };
 
 /// Format a version as major.minor.patch with its optional prerelease suffix.
 let show : Version -> :string;
@@ -152,15 +152,15 @@ let written : :string -> :integer;
 let written s = list.length (str.split "." (list.head (split_at "-" s)));
 
 /// One comparison, as `[:ok, [[op, v], ..]]`.
-let clause : :string -> [:ok, Requirement] | [:error, :string];
+let clause : :string -> Result Requirement :string;
 let clause text = {
     let t = str.trim text;
     let after n = str.trim (str.slice n (str.byte_length t - n) t);
     let versioned n k = {
         let rest = after n;
-        match parse rest { [:ok, v] => [:ok, k v (written rest)], [:error, why] => [:error, why] }
+        match parse rest { Result.ok(v) => Result.ok (k v (written rest)), Result.error(why) => Result.error why }
     };
-    if t == "*" || t == "" { [:ok, any] }
+    if t == "*" || t == "" { Result.ok any }
     else if str.starts_with ">=" t { versioned 2 (fn v n -> [[:ge, v]]) }
     else if str.starts_with "<=" t { versioned 2 (fn v n -> [[:le, v]]) }
     else if str.starts_with ">" t { versioned 1 (fn v n -> [[:gt, v]]) }
@@ -172,13 +172,13 @@ let clause text = {
 };
 
 /// `[:ok, requirement]` or `[:error, why]`, from comparisons joined by `,`.
-let parse_requirement : :string -> [:ok, Requirement] | [:error, :string];
+let parse_requirement : :string -> Result Requirement :string;
 let parse_requirement text =
     list.fold (fn acc part -> match [acc, clause part] {
-        [[:error, why], _] => [:error, why],
-        [_, [:error, why]] => [:error, "`" + text + "`: " + why],
-        [[:ok, have], [:ok, more]] => [:ok, list.append have more],
-    }) [:ok, any] (str.split "," text);
+        [Result.error(why), _] => Result.error why,
+        [_, Result.error(why)] => Result.error ("`" + text + "`: " + why),
+        [Result.ok(have), Result.ok(more)] => Result.ok (list.append have more),
+    }) (Result.ok any) (str.split "," text);
 
 /// Test a version against one operator-and-bound requirement.
 let holds : [Comparison, Version] -> Version -> :bool;
@@ -202,12 +202,12 @@ let matches req v = {
 };
 
 /// Parse both and test: `[:ok, bool]`, or the first parse error.
-let satisfies : :string -> :string -> [:ok, :bool] | [:error, :string];
+let satisfies : :string -> :string -> Result :bool :string;
 let satisfies requirement version =
     match [parse_requirement requirement, parse version] {
-        [[:error, why], _] => [:error, why],
-        [_, [:error, why]] => [:error, why],
-        [[:ok, r], [:ok, v]] => [:ok, matches r v],
+        [Result.error(why), _] => Result.error why,
+        [_, Result.error(why)] => Result.error why,
+        [Result.ok(r), Result.ok(v)] => Result.ok (matches r v),
     };
 
 /// `>=1.2.0, <2.0.0`, or `*`.
@@ -243,7 +243,7 @@ when test {
     import std.test;
 
     let v s = parse_or_unit s;
-    let ok r = match r { [:ok, x] => x, _ => () };
+    let ok r = match r { Result.ok(x) => x, _ => () };
     let sat r s = ok (satisfies r s);
 
     let tests = [
@@ -252,7 +252,7 @@ when test {
                         (list.map (fn s -> show (v s)) ["1", "1.2", "v1.2.3", "1.2.3-rc.1+build.7"]) ),
         test.case "what is not a version is said to be one"
             $( test.eq! [:error, :error, :error]
-                        (list.map (fn s -> list.head (parse s)) ["one", "1.x", "01.2"]) ),
+                        (list.map (fn s -> match parse s { Result.ok(_) => :ok, Result.error(_) => :error }) ["one", "1.x", "01.2"]) ),
         test.case "versions order by number, a pre-release before its release"
             $( test.eq! [0 - 1, 1, 0, 0 - 1, 0 - 1]
                         [compare_versions (v "1.2.3") (v "1.10.0"), compare_versions (v "2.0.0") (v "1.99.99"),
@@ -277,7 +277,7 @@ when test {
             $( test.eq! [false, true]
                         [sat "^1.2" "2.0.0-rc.1", sat ">=2.0.0-rc.1" "2.0.0-rc.2"] ),
         test.case "a requirement that is not one says where"
-            $( test.eq! :error (list.head (parse_requirement ">=1.2, <two")) ),
+            $( test.true! (match parse_requirement ">=1.2, <two" { Result.error(_) => true, _ => false }) ),
         test.case "a requirement reads back as its comparisons"
             $( test.eq! [">=1.2.0, <2.0.0", "*"]
                         [show_requirement (ok (parse_requirement "^1.2")), show_requirement any] ),

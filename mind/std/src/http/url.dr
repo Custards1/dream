@@ -63,8 +63,8 @@ let parse text = {
         let authority = str.slice 2 (auth_end - 2) hier;
         let path = str.slice auth_end (len hier - auth_end) hier;
         match parse_authority authority {
-            [:error, why] => result.error why,
-            [:ok, [user, password, host, port]] =>
+            Result.error(why) => result.error why,
+            Result.ok([user, password, host, port]) =>
                 result.ok (Url.make scheme user password host port path query fragment true has_query),
         }
     } else {
@@ -76,8 +76,8 @@ let parse text = {
 /// bug, and raises.
 let parse_or_raise : :string -> Url;
 let parse_or_raise text = match parse text {
-    [:ok, u] => u,
-    [:error, why] => type_assert false ("not a URL: " + why) (Url.new ()),
+    Result.ok(u) => u,
+    Result.error(why) => type_assert false ("not a URL: " + why) (Url.new ()),
 };
 
 /// Test whether text is a valid URI scheme.
@@ -165,8 +165,8 @@ let bare_host u = { let h = Url.host u; if str.starts_with "[" h { str.slice 1 (
 /// `Location: ../x` or an `href` means.
 let resolve : Url -> :string -> Url;
 let resolve base reference = match parse reference {
-    [:error, _] => base,
-    [:ok, r] => {
+    Result.error(_) => base,
+    Result.ok(r) => {
         if Url.scheme r != "" { Url.set_path (remove_dots (Url.path r)) r }
         else if Url.has_authority r { r |> Url.set_scheme (Url.scheme base) |> Url.set_path (remove_dots (Url.path r)) }
         else if Url.path r == "" {

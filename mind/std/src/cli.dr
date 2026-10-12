@@ -16,8 +16,8 @@
 //         cli.list_of "L" "package-path" "DIR" "a package, or a directory of them",
 //     ];
 //     match cli.parse opts (os.args! ()) {
-//         [:error, why] => ..,
-//         [:ok, c] => cli.flag_set c "quiet",
+//         Result.error(why) => ..,
+//         Result.ok(c) => cli.flag_set c "quiet",
 //     }
 //
 // A value may be written either way round -- `--output x` or `--output=x`, `-o
@@ -46,8 +46,8 @@
 //         cli.command "run"   "compile and run it"   [cli.list_of "L" "libs" "DIR" "search here"],
 //     ];
 //     match cli.commands global commands (os.args! ()) {
-//         [:error, why] => ..,
-//         [:ok, c] => cli.command_name c,   // the spelling that was used
+//         Result.error(why) => ..,
+//         Result.ok(c) => cli.command_name c,   // the spelling that was used
 //     }
 
 import std.list;
@@ -217,34 +217,34 @@ let add_rest : Parsed -> :string -> Parsed;
 let add_rest c a = c.[:rest => (list.append (rest c) [a])];
 
 /// Construct the diagnostic for an option whose value was omitted.
-let missing : Option -> :string -> [:error, :string];
+let missing : Option -> :string -> Result a :string;
 let missing o spelling =
-    [:error, spelling + " needs " + (if str.is_empty (meta o) { "a value" } else { meta o })];
+    Result.error (spelling + " needs " + (if str.is_empty (meta o) { "a value" } else { meta o }));
 
 /// A `choices` option was given a value it does not know; say so, naming the
 /// option and the value and everything it would have accepted.
-let choice_ok : Option -> :any -> (:ok | [:error, :string]);
+let choice_ok : Option -> :any -> Result :unit :string;
 let choice_ok o v = {
     let cs = o.[:choices else []];
-    if list.is_empty cs { :ok }
-    else if list.contains v cs { :ok }
-    else { [:error, "--" + long o + " expects one of " + str.join_str ", " cs +
-           " (got " + to_string v + ")"] }
+    if list.is_empty cs { Result.ok () }
+    else if list.contains v cs { Result.ok () }
+    else { Result.error ("--" + long o + " expects one of " + str.join_str ", " cs +
+           " (got " + to_string v + ")") }
 };
 
 /// Carry one option's value into `c` once its `choices` have approved it.
 let use_value : Parsed -> Option -> :any -> Arguments -> Step;
 let use_value c o v rest =
     match choice_ok o v {
-        :ok => [:ok, record c o v, rest],
-        [:error, m] => [:error, m],
+        Result.ok(_) => Result.ok [record c o v, rest],
+        Result.error(m) => Result.error m,
     };
 
 /// Everything after `--` is a positional, whatever it looks like.
 let take_rest : Parsed -> Arguments -> Outcome;
 let rec take_rest c args =
     match args {
-        [] => [:ok, c],
+        [] => Result.ok c,
         [a, ..more] => take_rest (add_rest c a) more,
     };
 
@@ -261,8 +261,8 @@ let unnegate name =
 
 /// Handle the option spelled `a` (which starts with `-` and is not `-` or
 /// `--`), consuming its value from `rest` when it takes one and does not carry
-/// it inline. Returns `[:ok, c, rest']` -- what the option became, and the line
-/// it left -- or `[:error, why]`.
+/// it inline. Returns `Result.ok [c, rest']` -- what the option became, and the line
+/// it left -- or `Result.error why`.
 let step : [Option] -> Parsed -> :string -> Arguments -> Step;
 let step os c a rest = {
     if str.starts_with "--" a {
@@ -275,21 +275,21 @@ let step os c a rest = {
             () => match unnegate name {
                 [:neg, real] =>
                     match by_long os real {
-                        () => [:error, "unknown option --" + name],
+                        () => Result.error ("unknown option --" + name),
                         o =>
                             if kind o == :toggle {
-                                if inline != () { [:error, "--" + name + " takes no value"] }
-                                else { [:ok, record c o false, rest] }
+                                if inline != () { Result.error ("--" + name + " takes no value") }
+                                else { Result.ok [record c o false, rest] }
                             }
-                            else { [:error, "unknown option --" + name] },
+                            else { Result.error ("unknown option --" + name) },
                     },
-                [:plain, _] => [:error, "unknown option --" + name],
+                [:plain, _] => Result.error ("unknown option --" + name),
             },
             o => match [kind o, inline] {
-                [:count, ()] => [:ok, add_count c o 1, rest],
-                [k, ()] if k == :flag || k == :toggle => [:ok, record c o true, rest],
+                [:count, ()] => Result.ok [add_count c o 1, rest],
+                [k, ()] if k == :flag || k == :toggle => Result.ok [record c o true, rest],
                 [k, _] if k == :flag || k == :toggle || k == :count =>
-                    [:error, "--" + name + " takes no value"],
+                    Result.error ("--" + name + " takes no value"),
                 [_, ()] => match rest {
                     [] => missing o ("--" + name),
                     [v, ..rest2] => use_value c o v rest2,
@@ -302,19 +302,19 @@ let step os c a rest = {
         let name = str.slice 1 1 a;
         let attached = str.slice 2 (str.byte_length a - 2) a;
         match by_short os name {
-            () => [:error, "unknown option -" + name],
+            () => Result.error ("unknown option -" + name),
             o => match kind o {
                 k if k == :flag || k == :toggle =>
-                    if not (str.is_empty attached) { [:error, "-" + name + " takes no value"] }
-                    else { [:ok, record c o true, rest] },
+                    if not (str.is_empty attached) { Result.error ("-" + name + " takes no value") }
+                    else { Result.ok [record c o true, rest] },
                 // `-vv` is `-v -v`: an attached run of the same letter counts.
                 :count => match str.to_list name {
                     [ch, ..] =>
                         if list.all (fn x -> x == ch) (str.to_list attached) {
-                            [:ok, add_count c o (1 + str.byte_length attached), rest]
+                            Result.ok [add_count c o (1 + str.byte_length attached), rest]
                         }
-                        else { [:error, "unknown option -" + name] },
-                    _ => [:ok, add_count c o 1, rest],
+                        else { Result.error ("unknown option -" + name) },
+                    _ => Result.ok [add_count c o 1, rest],
                 },
                 // `-oPATH` as well as `-o PATH`: the attached form is what
                 // people write for short options.
@@ -332,7 +332,7 @@ let step os c a rest = {
 let walk : [Option] -> Parsed -> Arguments -> Outcome;
 let rec walk os c args =
     match args {
-        [] => [:ok, c],
+        [] => Result.ok c,
         // The end of the options, not an option itself.
         ["--", ..more] => take_rest c more,
         [a, ..more] =>
@@ -340,8 +340,8 @@ let rec walk os c args =
             // programs, and it is never an option.
             if str.starts_with "-" a && str.byte_length a > 1 {
                 match step os c a more {
-                    [:error, m] => [:error, m],
-                    [:ok, c2, rest] => walk os c2 rest,
+                    Result.error(m) => Result.error m,
+                    Result.ok([c2, rest]) => walk os c2 rest,
                 }
             }
             else { walk os (add_rest c a) more },
@@ -365,14 +365,14 @@ let rec fill_default os c =
 
 /// A `required` option that was never written -- and has no default to stand in
 /// for it -- is an error in the line itself, named like the others.
-let missing_required : [Option] -> Parsed -> ([:ok, :unit] | [:error, :string]);
+let missing_required : [Option] -> Parsed -> (Result :unit :string);
 let rec missing_required os c =
     match os {
-        [] => [:ok, ()],
+        [] => Result.ok (),
         [o, ..more] =>
             if o.[:required else false] == true &&
                not (_map_has (values c) (long o)) {
-                [:error, "missing required option --" + long o]
+                Result.error ("missing required option --" + long o)
             }
             else { missing_required more c },
     };
@@ -383,34 +383,34 @@ let finalize : [Option] -> Parsed -> Outcome;
 let finalize os c = {
     let c2 = fill_default os c;
     match missing_required os c2 {
-        [:error, m] => [:error, m],
-        _ => [:ok, c2],
+        Result.error(m) => Result.error m,
+        _ => Result.ok c2,
     }
 };
 
-/// `[:ok, parsed]`, or `[:error, message]` naming the option at fault.
+/// `Result.ok parsed`, or `Result.error message` naming the option at fault.
 let parse : [Option] -> Arguments -> Outcome;
 let parse os args =
     match walk os (parsed (%{}) []) args {
-        [:error, m] => [:error, m],
-        [:ok, c] => finalize os c,
+        Result.error(m) => Result.error m,
+        Result.ok(c) => finalize os c,
     };
 
 /// Parse a selected command using both its own options and the global options.
 let finish_command : [Option] -> [Command] -> Parsed -> :string -> Arguments -> Outcome;
 let finish_command globals cmds c cmd args = {
     match by_command cmds cmd {
-        () => [:error, "unknown command `" + cmd + "`"],
+        () => Result.error ("unknown command `" + cmd + "`"),
         cm => {
             // The command's own options, and the shared ones too: an option
             // like `-o` is no less a global option for being written after the
             // command name, so both tables stay open until the line ends.
             let opts = list.append globals (command_opts cm);
             match walk opts c args {
-                [:error, m] => [:error, m],
-                [:ok, c2] => match finalize opts c2 {
-                    [:error, m] => [:error, m],
-                    [:ok, c3] => [:ok, c3.[:command => cm]],
+                Result.error(m) => Result.error m,
+                Result.ok(c2) => match finalize opts c2 {
+                    Result.error(m) => Result.error m,
+                    Result.ok(c3) => Result.ok (c3.[:command => cm]),
                 },
             }
         },
@@ -427,17 +427,17 @@ let finish_command globals cmds c cmd args = {
 let scan : [Option] -> [Command] -> Parsed -> Arguments -> Outcome;
 let rec scan globals cmds c args =
     match args {
-        [] => [:ok, c],
+        [] => Result.ok c,
         ["--", ..more] =>
             match more {
-                [] => [:ok, c],
+                [] => Result.ok c,
                 [cmd, ..rest] => finish_command globals cmds c cmd rest,
             },
         [a, ..more] =>
             if str.starts_with "-" a && str.byte_length a > 1 {
                 match step globals c a more {
-                    [:error, m] => [:error, m],
-                    [:ok, c2, rest] => scan globals cmds c2 rest,
+                    Result.error(m) => Result.error m,
+                    Result.ok([c2, rest]) => scan globals cmds c2 rest,
                 }
             }
             else { finish_command globals cmds c a more },
@@ -562,8 +562,8 @@ when test {
         flag "" "version" "print the version",
     ];
 
-    let ok args = match parse specs args { [:ok, c] => c, _ => () };
-    let why args = match parse specs args { [:error, m] => m, _ => "" };
+    let ok args = match parse specs args { Result.ok(c) => c, _ => () };
+    let why args = match parse specs args { Result.error(m) => m, _ => "" };
 
     let rich = [
         value "f" "format" "FMT" "how to render"
@@ -573,12 +573,12 @@ when test {
         toggle "c" "color" "colorize output",
     ];
 
-    let rok args = match parse rich args { [:ok, c] => c, _ => () };
-    let rwhy args = match parse rich args { [:error, m] => m, _ => "" };
+    let rok args = match parse rich args { Result.ok(c) => c, _ => () };
+    let rwhy args = match parse rich args { Result.error(m) => m, _ => "" };
 
     let req = [value "o" "output" "PATH" "write here" |> required];
-    let qok args = match parse req args { [:ok, c] => c, _ => () };
-    let qwhy args = match parse req args { [:error, m] => m, _ => "" };
+    let qok args = match parse req args { Result.ok(c) => c, _ => () };
+    let qwhy args = match parse req args { Result.error(m) => m, _ => "" };
 
     // --- subcommand fixtures ---
     let build_cmd = command "build" "compile the project"
@@ -588,9 +588,9 @@ when test {
     let cmds = [build_cmd, run_cmd];
 
     let gok args = match commands [value "d" "dir" "DIR" "the project"]
-                              cmds args { [:ok, c] => c, _ => () };
+                              cmds args { Result.ok(c) => c, _ => () };
     let gwhy args = match commands [value "d" "dir" "DIR" "the project"]
-                                cmds args { [:error, m] => m, _ => "" };
+                                cmds args { Result.error(m) => m, _ => "" };
 
     let tests = [
         // --- flags ---
@@ -708,7 +708,7 @@ when test {
             $( test.eq! "--format expects one of a, b (got c)"
                           (match commands [] [command "t" "tool" [value "f" "format" "V" "v" |> choices ["a", "b"]]]
                                          ["t", "-f", "c"]
-                           { [:error, m] => m, _ => "" }) ),
+                           { Result.error(m) => m, _ => "" }) ),
 
         // --- the usage message is the same description ---
         test.case "usage shows both spellings and the value's name"
@@ -738,14 +738,14 @@ type Parsed = %{ :values => %{ :string => :any }, :rest => Arguments };
 type Command = %{ :name => :string, :help => :string, :opts => [Option] };
 // What `parse` and `commands` answer, and what one step of the walk answers:
 // the table so far and the arguments it has not read.
-type Outcome = [:ok, Parsed] | [:error, :string];
-type Step = [:ok, Parsed, Arguments] | [:error, :string];
+type Outcome = Result Parsed :string;
+type Step = Result [Parsed, Arguments] :string;
 // The caller describes the values table after options and defaults are read.
 /// Parse arguments, then validate the parsed values against `description`.
-let parse_as : :any -> [Option] -> Arguments -> ([:ok, Parsed] | [:error, :any]);
+let parse_as : :any -> [Option] -> Arguments -> (Result Parsed :any);
 let parse_as description options args = match parse options args {
-    [:ok, parsed] => match types.validate description (values parsed) {
-        [:ok, _] => [:ok, parsed],
+    Result.ok(parsed) => match types.validate description (values parsed) {
+        Result.ok(_) => Result.ok parsed,
         failure => failure,
     },
     failure => failure,
@@ -785,5 +785,5 @@ let values_type options = {
 
 /// Validate against the option-derived schema, including programmer-provided
 /// defaults. `parse_as` accepts a precomputed schema to reuse across parses.
-let parse_typed : [Option] -> Arguments -> ([:ok, Parsed] | [:error, :any]);
+let parse_typed : [Option] -> Arguments -> (Result Parsed :any);
 let parse_typed options args = parse_as (values_type options) options args;

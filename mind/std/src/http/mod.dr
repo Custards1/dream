@@ -310,7 +310,7 @@ let with_form pairs msg = with_header "content-type" "application/x-www-form-url
 /// The request with pairs added to its URL's query.
 let with_query : :any -> :map -> :map;
 let with_query pairs req = match url.parse (Request.url req) {
-    [:ok, u] => Request.set_url (url.to_text (url.add_query pairs u)) req,
+    Result.ok(u) => Request.set_url (url.to_text (url.add_query pairs u)) req,
     _ => req,
 };
 
@@ -725,9 +725,9 @@ priv let run! c req0 sink = {
     let opts = Request.options req;
     let timeout = opts.[:timeout else default_timeout];
     match time.within! timeout (follow! c req (opts.[:redirects else 10]) sink) {
-        [:ok, resp] => result.ok resp,
-        [:error, e] => result.error (if error.is_error e { e } else { error.new :error e }),
-        :timeout => result.error (error.new :timeout ("no response from " + Request.url req + " within " + time.format_duration timeout)),
+        Result.ok(resp) => result.ok resp,
+        Result.error(:timeout) => result.error (error.new :timeout ("no response from " + Request.url req + " within " + time.format_duration timeout)),
+        Result.error(e) => result.error (if error.is_error e { e } else { error.new :error e }),
     }
 };
 
@@ -737,7 +737,7 @@ priv let with_client_defaults c req = {
     let address = match Client.base c {
         "" => Request.url req,
         base => match url.parse base {
-            [:ok, b] => {
+            Result.ok(b) => {
                 let rel = Request.url req;
                 // A path under the base, as "/users" under ".../v1" is meant.
                 let joined = if str.starts_with "/" rel && not (str.starts_with "//" rel) {
@@ -810,13 +810,13 @@ let download! address path = {
     let outcome = stream! (request "GET" address) (write_piece! h);
     io.close! h
     match outcome {
-        [:ok, resp] => if is_success resp {
+        Result.ok(resp) => if is_success resp {
             io.rename! partial path
             let size = match io.stat! path { () => 0, [n, _, _] => n };
             strict! size
             result.ok size
         } else { io.remove! partial; expect_ok resp |> result.map (fn _ -> 0) },
-        [:error, e] => { try! { io.remove! partial } catch ignored { () }; result.error e },
+        Result.error(e) => { try! { io.remove! partial } catch ignored { () }; result.error e },
     }
 };
 
@@ -856,8 +856,8 @@ priv let is_redirect code = code == 301 || code == 302 || code == 303 || code ==
 priv let target_url! : :map -> :map;
 priv let target_url! req = {
     let u = match url.parse (Request.url req) {
-        [:ok, parsed] => parsed,
-        [:error, why] => raise! (error.new :bad_url why),
+        Result.ok(parsed) => parsed,
+        Result.error(why) => raise! (error.new :bad_url why),
     };
     let scheme = url.Url.scheme u;
     if scheme != "http" && scheme != "https" { raise! (error.new :bad_url ("not an http or https URL: " + Request.url req)) }
@@ -898,9 +898,9 @@ priv let exchange! c req sink following = {
     let pool = Client.pool c;
     let pooled = match pool { () => (), pid => connections.checkout! pid key };
     let conn = match pooled { () => connect! u req, found => found };
-    match try! { let got = over! c key conn (pooled == ()) req u sink following; strict! got; [:ok, got] } catch e { [:error, e] } {
-        [:ok, resp] => resp,
-        [:error, e] => {
+    match try! { let got = over! c key conn (pooled == ()) req u sink following; strict! got; Result.ok got } catch e { Result.error e } {
+        Result.ok(resp) => resp,
+        Result.error(e) => {
             // A pooled connection the server closed while it sat idle fails
             // before any answer; that is not this request's failure, so it
             // goes again, once, on a connection of its own.
@@ -918,19 +918,19 @@ priv let over! c key conn is_new req u sink following = {
     match conn {
         [:h2, coordinator] => {
             let kept = pool != () && (not is_new || connections.share! pool key coordinator);
-            let outcome = try! { let resp = h2.request! coordinator req (if sink == () { () } else { sink }); strict! resp; [:ok, resp] }
-                          catch e { [:error, e] };
+            let outcome = try! { let resp = h2.request! coordinator req (if sink == () { () } else { sink }); strict! resp; Result.ok resp }
+                          catch e { Result.error e };
             if not kept { h2.shutdown! coordinator }
-            match outcome { [:ok, resp] => Response.set_url (Request.url req) resp, [:error, e] => raise! e }
+            match outcome { Result.ok(resp) => Response.set_url (Request.url req) resp, Result.error(e) => raise! e }
         },
         [:h1, sock] => {
             let keep = pool != ();
-            match try! { let got = exchange_on! sock u req sink keep following; strict! got; [:ok, got] } catch e { [:error, e] } {
-                [:ok, [resp, reusable]] => {
+            match try! { let got = exchange_on! sock u req sink keep following; strict! got; Result.ok got } catch e { Result.error e } {
+                Result.ok([resp, reusable]) => {
                     if keep && reusable { connections.checkin! pool key sock } else { close_quietly! sock }
                     resp
                 },
-                [:error, e] => { close_quietly! sock; raise! e },
+                Result.error(e) => { close_quietly! sock; raise! e },
             }
         },
     }

@@ -115,8 +115,8 @@ let encode codec value = result.and_then finish (write codec value builder);
 let decode_prefix codec data = read codec (reader data);
 /// Decode a value and reject trailing data after it.
 let decode codec data = match decode_prefix codec data {
-    [:error, e] => result.error e,
-    [:ok, [value, r]] => if remaining_bits r == 0 { result.ok value }
+    Result.error(e) => result.error e,
+    Result.ok([value, r]) => if remaining_bits r == 0 { result.ok value }
         else { failed :trailing_data (position r) "bytes or bits remain after the value" },
 };
 
@@ -184,15 +184,15 @@ let rest = layout (fn r -> read (bytes (remaining_bytes r)) r)
 /// the position of the field. Callback errors are messages.
 let convert decode_value encode_value codec = layout
     (fn r -> match read codec r {
-        [:error, e] => result.error e,
-        [:ok, [v, next]] => match decode_value v {
-            [:ok, x] => result.ok [x, next],
-            [:error, message] => failed :invalid_value (position r) message,
+        Result.error(e) => result.error e,
+        Result.ok([v, next]) => match decode_value v {
+            Result.ok(x) => result.ok [x, next],
+            Result.error(message) => failed :invalid_value (position r) message,
         },
     })
     (fn v b -> match encode_value v {
-        [:ok, x] => write codec x b,
-        [:error, message] => failed :invalid_value (written_bits b) message,
+        Result.ok(x) => write codec x b,
+        Result.error(message) => failed :invalid_value (written_bits b) message,
     });
 
 /// A restriction is checked in both directions.
@@ -220,8 +220,8 @@ let repeat count codec = layout
     } else {
         let rec go !i rr acc = if i == count { result.ok [list.reverse acc, rr] }
             else { match read (named i codec) rr {
-                [:error, e] => result.error e,
-                [:ok, [v, next]] => go (i + 1) next (v :: acc),
+                Result.error(e) => result.error e,
+                Result.ok([v, next]) => go (i + 1) next (v :: acc),
             } };
         go 0 r []
     })
@@ -243,8 +243,8 @@ let tuple codecs = layout
         let rec go cs rr acc !i = match cs {
             [] => result.ok [list.reverse acc, rr],
             [c, ..tail] => match read (named i c) rr {
-                [:error, e] => result.error e,
-                [:ok, [v, next]] => go tail next (v :: acc) (i + 1),
+                Result.error(e) => result.error e,
+                Result.ok([v, next]) => go tail next (v :: acc) (i + 1),
             },
         };
         go codecs r [] 0
@@ -271,8 +271,8 @@ let record fields = {
             let rec go fs rr acc = match fs {
                 [] => result.ok [acc, rr],
                 [[key, c], ..tail] => match read (named key c) rr {
-                    [:error, e] => result.error e,
-                    [:ok, [v, next]] => go tail next acc.[key => v],
+                    Result.error(e) => result.error e,
+                    Result.ok([v, next]) => go tail next acc.[key => v],
                 },
                 [c, ..tail] => result.and_then (fn [_, next] -> go tail next acc) (read c rr),
             };
@@ -299,8 +299,8 @@ let record fields = {
 /// A count-prefixed list, with an explicit element limit before allocation.
 let vector prefix limit item = layout
     (fn r -> match read prefix r {
-        [:error, e] => result.error e,
-        [:ok, [n, next]] => if not (bounded n limit) {
+        Result.error(e) => result.error e,
+        Result.ok([n, next]) => if not (bounded n limit) {
             failed :out_of_range (position r) "sequence length exceeds its limit"
         } else { read (repeat n item) next },
     })
@@ -319,14 +319,14 @@ priv let bounded n limit = type_of n == :integer && type_of limit == :integer &&
 /// Limits are bytes; a malicious count is rejected before touching its body.
 let sized prefix limit codec = layout
     (fn r -> match read prefix r {
-        [:error, e] => result.error e,
-        [:ok, [n, next]] => if not (bounded n limit) {
+        Result.error(e) => result.error e,
+        Result.ok([n, next]) => if not (bounded n limit) {
             failed :out_of_range (position r) "section length exceeds its limit"
         } else { result.and_then (fn rr -> {
             let stop = position rr + n * 8;
             match read codec #[rr.[0], position rr, stop, position rr] {
-                [:error, e] => result.error e,
-                [:ok, [v, end]] => if position end != stop {
+                Result.error(e) => result.error e,
+                Result.ok([v, end]) => if position end != stop {
                     failed :trailing_data (position end) "section was not consumed exactly"
                 } else { result.ok [v, #[rr.[0], stop, rr.[2], rr.[3]]] },
             }
@@ -345,8 +345,8 @@ let blob prefix limit = sized prefix limit rest;
 /// tags fail explicitly; alternatives never guess by trying decoders.
 let tagged tag_codec cases = layout
     (fn r -> match read tag_codec r {
-        [:error, e] => result.error e,
-        [:ok, [tag, next]] => if not (maps.has tag cases) { failed :unknown_tag (position r) "unknown variant tag" }
+        Result.error(e) => result.error e,
+        Result.ok([tag, next]) => if not (maps.has tag cases) { failed :unknown_tag (position r) "unknown variant tag" }
             else { result.map (fn [v, end] -> [[tag, v], end]) (read (named tag cases.[tag]) next) },
     })
     (fn value b -> match value {
@@ -405,8 +405,8 @@ let varuint max_bits = layout
         failed :invalid_argument (position r) "varint width must be 1..524288 bits"
     } else {
         let rec go rr !shift !acc = match read u8 rr {
-            [:error, e] => result.error e,
-            [:ok, [byte, next]] => {
+            Result.error(e) => result.error e,
+            Result.ok([byte, next]) => {
                 let payload = byte & 127;
                 let value = acc | (payload << shift);
                 if value >= (1 << max_bits) { failed :out_of_range (position rr) "varint exceeds its bit width" }
@@ -539,8 +539,8 @@ let patch codec offset value data = result.and_then (fn replacement ->
 /// selector. Unlike tagged, the selector can inspect a whole header record.
 let dependent header choose = layout
     (fn r -> match read header r {
-        [:error, e] => result.error e,
-        [:ok, [h, next]] => result.map (fn [v, end] -> [[h, v], end]) (read (choose h) next),
+        Result.error(e) => result.error e,
+        Result.ok([h, next]) => result.map (fn [v, end] -> [[h, v], end]) (read (choose h) next),
     })
     (fn value b -> match value {
         [h, v] => result.and_then (write (choose h) v) (write header h b),
@@ -594,8 +594,8 @@ let sleb128 width = layout
     (fn r -> if not (bit_width_ok width) { failed :invalid_argument (position r) "invalid signed varint width" }
     else {
         let rec go rr !shift !acc = match read u8 rr {
-            [:error, e] => result.error e,
-            [:ok, [byte, next]] => {
+            Result.error(e) => result.error e,
+            Result.ok([byte, next]) => {
                 let unsigned = acc | ((byte & 127) << shift);
                 if byte >= 128 {
                     if shift + 7 >= width { failed :out_of_range (position rr) "signed varint is too wide" }
@@ -621,8 +621,8 @@ let sleb128 width = layout
 /// digest is a pure bytes -> bytes function, such as crypto.sha256.
 let checksummed count digest codec = layout
     (fn r -> result.and_then (fn start -> match read codec start {
-        [:error, e] => result.error e,
-        [:ok, [v, next]] => result.and_then (fn [sum, end] -> {
+        Result.error(e) => result.error e,
+        Result.ok([v, next]) => result.and_then (fn [sum, end] -> {
             let body = str.slice (position start / 8) ((position next - position start) / 8) start.[0];
             if crypto.equal sum (digest body) { result.ok [v, end] }
             else { failed :checksum_mismatch (position next) "digest does not match the payload" }

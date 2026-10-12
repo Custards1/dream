@@ -49,7 +49,7 @@ let handle_call! request from state = match request {
     // Validation and replacement happen in one mailbox turn, so there is no
     // read/validate/write race and the client is never left awaiting a reply.
     [:update_as, description, f] => match types.validate description (f state) {
-        [:ok, next] => reply [:ok, ()] (strict! next),
+        Result.ok(next) => reply (Result.ok ()) (strict! next),
         failure => reply failure state,
     },
     // One trip for a read that depends on a write. `f` answers `[value, next]`,
@@ -59,7 +59,7 @@ let handle_call! request from state = match request {
         let pair = strict! (f state);
         reply (list.nth 0 pair) (list.nth 1 pair)
     },
-    _ => reply [:error, :unknown_request] state,
+    _ => reply (Result.error :unknown_request) state,
 };
 
 /// Apply an asynchronous agent update to its state.
@@ -157,7 +157,7 @@ when test {
                 let slow = server.call_within! a [:get, fn n -> list.sum (list.range 0 2000000) * 0 + n] 1;
                 let next = value! a;
                 stop! a
-                test.eq! [:timeout, 7] [slow, next]
+                test.eq! [Result.error :timeout, 7] [slow, next]
             } ),
         test.case "get_and_update! answers the old and keeps the new"
             $( {
@@ -187,7 +187,7 @@ when test {
                 let a = start! 0;
                 let r = call! a :nonsense;
                 stop! a
-                test.eq! [:error, :unknown_request] r
+                test.eq! (Result.error :unknown_request) r
             } ),
         test.case "a cast it does not understand leaves it alone"
             $( {

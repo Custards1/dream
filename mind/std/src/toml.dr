@@ -284,9 +284,9 @@ let parse_header cs = {
 /// the next header arrives, so a key can never land in the wrong section.
 let parse_items : [:char] -> Document -> :string -> %{ :string => Value } -> result.Of Document :string;
 let rec parse_items cs table section current = match skip_blank cs {
-    [] => [:ok, table.[section => current]],
+    [] => Result.ok (table.[section => current]),
     ['[', ..rest] => match parse_header rest {
-        () => [:error, "a section header is not closed"],
+        () => Result.error "a section header is not closed",
         h => {
             let done = table.[section => current];
             let name = str.trim (step_value h);
@@ -297,16 +297,16 @@ let rec parse_items cs table section current = match skip_blank cs {
         },
     },
     s => match parse_key s {
-        () => [:error, "expected a key"],
+        () => Result.error "expected a key",
         k => match skip_ws (step_rest k) {
             ['=', ..more] => match parse_value more {
-                () => [:error, "the value of " + step_value k + " is not valid TOML"],
+                () => Result.error ("the value of " + step_value k + " is not valid TOML"),
                 v => match end_of_line (step_rest v) {
-                    () => [:error, "unexpected text after the value of " + step_value k],
+                    () => Result.error ("unexpected text after the value of " + step_value k),
                     after => parse_items after table section current.[(step_value k) => (step_value v)],
                 },
             },
-            _ => [:error, "expected `=` after " + step_value k],
+            _ => Result.error ("expected `=` after " + step_value k),
         },
     },
 };
@@ -326,10 +326,10 @@ let parse text = parse_items (str.chars text) (%{}) "" (%{});
 
 /// Test whether a parse result has the success tag.
 let ok : result.Of a e -> :bool;
-let ok r = list.head r == :ok;
+let ok r = result.is_ok r;
 /// Extract the payload from a parse result.
 let value : result.Of a e -> :any;
-let value r = list.nth 1 r;
+let value r = match r { Result.ok(v) => v, Result.error(why) => why };
 
 /// Parse a document, returning `default` if parsing fails.
 let parse_or : :any -> :string -> :any;

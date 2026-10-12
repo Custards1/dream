@@ -92,7 +92,7 @@ let rec read_message! h =
                         n => {
                             let body = read_exactly! h n "";
                             match json.parse body {
-                                [:ok, v] => v,
+                                Result.ok(v) => v,
                                 _ => read_message! h,
                             }
                         },

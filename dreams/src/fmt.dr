@@ -376,33 +376,33 @@ let rec unplaced e =
     else { e };
 
 let meaning src = match parser.parse_module src {
-    [:ok, items, _] => [:ok, unplaced items],
-    [:error, message, span] => [:error, message, ast.span_start span],
+    [:ok, items, _] => Result.ok (unplaced items),
+    [:error, message, span] => Result.error [message, ast.span_start span],
 };
 
 // --- the formatter ----------------------------------------------------------------
 
-/// The file laid out: `[:ok, text]`, or `[:error, message, offset]` when it
+/// The file laid out: `Result.ok text`, or `Result.error [message, offset]` when it
 /// does not parse -- or, which would be a bug here, when the layout would
 /// change what it means.
-let format : :string -> ([:ok, :string] | [:error, :string, :integer]);
+let format : :string -> Result :string [:string, :integer];
 let format src =
     match meaning src {
-        [:error, message, at] => [:error, message, at],
-        [:ok, before] => match lexer.lex src {
-            [:error, message, at] => [:error, message, at],
-            [:ok, toks] => {
+        Result.error(why) => Result.error why,
+        Result.ok(before) => match lexer.lex src {
+            Result.error(why) => Result.error why,
+            Result.ok(toks) => {
                 let lines = classify src (line_spans src 0 []) toks 0 [];
                 let indents = settle_comments (list.reverse (walk lines [root] 0 []))
                                               (list.reverse lines) () [];
                 let rendered = list.map (fn [l, new] -> render src l new) (list.zip lines indents);
                 let out = str.join_str "\n" (squeeze rendered (list.map Line.kind lines) false []) + "\n";
                 match meaning out {
-                    [:ok, after] =>
-                        if after == before { [:ok, out] }
-                        else { [:error, "formatting would change what this file means, so it was left alone", 0] },
-                    [:error, message, at] =>
-                        [:error, "formatting would break this file (" + message + "), so it was left alone", 0],
+                    Result.ok(after) =>
+                        if after == before { Result.ok out }
+                        else { Result.error ["formatting would change what this file means, so it was left alone", 0] },
+                    Result.error([message, _]) =>
+                        Result.error ["formatting would break this file (" + message + "), so it was left alone", 0],
                 }
             },
         },
@@ -411,7 +411,7 @@ let format src =
 when test {
     import std.test;
 
-    let formatted src = match format src { [:ok, out] => out, other => other };
+    let formatted src = match format src { Result.ok(out) => out, other => other };
 
     let tests = [
         test.case "a block's statements go four past its opener"
@@ -455,6 +455,6 @@ when test {
         test.case "formatting twice changes nothing"
             $( { let once = formatted "let f x = {\n  g 1\n    2\n};\n"; test.eq! once (formatted once) } ),
         test.case "a file that does not parse is refused"
-            $( test.eq! :error (list.head (format "let = ;")) ),
+            $( test.eq! :error (Result.tag (format "let = ;")) ),
     ];
 }

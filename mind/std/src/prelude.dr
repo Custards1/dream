@@ -1,0 +1,29 @@
+// The names every module has without importing them.
+//
+// A program reaches everything else in the library by importing it, and that
+// stays the rule: an import says where a name comes from, and a reader who
+// sees `json.parse` knows to look in `std.json`. What is here is the
+// exception, and it has to earn it -- a name the *language* answers in, which
+// a module cannot opt out of hearing. `let?` is the first: it is written in
+// modules that import nothing, it means "carry on when this is `Result.ok`",
+// and it is unfolded by the parser before any name is resolved, so the
+// constructor it tests has to resolve in every module or in none.
+//
+// The loader loads this module ahead of every other (`modules.load_items!`)
+// and `scope` lends its names to each module that does not bind them itself
+// (`scope.lend_prelude`), the way a `mod` is lent the names of the file it is
+// written in. A module's own `Result`, or an imported one, wins: the prelude
+// is consulted last. It imports nothing, so anything may depend on it --
+// `std.list` included -- without a cycle.
+
+/// The answer of something that can fail: `Result.ok value`, or
+/// `Result.error reason`. A pure function cannot raise, so this is how it
+/// reports a failure; `let?` chains steps that answer one, and `std.result`
+/// has the rest of what to do with it.
+union Result a e {
+    ok(value : a)
+    error(reason : e)
+
+    /// Which one it is: `:ok` or `:error`.
+    tag self = match self { Result.ok(_) => :ok, Result.error(_) => :error }
+}

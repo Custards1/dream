@@ -72,17 +72,17 @@ let scram_attributes message = list.fold (fn m part ->
 /// `[:ok, [final, server_signature]]`, or `[:error, why]` when the server's
 /// first message is not one this client can accept -- a nonce that does not
 /// extend ours is a server that is not talking to us.
-let scram_final : :string -> :string -> :string -> :string -> [:ok, [:string, :string]] | [:error, :string];
+let scram_final : :string -> :string -> :string -> :string -> Result [:string, :string] :string;
 let scram_final password client_nonce client_bare server_first = {
     let attrs = scram_attributes server_first;
     let nonce = attrs.["r" else ""];
     let salt = crypto.unbase64 attrs.["s" else ""];
     let rounds = num.parse_int attrs.["i" else ""];
     if not (str.starts_with client_nonce nonce) || len nonce <= len client_nonce {
-        [:error, "the server's nonce does not extend the client's"]
+        Result.error "the server's nonce does not extend the client's"
     } else {
         match salt {
-            () => [:error, "the server's salt is not base64"],
+            () => Result.error "the server's salt is not base64",
             s => match rounds {
                 i if type_of i == :integer && i > 0 => {
                     let salted = pbkdf2_sha256 password s i;
@@ -91,10 +91,10 @@ let scram_final password client_nonce client_bare server_first = {
                     let auth = client_bare + "," + server_first + "," + without_proof;
                     let proof = crypto.xor client_key (hmac_sha256 (sha256 client_key) auth);
                     let server_signature = hmac_sha256 (hmac_sha256 salted "Server Key") auth;
-                    [:ok, [without_proof + ",p=" + crypto.base64 proof,
-                           crypto.base64 server_signature]]
+                    Result.ok [without_proof + ",p=" + crypto.base64 proof,
+                           crypto.base64 server_signature]
                 },
-                _ => [:error, "the server's iteration count is not a positive integer"],
+                _ => Result.error "the server's iteration count is not a positive integer",
             },
         }
     }
@@ -133,13 +133,13 @@ when test {
                                            "abcdefghijklmnopqrstuvwxyz",
                                            str.repeat 8 "1234567890"]) ),
         test.case "SCRAM-SHA-256 against RFC 7677's exchange"
-            $( test.eq! [[:ok, ["c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
-                                "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="]], true, false]
+            $( test.eq! [Result.ok ["c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
+                                "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="], true, false]
                         [scram_final "pencil" "rOprNGfwEbeRWgbNEkqO" "n=user,r=rOprNGfwEbeRWgbNEkqO"
                                      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
                          scram_verified "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=" "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=",
                          scram_verified "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=" "v=AAAA"] ),
         test.case "a SCRAM server whose nonce is not ours is refused"
-            $( test.eq! :error (list.head (scram_final "pw" "abc" "n=,r=abc" "r=xyz123,s=QUJD,i=4096")) ),
+            $( test.true! (match scram_final "pw" "abc" "n=,r=abc" "r=xyz123,s=QUJD,i=4096" { Result.error(_) => true, _ => false }) ),
     ];
 }

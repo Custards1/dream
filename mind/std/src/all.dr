@@ -225,7 +225,7 @@ when test {
     let compiled_packet = comp wire.frame_as (list.Of :integer) [2, 3, 5];
 
     let mismatch_kind result = match result {
-        [:error, e] => error.kind e,
+        Result.error(e) => error.kind e,
         _ => (),
     };
 
@@ -251,11 +251,11 @@ when test {
         test.case "TOML document type covers sections" $( test.true!
             (types.accepts toml.Document (result.unwrap! (toml.parse "[app]\nport=80"))) ),
         test.case "result types distinguish payloads and errors" $( test.eq! [true, false, true]
-            [types.accepts (result.Of :integer :string) [:ok, 3],
-             types.accepts (result.Of :integer :string) [:ok, "bad"],
-             types.accepts (result.Of :integer :string) [:error, "why"]] ),
-        test.case "result validation preserves an existing error" $( test.eq! [:error, "original"]
-            (result.validate_ok :integer [:error, "original"]) ),
+            [types.accepts (result.Of :integer :string) (Result.ok 3),
+             types.accepts (result.Of :integer :string) (Result.ok "bad"),
+             types.accepts (result.Of :integer :string) (Result.error "why")] ),
+        test.case "result validation preserves an existing error" $( test.eq! (Result.error "original")
+            (result.validate_ok :integer (Result.error "original")) ),
         test.case "typed errors remain inspectable values" $( test.true!
             (types.accepts (error.OfKind :type_error) (_error_new :type_error :integer)) ),
         test.case "compile time option schemas are reusable runtime data" $( test.eq! "fast"
@@ -296,7 +296,7 @@ when test {
              types.accepts (server.Action :string :integer) (server.reply "ok" "bad state")] ),
         test.case "protocol descriptions compose with application messages" $( test.eq! [true, false]
             [types.accepts (remote.Request :integer) [:call, 3],
-             types.accepts (remote.Response :integer) [:error, 3]] ),
+             types.accepts (remote.Response :integer) (Result.error 3)] ),
         test.case "supervisor types reject misspelled policies" $( test.eq! [true, false, false]
             [types.accepts supervisor.Strategy :one_for_one,
              types.accepts supervisor.Restart :forever,
@@ -306,7 +306,7 @@ when test {
             let rejected = agent.update_as! :integer pid (fn n -> "bad");
             test.eq! :type_error (mismatch_kind rejected)
             test.eq! 10 (agent.value_as! :integer pid)
-            test.eq! [:ok, ()] (agent.update_as! :integer pid (fn n -> n + 1))
+            test.eq! (Result.ok ()) (agent.update_as! :integer pid (fn n -> n + 1))
             test.eq! 11 (agent.value! pid)
             agent.stop! pid
         } ),

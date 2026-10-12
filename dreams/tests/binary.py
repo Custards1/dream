@@ -67,14 +67,14 @@ import std.console;
 import std.crypto;
 import std.num;
 import std.str;
-let show c v = match b.encode c v { [:ok, s] => crypto.hex s, [:error, e] => to_string e };
-let read c s = match b.decode c s { [:ok, v] => to_string v, [:error, e] => to_string e };
+let show c v = match b.encode c v { Result.ok(s) => crypto.hex s, Result.error(e) => to_string e };
+let read c s = match b.decode c s { Result.ok(v) => to_string v, Result.error(e) => to_string e };
 let rec sweep! n = if n == 65536 { () } else {
     if n & 31744 != 31744 || n & 1023 == 0 {
         let data = str.of_bytes [n >> 8, n & 255];
         match b.decode b.f16be data {
-            [:ok, f] => console.print! (crypto.hex (num.float_bytes f) + ":" + show b.f16be f),
-            [:error, e] => console.print! e,
+            Result.ok(f) => console.print! (crypto.hex (num.float_bytes f) + ":" + show b.f16be f),
+            Result.error(e) => console.print! e,
         }
     }
     sweep! (n + 1)

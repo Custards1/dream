@@ -76,7 +76,7 @@ let render entries = {
 /// broken lock is rewritten rather than trusted.
 let parse text =
     match toml.parse text {
-        [:ok, doc] => list.concat (list.map (fn pair -> {
+        Result.ok(doc) => list.concat (list.map (fn pair -> {
             let [section, table] = pair;
             list.map (fn kv -> {
                 let [key, v] = kv;

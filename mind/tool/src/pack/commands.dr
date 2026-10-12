@@ -107,8 +107,8 @@ let spec! c = {
         "os" => cli.get "" c "os",
     };
     match spec.load! (manifest_path! c) overrides {
-        [:error, why] => fail! why,
-        [:ok, sp] => match spec.problems sp {
+        Result.error(why) => fail! why,
+        Result.ok(sp) => match spec.problems sp {
             [] => {
                 if not (cli.flag_set c "quiet") {
                     list.each! (fn w -> console.error! ("mind pack: warning: " + w)) (spec.warnings sp)
@@ -122,8 +122,8 @@ let spec! c = {
 
 let layout! : Spec -> Layout;
 let layout! sp = match layout.collect! sp {
-    [:ok, lay] => lay,
-    [:error, why] => fail! why,
+    Result.ok(lay) => lay,
+    Result.error(why) => fail! why,
 };
 
 let say! : :any -> :string -> :unit;
@@ -137,16 +137,16 @@ let out! c = {
 };
 
 let compression : :any -> :any;
-let compression c = match compress.parse (cli.get "auto" c "compress") { [:ok, w] => w, _ => :auto };
+let compression c = match compress.parse (cli.get "auto" c "compress") { Result.ok(w) => w, _ => :auto };
 
 /// Report one package made, or stop.
-let made! : [:ok, :string] | [:error, :string] -> :string;
+let made! : Result :string :string -> :string;
 let made! r = match r {
-    [:ok, path] => {
+    Result.ok(path) => {
         console.print! ("made " + path)
         path
     },
-    [:error, why] => fail! why,
+    Result.error(why) => fail! why,
 };
 
 let counted : :integer -> :string -> :string;
@@ -156,10 +156,10 @@ let counted n noun = to_string n + " " + noun + (if n == 1 { "" } else { "s" });
 /// maintainer, and every format's dependencies read as that format reads them.
 let format_problems : Spec -> Layout -> [:string];
 let format_problems sp lay = {
-    let deb_ok = match deb.problems sp { [:ok, _] => deb.control sp lay, other => other };
+    let deb_ok = match deb.problems sp { Result.ok(_) => deb.control sp lay, other => other };
     let outcomes = [["deb", deb_ok], ["rpm", rpm.relations sp :xz], ["arch", arch.pkginfo sp lay]];
     list.flat_map (fn [format, r] -> match r {
-        [:error, why] => [if str.starts_with (format + ":") why { why } else { format + ": " + why }],
+        Result.error(why) => [if str.starts_with (format + ":") why { why } else { format + ": " + why }],
         _ => [],
     }) outcomes
 };
@@ -226,13 +226,13 @@ let cmd_installer! c = {
 let cmd_sums! c = made! (sums.make! (out! c));
 
 /// Say what was made, or why not, and answer whether it was.
-let report! : [:ok, :string] | [:error, :string] -> :bool;
+let report! : Result :string :string -> :bool;
 let report! r = match r {
-    [:ok, path] => {
+    Result.ok(path) => {
         console.print! ("made " + path)
         true
     },
-    [:error, why] => {
+    Result.error(why) => {
         console.error! ("mind pack: " + why)
         false
     },
@@ -296,7 +296,7 @@ let skeleton name summary maintainer =
 let cmd_init! c = {
     let path = manifest_path! c;
     let text = match file.read! path { () => "", t => t };
-    let doc = match toml.parse text { [:ok, d] => d, [:error, why] => fail! (path + ": " + why) };
+    let doc = match toml.parse text { Result.ok(d) => d, Result.error(why) => fail! (path + ": " + why) };
     if not (list.is_empty (toml.entries doc "ship")) || str.contains_str "\n[ship]" ("\n" + text) {
         fail! (path + " already has a [ship] section")
     }
@@ -316,8 +316,8 @@ let cmd_init! c = {
 
 let run! args = {
     match cli.commands opts command_spec args {
-        [:error, why] => fail! (why + "\n\n" + usage),
-        [:ok, c] => {
+        Result.error(why) => fail! (why + "\n\n" + usage),
+        Result.ok(c) => {
             if cli.rest c != [] { fail! "unexpected arguments; try `mind pack help`" }
             if cli.flag_set c "help" {
                 console.print! usage
@@ -353,8 +353,8 @@ let run! args = {
 // -m remains relative to the working directory, for release automation.
 let manifest_path! c = match cli.get () c "manifest" {
     () => match manifest.find! (cli.get (os.cwd! ()) c "dir") {
-        [:ok, m] => path.join (manifest.root m) "mind.toml",
-        [:error, why] => fail! why,
+        Result.ok(m) => path.join (manifest.root m) "mind.toml",
+        Result.error(why) => fail! why,
     },
     p => p,
 };

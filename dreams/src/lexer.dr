@@ -256,7 +256,7 @@ let rec brace_end s i depth = {
     let b = str.byte i s;
     if b == eof { [:error, "unterminated `{` in an interpolated string", i] }
     else if b == 123 { brace_end s (i + 1) (depth + 1) }
-    else if b == 125 { if depth == 0 { [:ok, i] } else { brace_end s (i + 1) (depth - 1) } }
+    else if b == 125 { if depth == 0 { Result.ok i } else { brace_end s (i + 1) (depth - 1) } }
     else if b == 34 {
         let r = string_body s (i + 1) [] i;
         if list.head r == :error { r } else { brace_end s (list.nth 2 r) depth }
@@ -298,7 +298,7 @@ let rec interp_body s i pieces parts opened = {
     }
     else if b == 123 {
         match brace_end s (i + 1) 0 {
-            [:ok, j] =>
+            Result.ok(j) =>
                 if j == i + 1 { [:error, "an empty `{}` in an interpolated string; write `\\{` for a brace", i] }
                 else {
                     // The `}` goes with the tokens, so a parse that runs out
@@ -564,20 +564,16 @@ let rec find_error ts = match ts {
     [t, ..rest] => if is_error t { t } else { find_error rest },
 };
 
-/// The whole file at once: `[:ok, tokens]`, or `[:error, message, offset]`.
-/// For a caller that wants a diagnosis rather than a stream to pull on.
-let lex : :string -> [:ok, [Token]] | [:error, :string, :integer];
+/// The whole file at once: `Result.ok tokens`, or `Result.error [message,
+/// offset]`. For a caller that wants a diagnosis rather than a stream to pull
+/// on.
+let lex : :string -> Result [Token] [:string, :integer];
 let lex s = {
     let ts = tokens s;
     let bad = find_error ts;
-    if bad == () { [:ok, ts] }
-    else { [:error, value bad, span_start bad] }
+    if bad == () { Result.ok ts }
+    else { Result.error [value bad, span_start bad] }
 };
-
-let ok r = list.head r == :ok;
-let result r = list.nth 1 r;
-let error_message r = list.nth 1 r;
-let error_offset r = list.nth 2 r;
 
 // --- many files -------------------------------------------------------------
 //
@@ -614,10 +610,7 @@ let error_offset r = list.nth 2 r;
 // from an impure context is a module that cannot be reused.
 
 /// Whether a source lexes: `()` if it does, `[message, offset]` if it does not.
-let verdict s = {
-    let r = lex s;
-    if ok r { () } else { [error_message r, error_offset r] }
-};
+let verdict s = match lex s { Result.ok(_) => (), Result.error(why) => why };
 
 /// Check several sources, in order. Pure, sequential, and the one to reach for
 /// by default -- it works anywhere, including from inside a pure function,
@@ -656,15 +649,12 @@ when test {
     let values src = list.map (fn t -> value t) (lex_ok src);
 
     /// Tokens of a source that must lex cleanly.
-    let lex_ok src = {
-        let r = lex src;
-        if ok r { result r } else { [] }
-    };
+    let lex_ok src = match lex src { Result.ok(ts) => ts, Result.error(_) => [] };
 
     /// The message of a source that must not.
-    let lex_error src = {
-        let r = lex src;
-        if ok r { :lexed_when_it_should_not_have } else { error_message r }
+    let lex_error src = match lex src {
+        Result.ok(_) => "lexed when it should not have",
+        Result.error([message, _]) => message,
     };
 
     let one src = list.head (lex_ok src);

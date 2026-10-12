@@ -1421,7 +1421,7 @@ NativeResult vm_mailbox_size(Process& p, Value, Value*, uint32_t) {
     return NativeResult::ok(make_fixnum(int64_t(p.mailbox.size())));
 }
 
-/// `vm.mailbox_peek! i` -- `[:ok, message]` for the message at position `i`,
+/// `vm.mailbox_peek! i` -- `Result.ok message` for the message at position `i`,
 /// left where it is, or `:none` past the end. Positions are stable until this
 /// process takes a message: nobody else removes one.
 NativeResult vm_mailbox_peek(Process& p, Value, Value* args, uint32_t) {
@@ -1434,8 +1434,7 @@ NativeResult vm_mailbox_peek(Process& p, Value, Value* args, uint32_t) {
     }
     // `msg` is held across one allocation and no collection: a heap only
     // collects at a safepoint, and an allocation is not one.
-    Value tail = p.heap().make_cons(msg, NIL);
-    return NativeResult::ok(p.heap().make_cons(make_atom(well_known(p.runtime()).ok), tail));
+    return NativeResult::ok(make_result(p.heap(), p.runtime(), true, msg));
 }
 
 /// `vm.mailbox_take! i` -- remove the message at position `i`. Answers `:ok`;
@@ -2552,7 +2551,7 @@ NativeResult vm_image_function(Process& p, Value callee, Value* args, uint32_t) 
 }
 
 /// `locate_image! lib`: the file an image descriptor names, or why there is
-/// none, as `[:ok, label]` or `[:error, why]`. It opens the image, which is
+/// none, as `Result.ok label` or `Result.error why`. It opens the image, which is
 /// O(1) once read, and is what using it would do anyway.
 NativeResult vm_locate_image(Process& p, Value, Value* args, uint32_t) {
     Value desc;
@@ -2561,9 +2560,7 @@ NativeResult vm_locate_image(Process& p, Value, Value* args, uint32_t) {
     uint64_t handle = open_image_library(p, desc, &why);
     std::string said = handle ? p.runtime().session(handle)->label : why;
     Value text = p.heap().make_string(said.data(), uint32_t(said.size()));
-    Pin kept(p, text);
-    Value rest = p.heap().make_cons(kept.get(), NIL);
-    return NativeResult::ok(p.heap().make_cons(make_atom(p.runtime().intern_atom(handle ? "ok" : "error")), rest));
+    return NativeResult::ok(make_result(p.heap(), p.runtime(), handle != 0, text));
 }
 
 /// Decode one UTF-8 scalar starting at `i`, advancing it. Invalid bytes are
@@ -4431,10 +4428,8 @@ NativeResult vm_wire_decode(Process& p, Value, Value* args, uint32_t) {
     const char* why = nullptr;
     if (!r.read(&v, 0)) why = "not a wire value";
     else if (r.at != r.len) why = "trailing bytes after a wire value";
-    Value tag = make_atom(p.runtime().intern_atom(why ? "error" : "ok"));
     Value second = why ? p.heap().make_string(why, uint32_t(std::strlen(why))) : v;
-    Value list = p.heap().make_cons(second, NIL);
-    return NativeResult::ok(p.heap().make_cons(tag, list));
+    return NativeResult::ok(make_result(p.heap(), p.runtime(), why == nullptr, second));
 }
 
 // --- large data ---
@@ -4562,5 +4557,15 @@ const BuiltinDef BUILTINS[] = {
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }
 
+
+Value make_result(Heap& h, Runtime& rt, bool ok, Value value) {
+    const WellKnownAtoms& wk = well_known(rt);
+    if (!rt.has_image() || !rt.image().results_are_records()) {
+        return h.make_cons(make_atom(ok ? wk.ok : wk.error), h.make_cons(value, NIL));
+    }
+    Value r = h.make_record((ok ? wk.result_ok : wk.result_error) | RECORD_VARIANT, 1);
+    static_cast<RecordObj*>(as_obj(r))->items()[0] = value;
+    return r;
+}
 
 }  // namespace dream

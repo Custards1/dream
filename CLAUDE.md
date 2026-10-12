@@ -330,9 +330,19 @@ The lessons that keep coming back:
   `local` statement at the top of the body (`lower_body`).
   `std` uses it wherever an accumulator could grow (`list.fold_strict`,
   `list.sum`, the folds of `std.seq` and `std.map`).
-- `let? x = e;` in a block is one step of an errors-as-values chain: on
-  `[:ok, v]` it binds `v` and goes on, and anything else is the block's
-  answer. The parser unfolds it to a `match` (`unfold_let_try`). The compiler
+- Errors are values: a function that can fail answers `Result.ok v` or
+  `Result.error r`, the union in `std.prelude` that every module has
+  without an import ("The prelude" in docs/language-spec.md; `modules.with_prelude!`
+  loads it, `scope.lend_prelude` lends it, and a module's own name wins).
+  `raise!`/`try!` are for what is not an answer, and a wait that runs out
+  is `Result.error :timeout`. `let? x = e;` in a block is one step of a
+  chain: on `Result.ok v` it binds `v` and goes on, and anything else is the
+  block's answer. The parser unfolds it to a `match` (`unfold_let_try`),
+  and an `[:ok, v]` list is not a result to it. A native answers a result as the record too
+  (`make_result`) -- for an image whose header sets bit 1, which every image
+  this compiler writes does; an older image, a stale seed included, gets the
+  `[:ok, v]` list it was written for. Changing what a native answers is a
+  staged reseed for that reason: the seed runs on the new VM. The compiler
   also warns about an accumulator nothing forces (`dreams/src/lint.dr`).
 - `virtual dyn let f self` and a record's `derive dyn base` opt in to run-time
   dispatch: the record's values carry a table in slot 0, and `base.f x`
@@ -488,9 +498,12 @@ the unit cache computes and reapplies their diffs. `scope.Function.recursive`
 is the function's recursion flag; the surface AST still uses its original
 list representation.
 
-Four list protocols must stay lists: the AST that macros receive,
-`[:ok, ..]`/`[:error, ..]` results consumed by `let?`, `[:crashed, e]` around
-compiler-owned results, and placeholder holes inside syntax trees. Signatures
+Three list protocols must stay lists: the AST that macros receive,
+`[:crashed, e]` around compiler-owned results, and placeholder holes inside
+syntax trees. A result is the prelude's `Result`, never `[:ok, v]`. What
+tagged lists are left are not results: the parsers' internal steps
+(`[:ok, item, rest]` in `parser.dr`, `lexer.dr`, `std.parse`), tokens and
+pieces tagged `:error` (`sql.lint`), and `[reply, state]` pairs. Signatures
 use `ast.Expr`, `Pattern`, `Decl`, `Param` and `Span` without changing those
 representations. Optional lookups may remain unsigned where their truthful
 unit alternative would require unrelated caller changes. Force finite loop

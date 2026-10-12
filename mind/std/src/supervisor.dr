@@ -79,11 +79,11 @@ let child_restart c = map.get :permanent :restart c;
 /// `:permanent` is the default because a supervised child is usually a server
 /// that is not supposed to end at all, and one that returns has ended for a
 /// reason the supervisor cannot know.
-let should_restart : Child -> :list -> :bool;
+let should_restart : Child -> Result :any :any -> :bool;
 let should_restart c outcome =
     match child_restart c {
         :temporary => false,
-        :transient => list.nth 0 outcome == :error,
+        :transient => match outcome { Result.error(_) => true, Result.ok(_) => false },
         _ => true,
     };
 
@@ -263,7 +263,7 @@ let stop_child! s name =
         p => {
             send! p proc.shutdown
             match proc.recv_where_within! (fn m -> proc.is_down_of p m) (shutdown_after (s_limits s)) {
-                [:ok, _] => (),
+                Result.ok(_) => (),
                 _ => {
                     proc.kill! p :shutdown
                     proc.recv_where! (fn m -> proc.is_down_of p m)
@@ -306,8 +306,8 @@ let handle_down! s name outcome = {
         if over_limit gone times {
             // Giving up is a decision, and it is reported as one: the caller
             // joins the supervisor and gets this instead of a value.
-            [:stop, [:error, error.new :restart_limit
-                         ("child `" + name + "` restarted too often")]]
+            [:stop, Result.error (error.new :restart_limit
+                         ("child `" + name + "` restarted too often"))]
         }
         else {
             let group = affected (s_strategy gone) (names_of gone) name;
@@ -359,7 +359,7 @@ let handle! s m =
             let cleared = stop_all! s (names_of s);
             strict! cleared
             answer! from :stopped
-            [:stop, [:ok, :stopped]]
+            [:stop, Result.ok :stopped]
         },
         _ => [:go, s],
     };
@@ -546,8 +546,7 @@ when test {
                 let sup = start_with! :one_for_one
                               [child_with "again" quitter! :permanent] (limits 2 5000);
                 let ended = proc.outcome! sup;
-                test.eq! [:ok, :error]
-                         [list.nth 0 ended, list.nth 0 (list.nth 1 ended)]
+                test.true! (match ended { Result.ok(Result.error(_)) => true, _ => false })
             } ),
 
         test.case "restarting too often stops the supervisor"
@@ -555,7 +554,7 @@ when test {
                 let sup = start_with! :one_for_one
                               [child_with "flap" quitter! :permanent] (limits 1 5000);
                 let ended = proc.outcome! sup;
-                test.eq! :restart_limit (error.kind (list.nth 1 (list.nth 1 ended)))
+                test.eq! :restart_limit (match ended { Result.ok(Result.error(e)) => error.kind e, _ => () })
             } ),
 
         test.case "which! reports the running children"
@@ -570,14 +569,14 @@ when test {
             $( {
                 let sup = start_with! :one_for_one [child "deaf" deaf!] (with_shutdown 50 default_limits);
                 let ended = stop! sup;
-                test.eq! [:ok, [:ok, :stopped]] ended
+                test.eq! (Result.ok (Result.ok :stopped)) ended
             } ),
 
         test.case "stop! takes the children down with it"
             $( {
                 let sup = start! :one_for_one [child "x" counter!, child "y" counter!];
                 let ended = stop! sup;
-                test.eq! [:ok, [:ok, :stopped]] ended
+                test.eq! (Result.ok (Result.ok :stopped)) ended
             } ),
 
         // --- the strategy tables, which are pure and can be checked directly ---
@@ -590,12 +589,12 @@ when test {
 
         test.case "a transient child is restarted only when it fails"
             $( test.eq! [true, false]
-                        [should_restart (child_with "t" quitter! :transient) [:error, :x],
-                         should_restart (child_with "t" quitter! :transient) [:ok, 1]] ),
+                        [should_restart (child_with "t" quitter! :transient) (Result.error :x),
+                         should_restart (child_with "t" quitter! :transient) (Result.ok 1)] ),
         test.case "a permanent child is restarted either way"
             $( test.eq! [true, true]
-                        [should_restart (child "p" quitter!) [:error, :x],
-                         should_restart (child "p" quitter!) [:ok, 1]] ),
+                        [should_restart (child "p" quitter!) (Result.error :x),
+                         should_restart (child "p" quitter!) (Result.ok 1)] ),
 
         test.case "the window drops old restarts"
             $( test.eq! [1000, 900] (recent 500 1000 [900, 100]) ),

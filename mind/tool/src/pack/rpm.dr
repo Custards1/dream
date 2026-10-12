@@ -201,7 +201,7 @@ let relation names flags versions ds = match ds {
           entry versions (Value.strings (list.map (fn d -> d.[2]) ds))],
 };
 
-let relations : Spec -> compress.Compression -> [:ok, [Entry]] | [:error, :string];
+let relations : Spec -> compress.Compression -> Result [Entry] :string;
 let relations sp c = {
     let? needs = deps.parse_all (spec.strings sp "rpm" "depends");
     let? provides = deps.parse_all (spec.strings sp "rpm" "provides");
@@ -211,10 +211,10 @@ let relations sp c = {
         () => [],
         _ => [["/bin/sh", interp + flag, ""]],
     }) script_tags;
-    [:ok, relation 1049 1048 1050 (list.map as_triple needs + shells + rpmlib_needs c)
+    Result.ok (relation 1049 1048 1050 (list.map as_triple needs + shells + rpmlib_needs c)
           + relation 1047 1112 1113 ([Spec.name sp, 8, spec.full_version sp] :: list.map as_triple provides)
           + relation 1054 1053 1055 (list.map as_triple conflicts)
-          + relation 1090 1114 1115 (list.map as_triple obsoletes)]
+          + relation 1090 1114 1115 (list.map as_triple obsoletes))
 };
 
 // --- the package --------------------------------------------------------------------
@@ -258,7 +258,7 @@ let signature head payload cpio_size = {
 /// only the 32-bit tags.
 let too_big : :integer = 4294967295;
 
-let build! : Spec -> Layout -> compress.Compression -> [Entry] -> :string -> :string -> [:ok, :string] | [:error, :string];
+let build! : Spec -> Layout -> compress.Compression -> [Entry] -> :string -> :string -> Result :string :string;
 let build! sp lay c deps_tags dir dest = {
     let listed = entries_of lay;
     let payload = dir + "/payload.cpio";
@@ -280,11 +280,11 @@ let build! sp lay c deps_tags dir dest = {
     io.close! w
     let target = dest + "/" + file_name sp;
     scratch.place! made target
-    [:ok, target]
+    Result.ok target
 };
 
 /// Make the package in `out`, answering its path.
-let make! : Spec -> Layout -> :string -> :any -> [:ok, :string] | [:error, :string];
+let make! : Spec -> Layout -> :string -> :any -> Result :string :string;
 let make! sp lay dest wanted = {
     let? c = compress.pick! wanted [:xz, :zstd, :gzip];
     let? deps_tags = relations sp c;

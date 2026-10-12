@@ -84,8 +84,8 @@ let outcome! p = try! {
     // forces the element -- long past the `catch`. Binding it is what forces
     // it here, because a statement of an impure block is sequenced.
     let value = join! p;
-    [:ok, value]
-} catch e { [:error, e] };
+    Result.ok value
+} catch e { Result.error e };
 
 /// Wait for all processes, returning each success or error outcome in input order.
 let outcomes! : [Process] -> [Outcome :any];
@@ -142,8 +142,8 @@ let map_reporting! n done! f xs = {
     let ref = vm.unique! ();
     let results = pool! me ref done! f items (if n < 1 { 1 } else { n }) 0 0 (%{});
     strict! (list.map (fn i -> match results.[i] {
-        [:ok, v] => v,
-        [:error, e] => error.rethrow! e,
+        Result.ok(v) => v,
+        Result.error(e) => error.rethrow! e,
     }) (list.range 0 total))
 };
 
@@ -176,8 +176,8 @@ priv let answer! : Process -> :integer -> (a -> b) -> :integer -> a -> :any;
 priv let answer! me ref f i x = {
     let outcome = try! {
         let v = strict! (f x);
-        [:ok, v]
-    } catch e { [:error, e] };
+        Result.ok v
+    } catch e { Result.error e };
     send! me [:mapped, ref, i, outcome]
 };
 
@@ -230,21 +230,21 @@ let is_reply_of ref m = match m {
 /// reply that cannot come.
 let call! : Process -> :any -> :any;
 let call! target body = match await_reply! target body forever {
-    [:ok, value] => value,
+    Result.ok(value) => value,
     // Unreachable: there is no deadline to reach. Said, so the match is whole.
     other => raise! (error.new :timeout other),
 };
 
-/// `call!` that gives up after `ms` milliseconds: `[:ok, reply]`, or
-/// `:timeout`. A reply that comes later is left in the mailbox, where
+/// `call!` that gives up after `ms` milliseconds: `Result.ok reply`, or
+/// `Result.error :timeout`. A reply that comes later is left in the mailbox, where
 /// nothing that waits for a reference will take it -- but a plain `recv!`
 /// will, so a process that times out calls should not also read its mailbox
 /// blind.
-let call_within! : Process -> :any -> :integer -> ([:ok, :any] | :timeout);
+let call_within! : Process -> :any -> :integer -> Result :any :timeout;
 let call_within! target body ms = await_reply! target body (deadline_in! ms);
 
 /// Monitor a target, send a request, and wait for its reply or the deadline.
-priv let await_reply! : Process -> :any -> :integer -> ([:ok, :any] | :timeout);
+priv let await_reply! : Process -> :any -> :integer -> Result :any :timeout;
 priv let await_reply! target body deadline = {
     let me = self! ();
     let ref = vm.unique! ();
@@ -253,9 +253,9 @@ priv let await_reply! target body deadline = {
     let answer = recv_until! (fn m -> is_reply_of ref m || is_down_of target m) deadline;
     demonitor! target
     match answer {
-        [:ok, [:reply, _, value]] => [:ok, value],
-        [:ok, [:down, _, outcome]] => raise! (error.new :down outcome),
-        _ => :timeout,
+        Result.ok([:reply, _, value]) => Result.ok value,
+        Result.ok([:down, _, outcome]) => raise! (error.new :down outcome),
+        _ => Result.error :timeout,
     }
 };
 
@@ -276,47 +276,47 @@ let deadline_in! : :integer -> :integer;
 let deadline_in! ms = vm.now_ns! () + ms * 1000000;
 
 /// The first message `wanted` accepts, taken out of the mailbox as
-/// `[:ok, message]`, or `:timeout` once the clock reaches `deadline` (see
+/// `Result.ok message`, or `Result.error :timeout` once the clock reaches `deadline` (see
 /// `deadline_in!`; `forever` waits for ever, and `0` only looks). Messages it
 /// does not accept stay where they were, in order.
 ///
 /// A position, once looked at, keeps meaning the same message: only this
 /// process ever removes one, and senders only append. So the scan resumes
 /// where it stopped after each wait, and looks at each message once.
-let recv_until! : (:any -> :bool) -> :integer -> ([:ok, :any] | :timeout);
+let recv_until! : (:any -> :bool) -> :integer -> Result :any :timeout;
 let recv_until! wanted deadline = scan! wanted deadline 0;
 
 /// Search the mailbox for a matching message until the deadline, leaving other messages
 /// queued.
-priv let scan! : (:any -> :bool) -> :integer -> :integer -> ([:ok, :any] | :timeout);
+priv let scan! : (:any -> :bool) -> :integer -> :integer -> Result :any :timeout;
 priv let rec scan! wanted deadline !at = match vm.mailbox_peek! at {
-    [:ok, m] =>
+    Result.ok(m) =>
         if wanted m {
             vm.mailbox_take! at
-            [:ok, m]
+            Result.ok m
         }
         else { scan! wanted deadline (at + 1) },
     _ => match vm.await_message! at deadline {
         :ok => scan! wanted deadline at,
-        _ => :timeout,
+        _ => Result.error :timeout,
     },
 };
 
 /// The first message `wanted` accepts, waiting as long as it takes.
 let recv_where! : (:any -> :bool) -> :any;
 let recv_where! wanted = match recv_until! wanted forever {
-    [:ok, m] => m,
+    Result.ok(m) => m,
     // Unreachable: there is no deadline to reach. Said, so the match is whole.
     other => raise! (error.new :timeout other),
 };
 
-/// The next message as `[:ok, message]`, or `:timeout` after `ms`
+/// The next message as `Result.ok message`, or `Result.error :timeout` after `ms`
 /// milliseconds without one.
-let recv_within! : :integer -> ([:ok, :any] | :timeout);
+let recv_within! : :integer -> Result :any :timeout;
 let recv_within! ms = recv_until! (fn m -> true) (deadline_in! ms);
 
 /// `recv_where!` with a limit of `ms` milliseconds.
-let recv_where_within! : (:any -> :bool) -> :integer -> ([:ok, :any] | :timeout);
+let recv_where_within! : (:any -> :bool) -> :integer -> Result :any :timeout;
 let recv_where_within! wanted ms = recv_until! wanted (deadline_in! ms);
 
 /// Do nothing for `ms` milliseconds. Messages that arrive meanwhile wait.
@@ -432,7 +432,7 @@ when test {
         test.case "map_limit! raises the first failure"
             $( {
                 let got = outcome! (spawn! $( map_limit! 3 (fn x -> if x == 2 { raise! :bad } else { x }) [1, 2, 3] ));
-                test.eq! :bad (error.payload (list.nth 1 got))
+                test.eq! :bad (match got { Result.error(e) => error.payload e, _ => () })
             } ),
         test.case "map_reporting! counts every finish, in the caller"
             $( {
@@ -444,19 +444,19 @@ when test {
                 test.eq! [[:tick, 1], [:tick, 2], [:tick, 3]] [a, b, c]
             } ),
         test.case "outcome! of a value"
-            $( test.eq! [:ok, 7] (outcome! (spawn! $( 7 ))) ),
+            $( test.eq! (Result.ok 7) (outcome! (spawn! $( 7 ))) ),
         // `catch` binds the error itself, not what was raised: `raise! :boom`
         // wraps `:boom` in a box whose kind is the catch-all `:error` and whose
         // payload is the atom. That is why the payload is what is compared
         // here, and it is the reason `std.error` exists.
         test.case "outcome! of a failure is a value, not a raise"
-            $( test.eq! :boom (error.payload (list.nth 1 (outcome! (spawn! $( raise! :boom ))))) ),
+            $( test.eq! :boom (match outcome! (spawn! $( raise! :boom )) { Result.error(e) => error.payload e, _ => () }) ),
         test.case "try_map! keeps going past a failure"
             $( {
                 let got = try_map! (fn x -> if x == 1 { 1 } else { raise! :bad }) [1, 2];
-                test.eq! [[:ok, 1], [:error, :bad]]
+                test.eq! [Result.ok 1, Result.error :bad]
                          [list.nth 0 got,
-                          [:error, error.payload (list.nth 1 (list.nth 1 got))]]
+                          match list.nth 1 got { Result.error(e) => Result.error (error.payload e), other => other }]
             } ),
 
         test.case "call! gets an answer back"
@@ -484,30 +484,32 @@ when test {
                 test.eq! [[:b, 1], :a, :c] [got, recv! (), recv! ()]
             } ),
         test.case "recv_within! times out"
-            $( test.eq! :timeout (recv_within! 20) ),
+            $( test.eq! (Result.error :timeout) (recv_within! 20) ),
         test.case "recv_within! answers a message that is there"
             $( {
                 send! (self! ()) :here
-                test.eq! [:ok, :here] (recv_within! 1000)
+                test.eq! (Result.ok :here) (recv_within! 1000)
             } ),
         test.case "recv_where_within! waits for a late message"
             $( {
                 let me = self! ();
                 spawn! $( { sleep! 20; send! me :late } )
-                test.eq! [:ok, :late] (recv_where_within! (fn m -> m == :late) 5000)
+                test.eq! (Result.ok :late) (recv_where_within! (fn m -> m == :late) 5000)
             } ),
         test.case "kill! stops a loop that reads nothing"
             $( {
                 let p = spawn! $( spin 0 );
                 kill! p :enough
-                let [tag, e] = outcome! p;
-                test.eq! [:error, :killed, :enough] [tag, error.kind e, error.payload e]
+                match outcome! p {
+                    Result.error(e) => test.eq! [:killed, :enough] [error.kind e, error.payload e],
+                    other => test.eq! :killed other,
+                }
             } ),
         test.case "monitor! reports how a process ended"
             $( {
                 let p = spawn! $( 6 * 7 );
                 monitor! p
-                test.eq! [:ok, 42] (list.nth 2 (recv_where! (fn m -> is_down_of p m)))
+                test.eq! (Result.ok 42) (list.nth 2 (recv_where! (fn m -> is_down_of p m)))
             } ),
         test.case "demonitor! takes back a report already sent"
             $( {
@@ -515,7 +517,7 @@ when test {
                 join! p
                 monitor! p
                 demonitor! p
-                test.eq! :timeout (recv_within! 0)
+                test.eq! (Result.error :timeout) (recv_within! 0)
             } ),
         test.case "call! raises when the target dies first"
             $( {
@@ -532,7 +534,7 @@ when test {
                 kill! p :done
                 // Taken, so its end is handled rather than reported at exit.
                 outcome! p
-                test.eq! :timeout got
+                test.eq! (Result.error :timeout) got
             } ),
         test.case "a reply after a timeout is not the next call's answer"
             $( {
@@ -548,7 +550,7 @@ when test {
                 let missed = call_within! p 1 10;
                 sleep! 80
                 let next = call! p 2;
-                test.eq! [:timeout, :prompt] [missed, next]
+                test.eq! [Result.error :timeout, :prompt] [missed, next]
             } ),
         test.case "kill! reaches a force that never ends, through a try!"
             $( {
@@ -556,7 +558,7 @@ when test {
                 let p = spawn! $( try! { strict! (list.length (from 0)) } catch e { :caught } );
                 sleep! 20
                 kill! p :stop
-                test.eq! :killed (error.kind (list.nth 1 (outcome! p)))
+                test.eq! :killed (match outcome! p { Result.error(e) => error.kind e, _ => () })
             } ),
         test.case "call! keeps messages that are not the reply"
             $( {
@@ -587,4 +589,4 @@ when test {
 type Process = :process;
 type Call body = [:call, Process, body, :integer];
 type Reply value = [:reply, :integer, value];
-type Outcome value = [:ok, value] | [:error, :any];
+type Outcome value = Result value :any;

@@ -1487,20 +1487,17 @@ NativeResult ffi_function(Process& p, Value callee, Value* args, uint32_t) {
     return bind_in(p, lib, args[1], args[2], args[3], pure);
 }
 
-/// `locate! lib`: where a library is, by opening it -- `[:ok, file]`, or
-/// `[:error, why]` with the same account of what was tried that a binding
+/// `locate! lib`: where a library is, by opening it -- `Result.ok file`, or
+/// `Result.error why` with the same account of what was tried that a binding
 /// would raise. Opening is the only honest answer: a file that is there but
 /// built for another machine is not a library this program can use.
 NativeResult ffi_locate(Process& p, Value, Value* args, uint32_t) {
     Err e;
     Library* lib = library_of(p, args[0], &e);
     if (!lib && e.raised) return NativeResult::raise(e.value);
-    Value tag = make_atom(p.runtime().intern_atom(lib ? "ok" : "error"));
     std::string said = lib ? lib->where : e.text;
     Value text = p.heap().make_string(said.data(), uint32_t(said.size()));
-    Pin kept(p, text);
-    Value rest = p.heap().make_cons(kept.get(), NIL);
-    return NativeResult::ok(p.heap().make_cons(tag, rest));
+    return NativeResult::ok(make_result(p.heap(), p.runtime(), lib != nullptr, text));
 }
 
 /// `call! f args`: a foreign function applied to a list. What a library server

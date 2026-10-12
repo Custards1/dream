@@ -121,9 +121,9 @@ priv let attempt! gen holds tape = {
         let used = random.tape_used after;
         strict! value
         [:ok, value, used]
-    } catch e { [:error, e] };
+    } catch e { Result.error e };
     match drawn {
-        [:error, e] => [:broken_generator, e],
+        Result.error(e) => [:broken_generator, e],
         [:ok, value, used] => {
             let verdict = try! {
                 let answer = holds value;

@@ -26,7 +26,7 @@ let rec serve! parent parsed cached = match recv! () {
             },
         };
         strict! result
-        send! parent [:background_reply, job, rpc.id m, [:ok, result]]
+        send! parent [:background_reply, job, rpc.id m, Result.ok result]
         let kept = if map.size cached >= 16 { %{} } else { cached };
         serve! parent (map.merge parsed (analysis.parses a)) (kept.[key => [job, a, result]])
     },

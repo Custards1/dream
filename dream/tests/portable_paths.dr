@@ -9,7 +9,7 @@ let main! = {
         :windows => {
             console.print! (path.normalize "C:\\a\\..\\..\\b" == "C:/b")
             console.print! (path.dirname "C:\\" == "C:/")
-            console.print! (path.normalize "\\\\server\\share\\a\\..\\.." == "//server/share")
+            console.print! (path.normalize "\\\\server\\share\\a\\..\\.." == "//server/share/")
             console.print! (path.join "C:/a" "D:\\b" == "D:/b")
             console.print! (path.extension "C:\\a.b\\file" == "")
         },

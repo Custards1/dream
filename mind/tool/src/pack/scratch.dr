@@ -20,12 +20,12 @@ let describe e = match error.payload e {
 
 /// Run `build!` with a fresh directory under `out`, answering what it answers.
 /// Anything it raises becomes `[:error, why]`.
-let within! : :string -> :string -> (:string -> [:ok, :any] | [:error, :string]) -> [:ok, :any] | [:error, :string];
+let within! : :string -> :string -> (:string -> Result :any :string) -> Result :any :string;
 let within! out label build! = {
     let dir = out + "/.ship-" + label + "-" + file.scratch_suffix! ();
     file.remove_all! dir
     file.mkdir_all! dir
-    let answer = try! { build! dir } catch e { [:error, describe e] };
+    let answer = try! { build! dir } catch e { Result.error (describe e) };
     file.remove_all! dir
     answer
 };

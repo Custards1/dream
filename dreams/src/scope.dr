@@ -147,10 +147,13 @@ mapping Environment {
     aliases = %{}
     only = %{}
     derives = ()
+    // The names in `only` that were lent by the prelude rather than imported
+    // (`lend_prelude`), each mapped to `true`.
+    lent = %{}
 }
 
 let env : :string -> :integer -> Environment;
-let env name source = Environment.make name source %{} %{} %{} ();
+let env name source = Environment.make name source %{} %{} %{} () %{};
 
 let env_name : Environment -> :string;
 let env_name e = Environment.name e;
@@ -180,7 +183,12 @@ let with_alias n r e     = e.[:aliases => (aliases e).[n => r]];
 let with_only : :string -> :any -> Environment -> Environment;
 let with_only n v e      = e.[:only => (only e).[n => v]];
 let without_only : :string -> Environment -> Environment;
-let without_only n e     = e.[:only => (map.remove n (only e))];
+let without_only n e     = Environment.set_lent (map.remove n (Environment.lent e))
+                                                (e.[:only => (map.remove n (only e))]);
+
+/// Was `n` lent to this module by the prelude, rather than imported or declared?
+let is_lent : Environment -> :string -> :bool;
+let is_lent e n = map.has n (Environment.lent e);
 
 let has_global : Environment -> :string -> :bool;
 let has_global e n = map.has n (globals e);
@@ -452,10 +460,10 @@ let rec declare_import_names mi r p names span s =
         if inaccessible {
             complain span ("member `" + p + "." + list.nth 0 sel + "` is private") (env_source e) acc
         }
-        else if has_global e bound || only_of e bound != () {
+        else if has_global e bound || (only_of e bound != () && not (is_lent e bound)) {
             complain span ("`" + bound + "` is already bound in this module") (env_source e) acc
         }
-        else { set_env mi (with_only bound [r, list.nth 0 sel, p] e) acc }
+        else { set_env mi (with_only bound [r, list.nth 0 sel, p] (without_only bound e)) acc }
     }) s names;
 
 let rec declare_import l mi imp s = {
@@ -900,6 +908,11 @@ let report_clashes mi span s = {
     let e = env_at s mi;
     let clashing = list.filter (fn n -> has_global e n)
                                (list.map (fn kv -> list.head kv) (map.pairs (only e)));
+    // A name the prelude lent is the module's to take: declaring it is
+    // shadowing, not a clash (`lend_prelude`).
+    let given_back = list.fold (fn acc n ->
+        if is_lent (env_at acc mi) n { set_env mi (without_only n (env_at acc mi)) acc } else { acc })
+        s clashing;
     list.fold (fn acc n -> {
         let e2 = env_at acc mi;
         let sel = only_of e2 n;
@@ -907,7 +920,7 @@ let report_clashes mi span s = {
                  ("it is imported from `" + list.nth 2 sel + "` and also defined here; rename one, "
                   + "or use `" + list.nth 2 sel + "." + list.nth 1 sel + "` where the import is meant")
                  (env_source e2) acc) |> State.set_envs (envs (set_env mi (without_only n e2) acc)))
-    }) s clashing
+    }) given_back (list.filter (fn n -> not (is_lent e n)) clashing)
 };
 
 /// The span to hang a module-wide complaint on: its first item, or nothing.
@@ -977,7 +990,7 @@ let declare_items! l mi items s0 = {
     let collected = collected_lets l pairs imported;
     let declared = list.fold (fn acc od -> declare_one_let l mi od acc)
                              (list.nth 1 collected) (list.head collected);
-    report_clashes mi (module_span l mi) declared
+    lend_prelude l mi (report_clashes mi (module_span l mi) declared)
 };
 
 let declare_module : modules.Loader -> :integer -> State -> State;
@@ -1039,7 +1052,7 @@ let declare_module l mi s0 = {
     let declared = list.fold (fn acc od -> declare_one_let l mi od acc)
                              contracts (list.head filled);
 
-    let checked = report_clashes mi (module_span l mi) declared;
+    let checked = lend_prelude l mi (report_clashes mi (module_span l mi) declared);
     // A module that declares a virtual is abstract: it has a hole in it, and
     // running it directly would reach one.
     (checked |> State.set_module_recs (list.cons [mi, globals_from, next_global checked - globals_from,
@@ -2349,19 +2362,58 @@ let inherit_enclosing l s =
 
 /// `e`, a module written inside module `outer`, lent `oe`'s names.
 let inherited outer oe e = {
-    let binds e n = has_global e n || only_of e n != ();
+    // A name the prelude lent binds nothing here: the enclosing module's own
+    // is nearer, and takes it back.
+    let binds e n = has_global e n || (only_of e n != () && not (is_lent e n));
     let lendable n = not (is_hidden_name n);
     let values = list.fold (fn acc [n, _] ->
-        if lendable n && not (binds acc n) { with_only n [Ref.dream outer, n, env_name oe] acc } else { acc })
+        if lendable n && not (binds acc n) {
+            with_only n [Ref.dream outer, n, env_name oe] (without_only n acc)
+        } else { acc })
         e (map.pairs (globals oe));
+    // What the enclosing module was itself lent stays lent here.
     let members = list.fold (fn acc [n, sel] ->
-        if lendable n && not (binds acc n) { with_only n sel acc } else { acc })
+        if lendable n && not (binds acc n) {
+            let taken = with_only n sel (without_only n acc);
+            if is_lent oe n { Environment.set_lent ((Environment.lent taken).[n => true]) taken } else { taken }
+        } else { acc })
         values (map.pairs (only oe));
     let named = list.fold (fn acc [n, r] ->
         if alias_of acc n == () { with_alias n r acc } else { acc })
         members (map.pairs (aliases oe));
     named.[:within => list.cons outer (within oe)]
 };
+
+/// The prelude's names, lent to module `mi` wherever it binds none of its
+/// own -- see the head of `std.prelude`. Lent as `import std.prelude.{Result}`
+/// would bind them, so a lent name resolves, is checked and is a namespace
+/// exactly as an imported one is. It is marked as lent, so a declaration or an
+/// import of the same name that comes after it -- a session's next entry --
+/// takes the name back rather than clashing with it.
+///
+/// This runs once a module's own names are declared, which is what makes the
+/// prelude the last place a name is looked for. The prelude is loaded ahead
+/// of every module that can see it (`modules.with_prelude!`), so its own
+/// environment is always there to lend from.
+let lend_prelude : modules.Loader -> :integer -> State -> State;
+let lend_prelude l mi s =
+    match modules.find l modules.prelude_name {
+        () => s,
+        p if p == mi || not (has_env s p) => s,
+        p => {
+            let pe = env_at s p;
+            let e = env_at s mi;
+            let lendable n = not (is_hidden_name n) && not (is_private pe n)
+                && not (has_global e n) && only_of e n == () && alias_of e n == ();
+            let lent = list.fold (fn acc [n, _] ->
+                if lendable n {
+                    Environment.set_lent ((Environment.lent acc).[n => true])
+                        (with_only n [Ref.dream p, n, modules.prelude_name] acc)
+                }
+                else { acc }) e (map.pairs (globals pe));
+            set_env mi lent s
+        },
+    };
 
 /// The modules `e` was written inside, nearest first.
 let within e = e.[:within else []];

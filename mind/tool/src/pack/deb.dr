@@ -68,12 +68,12 @@ let relations : [[:string, :string]] = [
     ["Provides", "provides"], ["Replaces", "replaces"],
 ];
 
-let control : Spec -> Layout -> [:ok, :string] | [:error, :string];
+let control : Spec -> Layout -> Result :string :string;
 let control sp lay = {
     let? lines = result.all (list.map (fn [label, key] -> result.map (fn v -> field label v)
                                                                        (deps.deb_list (spec.strings sp "deb" key)))
                                       relations);
-    [:ok, field "Package" (Spec.name sp)
+    Result.ok (field "Package" (Spec.name sp)
           + field "Version" (spec.full_version sp)
           + field "Architecture" (platform.deb (Spec.arch sp))
           + field "Maintainer" (Spec.maintainer sp)
@@ -82,14 +82,14 @@ let control sp lay = {
           + field "Section" (spec.text sp "deb" "section" "misc")
           + field "Priority" (spec.text sp "deb" "priority" "optional")
           + field "Homepage" (Spec.homepage sp)
-          + "Description: " + Spec.summary sp + long_lines sp + "\n"]
+          + "Description: " + Spec.summary sp + long_lines sp + "\n")
 };
 
 /// What Debian needs that the other formats do not.
-let problems : Spec -> [:ok, :unit] | [:error, :string];
+let problems : Spec -> Result :unit :string;
 let problems sp =
-    if str.is_empty (Spec.maintainer sp) { [:error, "deb: a Debian package needs a maintainer: set maintainer = \"Name <email>\" in [ship]"] }
-    else { [:ok, ()] };
+    if str.is_empty (Spec.maintainer sp) { Result.error "deb: a Debian package needs a maintainer: set maintainer = \"Name <email>\" in [ship]" }
+    else { Result.ok () };
 
 /// The files, from the root: every directory above them, then each in order.
 let data_items : Layout -> [Item];
@@ -127,7 +127,7 @@ let control_items! sp lay text = {
                             + scripts)
 };
 
-let build! : Spec -> Layout -> :string -> compress.Compression -> :string -> :string -> [:ok, :string] | [:error, :string];
+let build! : Spec -> Layout -> :string -> compress.Compression -> :string -> :string -> Result :string :string;
 let build! sp lay text c dir out = {
     let epoch = Layout.epoch lay;
     file.write! (dir + "/debian-binary") "2.0\n"
@@ -142,11 +142,11 @@ let build! sp lay text c dir out = {
                          ["data.tar" + compress.extension c, data_tar]]
     let target = out + "/" + file_name sp;
     scratch.place! made target
-    [:ok, target]
+    Result.ok target
 };
 
 /// Make the package in `out`, answering its path.
-let make! : Spec -> Layout -> :string -> :any -> [:ok, :string] | [:error, :string];
+let make! : Spec -> Layout -> :string -> :any -> Result :string :string;
 let make! sp lay out wanted = {
     let? _ = problems sp;
     let? c = compress.pick! wanted [:xz, :gzip, :zstd, :none];
@@ -161,7 +161,7 @@ when test {
     let sp! () = match toml.parse ("[package]\nname = \"demo\"\nversion = \"1.0\"\n[ship]\nsummary = \"a demo\"\n"
                                    + "description = \"First.\\n\\nSecond.\"\nmaintainer = \"A <a@b>\"\narch = \"amd64\"\n"
                                    + "[ship.deb]\ndepends = [\"libc6 >= 2.31\", \"libssl3 | libssl1.1\"]\n") {
-        [:ok, doc] => match spec.of_doc "." doc (%{}) (%{}) { [:ok, s] => s, other => raise! other },
+        Result.ok(doc) => match spec.of_doc "." doc (%{}) (%{}) { Result.ok(s) => s, other => raise! other },
         other => raise! other,
     };
 
@@ -171,14 +171,14 @@ when test {
         test.case "the file is named as Debian names it"
             $( test.eq! "demo_1.0-1_amd64.deb" (file_name (sp! ())) ),
         test.case "the control file"
-            $( test.eq! [:ok, "Package: demo\nVersion: 1.0-1\nArchitecture: amd64\nMaintainer: A <a@b>\nInstalled-Size: 5\n"
+            $( test.eq! (Result.ok ("Package: demo\nVersion: 1.0-1\nArchitecture: amd64\nMaintainer: A <a@b>\nInstalled-Size: 5\n"
                               + "Depends: libc6 (>= 2.31), libssl3 | libssl1.1\nSection: misc\nPriority: optional\n"
-                              + "Description: a demo\n First.\n .\n Second.\n"]
+                              + "Description: a demo\n First.\n .\n Second.\n"))
                         (control (sp! ()) lay) ),
         test.case "the data starts at the root, directories first"
             $( test.eq! ["./", "./usr/", "./usr/bin/", "./usr/bin/d", "./usr/bin/demo"]
                         (list.map item.path (data_items lay)) ),
         test.case "a package needs a maintainer"
-            $( test.eq! :error (list.head (problems (Spec.set_maintainer "" (sp! ())))) ),
+            $( test.eq! :error (Result.tag (problems (Spec.set_maintainer "" (sp! ())))) ),
     ];
 }

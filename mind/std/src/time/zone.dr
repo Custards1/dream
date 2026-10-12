@@ -198,7 +198,7 @@ let parse_rule s = {
                                         else { "" };
                             match str.split "," rules {
                                 [a, b] => match [tz_change a, tz_change b] {
-                                    [[:ok, start], [:ok, end]] => result.ok (Rule.make standard daylight start end),
+                                    [Result.ok(start), Result.ok(end)] => result.ok (Rule.make standard daylight start end),
                                     _ => fail,
                                 },
                                 _ => fail,
@@ -330,7 +330,7 @@ priv let read_block name bytes counts at width = {
     let end = at + block_size counts width;
     let rule = if width == 8 && str.byte end bytes == 10 {
         let stop = str.upto "\n" (end + 1) bytes;
-        match parse_rule (str.slice (end + 1) (stop - end - 1) bytes) { [:ok, r] => r, _ => () }
+        match parse_rule (str.slice (end + 1) (stop - end - 1) bytes) { Result.ok(r) => r, _ => () }
     } else { () };
     if types == 0 { result.error (name + " has no local time types") }
     else { result.ok (Zone.make name transitions initial rule) }
@@ -391,9 +391,9 @@ let local! () = match os.env! "TZ" {
         if str.starts_with "/" spec { from_file_or_utc! spec spec }
         else {
             match load! spec {
-                [:ok, z] => z,
+                Result.ok(z) => z,
                 _ => match parse_rule spec {
-                    [:ok, rule] => Zone.make spec #[] (Rule.standard rule) rule,
+                    Result.ok(rule) => Zone.make spec #[] (Rule.standard rule) rule,
                     _ => utc,
                 },
             }
@@ -445,7 +445,7 @@ when test {
             $( test.eq! ["MST", "MDT"] [Period.abbrev (rule_period (result.or_else () denver) (at 2025 1 1 0)),
                                        Period.abbrev (rule_period (result.or_else () denver) (at 2025 7 1 0))] ),
         test.case "nonsense is refused"     $( test.true! (result.is_error (parse_rule "7")) ),
-        test.case "UTC needs no database"   $( test.eq! [:ok, utc] (load! "UTC") ),
+        test.case "UTC needs no database"   $( test.eq! (Result.ok utc) (load! "UTC") ),
         test.case "paths are not names"     $( test.true! (result.is_error (load! "../../etc/passwd")) ),
         test.case "a fixed zone"            $( test.eq! 3600 (offset_at (fixed 3600 "X") 0) ),
         test.case "a skipped local time moves forward" $( {

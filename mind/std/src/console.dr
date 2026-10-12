@@ -55,13 +55,13 @@ let error_write! value = write_to! (io.stderr! ()) value;
 
 /// `{}` consumes one value; `{{` and `}}` write literal braces. Malformed
 /// templates and missing/extra values are errors, never silently discarded.
-let format : :string -> [:any] -> [:ok, :string] | [:error, :string];
+let format : :string -> [:any] -> Result :string :string;
 let format template values = {
     let size = str.byte_length template;
     let rec walk !at !start remaining !pieces =
         if at >= size {
-            if not (list.is_empty remaining) { [:error, "too many format values"] }
-            else { [:ok, str.concat_all (list.reverse (list.cons (str.slice start (at - start) template) pieces))] }
+            if not (list.is_empty remaining) { Result.error "too many format values" }
+            else { Result.ok (str.concat_all (list.reverse (list.cons (str.slice start (at - start) template) pieces))) }
         } else {
             let c = str.byte at template;
             let next = str.byte (at + 1) template;
@@ -70,10 +70,10 @@ let format template values = {
                 if next == c { walk (at + 2) (at + 2) remaining (list.cons (str.slice at 1 template) before) }
                 else if c == 123 && next == 125 {
                     match remaining {
-                        [] => [:error, "not enough format values"],
+                        [] => Result.error "not enough format values",
                         [value, ..rest] => walk (at + 2) (at + 2) rest (list.cons (to_string value) before),
                     }
-                } else { [:error, "unmatched format brace at byte " + to_string at] }
+                } else { Result.error ("unmatched format brace at byte " + to_string at) }
             } else { walk (at + 1) start remaining pieces }
         };
     walk 0 0 values []
@@ -82,8 +82,8 @@ let format template values = {
 /// Format a template with values, raising when the template cannot be satisfied.
 let format! : :string -> [:any] -> :string;
 let format! template values = match format template values {
-    [:ok, rendered] => rendered,
-    [:error, why] => error.raise_as! :bad_argument why,
+    Result.ok(rendered) => rendered,
+    Result.error(why) => error.raise_as! :bad_argument why,
 };
 /// Format a template and print it to standard output with a newline.
 let printf! : :string -> [:any] -> :unit;
@@ -142,28 +142,28 @@ let prompt! question = prompt_with! (session! ()) question;
 
 /// The parser returns [:ok, value] or [:error, help]. Invalid input is retried;
 /// EOF always returns (), never the default or an implicit confirmation.
-let ask_with! : Session -> :any -> (:string -> [:ok, a] | [:error, :string]) -> a | :unit;
+let ask_with! : Session -> :any -> (:string -> Result a :string) -> a | :unit;
 let rec ask_with! session question parse = match prompt_with! session question {
     () => (),
     line => match parse line {
-        [:ok, value] => value,
-        [:error, help] => {
+        Result.ok(value) => value,
+        Result.error(help) => {
             print_to! (Session.output session) help
             ask_with! session question parse
         },
     },
 };
 /// Prompt until `parse` accepts the answer, using the default interactive session.
-let ask! : :any -> (:string -> [:ok, a] | [:error, :string]) -> a | :unit;
+let ask! : :any -> (:string -> Result a :string) -> a | :unit;
 let ask! question parse = ask_with! (session! ()) question parse;
 
 /// Parse a yes/no answer, using `default` for an empty response.
-let confirmation : :bool -> :string -> [:ok, :bool] | [:error, :string];
+let confirmation : :bool -> :string -> Result :bool :string;
 let confirmation default line = match str.lower (str.trim line) {
-    "" => [:ok, default],
-    "y" => [:ok, true], "yes" => [:ok, true],
-    "n" => [:ok, false], "no" => [:ok, false],
-    _ => [:error, "Please answer yes or no."],
+    "" => Result.ok default,
+    "y" => Result.ok true, "yes" => Result.ok true,
+    "n" => Result.ok false, "no" => Result.ok false,
+    _ => Result.error "Please answer yes or no.",
 };
 /// Ask a yes/no question through the supplied session, with an explicit default.
 let confirm_with! : Session -> :any -> :bool -> :bool | :unit;
@@ -174,10 +174,10 @@ let confirm! : :any -> :bool -> :bool | :unit;
 let confirm! question default = confirm_with! (session! ()) question default;
 
 /// Parse a trimmed integer response, returning a validation error for invalid input.
-let integer : :string -> [:ok, :integer] | [:error, :string];
+let integer : :string -> Result :integer :string;
 let integer line = match num.parse_int (str.trim line) {
-    () => [:error, "Please enter an integer."],
-    n => [:ok, n],
+    () => Result.error "Please enter an integer.",
+    n => Result.ok n,
 };
 /// Prompt repeatedly until the user supplies an integer or input ends.
 let prompt_int! : :any -> :integer | :unit;
@@ -283,14 +283,14 @@ when test {
     import std.test;
     let tests = [
         test.case "format values, escapes, Unicode, and empty templates"
-            $( test.eq! [[:ok, "{雪}: 42"], [:ok, ""], [:ok, "[] () true"]]
+            $( test.eq! [Result.ok "{雪}: 42", Result.ok "", Result.ok "[] () true"]
                         [format "{{{}}}: {}" ["雪", 42], format "" [], format "{} {} {}" [[], (), true]] ),
         test.case "format errors keep missing and extra values visible"
-            $( test.eq! [[:error, "not enough format values"], [:error, "too many format values"],
-                         [:error, "unmatched format brace at byte 0"]]
+            $( test.eq! [Result.error "not enough format values", Result.error "too many format values",
+                         Result.error "unmatched format brace at byte 0"]
                         [format "{}" [], format "" [1], format "{" []] ),
         test.case "confirmation normalizes text and honors the empty-line default"
-            $( test.eq! [[:ok, true], [:ok, false], [:ok, true], [:error, "Please answer yes or no."]]
+            $( test.eq! [Result.ok true, Result.ok false, Result.ok true, Result.error "Please answer yes or no."]
                         [confirmation false " YES ", confirmation true "n", confirmation true "", confirmation false "maybe"] ),
         test.case "nested styles restore their outer style"
             $( test.eq! "\u{1b}[31ma\u{1b}[1mb\u{1b}[0m\u{1b}[31mc\u{1b}[0m"

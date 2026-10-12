@@ -51,19 +51,19 @@ let items sp lay = {
     list.sort_on item.path (dirs + moved)
 };
 
-let build! : Spec -> Layout -> compress.Compression -> :string -> :string -> [:ok, :string] | [:error, :string];
+let build! : Spec -> Layout -> compress.Compression -> :string -> :string -> Result :string :string;
 let build! sp lay c dir dest = {
     let tar_path = dir + "/release.tar";
     tar.file! tar_path :pax (Layout.epoch lay) (items sp lay)
     let? packed = compress.file! c tar_path;
     let target = dest + "/" + file_name sp c;
     scratch.place! packed target
-    [:ok, target]
+    Result.ok target
 };
 
 /// Make the tarball in `dest`, answering its path. gzip unless asked, since
 /// it is the one every `tar` and every Homebrew unpacks.
-let make! : Spec -> Layout -> :string -> :any -> [:ok, :string] | [:error, :string];
+let make! : Spec -> Layout -> :string -> :any -> Result :string :string;
 let make! sp lay dest wanted = {
     let? c = compress.pick! wanted [:gzip, :xz, :zstd];
     scratch.within! dest "tarball" (fn dir -> build! sp lay c dir dest)
@@ -74,7 +74,7 @@ when test {
     import std.toml;
 
     let sp! a = match toml.parse ("[package]\nname = \"demo\"\nversion = \"1.0\"\n[ship]\nsummary = \"x\"\n") {
-        [:ok, doc] => match spec.of_doc "." doc (%{ "arch" => a, "os" => "linux" }) (%{}) { [:ok, s] => s, other => raise! other },
+        Result.ok(doc) => match spec.of_doc "." doc (%{ "arch" => a, "os" => "linux" }) (%{}) { Result.ok(s) => s, other => raise! other },
         other => raise! other,
     };
 

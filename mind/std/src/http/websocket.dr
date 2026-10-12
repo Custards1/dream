@@ -135,7 +135,7 @@ let connect_with! config address = try! {
 /// Establish and validate a WebSocket connection using the configured HTTP handshake.
 priv let open! : :map -> :string -> :map;
 priv let open! config address = {
-    let u = match url.parse address { [:ok, parsed] => parsed, [:error, why] => raise! (error.new :bad_url why) };
+    let u = match url.parse address { Result.ok(parsed) => parsed, Result.error(why) => raise! (error.new :bad_url why) };
     let scheme = url.Url.scheme u;
     if scheme != "ws" && scheme != "wss" { raise! (error.new :bad_url ("not a ws or wss URL: " + address)) }
     let sock = net.connect! (url.bare_host u) (url.port_of u);
@@ -180,13 +180,14 @@ let recv! socket = {
     receive! { [:websocket, from, message] if from == reader => message }
 };
 
-/// The next message, or `:timeout` after `ms` milliseconds.
-let recv_within! : :map -> :integer -> :any;
+/// The next message as `Result.ok message`, or `Result.error :timeout` after
+/// `ms` milliseconds.
+let recv_within! : :map -> :integer -> Result :any :timeout;
 let recv_within! socket ms = {
     let reader = Socket.reader socket;
     receive! {
-        [:websocket, from, message] if from == reader => message,
-        after ms => :timeout,
+        [:websocket, from, message] if from == reader => Result.ok message,
+        after ms => Result.error :timeout,
     }
 };
 
@@ -310,13 +311,13 @@ priv let read_loop! sock r role owner = {
     let reply! opcode payload = {
         try! { streams.write_all! sock (frame opcode payload (role == :client) (crypto.random_bytes! 4)); () } catch e { () }
     };
-    let rec go! rr partial_op parts !size = match try! { let f = read_frame! rr (role == :server) max_message; strict! f; [:ok, f] } catch e { [:error, e] } {
-        [:error, e] => {
+    let rec go! rr partial_op parts !size = match try! { let f = read_frame! rr (role == :server) max_message; strict! f; Result.ok f } catch e { Result.error e } {
+        Result.error(e) => {
             let code = match error.kind e { :protocol => 1002, :too_large => 1009, _ => 1006 };
             if code != 1006 { reply! 8 (be16 code) }
             deliver! [:close, code, error.describe e]
         },
-        [:ok, [fin, opcode, payload, r2]] => match opcode {
+        Result.ok([fin, opcode, payload, r2]) => match opcode {
             8 => {
                 let code = if len payload >= 2 { u16 payload } else { 1005 };
                 reply! 8 (if len payload >= 2 { str.slice 0 2 payload } else { "" })
@@ -368,7 +369,7 @@ when test {
         test.case "echo, text and binary, small and large" $( {
             let s = server.serve! 0 (server.router |> server.get "/ws" (upgrade! echo!));
             let got = match connect! ("ws://127.0.0.1:" + to_string (server.port s) + "/ws") {
-                [:ok, socket] => {
+                Result.ok(socket) => {
                     send_text! socket "hi"
                     let a = recv! socket;
                     send_binary! socket (str.of_bytes [0, 255, 1])
@@ -379,7 +380,7 @@ when test {
                     close! socket
                     [a, b, c == [:text, "echo " + big]]
                 },
-                [:error, e] => [e],
+                Result.error(e) => [e],
             };
             server.stop! s
             settled! ()
@@ -389,8 +390,8 @@ when test {
             let greet_and_go! socket = { send_text! socket "bye"; close_with! socket 4000 "done" };
             let s = server.serve! 0 (server.router |> server.get "/" (upgrade! greet_and_go!));
             let got = match connect! ("ws://127.0.0.1:" + to_string (server.port s) + "/") {
-                [:ok, socket] => { let first = recv! socket; let second = recv! socket; [first, second] },
-                [:error, e] => [e],
+                Result.ok(socket) => { let first = recv! socket; let second = recv! socket; [first, second] },
+                Result.error(e) => [e],
             };
             server.stop! s
             settled! ()
@@ -399,8 +400,8 @@ when test {
         test.case "a subprotocol is agreed" $( {
             let s = server.serve! 0 (server.router |> server.get "/" (upgrade_with! %{ :protocols => ["v2", "v1"] } echo!));
             let got = match connect_with! %{ :protocols => ["v1", "v3"] } ("ws://127.0.0.1:" + to_string (server.port s) + "/") {
-                [:ok, socket] => { let p = Socket.protocol socket; close! socket; p },
-                [:error, e] => e,
+                Result.ok(socket) => { let p = Socket.protocol socket; close! socket; p },
+                Result.error(e) => e,
             };
             server.stop! s
             settled! ()
@@ -411,18 +412,18 @@ when test {
             let got = http.get! (server.local_url s);
             server.stop! s
             settled! ()
-            test.eq! [:ok, 400] (result.map http.status got)
+            test.eq! (Result.ok 400) (result.map http.status got)
         } ),
         test.case "recv_within times out" $( {
             let quiet! socket = { recv! socket; () };
             let s = server.serve! 0 (server.router |> server.get "/" (upgrade! quiet!));
             let got = match connect! ("ws://127.0.0.1:" + to_string (server.port s) + "/") {
-                [:ok, socket] => { let r = recv_within! socket 50; close! socket; r },
-                [:error, e] => e,
+                Result.ok(socket) => { let r = recv_within! socket 50; close! socket; r },
+                Result.error(e) => e,
             };
             server.stop! s
             settled! ()
-            test.eq! :timeout got
+            test.eq! (Result.error :timeout) got
         } ),
         test.case "a handshake refused" $( {
             let s = server.serve! 0 (server.router |> server.get "/" (fn req -> http.text "no"));

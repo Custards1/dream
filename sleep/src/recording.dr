@@ -116,8 +116,8 @@ priv let to_fields r = %{
 /// byte and the field that are wrong.
 let decode : :string -> result.Of Recording :string;
 let decode bytes = match binary.decode layout bytes {
-    [:error, e] => result.error (binary.describe e),
-    [:ok, fields] => of_fields fields,
+    Result.error(e) => result.error (binary.describe e),
+    Result.ok(fields) => of_fields fields,
 };
 
 priv let of_fields : %{:atom => :any} -> result.Of Recording :string;
@@ -182,8 +182,8 @@ let of_csv text = {
     let fields = map.from_pairs (list.map (fn m -> [regex.named "key" m, regex.named "value" m]) found);
     let body = str.join_str "\n" (list.filter (fn l -> not (str.starts_with "#" l)) lines);
     match data.parse_csv body {
-        [:error, why] => result.error why,
-        [:ok, table] => of_table fields table,
+        Result.error(why) => result.error why,
+        Result.ok(table) => of_table fields table,
     }
 };
 
@@ -224,8 +224,8 @@ when test {
     let unscored = Recording.set_stages () r;
 
     let tests = [
-        test.case "a recording reads back exactly" $( test.eq! [:ok, r] (decode (encode r)) ),
-        test.case "so does an unscored one" $( test.eq! [:ok, unscored] (decode (encode unscored)) ),
+        test.case "a recording reads back exactly" $( test.eq! (Result.ok r) (decode (encode r)) ),
+        test.case "so does an unscored one" $( test.eq! (Result.ok unscored) (decode (encode unscored)) ),
         test.case "it starts with its magic and version" $( test.eq! [83, 76, 80, 1] (str_bytes (str.slice 0 4 (encode r))) ),
         test.case "a truncated file is refused"
             $( test.true! (result.is_error (decode (str.slice 0 (len (encode r) - 7) (encode r)))) ),
@@ -233,13 +233,13 @@ when test {
             $( test.true! (result.is_error (decode (str.slice 0 30 (encode r) + str.of_bytes [255, 255, 255, 255]))) ),
         test.case "another format is refused" $( test.true! (result.is_error (decode "PNG")) ),
         test.case "CSV reads back"
-            $( test.eq! [:ok, [Recording.subject r, Recording.zone r, Recording.stages r, tensor.shape signals]]
+            $( test.eq! (Result.ok [Recording.subject r, Recording.zone r, Recording.stages r, tensor.shape signals])
                         (result.map (fn x -> [Recording.subject x, Recording.zone x, Recording.stages x, tensor.shape (Recording.signals x)]) (of_csv (to_csv r))) ),
         test.case "CSV keeps the readings"
             $( test.true! (tensor.maximum (tensor.abs (Recording.signals (result.or_else unscored (of_csv (to_csv r))) - signals)) < 1.0e-9) ),
         property.check "the encoding round-trips any scoring" (random.list_n 4 (random.int 0 4)) (fn ix -> {
             let x = Recording.set_stages (list.map stage.of_index ix) r;
-            decode (encode x) == [:ok, x]
+            decode (encode x) == (Result.ok x)
         }),
     ];
 }

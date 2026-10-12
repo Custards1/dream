@@ -285,10 +285,10 @@ let check : Description -> a -> a;
 let check description value = type_assert (accepts description value) description value;
 
 /// The non-raising form, for parsers and other result-returning APIs.
-let validate : Description -> a -> ([:ok, a] | [:error, :error]);
+let validate : Description -> a -> Result a :error;
 let validate description value =
-    if accepts description value { [:ok, value] }
-    else { [:error, _error_new :type_error description] };
+    if accepts description value { Result.ok value }
+    else { Result.error (_error_new :type_error description) };
 
 /// Check elements as they are demanded, which is the form that works on an
 /// infinite list. `list_of` cannot: deciding it walks the whole spine.

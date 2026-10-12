@@ -1522,30 +1522,30 @@ let valid_rename old new = {
     let m = str.byte_length body;
     let first = if m == 0 { 0 } else { str.byte 0 body };
     if m == 0 || not ((first >= 97 && first <= 122) || (first >= 65 && first <= 90) || first == 95) {
-        [:error, "`" + new + "` is not a name"]
+        Result.error ("`" + new + "` is not a name")
     }
     else if not (list.all (fn i -> { let b = str.byte i body; is_name_byte b && b != 33 }) (list.range 0 m)) {
-        [:error, "`" + new + "` is not a name"]
+        Result.error ("`" + new + "` is not a name")
     }
     else if bang != str.ends_with "!" old {
-        [:error, if bang { "only an impure name ends with `!`" } else { "an impure name must keep its `!`" }]
+        Result.error (if bang { "only an impure name ends with `!`" } else { "an impure name must keep its `!`" })
     }
-    else { [:ok, new] }
+    else { Result.ok new }
 };
 
 /// What the cursor is on, for a rename: `[:ok, identity, start, end, name]`
 /// or `[:error, why]`.
 let rename_target a line character = match module_of a {
-    () => [:error, "this file is not part of the program"],
+    () => Result.error "this file is not part of the program",
     mi => {
         let src = module_text a mi;
         let here = name_start src (pos.offset_of src line character);
         let name = name_at src here;
         let toks = lexer.tokens src;
-        if name == "" { [:error, "there is no name here"] }
+        if name == "" { Result.error "there is no name here" }
         else {
             match identity a mi toks (binders_in toks (source_items a mi)) here name {
-                () => [:error, "`" + name + "` cannot be renamed here"],
+                () => Result.error ("`" + name + "` cannot be renamed here"),
                 id => [:ok, id, here, here + str.byte_length name, name],
             }
         }
@@ -1556,7 +1556,7 @@ let rename_target a line character = match module_of a {
 let prepare_rename_at a line character = match rename_target a line character {
     [:ok, _, start, end, name] => {
         let src = module_text a (module_of a);
-        [:ok, %{ "range" => pos.range src start end, "placeholder" => name }]
+        Result.ok %{ "range" => pos.range src start end, "placeholder" => name }
     },
     failed => failed,
 };
@@ -1646,7 +1646,7 @@ let local_sites a mi toks binders name id =
 /// LSP's `rename`: a `WorkspaceEdit` replacing every occurrence, or an error.
 let rename_at a line character new = match rename_target a line character {
     [:ok, id, _, _, name] => match valid_rename name new {
-        [:error, why] => [:error, why],
+        Result.error(why) => Result.error why,
         _ => {
             let l = loader a;
             let mi = module_of a;
@@ -1660,14 +1660,14 @@ let rename_at a line character new = match rename_target a line character {
                 [:global, target, _] => global_sites a target name,
             };
             let files = list.unique (list.map (fn s -> list.head s) sites);
-            [:ok, %{ "changes" => list.fold_strict (fn m f -> {
+            Result.ok %{ "changes" => list.fold_strict (fn m f -> {
                 let file = modules.file_at l f;
                 let text = diag.source_text file;
                 m.[path_to_uri (diag.source_path file) =>
                     list.map (fn s -> %{ "range" => pos.range text (list.nth 1 s) (list.nth 1 s + str.byte_length name),
                                          "newText" => new })
                              (list.sort_on (fn s -> list.nth 1 s) (list.filter (fn s -> list.head s == f) sites))]
-            }) %{} files }]
+            }) %{} files }
         },
     },
     failed => failed,
@@ -1887,11 +1887,11 @@ when test {
 
     let tests = [
         test.case "a rename keeps a name a name"
-            $( test.eq! [[:ok, "b"], [:error, "`1b` is not a name"], [:error, "`a-b` is not a name"]]
+            $( test.eq! [Result.ok "b", Result.error "`1b` is not a name", Result.error "`a-b` is not a name"]
                         [valid_rename "a" "b", valid_rename "a" "1b", valid_rename "a" "a-b"] ),
         test.case "a rename keeps purity"
-            $( test.eq! [[:ok, "go!"], [:error, "only an impure name ends with `!`"],
-                         [:error, "an impure name must keep its `!`"]]
+            $( test.eq! [Result.ok "go!", Result.error "only an impure name ends with `!`",
+                         Result.error "an impure name must keep its `!`"]
                         [valid_rename "run!" "go!", valid_rename "run" "go!", valid_rename "run!" "go"] ),
         test.case "a member is the last segment of its chain"
             $( test.eq! [11, (), 0]

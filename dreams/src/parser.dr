@@ -756,12 +756,12 @@ let rec parse_let c sp ts = {
 // `let?` is one step of that staircase:
 //
 //     let? x = step one;          match step one {
-//     let? y = step x;      ==        [:ok, x] => match step x {
-//     [:ok, x + y]                        [:ok, y] => [:ok, x + y],
+//     let? y = step x;      ==        Result.ok(x) => match step x {
+//     Result.ok (x + y)                   Result.ok(y) => Result.ok (x + y),
 //                                         other => other },
 //                                     other => other }
 //
-// Anything that is not `[:ok, _]` is the block's answer as it stands, which is
+// Anything that is not `Result.ok` is the block's answer as it stands, which is
 // what `macros.with_ok` and `result.and_then` already mean by it. A pattern
 // binds as a destructuring `let` does, lazily, out of the payload.
 //
@@ -784,6 +784,15 @@ let let_try_name = "<let?>";
 /// so offsets 1 to 3 are free: 1 binds the payload, 2 binds what is passed on
 /// and reads it back (a binder and a use are kept apart), 3 reads the payload.
 let let_try_at span k = [ast.span_start span + k, ast.span_start span + k + 1];
+
+/// Where the names that do not fit inside the keyword are written: in the
+/// generated offsets the keyword's own offset owns (`ast.generated_base`).
+let let_try_far span k = [ast.generated_base + ast.span_start span * 128 + k,
+                          ast.generated_base + ast.span_start span * 128 + k + 1];
+
+/// `Result.ok`, as written at `at`: the prelude's constructor
+/// (`std.prelude`), which every module can name without an import.
+let result_ok at = ast.field_e (ast.name_e "Result" at) "ok" at;
 
 /// `let? name = e` or `let? pattern = e`, as `[:let_try, binding, e, span,
 /// keyword]`: the `let` it binds with, its value replaced by the payload's
@@ -818,8 +827,8 @@ let rec unfold_let_try stmts end =
                 [:error, m, s] => [:error, m, s],
                 after => {
                     let body = ast.span_to sp end;
-                    let ok_p = ast.list_p [ast.literal_p (ast.atom_e "ok" sp) sp,
-                                           ast.bind_p let_try_name (let_try_at sp 1)] () sp;
+                    let ok_p = ast.record_p (result_ok (let_try_far sp 4))
+                                            [ast.bind_p let_try_name (let_try_at sp 1)] sp;
                     let passed = let_try_at sp 2;
                     [ast.match_e value
                          [ast.arm ok_p () (ast.block_e (list.cons binding after) body) body,
@@ -1782,14 +1791,14 @@ let rec pattern_map_entries c !acc ts sp =
 /// the moment it reaches it, at an expression or pattern position. Walking the
 /// whole stream once for a lookup that the walk beneath already performs was
 /// five percent of a compile.
-let parse_expression : :string -> [:any];
+let parse_expression : :string -> Result ast.Expr [:string, ast.Span];
 let parse_expression src =
     match parse_expr top (lexer.tokens src) {
-        [:error, m, s] => err m s,
+        [:error, m, s] => Result.error [m, s],
         [:ok, e, rest] =>
-            if at_end rest { [:ok, e] }
-            else { err ("unexpected " + describe rest + " after the expression") (peek_span rest) },
-        _ => err "the lexer answered something unexpected" ast.no_span,
+            if at_end rest { Result.ok e }
+            else { Result.error ["unexpected " + describe rest + " after the expression", peek_span rest] },
+        _ => Result.error ["the lexer answered something unexpected", ast.no_span],
     };
 
 // --- module items -----------------------------------------------------------
@@ -2865,8 +2874,8 @@ when test {
     /// An expression's tree, written on one line without spans.
     let shape src =
         match parse_expression src {
-            [:ok, e] => ast.show e,
-            [:error, m, _] => "error: " + m,
+            Result.ok(e) => ast.show e,
+            Result.error([m, _]) => "error: " + m,
         };
 
     /// A whole module's items, one line each.
@@ -2902,8 +2911,8 @@ when test {
     /// The message of a source that must not parse.
     let fails src =
         match parse_expression src {
-            [:ok, e] => "parsed when it should not have",
-            [:error, m, _] => m,
+            Result.ok(e) => "parsed when it should not have",
+            Result.error([m, _]) => m,
         };
 
     let tests = [
@@ -3178,16 +3187,16 @@ when test {
             $( test.eq! "(block (name a) (name b))" (shape "{ a\n  b }") ),
         test.case "semicolons separate statements too"
             $( test.eq! "(block (name a) (name b))" (shape "{ a; b }") ),
-        test.case "`let?` is the match that passes anything but `[:ok, _]` on"
-            $( test.eq! "(block (match (name f) [[(atom ok) <let?>] (block (let x (name <let?>)) (apply (name g) (name x)))] [<let?> (name <let?>)]))"
+        test.case "`let?` is the match that passes anything but `Result.ok` on"
+            $( test.eq! "(block (match (name f) [(field (name Result) ok)(<let?>) (block (let x (name <let?>)) (apply (name g) (name x)))] [<let?> (name <let?>)]))"
                         (shape "{ let? x = f; g x }") ),
         test.case "the statements after a `let?` are what it guards, the ones before are not"
-            $( test.eq! ("(block (name a) (match (name f) [[(atom ok) <let?>] (block (let x (name <let?>))"
-                         + " (match (apply (name g) (name x)) [[(atom ok) <let?>] (block (let y (name <let?>))"
+            $( test.eq! ("(block (name a) (match (name f) [(field (name Result) ok)(<let?>) (block (let x (name <let?>))"
+                         + " (match (apply (name g) (name x)) [(field (name Result) ok)(<let?>) (block (let y (name <let?>))"
                          + " (apply (name h) (name x) (name y)))] [<let?> (name <let?>)]))] [<let?> (name <let?>)]))")
                         (shape "{ a\n  let? x = f\n  let? y = g x\n  h x y }") ),
         test.case "a `let?` pattern destructures the payload as a `let` does"
-            $( test.eq! "(block (match (name f) [[(atom ok) <let?>] (block (let [a b] (name <let?>)) (binary add (name a) (name b)))] [<let?> (name <let?>)]))"
+            $( test.eq! "(block (match (name f) [(field (name Result) ok)(<let?>) (block (let [a b] (name <let?>)) (binary add (name a) (name b)))] [<let?> (name <let?>)]))"
                         (shape "{ let? [a, b] = f; a + b }") ),
         test.case "a `let?` with nothing after it has nothing to guard"
             $( test.eq! "`let?` must be followed by the statements it guards" (fails "{ let? x = f }") ),

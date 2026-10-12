@@ -118,7 +118,7 @@ let join ts = {
 /// Where a program must run to satisfy both: the intersection, with "any" the
 /// identity. `[:error, side]` when a side comes out empty -- a program that
 /// can run nowhere -- naming which side it was.
-let meet : Target -> Target -> [:ok, Target] | [:error, :string];
+let meet : Target -> Target -> Result Target :string;
 let meet a b = {
     let side x y = match [x, y] {
         [[], _] => y,
@@ -130,13 +130,13 @@ let meet a b = {
     let wanted x y = not (list.is_empty x && list.is_empty y);
     if list.is_empty os && wanted (Target.os a) (Target.os b)
        && not (list.is_empty (Target.os a) || list.is_empty (Target.os b)) {
-        [:error, "os"]
+        Result.error "os"
     }
     else if list.is_empty arch && wanted (Target.arch a) (Target.arch b)
             && not (list.is_empty (Target.arch a) || list.is_empty (Target.arch b)) {
-        [:error, "arch"]
+        Result.error "arch"
     }
-    else { [:ok, make os arch] }
+    else { Result.ok (make os arch) }
 };
 
 /// `linux, macos (x86_64)`, or `any platform`, for a message.
@@ -160,52 +160,52 @@ let describe t = {
 /// `any` answers `()` rather than a target, because it means something a
 /// target cannot: not "any platform" as a constraint to meet with the
 /// program's, but "record nothing, whatever the program carries".
-let parse : :string -> [:ok, Target | :unit] | [:error, :string];
+let parse : :string -> Result (Target | :unit) :string;
 let parse spec =
-    if spec == "any" { [:ok, ()] }
+    if spec == "any" { Result.ok () }
     else {
         let item acc part = match acc {
-            [:error, why] => [:error, why],
+            Result.error(why) => Result.error why,
             [:ok, os, arch] => {
                 let at = str.find "=" part;
                 let key = if at < 0 { "" } else { str.slice 0 at part };
                 let value = if at < 0 { part } else { str.slice (at + 1) (str.byte_length part - at - 1) part };
                 match [key, os_named value, arch_named value] {
-                    ["os", (), _] => [:error, "`" + value + "` is not an operating system; "
-                                              + "say linux, macos, windows or android"],
-                    ["arch", _, ()] => [:error, "`" + value + "` is not an architecture; "
-                                                + "say x86_64 or aarch64"],
+                    ["os", (), _] => Result.error ("`" + value + "` is not an operating system; "
+                                              + "say linux, macos, windows or android"),
+                    ["arch", _, ()] => Result.error ("`" + value + "` is not an architecture; "
+                                                + "say x86_64 or aarch64"),
                     ["os", o, _] => [:ok, list.append os [o], arch],
                     ["arch", _, a] => [:ok, os, list.append arch [a]],
-                    ["", (), ()] => [:error, "`" + value + "` is neither a system nor an architecture"],
+                    ["", (), ()] => Result.error ("`" + value + "` is neither a system nor an architecture"),
                     ["", (), a] => [:ok, os, list.append arch [a]],
                     ["", o, _] => [:ok, list.append os [o], arch],
-                    _ => [:error, "a target is os=NAME or arch=NAME, not `" + key + "=`"],
+                    _ => Result.error ("a target is os=NAME or arch=NAME, not `" + key + "=`"),
                 }
             },
         };
         match list.fold item [:ok, [], []] (list.filter (fn p -> not (str.is_empty p))
                                                         (str.split "," spec)) {
-            [:error, why] => [:error, "--target " + spec + ": " + why],
-            [:ok, os, arch] => [:ok, make os arch],
+            Result.error(why) => Result.error ("--target " + spec + ": " + why),
+            [:ok, os, arch] => Result.ok (make os arch),
         }
     };
 
 /// Every `--target` given, as one: `[:ok, ()]` for none or for `any`, which
 /// leave the target to the program; otherwise the union of what they said.
 /// `any` beside another target is a contradiction and is reported as one.
-let parse_all : [:string] -> [:ok, Target | :unit | :any] | [:error, :string];
+let parse_all : [:string] -> Result (Target | :unit | :any) :string;
 let parse_all specs = {
     let parsed = list.map parse specs;
-    match list.filter (fn r -> list.head r == :error) parsed {
-        [[:error, why], ..rest] => [:error, why],
+    match list.filter (fn r -> match r { Result.error(_) => true, _ => false }) parsed {
+        [Result.error(why), ..rest] => Result.error why,
         _ => {
-            let said = list.map (fn r -> list.nth 1 r) parsed;
+            let said : [:any] = list.map (fn r -> match r { Result.ok(v) => v, _ => () }) parsed;
             match [list.contains () said, list.compact said] {
-                [false, []] => [:ok, ()],
-                [true, []] => [:ok, :any],
-                [true, _] => [:error, "--target any cannot be given beside another target"],
-                [false, ts] => [:ok, join ts],
+                [false, []] => Result.ok (),
+                [true, []] => Result.ok :any,
+                [true, _] => Result.error "--target any cannot be given beside another target",
+                [false, ts] => Result.ok (join ts),
             }
         },
     }
@@ -334,22 +334,22 @@ let of_payloads heads =
 /// `--target any`, or a target, which wins -- a cross-build carries libraries
 /// for the machine it is built *for*, and it is the person building who knows
 /// which that is.
-let decide : Target | :unit | :any -> Target | :unit -> Target -> [:ok, Target] | [:error, :string];
+let decide : Target | :unit | :any -> Target | :unit -> Target -> Result Target :string;
 let decide said carried pinned =
     match said {
-        :any => [:ok, any],
+        :any => Result.ok any,
         () => match carried {
-            () => [:ok, pinned],
+            () => Result.ok pinned,
             c => match meet c pinned {
-                [:ok, t] => [:ok, t],
-                [:error, side] =>
-                    [:error, "this program can run nowhere: its payloads are for "
+                Result.ok(t) => Result.ok t,
+                Result.error(side) =>
+                    Result.error ("this program can run nowhere: its payloads are for "
                              + describe c + ", but its `when` conditions chose "
                              + describe pinned + " (by `" + side + "`). "
-                             + "Say where it runs with --target, or --target any"],
+                             + "Say where it runs with --target, or --target any"),
             },
         },
-        t => [:ok, t],
+        t => Result.ok t,
     };
 
 // --- tests ---------------------------------------------------------------------------
@@ -372,14 +372,14 @@ when test {
 
     let tests = [
         test.case "Android has its own stable OS bit and Unix family"
-            $( test.eq! [2048, [:ok, make [:android] [:aarch64]], "unix"]
+            $( test.eq! [2048, Result.ok (make [:android] [:aarch64]), "unix"]
                         [flags (make [:android] []), parse "os=android,arch=arm64", family_of :android] ),
         test.case "Android cross compilation sets the condition environment"
             $( test.eq! ["android", "unix", "aarch64"]
                         { let c = configure (make [:android] [:aarch64]) config.empty;
                           [config.value "os" c, config.value "family" c, config.value "arch" c] } ),
         test.case "Linux and Android are incompatible targets"
-            $( test.eq! [:error, "os"] (meet (make [:linux] []) (make [:android] [])) ),
+            $( test.eq! (Result.error "os") (meet (make [:linux] []) (make [:android] [])) ),
         test.case "no target is the header's zero"
             $( test.eq! 0 (flags any) ),
         test.case "systems are bits 8-15 and architectures 16-23"
@@ -387,22 +387,22 @@ when test {
                         [flags (make [:linux] []), flags (make [:linux, :windows] []),
                          flags (make [:linux] [:x86_64, :aarch64])] ),
         test.case "a target names systems and architectures, bare or keyed"
-            $( test.eq! [[:ok, make [:linux] []], [:ok, make [:macos] [:aarch64]],
-                         [:ok, make [:windows] [:x86_64]], [:ok, ()]]
+            $( test.eq! [Result.ok (make [:linux] []), Result.ok (make [:macos] [:aarch64]),
+                         Result.ok (make [:windows] [:x86_64]), Result.ok ()]
                         [parse "linux", parse "os=darwin,arch=arm64", parse "windows,x64", parse "any"] ),
         test.case "a target that names nothing known is refused"
             $( test.eq! [:error, :error, :error]
-                        [list.head (parse "beos"), list.head (parse "os=x86_64"),
-                         list.head (parse "cpu=arm64")] ),
+                        [Result.tag (parse "beos"), Result.tag (parse "os=x86_64"),
+                         Result.tag (parse "cpu=arm64")] ),
         test.case "several targets are their union; any beside one is a contradiction"
-            $( test.eq! [[:ok, make [:linux, :macos] []], [:ok, ()], [:ok, :any], :error]
+            $( test.eq! [Result.ok (make [:linux, :macos] []), Result.ok (), Result.ok :any, :error]
                         [parse_all ["linux", "macos,arm64"], parse_all [], parse_all ["any"],
-                         list.head (parse_all ["any", "linux"])] ),
+                         Result.tag (parse_all ["any", "linux"])] ),
         test.case "the union of a target that allows any architecture allows any"
             $( test.eq! (make [:linux, :windows] [])
                         (join [make [:linux] [:x86_64], make [:windows] []]) ),
         test.case "meeting is intersection, with any as the identity"
-            $( test.eq! [[:ok, make [:linux] [:x86_64]], [:ok, make [:linux] []], [:error, "os"]]
+            $( test.eq! [Result.ok (make [:linux] [:x86_64]), Result.ok (make [:linux] []), Result.error "os"]
                         [meet (make [:linux, :windows] [:x86_64]) (make [:linux] []),
                          meet any (make [:linux] []),
                          meet (make [:windows] []) (make [:linux] [])] ),
@@ -424,10 +424,10 @@ when test {
                         { let c = configure (make [:windows] [:aarch64]) config.empty;
                           [config.value "os" c, config.value "family" c, config.value "arch" c] } ),
         test.case "what was said wins; any records nothing"
-            $( test.eq! [[:ok, make [:macos] []], [:ok, any]]
+            $( test.eq! [Result.ok (make [:macos] []), Result.ok any]
                         [decide (make [:macos] []) (make [:linux] []) (make [:linux] []),
                          decide :any (make [:linux] []) any] ),
         test.case "a program whose payloads and conditions disagree runs nowhere"
-            $( test.eq! :error (list.head (decide () (make [:windows] []) (make [:linux] []))) ),
+            $( test.eq! :error (Result.tag (decide () (make [:windows] []) (make [:linux] []))) ),
     ];
 }

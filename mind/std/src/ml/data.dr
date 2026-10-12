@@ -182,14 +182,14 @@ let read_csv! : :string -> [[:float]];
 let read_csv! path = match file.read! path {
     () => raise! ("cannot read " + path),
     text => match parse_csv text {
-        [:ok, table] => table,
-        [:error, why] => raise! (path + ": " + why),
+        Result.ok(table) => table,
+        Result.error(why) => raise! (path + ": " + why),
     },
 };
 
-/// The rows of CSV text, as `read_csv!` reads a file: `[:ok, rows]`, or
-/// `[:error, why]` naming the first line with a field that is not a number.
-let parse_csv : :string -> [:ok, [[:any]]] | [:error, :string];
+/// The rows of CSV text, as `read_csv!` reads a file: `Result.ok rows`, or
+/// `Result.error why` naming the first line with a field that is not a number.
+let parse_csv : :string -> Result [[:any]] :string;
 let parse_csv text = {
     let lines = list.filter (fn [_, l] -> not (str.is_empty l))
         (list.enumerate (list.map str.trim (str.lines text)));
@@ -199,8 +199,8 @@ let parse_csv text = {
     };
     let parsed = list.map (fn [i, l] -> [i, list.map field (str.split "," l)]) body;
     match list.filter (fn [_, r] -> list.contains () r) parsed {
-        [] => [:ok, list.map (fn [_, r] -> r) parsed],
-        [[i, _], .._] => [:error, "line " + to_string (i + 1) + " has a field that is not a number"],
+        [] => Result.ok (list.map (fn [_, r] -> r) parsed),
+        [[i, _], .._] => Result.error ("line " + to_string (i + 1) + " has a field that is not a number"),
     }
 };
 
@@ -300,8 +300,8 @@ when test {
         test.case "unscale undoes scale"
             $( test.true! ({ let sc = fit_minmax (x ds); tensor.maximum (tensor.abs (unscale sc (scale sc (x ds)) - x ds)) < 1.0e-9 }) ),
         test.case "minmax reaches 0 and 1" $( test.eq! [0.0, 1.0] ({ let s = scale (fit_minmax (x ds)) (x ds); [tensor.minimum s, tensor.maximum s] }) ),
-        test.case "csv with a header" $( test.eq! [[1.0, 2.0], [3.5, -4.0]] (parse_csv "a,b\n1,2\n\n3.5, -4\n").[1] ),
-        test.case "a bad field names its line" $( test.eq! [:error, "line 3 has a field that is not a number"] (parse_csv "a,b\n1,2\n3,x\n") ),
+        test.case "csv with a header" $( test.eq! (Result.ok [[1.0, 2.0], [3.5, -4.0]]) (parse_csv "a,b\n1,2\n\n3.5, -4\n") ),
+        test.case "a bad field names its line" $( test.eq! (Result.error "line 3 has a field that is not a number") (parse_csv "a,b\n1,2\n3,x\n") ),
         test.case "csv rows to a dataset"
             $( test.eq! [[2, 1], [2]] ({ let d = of_rows [[1.0, 9.0], [2.0, 8.0]] 0; [tensor.shape (x d), tensor.shape (y d)] }) ),
         test.case "spirals" $( test.eq! [[300, 2], 3] ({ let d = spirals 1 100 3; [tensor.shape (x d), class_count d] }) ),

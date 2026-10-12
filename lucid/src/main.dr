@@ -204,8 +204,8 @@ let answer! out id result = rpc.write_message! out (rpc.response id result);
 /// `[:ok, result]` answered, `[:error, why]` refused: an LSP request failure,
 /// whose message an editor shows.
 let refusable! out id outcome = match outcome {
-    [:ok, result] => answer! out id result,
-    [:error, why] => rpc.write_message! out (rpc.error_response id (0 - 32803) why),
+    Result.ok(result) => answer! out id result,
+    Result.error(why) => rpc.write_message! out (rpc.error_response id (0 - 32803) why),
 };
 
 /// One request or notification. Answers `[:go, state]` or `[:exit, code]`.
@@ -316,7 +316,7 @@ let handle! out s m = {
         "textDocument/formatting" => {
             let text = ((docs s)).[path else ""];
             let edits = match fmt.format text {
-                [:ok, out] => if out == text { [] }
+                Result.ok(out) => if out == text { [] }
                               else { [%{ "range" => pos.range text 0 (str.byte_length text), "newText" => out }] },
                 _ => [],
             };
@@ -362,7 +362,7 @@ let rec events! out !s = match recv! () {
         events! out s.[:pending => (map.remove id pending)]
     },
     [:down, process, outcome] => {
-        let why = match outcome { [:error, e] => error.describe e, other => to_string other };
+        let why = match outcome { Result.error(e) => error.describe e, other => to_string other };
         rpc.write_message! out (rpc.notification "window/logMessage"
             %{ "type" => 1, "message" => "Lucid background worker stopped: " + why })
         list.map (fn id -> rpc.write_message! out
@@ -428,11 +428,11 @@ let stdlib_roots! () =
 
 let main! =
     match cli.parse opts (os.args! ()) {
-        [:error, why] => {
+        Result.error(why) => {
             console.error! ("lucid: " + to_string why)
             os.exit! 2
         },
-        [:ok, c] =>
+        Result.ok(c) =>
             if cli.flag_set c "help" { console.error! usage }
             else if cli.flag_set c "version" { console.print! ("lucid " + version) }
             else {

@@ -88,9 +88,9 @@ priv let uint s at width = list.fold (fn acc k -> acc * 256 + str.byte (at + k) 
 /// The next frame: `[kind, flags, id, payload, reader]`, or `()` at the end
 /// of the stream. A frame longer than `max` raises `:protocol`.
 let read_frame! : :any -> :integer -> :any;
-let read_frame! r max = match try! { let got = rd.read_exact! r 9; strict! got; [:ok, got] } catch e { [:error, e] } {
-    [:error, _] => (),
-    [:ok, [head, r2]] => {
+let read_frame! r max = match try! { let got = rd.read_exact! r 9; strict! got; Result.ok got } catch e { Result.error e } {
+    Result.error(_) => (),
+    Result.ok([head, r2]) => {
         let n = uint head 0 3;
         if n > max { raise! (error.new :protocol ("a frame of " + to_string n + " bytes")) }
         let [payload, r3] = rd.read_exact! r2 n;
@@ -120,10 +120,10 @@ priv let unpadded kind flags payload = {
 
 /// Read HTTP/2 frames and forward them to the coordinating process.
 priv let read_loop! : :any -> :process -> :unit;
-priv let rec read_loop! r coordinator = match try! { let f = read_frame! r 16777215; strict! f; [:ok, f] } catch e { [:error, e] } {
-    [:ok, ()] => { send! coordinator [:h2_closed, "the connection ended"]; () },
-    [:error, e] => { send! coordinator [:h2_closed, error.describe e]; () },
-    [:ok, [kind, flags, id, payload, r2]] => {
+priv let rec read_loop! r coordinator = match try! { let f = read_frame! r 16777215; strict! f; Result.ok f } catch e { Result.error e } {
+    Result.ok(()) => { send! coordinator [:h2_closed, "the connection ended"]; () },
+    Result.error(e) => { send! coordinator [:h2_closed, error.describe e]; () },
+    Result.ok([kind, flags, id, payload, r2]) => {
         send! coordinator [:h2_frame, kind, flags, id, payload]
         read_loop! r2 coordinator
     },
@@ -240,10 +240,10 @@ priv let rec coordinate! c =
         receive! {
             [:h2_frame, kind, flags, id, payload] => {
                 match Conn.progress c { () => (), p => p () }
-                match try! { let next = on_frame! c kind flags id payload; strict! next; [:ok, next] } catch e { [:error, e] } {
-                    [:ok, ()] => (),
-                    [:ok, next] => coordinate! next,
-                    [:error, e] => {
+                match try! { let next = on_frame! c kind flags id payload; strict! next; Result.ok next } catch e { Result.error e } {
+                    Result.ok(()) => (),
+                    Result.ok(next) => coordinate! next,
+                    Result.error(e) => {
                         // A connection error: say why, and stop.
                         write! c (frame goaway_frame 0 0 (be 4 0 + be 4 1 + error.describe e))
                         fail_all! c (error.describe e)
@@ -390,8 +390,8 @@ priv let headers_done! : :map -> :integer -> :bool -> :map;
 priv let headers_done! c id end_stream = {
     let s = stream_of c id;
     match hpack.decode (Conn.decoder c) (Stream.block s) {
-        [:error, why] => raise! (error.new :compression why),
-        [:ok, [headers, d2]] => {
+        Result.error(why) => raise! (error.new :compression why),
+        Result.ok([headers, d2]) => {
             let c2 = Conn.set_decoder d2 c;
             match Conn.role c {
                 :server => {

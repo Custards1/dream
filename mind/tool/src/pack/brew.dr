@@ -111,12 +111,12 @@ let formula sp lay assets = {
 };
 
 /// Write the formula into `dest`, answering its path.
-let make! : Spec -> Layout -> :string -> [:ok, :string] | [:error, :string];
+let make! : Spec -> Layout -> :string -> Result :string :string;
 let make! sp lay dest = {
     let? assets = release.find! sp "brew" dest;
     let path = dest + "/" + Spec.name sp + ".rb";
     file.write! path (formula sp lay assets)
-    [:ok, path]
+    Result.ok path
 };
 
 when test {

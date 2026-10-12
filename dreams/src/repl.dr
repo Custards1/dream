@@ -124,20 +124,20 @@ let declarative text =
 let parsed text =
     if declarative text {
         match parser.parse_module text {
-            [:ok, _, _] => [:ok],
-            [:error, m, _] => [:error, m],
+            [:ok, _, _] => Result.ok (),
+            [:error, m, _] => Result.error m,
         }
     } else {
         match parser.parse_expression text {
-            [:ok, _] => [:ok],
-            [:error, m, _] => [:error, m],
+            Result.ok(_) => Result.ok (),
+            Result.error([m, _]) => Result.error m,
         }
     };
 
 let complete text =
     match parsed text {
-        [:ok] => true,
-        [:error, m] => not (unfinished m),
+        Result.ok(_) => true,
+        Result.error(m) => not (unfinished m),
     };
 
 /// Read until the entry is something the parser can finish reading. An empty
@@ -235,11 +235,11 @@ let define! s text roots cfg source image = {
                 else { with_def text s };
     match session_mod.compile! roots cfg source image (program grown quiet_main)
                                (base_text grown) (engine s) (base s) {
-        [[:error, why], _, _] => {
+        [Result.error(why), _, _] => {
             console.error! why
             s
         },
-        [[:ok, _], en, nb] => with_engine en nb grown,
+        [Result.ok(_), en, nb] => with_engine en nb grown,
     }
 };
 
@@ -251,11 +251,11 @@ let define! s text roots cfg source image = {
 let evaluate! s text roots cfg source image =
     match session_mod.compile! roots cfg source image (program s (echo text))
                                (base_text s) (engine s) (base s) {
-        [[:error, why], _, _] => {
+        [Result.error(why), _, _] => {
             console.error! why
             s
         },
-        [[:ok, img], en, nb] => {
+        [Result.ok(img), en, nb] => {
             run! img
             with_engine en nb s
         },

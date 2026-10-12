@@ -251,9 +251,9 @@ priv let compile_driver! setting dir group = {
     if Setting.verbose setting { console.error! (str.join_str " " (list.cons program args)) }
     let r = os.exec_with! (os.cwd! ()) (progress.child_env! ()) program args 0;
     match r.[:code] {
-        0 => { io.rename! scratch (path.join dir "script.dream"); [:ok, ()] },
-        _ => [:error, "the build scripts of " + str.join_str ", " (list.map (fn s -> "`" + Scripted.key s + "`") group)
-                      + " do not compile:\n" + str.trim (r.[:err] + r.[:out])],
+        0 => { io.rename! scratch (path.join dir "script.dream"); Result.ok () },
+        _ => Result.error ("the build scripts of " + str.join_str ", " (list.map (fn s -> "`" + Scripted.key s + "`") group)
+                      + " do not compile:\n" + str.trim (r.[:err] + r.[:out])),
     }
 };
 
@@ -262,7 +262,7 @@ priv let compile_driver! setting dir group = {
 priv let read_record! : :string -> :map;
 priv let read_record! f = match file.read! f {
     () => %{},
-    text => match wire.decode text { [:ok, r] => r, _ => %{} },
+    text => match wire.decode text { Result.ok(r) => r, _ => %{} },
 };
 
 /// Whether a package's last answer is still good: the same context, and
@@ -295,7 +295,7 @@ priv let run_group! job = {
     let stale = list.filter (fn [_, _, digest, _, record] ->
         asking setting || not (io.exists! image && fresh! record digest)) each;
     match stale {
-        [] => [:ok, list.map (fn [s, _, _, _, record] -> [Scripted.key s, record.[:outcome]]) each],
+        [] => Result.ok (list.map (fn [s, _, _, _, record] -> [Scripted.key s, record.[:outcome]]) each),
         _ => {
             file.mkdir_all! dir
             let driver = read_record! (path.join dir "record");
@@ -307,12 +307,12 @@ priv let run_group! job = {
                 sources => not (unmoved! sources),
             }) stale;
             let compiled = match [driver.[:scripts else ()] == listed && io.exists! image, moved] {
-                [true, []] => [:ok, ()],
+                [true, []] => Result.ok (),
                 _ => compile_driver! setting dir group,
             };
             match compiled {
-                [:error, why] => [:error, why],
-                [:ok, _] => {
+                Result.error(why) => Result.error why,
+                Result.ok(_) => {
                     replace! (path.join dir "record") (wire.encode (%{ :scripts => listed }))
                     let contexts = list.fold (fn m [s, ctx, _, _, _] -> m.[Scripted.key s => ctx]) (%{}) stale;
                     // This run's own: another run of the same group may be
@@ -329,9 +329,9 @@ priv let run_group! job = {
                     file.remove_all! ctx_file
                     file.remove_all! out_file
                     match [r.[:timed_out], r.[:code]] {
-                        [true, _] => [:error, "the build scripts ran for longer than " + to_string (deadline_ms / 60000) + " minutes"],
+                        [true, _] => Result.error ("the build scripts ran for longer than " + to_string (deadline_ms / 60000) + " minutes"),
                         [_, 0] => match wire.decode (match answer { () => "", t => t }) {
-                            [:ok, outcomes] if list.all (fn [_, o] -> types.accepts Outcome.type o) (map.pairs outcomes) => {
+                            Result.ok(outcomes) if list.all (fn [_, o] -> types.accepts Outcome.type o) (map.pairs outcomes) => {
                                 strict! (list.map (fn [s, _, digest, record_file, record] -> {
                                     let sources = match list.any (fn [m, .._] -> Scripted.key m == Scripted.key s) moved {
                                         true => script_sources! setting s,
@@ -344,12 +344,12 @@ priv let run_group! job = {
                                                                                 :reads => Outcome.reads o, :outcome => o }))
                                     }
                                 }) stale)
-                                [:ok, list.map (fn [s, _, _, _, record] -> [Scripted.key s, outcomes.[Scripted.key s else record.[:outcome]]])
-                                               each]
+                                Result.ok (list.map (fn [s, _, _, _, record] -> [Scripted.key s, outcomes.[Scripted.key s else record.[:outcome]]])
+                                               each)
                             },
-                            _ => [:error, "the build scripts wrote outcomes that do not read"],
+                            _ => Result.error "the build scripts wrote outcomes that do not read",
                         },
-                        _ => [:error, str.trim (r.[:err] + r.[:out])],
+                        _ => Result.error (str.trim (r.[:err] + r.[:out])),
                     }
                 },
             }
@@ -366,15 +366,15 @@ let run_all! setting scripted = {
     let results = proc.try_map! run_group! (list.map (fn g -> [setting, g]) (groups scripted));
     strict! results
     let found = list.fold (fn acc r -> match [acc, r] {
-        [[:error, _], _] => acc,
-        [[:ok, done], [:ok, [:ok, more]]] => [:ok, list.append done more],
-        [_, [:ok, [:error, why]]] => [:error, why],
-        [_, [:error, e]] => [:error, "the build scripts failed: " + to_string e],
-    }) [:ok, []] results;
+        [Result.error(_), _] => acc,
+        [Result.ok(done), Result.ok(Result.ok(more))] => Result.ok (list.append done more),
+        [_, Result.ok(Result.error(why))] => Result.error why,
+        [_, Result.error(e)] => Result.error ("the build scripts failed: " + to_string e),
+    }) (Result.ok []) results;
     match found {
-        [:ok, pairs] => {
+        Result.ok(pairs) => {
             let by = map.from_pairs pairs;
-            [:ok, list.map (fn s -> [Scripted.key s, by.[Scripted.key s]]) scripted]
+            Result.ok (list.map (fn s -> [Scripted.key s, by.[Scripted.key s]]) scripted)
         },
         failed => failed,
     }
@@ -401,10 +401,10 @@ let compile_args outcomes = {
                                  outcomes;
     let clash = list.filter (fn [n, _, k] -> list.any (fn [n2, _, k2] -> n2 == n && k2 != k) payloads) payloads;
     match clash {
-        [[n, _, k], .._] => [:error, "two build scripts embed a payload called `" + n + "`, `" + k + "`'s and another's"],
+        [[n, _, k], .._] => Result.error ("two build scripts embed a payload called `" + n + "`, `" + k + "`'s and another's"),
         [] => {
             let targets = list.filter_map (fn [_, o] -> Outcome.target o) outcomes;
-            [:ok, list.concat [
+            Result.ok (list.concat [
                 list.flat_map (fn [n, p, _] -> ["--payload", n + "=" + p]) payloads,
                 list.flat_map (fn [key, o] -> match Outcome.modules o {
                     () => [],
@@ -420,7 +420,7 @@ let compile_args outcomes = {
                     [first, ..rest] => list.flat_map (fn t -> ["--target", target_arg t])
                                                      (list.fold (fn acc ts -> list.filter (fn t -> list.contains t ts) acc) first rest),
                 },
-            ]]
+            ])
         },
     }
 };
@@ -433,15 +433,15 @@ when test {
             $( test.eq! ["/s/std/list.dr", "/p/build.dr"]
                         (sources_of "std.list  /s/std/list.dr\nstd.build.Step  std.build.Step\nbuild   /p/build.dr\n") ),
         test.case "outcomes become compiler arguments"
-            $( test.eq! [:ok, ["--payload", "lib=/c/lib.so", "-L", "sq+=/c/mods", "-D", "sq:fast",
-                               "--host-module", "host.gpu"]]
+            $( test.eq! (Result.ok ["--payload", "lib=/c/lib.so", "-L", "sq+=/c/mods", "-D", "sq:fast",
+                               "--host-module", "host.gpu"])
                         (compile_args [["sq", %{ :payloads => %{ "lib" => "/c/lib.so" }, :modules => "/c/mods",
                                                  :defines => %{ "fast" => true }, :hosts => ["host.gpu"] }],
                                        ["other", %{ :defines => %{}, :payloads => %{} }]]) ),
         test.case "a define with a value is scoped with it"
-            $( test.eq! [:ok, ["-D", "sq:n=3"]] (compile_args [["sq", %{ :defines => %{ "n" => 3 } }]]) ),
+            $( test.eq! (Result.ok ["-D", "sq:n=3"]) (compile_args [["sq", %{ :defines => %{ "n" => 3 } }]]) ),
         test.case "two packages cannot embed one name"
-            $( test.eq! :error (list.head (compile_args [["a", %{ :payloads => %{ "x" => "/1" } }],
+            $( test.eq! :error (Result.tag (compile_args [["a", %{ :payloads => %{ "x" => "/1" } }],
                                                          ["b", %{ :payloads => %{ "x" => "/2" } }]])) ),
         test.case "a target as the compiler takes it"
             $( test.eq! "os=linux,arch=x86_64" (target_arg (Target.make :linux :x86_64)) ),

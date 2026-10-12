@@ -148,7 +148,7 @@ adopts numbered SQL from elsewhere as a fragment.
 
 | `std.sql.pg.db` | Answers |
 |---|---|
-| `query! conn q` | a `Result`: `rows`, `tuples`, `columns`, `command`, `count`, `status`, `notices`, `notifications` |
+| `query! conn q` | a `Reply`: `rows`, `tuples`, `columns`, `command`, `count`, `status`, `notices`, `notifications` |
 | `rows! conn q` | the rows, as maps |
 | `one! conn q` | the one row; `:no_rows` or `:too_many_rows` otherwise |
 | `first! conn q` | the first row, or `()` |
@@ -156,7 +156,7 @@ adopts numbered SQL from elsewhere as a fragment.
 | `column! conn q` | the first column of every row |
 | `exec! conn q` | the number of rows affected |
 | `query_as! T conn q` | the rows, each checked against the type `T` |
-| `script! conn text` | a `Result` per statement |
+| `script! conn text` | a `Reply` per statement |
 | `fold! conn q n f init`, `each! conn q n f!` | the rows `n` at a time through a portal, in constant memory |
 | `prepare!`, `execute!`, `deallocate!` | named prepared statements |
 | `copy_in! conn table columns rows`, `copy_out! conn "COPY .. TO STDOUT"` | COPY, in text format |

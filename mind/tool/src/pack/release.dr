@@ -33,9 +33,9 @@ let url_template : Spec -> :string -> :string;
 let url_template sp format = spec.text sp format "url" "";
 
 /// Every tarball of this release in `dir`.
-let find! : Spec -> :string -> :string -> [:ok, [:any]] | [:error, :string];
+let find! : Spec -> :string -> :string -> Result [:any] :string;
 let find! sp format dir = match url_template sp format {
-    "" => [:error, format + ": set url in [ship] to where the tarballs will be published, with {file} for each one's name"],
+    "" => Result.error (format + ": set url in [ship] to where the tarballs will be published, with {file} for each one's name"),
     template => {
         let wanted = match Spec.arch sp {
             :all => [["any", "any"]],
@@ -49,9 +49,9 @@ let find! sp format dir = match url_template sp format {
         }) found;
         strict! assets
         match assets {
-            [] => [:error, format + ": no tarballs of " + Spec.name sp + " " + Spec.version sp + " in " + dir
-                           + "; run `mind pack tarball` on each machine it is for, and gather them there"],
-            _ => [:ok, assets],
+            [] => Result.error (format + ": no tarballs of " + Spec.name sp + " " + Spec.version sp + " in " + dir
+                           + "; run `mind pack tarball` on each machine it is for, and gather them there"),
+            _ => Result.ok assets,
         }
     },
 };

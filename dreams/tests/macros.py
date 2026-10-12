@@ -235,7 +235,7 @@ let main! = {
 
     failure('macro id x = x; let main! = expand id;', 'expects 1 syntax arguments')
     failure('let id x = x; let main! = expand id 1;', 'declared macro')
-    failure('macro bad x = [:error, \"expected a literal list\"]; let main! = expand bad 1;',
+    failure('macro bad x = Result.error \"expected a literal list\"; let main! = expand bad 1;',
             'expected a literal list')
     failure('macro bad x = 42; let main! = expand bad 1;', 'valid expression syntax tree')
     failure('macro bad x = [:binary, :bogus, x, x, [0, 0]]; let main! = expand bad 1;',

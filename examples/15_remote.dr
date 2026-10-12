@@ -20,7 +20,7 @@ mod store {
         [:get, k]    => reply (map.get :missing k state) state,
         [:put, k, v] => reply :ok (map.put k v state),
         :keys        => reply (map.sorted_keys state) state,
-        _            => reply [:error, :unknown] state,
+        _            => reply (Result.error :unknown) state,
     };
 
     let handle_cast! message state = match message {

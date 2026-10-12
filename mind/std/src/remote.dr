@@ -167,13 +167,13 @@ let stop_serving! listener = io.close! listener;
 priv let reply_bytes! : (:unit -> :any) -> :any -> :string;
 priv let reply_bytes! find! request = try! {
     match find! () {
-        () => strict! (wire.frame [:error, "nothing is serving this listener now"]),
+        () => strict! (wire.frame (Result.error "nothing is serving this listener now")),
         pid => {
             let value = server.call! pid request;
-            strict! (wire.frame [:ok, value])
+            strict! (wire.frame (Result.ok value))
         },
     }
-} catch e { wire.frame [:error, error.describe e] };
+} catch e { wire.frame (Result.error (error.describe e)) };
 
 /// A cast, to whoever is there.
 ///
@@ -190,23 +190,23 @@ priv let cast_to! find! message = match find! () {
 priv let serve_connection! : :any -> (:unit -> :any) -> :any;
 priv let rec serve_connection! sock find! = match next! sock {
     () => io.close! sock,
-    [:error, why] => {
-        send! sock [:error, "cannot read that message: " + to_string why]
+    Result.error(why) => {
+        send! sock (Result.error ("cannot read that message: " + to_string why))
         io.close! sock
     },
-    [:ok, [:call, request]] => {
+    Result.ok([:call, request]) => {
         streams.write_all! sock (reply_bytes! find! request)
         serve_connection! sock find!
     },
-    [:ok, [:cast, message]] => {
+    Result.ok([:cast, message]) => {
         cast_to! find! message
         serve_connection! sock find!
     },
     // Something that framed and decoded but is not a request. The connection
     // survives it: the frame said where the message ended, so the stream is
     // still in step, and saying so is more use than hanging up.
-    [:ok, other] => {
-        send! sock [:error, "not a request: " + to_string other]
+    Result.ok(other) => {
+        send! sock (Result.error ("not a request: " + to_string other))
         serve_connection! sock find!
     },
 };
@@ -223,13 +223,13 @@ priv let accept_loop! : :any -> (:unit -> :any) -> :atom;
 priv let rec accept_loop! listener find! =
     match try! {
         let sock = net.accept! listener;
-        [:ok, sock]
-    } catch e { [:error, e] } {
-        [:ok, sock] => {
+        Result.ok sock
+    } catch e { Result.error e } {
+        Result.ok(sock) => {
             spawn! $( serve_connection! sock find! )
             accept_loop! listener find!
         },
-        [:error, _] => :closed,
+        Result.error(_) => :closed,
     };
 
 /// Serve whatever `find!` answers, on an existing listener, in a process of
@@ -291,10 +291,10 @@ let try_call! conn request = {
     streams.write_all! conn (wire.frame [:call, request])
     match next! conn {
         () => result.error "the connection ended before a reply arrived",
-        [:error, why] => result.error ("cannot read the reply: " + to_string why),
-        [:ok, [:ok, value]] => result.ok value,
-        [:ok, [:error, why]] => result.error why,
-        [:ok, other] => result.error ("not a reply: " + to_string other),
+        Result.error(why) => result.error ("cannot read the reply: " + to_string why),
+        Result.ok(Result.ok(value)) => result.ok value,
+        Result.ok(Result.error(why)) => result.error why,
+        Result.ok(other) => result.error ("not a reply: " + to_string other),
     }
 };
 
@@ -305,8 +305,8 @@ let try_call! conn request = {
 /// remains is the honest one: a local call cannot fail to arrive.
 let call! : :any -> :any -> :any;
 let call! conn request = match try_call! conn request {
-    [:ok, value] => value,
-    [:error, why] => error.raise_as! :remote_error why,
+    Result.ok(value) => value,
+    Result.error(why) => error.raise_as! :remote_error why,
 };
 
 /// Tell, and carry on. Nothing comes back, including a failure to arrive.
@@ -333,7 +333,7 @@ when test {
             [:get, k]    => reply (map.get :missing k state) state,
             [:put, k, v] => reply :ok (map.put k v state),
             :keys        => reply (map.sorted_keys state) state,
-            _            => reply [:error, :unknown] state,
+            _            => reply (Result.error :unknown) state,
         };
 
         let handle_cast! message state = match message {
@@ -434,14 +434,14 @@ when test {
         // must not be spelled the same: this arrives as a perfectly good reply
         // whose value happens to say no.
         test.case "a request the server refuses is still a reply"
-            $( test.eq! [:ok, [:error, :unknown]] (with_store! (fn port -> {
+            $( test.eq! (Result.ok (Result.error :unknown)) (with_store! (fn port -> {
                    let c = here! port;
                    let r = try_call! c :nonsense;
                    close! c
                    r
                })) ),
         test.case "and reaches call! as the value it is"
-            $( test.eq! [:error, :unknown] (with_store! (fn port -> {
+            $( test.eq! (Result.error :unknown) (with_store! (fn port -> {
                    let c = here! port;
                    let r = call! c :nonsense;
                    close! c
@@ -533,7 +533,7 @@ when test {
 
 import std.types;
 type Request body = [:call, body] | [:cast, body];
-type Response value = [:ok, value] | [:error, :string];
+type Response value = Result value :string;
 /// Perform a remote call and validate the returned value against `description`.
 let call_as! : :any -> :any -> :any -> :any;
 let call_as! description connection request = types.check description (call! connection request);

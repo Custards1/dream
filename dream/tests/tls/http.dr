@@ -43,9 +43,9 @@ let suite! : :string -> :never;
 let suite! dir = {
     let s = https! dir;
     let cases = [
-        test.case "ALPN agrees on HTTP/2" $( test.eq! [:ok, "HTTP/2"] (result.map http.body (get! dir s "/" %{})) ),
-        test.case "a client that will not speak it gets HTTP/1.1" $( test.eq! [:ok, "HTTP/1.1"] (result.map http.body (get! dir s "/" %{ :http2 => false })) ),
-        test.case "a large body over HTTP/2" $( test.eq! [:ok, 2000000] (result.map (fn r -> len (http.body r)) (get! dir s "/big" %{})) ),
+        test.case "ALPN agrees on HTTP/2" $( test.eq! (Result.ok "HTTP/2") (result.map http.body (get! dir s "/" %{})) ),
+        test.case "a client that will not speak it gets HTTP/1.1" $( test.eq! (Result.ok "HTTP/1.1") (result.map http.body (get! dir s "/" %{ :http2 => false })) ),
+        test.case "a large body over HTTP/2" $( test.eq! (Result.ok 2000000) (result.map (fn r -> len (http.body r)) (get! dir s "/big" %{})) ),
         test.case "an untrusted server is refused" $( test.eq! :certificate_untrusted
             (error.kind (result.reason () (http.get! ("https://localhost:" + to_string (server.port s) + "/")))) ),
         test.case "many at once through one client" $( {
@@ -53,7 +53,7 @@ let suite! dir = {
             let first = http.call! c (http.request "GET" "/");
             let all = proc.parallel! (list.map (fn i -> $( http.call! c (http.request "POST" "/echo" |> http.with_body (to_string i)) )) (list.range 0 25));
             http.close_client! c
-            test.eq! [[:ok, "HTTP/2"], list.map (fn i -> [:ok, to_string i]) (list.range 0 25)]
+            test.eq! [Result.ok "HTTP/2", list.map (fn i -> Result.ok (to_string i)) (list.range 0 25)]
                      [result.map http.body first, list.map (fn r -> result.map http.body r) all]
         } ),
         test.case "the server stops, and every connection with it" $( {

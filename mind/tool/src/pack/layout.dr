@@ -69,51 +69,51 @@ mapping Source {
 
 /// A permission written as `"755"`, `"0755"`, `"0o755"` or `755`: always octal,
 /// since that is how anyone who writes one thinks of it.
-let parse_mode : :any -> [:ok, :integer] | [:error, :string];
+let parse_mode : :any -> Result :integer :string;
 let parse_mode v = {
     let digits = match spec.text_of v {
         t if str.starts_with "0o" t => str.slice 2 (str.byte_length t - 2) t,
         t => t,
     };
     let rec go cs !acc = match cs {
-        [] => [:ok, acc],
+        [] => Result.ok acc,
         [c, ..rest] if c >= '0' && c <= '7' => go rest (acc * 8 + char.code c - 48),
-        _ => [:error, "mode `" + spec.text_of v + "`: write it in octal, as \"755\""],
+        _ => Result.error ("mode `" + spec.text_of v + "`: write it in octal, as \"755\""),
     };
-    match str.chars digits { [] => [:error, "mode: empty"], cs => go cs 0 }
+    match str.chars digits { [] => Result.error "mode: empty", cs => go cs 0 }
 };
 
-let source_of : [:string, :any] -> [:ok, Source] | [:error, :string];
+let source_of : [:string, :any] -> Result Source :string;
 let source_of [dest, value] = match type_of value {
-    :string => [:ok, Source.new dest value],
+    :string => Result.ok (Source.new dest value),
     :map => match spec.text_of value.["src" else ()] {
-        "" => [:error, "[ship.files] \"" + dest + "\": say where it comes from, as src = \"...\""],
+        "" => Result.error ("[ship.files] \"" + dest + "\": say where it comes from, as src = \"...\""),
         src => {
             let? mode = match value.["mode" else ()] {
-                () => [:ok, ()],
+                () => Result.ok (),
                 m => parse_mode m,
             };
-            [:ok, Source.new dest src
+            Result.ok (Source.new dest src
                   |> Source.set_mode mode
                   |> Source.set_exclude (list.map spec.text_of (spec.as_list value.["exclude" else ()]))
-                  |> Source.set_config (value.["config" else false] == true)]
+                  |> Source.set_config (value.["config" else false] == true))
         },
     },
-    _ => [:error, "[ship.files] \"" + dest + "\": a path, or { src = \"...\" }"],
+    _ => Result.error ("[ship.files] \"" + dest + "\": a path, or { src = \"...\" }"),
 };
 
 /// Where a destination is, from the root: under the prefix unless it begins
 /// with `/`. `..` is refused, since a package that writes outside what it
 /// says it writes is not one anybody should install.
-let dest_path : Spec -> :string -> [:ok, :string] | [:error, :string];
+let dest_path : Spec -> :string -> Result :string :string;
 let dest_path sp dest = {
     // `path.posix`, whatever the system: a destination is a path inside
     // the package, which is installed on a POSIX system.
     let names = path.posix.segments dest;
     let under = if path.posix.is_absolute dest { [] } else { path.posix.segments (spec.prefix_path sp) };
-    if list.contains ".." names { [:error, "\"" + dest + "\": `..` is not allowed in a destination"] }
-    else if list.is_empty names { [:error, "\"" + dest + "\": install it somewhere below the root"] }
-    else { [:ok, str.join_str "/" (under + names)] }
+    if list.contains ".." names { Result.error ("\"" + dest + "\": `..` is not allowed in a destination") }
+    else if list.is_empty names { Result.error ("\"" + dest + "\": install it somewhere below the root") }
+    else { Result.ok (str.join_str "/" (under + names)) }
 };
 
 // --- permissions -----------------------------------------------------------------------
@@ -166,22 +166,22 @@ let mode_of! s path source = match Source.mode s {
 // --- collecting ------------------------------------------------------------------------
 
 /// One file, and when it was last written.
-let file_at! : Source -> :string -> :string -> [:ok, [Item, :integer]] | [:error, :string];
+let file_at! : Source -> :string -> :string -> Result [Item, :integer] :string;
 let file_at! s path source = match io.stat! source {
     [size, modified, :file] => {
         let mode = mode_of! s path source;
-        [:ok, [item.Item.file path mode source size, modified]]
+        Result.ok [item.Item.file path mode source size, modified]
     },
-    _ => [:error, source + " is not a file it can read"],
+    _ => Result.error (source + " is not a file it can read"),
 };
 
 /// Everything one entry installs.
-let expand! : Spec -> Source -> [:ok, [[Item, :integer]]] | [:error, :string];
+let expand! : Spec -> Source -> Result [[Item, :integer]] :string;
 let expand! sp s = {
     let? dest = dest_path sp (Source.dest s);
     let from = path.join (Spec.root sp) (Source.src s);
     match io.stat! from {
-        () => [:error, "[ship.files] \"" + Source.dest s + "\": " + from + " is not there"],
+        () => Result.error ("[ship.files] \"" + Source.dest s + "\": " + from + " is not there"),
         [_, _, :dir] => {
             let patterns = glob.always + Source.exclude s;
             let wanted = list.filter (fn rel -> not (glob.excluded patterns rel)) (io.walk! from);
@@ -189,19 +189,19 @@ let expand! sp s = {
         },
         [_, _, :file] => {
             let? one = file_at! s dest from;
-            [:ok, [one]]
+            Result.ok [one]
         },
-        _ => [:error, "[ship.files] \"" + Source.dest s + "\": " + from + " is neither a file nor a directory"],
+        _ => Result.error ("[ship.files] \"" + Source.dest s + "\": " + from + " is neither a file nor a directory"),
     }
 };
 
 /// The results of a list of steps, run in order: every answer, or the first
 /// failure. The list is forced here, since each step reads the disk.
-let all! : [:any] -> [:ok, [:any]] | [:error, :string];
+let all! : [:any] -> Result [:any] :string;
 let all! results = {
     strict! results
-    match list.filter (fn r -> list.head r == :error) results {
-        [] => [:ok, list.map (fn r -> r.[1]) results],
+    match list.filter (fn r -> match r { Result.error(_) => true, _ => false }) results {
+        [] => Result.ok (list.map (fn r -> match r { Result.ok(v) => v, _ => () }) results),
         [first, ..] => first,
     }
 };
@@ -229,12 +229,12 @@ let epoch! modified = match os.env! "SOURCE_DATE_EPOCH" {
     },
 };
 
-let links_of : Spec -> [:ok, [Item]] | [:error, :string];
+let links_of : Spec -> Result [Item] :string;
 let links_of sp = result.all (list.map (fn [dest, target] -> {
     let? path = dest_path sp dest;
     match spec.text_of target {
-        "" => [:error, "[ship.links] \"" + dest + "\": say what it points to"],
-        t => [:ok, item.Item.link path t],
+        "" => Result.error ("[ship.links] \"" + dest + "\": say what it points to"),
+        t => Result.ok (item.Item.link path t),
     }
 }) (sections sp "ship.links"));
 
@@ -245,7 +245,7 @@ let sections : Spec -> :string -> [[:string, :any]];
 let sections sp name = spec.entries sp name + spec.entries sp (name + "." + platform.os_name (Spec.os sp));
 
 /// Everything the manifest installs, found on disk and checked.
-let collect! : Spec -> [:ok, Layout] | [:error, :string];
+let collect! : Spec -> Result Layout :string;
 let collect! sp = {
     let? sources = result.all (list.map source_of (sections sp "ship.files"));
     let? expanded = all! (list.map (fn s -> expand! sp s) sources);
@@ -255,15 +255,15 @@ let collect! sp = {
     match clashes items {
         [] => {
             let configured = list.flat_map (fn s -> match [Source.config s, dest_path sp (Source.dest s)] {
-                [true, [:ok, d]] => [d],
+                [true, Result.ok(d)] => [d],
                 _ => [],
             }) sources;
             let config = list.filter (fn p -> str.starts_with "etc/" p
                                               || list.any (fn d -> p == d || str.starts_with (d + "/") p) configured)
                                      (list.map item.path (list.filter (fn i -> list.head i == :file) items));
-            [:ok, Layout.make items config (epoch! (list.map (fn f -> f.[1]) found))]
+            Result.ok (Layout.make items config (epoch! (list.map (fn f -> f.[1]) found)))
         },
-        problems => [:error, str.join_str "\n" problems],
+        problems => Result.error (str.join_str "\n" problems),
     }
 };
 
@@ -320,28 +320,28 @@ when test {
     import std.toml;
 
     let sp! () = match toml.parse "[package]\nname = \"demo\"\nversion = \"1.0\"\n[ship]\nsummary = \"x\"\n" {
-        [:ok, doc] => match spec.of_doc "." doc (%{}) (%{}) { [:ok, s] => s, other => raise! other },
+        Result.ok(doc) => match spec.of_doc "." doc (%{}) (%{}) { Result.ok(s) => s, other => raise! other },
         other => raise! other,
     };
 
     let tests = [
         test.case "modes are octal however they are written"
-            $( test.eq! [[:ok, 493], [:ok, 493], [:ok, 493], [:ok, 420], :error]
+            $( test.eq! [Result.ok 493, Result.ok 493, Result.ok 493, Result.ok 420, :error]
                         [parse_mode "755", parse_mode "0o755", parse_mode 755, parse_mode "0644",
-                         list.head (parse_mode "9")] ),
+                         Result.tag (parse_mode "9")] ),
         test.case "an entry is a path or a table"
-            $( test.eq! [[:ok, ["bin/x", "x", (), [], false]], [:ok, ["etc/y", "y", 384, ["*.o"], true]], :error]
+            $( test.eq! [Result.ok ["bin/x", "x", (), [], false], Result.ok ["etc/y", "y", 384, ["*.o"], true], :error]
                         [result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
                                     (source_of ["bin/x", "x"]),
                          result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
                                     (source_of ["etc/y", %{ "src" => "y", "mode" => "600", "exclude" => "*.o", "config" => true }]),
-                         list.head (source_of ["z", %{ "mode" => "600" }])] ),
+                         Result.tag (source_of ["z", %{ "mode" => "600" }])] ),
         test.case "destinations are under the prefix unless absolute"
             $( {
                 let s = sp! ();
-                test.eq! [[:ok, "usr/bin/x"], [:ok, "etc/x.conf"], :error, :error]
-                         [dest_path s "bin/x", dest_path s "/etc/x.conf", list.head (dest_path s "../x"),
-                          list.head (dest_path s "/")]
+                test.eq! [Result.ok "usr/bin/x", Result.ok "etc/x.conf", :error, :error]
+                         [dest_path s "bin/x", dest_path s "/etc/x.conf", Result.tag (dest_path s "../x"),
+                          Result.tag (dest_path s "/")]
             } ),
         test.case "paths relative to the prefix"
             $( {

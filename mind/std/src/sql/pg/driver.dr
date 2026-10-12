@@ -58,23 +58,23 @@ priv let tuples columns rows = list.map
 /// Extract the affected-row count from a PostgreSQL command result.
 priv let changed : :map -> :integer;
 priv let changed result = {
-    let command = db.Result.command result;
+    let command = db.Reply.command result;
     if list.any (fn prefix -> str.starts_with prefix command) ["INSERT ", "UPDATE ", "DELETE ", "MERGE ", "COPY "] {
-        match db.Result.count result { () => 0, n => n }
+        match db.Reply.count result { () => 0, n => n }
     } else { 0 }
 };
 
 /// Convert a PostgreSQL command result to the common SQL outcome shape.
 priv let outcome : :map -> sql.Outcome;
 priv let outcome result = %{
-    :columns => list.map wire.Column.name (db.Result.columns result),
-    :rows => tuples (db.Result.columns result) (db.Result.tuples result),
+    :columns => list.map wire.Column.name (db.Reply.columns result),
+    :rows => tuples (db.Reply.columns result) (db.Reply.tuples result),
     :changes => changed result,
     :last_id => (),
     :metadata => list.map (fn col -> %{ :name => wire.Column.name col, :native_type => wire.Column.oid col,
-        :table => wire.Column.table col, :attribute => wire.Column.attribute col }) (db.Result.columns result),
-    :command => db.Result.command result, :status => db.Result.status result,
-    :notices => db.Result.notices result, :notifications => db.Result.notifications result,
+        :table => wire.Column.table col, :attribute => wire.Column.attribute col }) (db.Reply.columns result),
+    :command => db.Reply.command result, :status => db.Reply.status result,
+    :notices => db.Reply.notices result, :notifications => db.Reply.notifications result,
 };
 
 /// Execute a statement using the PostgreSQL driver.

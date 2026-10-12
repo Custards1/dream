@@ -24,7 +24,7 @@ let analyse! job parsed previous = match previous {
 let latest! : :map -> :integer -> [:map];
 let rec latest! jobs deadline = match proc.recv_until!
     (fn m -> match m { [:check, _] => true, _ => false }) deadline {
-    [:ok, [:check, job]] => latest! (jobs.[job.[:path] => job]) deadline,
+    Result.ok([:check, job]) => latest! (jobs.[job.[:path] => job]) deadline,
     _ => map.values jobs,
 };
 
@@ -44,11 +44,11 @@ let requested a m held = {
                 let at = (h.["position"]).["line"];
                 at >= first && at <= last
             }) hints;
-            [[:ok, shown], hints]
+            [Result.ok shown, hints]
         },
         "textDocument/prepareRename" => [analysis.prepare_rename_at a line character, held],
         "textDocument/rename" => [analysis.rename_at a line character (p.["newName" else ""]), held],
-        _ => [[:ok, ()], held],
+        _ => [Result.ok (), held],
     }
 };
 
@@ -66,7 +66,7 @@ let rec serve! parent parsed previous pending = {
     // Interactive requests already queued beat the next background check.
     let incoming = match proc.recv_until!
         (fn m -> match m { [:request, _, _] => true, _ => false }) 0 {
-        [:ok, m] => m,
+        Result.ok(m) => m,
         _ => match pending { [] => recv! (), [job, .._] => [:check_now, job] },
     };
     match incoming {

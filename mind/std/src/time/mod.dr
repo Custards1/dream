@@ -210,24 +210,25 @@ let sleep! d = if d <= 0 { :ok } else { vm.sleep_until! (vm.now_ns! () + d) };
 let sleep_until! : Instant -> :atom;
 let sleep_until! t = sleep! (until! t);
 
-/// `[:ok, value]` if `value` can be computed within `d`, or `:timeout`.
+/// `Result.ok value` if `value` can be computed within `d`, or
+/// `Result.error :timeout`.
 ///
 /// The value is computed in a process of its own, which is killed at the
 /// deadline: a computation that never finishes costs this caller `d` and
-/// nothing more. A value that raises answers `[:error, e]`.
-let within! : Duration -> a -> ([:ok, a] | [:error, :any] | :timeout);
+/// nothing more. A value that raises answers `Result.error e`.
+let within! : Duration -> a -> Result a :any;
 let within! d value = {
     let worker = spawn! $( strict! value );
     proc.monitor! worker
     match proc.recv_where_within! (fn m -> proc.is_down_of worker m) (to_milliseconds (d + millisecond - 1)) {
-        [:ok, [:down, _, outcome]] => outcome,
+        Result.ok([:down, _, outcome]) => outcome,
         _ => {
             // Wait for the kill to land and take its report: left in the
             // mailbox, a stray `[:down, ..]` would be the next thing an
             // innocent `recv!` in the caller saw.
             proc.kill! worker :timeout
             proc.recv_where! (fn m -> proc.is_down_of worker m)
-            :timeout
+            Result.error :timeout
         },
     }
 };
@@ -677,8 +678,8 @@ let parse : :string -> :string -> result.Of DateTime :string;
 let parse pattern text = {
     let p = expand_pattern pattern;
     match read_fields p 0 text 0 %{} {
-        [:error, why] => result.error why,
-        [:ok, fields] => build fields,
+        Result.error(why) => result.error why,
+        Result.ok(fields) => build fields,
     }
 };
 
@@ -902,7 +903,7 @@ let parse_iso text = {
             let pattern = "%Y-%m-%dT" + clock + frac + "%z";
             let cleaned = date_part + "T" + str.replace "," "." rest;
             match parse pattern cleaned {
-                [:error, why] => if parse_local_ok (date_part + "T" + rest) {
+                Result.error(why) => if parse_local_ok (date_part + "T" + rest) {
                                      result.error ("a time with no offset is not an instant: " + text)
                                  } else { result.error ("not an RFC 3339 date-time: " + text + " (" + why + ")") },
                 ok => ok,
@@ -922,7 +923,7 @@ let parse_local zone text = {
     let s = str.replace " " "T" (str.trim text);
     let patterns = ["%Y-%m-%dT%H:%M:%S.%N", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"];
     match list.filter result.is_ok (list.map (fn p -> parse p s) patterns) {
-        [[:ok, dt], .._] => result.ok (localize zone dt),
+        [Result.ok(dt), .._] => result.ok (localize zone dt),
         _ => result.error ("not a local date-time: " + text),
     }
 };
@@ -1066,11 +1067,11 @@ when test {
                                                      format_duration (milliseconds 250), format_duration 1500,
                                                      format_duration 7, format_duration 0, format_duration (minutes (0 - 5)),
                                                      format_duration (hours 26 + minutes 3 + seconds 4 + milliseconds 5)] ),
-        test.case "parse a duration"           $( test.eq! [[:ok, minutes 90], [:ok, seconds 1.5], [:ok, days 2 + hours 12],
-                                                           [:ok, 0 - minutes 5], [:ok, milliseconds 250]]
+        test.case "parse a duration"           $( test.eq! [Result.ok (minutes 90), Result.ok (seconds 1.5), Result.ok (days 2 + hours 12),
+                                                           Result.ok (0 - minutes 5), Result.ok (milliseconds 250)]
                                                     [parse_duration "1h30m", parse_duration "1.5s", parse_duration "2d 12h",
                                                      parse_duration "-5m", parse_duration "250ms"] ),
-        test.case "a duration round-trips"     $( test.eq! [:ok, hours 26 + seconds 4 + 5] (parse_duration (format_duration (hours 26 + seconds 4 + 5))) ),
+        test.case "a duration round-trips"     $( test.eq! (Result.ok (hours 26 + seconds 4 + 5)) (parse_duration (format_duration (hours 26 + seconds 4 + 5))) ),
         test.case "a bad unit is said"         $( test.true! (result.is_error (parse_duration "5 parsecs")) ),
         test.case "rounding"                   $( test.eq! [minute * 2, minute, 0 - minute] [round_to minute (seconds 90), floor_to minute (seconds 90),
                                                                                           floor_to minute (0 - seconds 1)] ),
@@ -1114,30 +1115,30 @@ when test {
         test.case "strftime"                   $( test.eq! "Sunday 04 October 2026 06:21:07 PM +0000 UTC 512 277 2026-W40"
                                                     (format "%A %d %B %Y %I:%M:%S %p %z %Z %L %j %G-W%V" (to_utc t)) ),
         test.case "composites and escapes"     $( test.eq! "2026-10-04 18:21:07 100%" (format "%F %T 100%%" (to_utc t)) ),
-        test.case "parse a pattern"            $( test.eq! [:ok, "2026-10-04T18:21:00Z"]
+        test.case "parse a pattern"            $( test.eq! (Result.ok "2026-10-04T18:21:00Z")
                                                     (result.map datetime_text (parse "%d/%m/%Y %H:%M" "04/10/2026 18:21")) ),
-        test.case "parse names and 12 hours"   $( test.eq! [:ok, "2026-10-04T18:21:00-06:00"]
+        test.case "parse names and 12 hours"   $( test.eq! (Result.ok "2026-10-04T18:21:00-06:00")
                                                     (result.map datetime_text (parse "%a %b %e %Y %I:%M %p %z" "sun OCT  4 2026 6:21 pm -06:00")) ),
         test.case "parse refuses a bad day"    $( test.true! (result.is_error (parse "%Y-%m-%d" "2025-02-29")) ),
-        test.case "parse says what it wanted"  $( test.eq! [:error, "expected a month at byte 5, found xx-01"] (parse "%Y-%m-%d" "2025-xx-01") ),
-        test.case "format and parse agree"     $( test.eq! [:ok, t] (parse_instant "%Y-%m-%dT%H:%M:%S.%L%z" (format "%Y-%m-%dT%H:%M:%S.%L%z" (to_utc t))) ),
-        test.case "epoch seconds"              $( test.eq! [:ok, 1700000000 * second] (parse_instant "%s" "1700000000") ),
-        test.case "RFC 3339 parses"            $( test.eq! [[:ok, t], [:ok, t - hours 2], [:ok, t - 512 * millisecond]]
+        test.case "parse says what it wanted"  $( test.eq! (Result.error "expected a month at byte 5, found xx-01") (parse "%Y-%m-%d" "2025-xx-01") ),
+        test.case "format and parse agree"     $( test.eq! (Result.ok t) (parse_instant "%Y-%m-%dT%H:%M:%S.%L%z" (format "%Y-%m-%dT%H:%M:%S.%L%z" (to_utc t))) ),
+        test.case "epoch seconds"              $( test.eq! (Result.ok (1700000000 * second)) (parse_instant "%s" "1700000000") ),
+        test.case "RFC 3339 parses"            $( test.eq! [Result.ok t, Result.ok (t - hours 2), Result.ok (t - 512 * millisecond)]
                                                     [parse_rfc3339 "2026-10-04T18:21:07.512Z", parse_rfc3339 "2026-10-04T18:21:07.512+02:00",
                                                      parse_rfc3339 "2026-10-04 18:21:07z"] ),
-        test.case "ISO's other forms"          $( test.eq! [[:ok, to_instant (date 2026 10 4)], [:ok, t - 7512 * millisecond]]
+        test.case "ISO's other forms"          $( test.eq! [Result.ok (to_instant (date 2026 10 4)), Result.ok (t - 7512 * millisecond)]
                                                     [parse_rfc3339 "2026-10-04", parse_rfc3339 "2026-10-04T18:21+0000"] ),
-        test.case "no offset, no instant"      $( test.eq! [:error, "a time with no offset is not an instant: 2026-10-04T18:21:07"]
+        test.case "no offset, no instant"      $( test.eq! (Result.error "a time with no offset is not an instant: 2026-10-04T18:21:07")
                                                     (parse_rfc3339 "2026-10-04T18:21:07") ),
-        test.case "a local time in a zone"     $( test.eq! [:ok, "2026-07-04T09:00:00-06:00"]
+        test.case "a local time in a zone"     $( test.eq! (Result.ok "2026-07-04T09:00:00-06:00")
                                                     (result.map datetime_text (parse_local denver "2026-07-04 09:00")) ),
         test.case "HTTP dates, all three forms"
-            $( test.eq! [[:ok, 784111777 * second], [:ok, 784111777 * second], [:ok, 784111777 * second]]
+            $( test.eq! [Result.ok (784111777 * second), Result.ok (784111777 * second), Result.ok (784111777 * second)]
                         [parse_http_date "Sun, 06 Nov 1994 08:49:37 GMT", parse_http_date "Sunday, 06-Nov-94 08:49:37 GMT",
                          parse_http_date "Sun Nov  6 08:49:37 1994"] ),
 
         // clocks
-        test.case "a zone from a rule"         $( test.eq! [:ok, "CEST"]
+        test.case "a zone from a rule"         $( test.eq! (Result.ok "CEST")
                                                     (result.map (fn z -> DateTime.abbrev (in_zone z t)) (posix_zone "CET-1CEST,M3.5.0,M10.5.0/3")) ),
         test.case "the clock is after 2025"    $( test.true! (now! () > to_instant (date 2025 1 1)) ),
         test.case "measure forces what it times" $( {
@@ -1149,16 +1150,16 @@ when test {
             sleep! (milliseconds 20)
             test.true! (monotonic! () - start >= milliseconds 20)
         } ),
-        test.case "within, in time"            $( test.eq! [:ok, 3] (within! second (1 + 2)) ),
-        test.case "within, too slow"           $( test.eq! :timeout (within! (milliseconds 20) (list.length (list.from 1))) ),
+        test.case "within, in time"            $( test.eq! (Result.ok 3) (within! second (1 + 2)) ),
+        test.case "within, too slow"           $( test.eq! (Result.error :timeout) (within! (milliseconds 20) (list.length (list.from 1))) ),
         test.case "a real zone, when the machine has one" $( match zone! "America/Denver" {
-            [:ok, z] => test.eq! ["-06:00", "-07:00", "1966-01-01T00:00:00-07:00"]
+            Result.ok(z) => test.eq! ["-06:00", "-07:00", "1966-01-01T00:00:00-07:00"]
                                  [offset_text ":" (offset_in z t), offset_text ":" (offset_in z (to_instant (date 2026 1 1))),
                                   datetime_text (in_zone z (to_instant (datetime 1966 1 1 7 0 0)))],
             _ => :ok,
         } ),
         test.case "the far future uses the zone's rule" $( match zone! "Europe/London" {
-            [:ok, z] => test.eq! ["BST", "GMT"] [DateTime.abbrev (in_zone z (to_instant (date 2300 7 1))),
+            Result.ok(z) => test.eq! ["BST", "GMT"] [DateTime.abbrev (in_zone z (to_instant (date 2300 7 1))),
                                                 DateTime.abbrev (in_zone z (to_instant (date 2300 12 1)))],
             _ => :ok,
         } ),

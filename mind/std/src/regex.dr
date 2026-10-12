@@ -103,7 +103,7 @@ type Flag = :ignore_case | :multiline | :dot_all;
 
 /// What is wrong with a pattern, or `()` when nothing is.
 let problem : :string -> (:string | :unit);
-let problem source = match parse source { [:ok, _] => (), [:error, why] => why };
+let problem source = match parse source { Result.ok(_) => (), Result.error(why) => why };
 
 /// The pattern compiled. A literal is checked while the program is built; a
 /// string made at run time that is not a pattern raises a `:type_error`
@@ -114,8 +114,8 @@ let compile source = compile_with [] source;
 /// Parse and compile a regular expression using explicit matching flags.
 let compile_with : [Flag] -> Pattern -> Regex;
 let compile_with flags source = match parse_with flags source {
-    [:ok, re] => re,
-    [:error, why] => type_assert false ("not a regular expression: " + why) (Regex.make source 0 %{} "" () "" ""),
+    Result.ok(re) => re,
+    Result.error(why) => type_assert false ("not a regular expression: " + why) (Regex.make source 0 %{} "" () "" ""),
 };
 
 /// The pattern compiled, or `[:error, why]`: for patterns that arrive at run
@@ -126,8 +126,8 @@ let parse source = parse_with [] source;
 /// Parse regular-expression syntax and apply explicit flags, returning a result.
 let parse_with : [Flag] -> :string -> result.Of Regex :string;
 let parse_with flags source = match p.run regex_syntax source {
-    [:error, e] => result.error ("column " + to_string (p.Error.column e) + ": " + p.Error.message e),
-    [:ok, tree] => {
+    Result.error(e) => result.error ("column " + to_string (p.Error.column e) + ": " + p.Error.message e),
+    Result.ok(tree) => {
         let numbered = number_groups tree 1;
         let ast = numbered.[0];
         let groups = numbered.[1];
@@ -897,7 +897,7 @@ when test {
         test.case "a backwards range is refused" $( test.true! (problem "[z-a]" != ()) ),
         test.case "parse is a result"        $( test.eq! [true, true] [result.is_ok (parse "a+"), result.is_error (parse "a{2,1}")] ),
         test.case "compile-time compiling"   $( test.eq! "abc" (group 0 (find compiled_at_build "xxabcxx")) ),
-        test.case "inside a parser"          $( test.eq! [:ok, ["key", "42"]]
+        test.case "inside a parser"          $( test.eq! (Result.ok ["key", "42"])
                                                    (p.run (p.seq [token (r "[a-z]+"), p.then (token (r "\\d+")) (p.text "=")]) "key=42") ),
         test.case "the literal prefix"       $( test.eq! ["abc", "ab"] [Regex.prefix (r "abc(d|e)"), Regex.prefix (r "(ab)+")] ),
         test.case "the bytes a match starts with" $( test.eq! ["0123456789", "xXyY", (), (), ()]

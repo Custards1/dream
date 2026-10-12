@@ -115,25 +115,26 @@ let with_aliases aliases known c = {
      list.filter (fn k -> not (known k)) (list.map (fn [k, _] -> k) (map.pairs (scoped c)))]
 };
 
-/// A package option as a condition reads it: `[:ok, value]` when the name is
-/// one -- `sqlite.vendored` anywhere, `vendored` inside `sqlite` -- and `()`
-/// when it is not, so the program's settings answer instead. A dotted name is
-/// only ever an option, so `[:ok, ()]` for one nobody set rather than falling
-/// through to a flag no `-D` could have spelled.
-let option : Configuration -> :string -> [:ok, :string | :unit] | :unit;
+/// A package option as a condition reads it: `Result.ok value` when the name
+/// is one -- `sqlite.vendored` anywhere, `vendored` inside `sqlite` -- and
+/// `Result.error :not_an_option` when it is not, so the program's settings
+/// answer instead. A dotted name is only ever an option, so `Result.ok ()`
+/// for one nobody set rather than falling through to a flag no `-D` could
+/// have spelled.
+let option : Configuration -> :string -> Result (:string | :unit) :atom;
 let option c name = {
     let dot = str.find "." name;
     match dot >= 0 {
         true => {
             let key = str.slice 0 dot name;
             let rest = str.slice (dot + 1) (str.byte_length name - dot - 1) name;
-            [:ok, ((scoped c).[canonical c key else (%{})]).[rest else ()]]
+            Result.ok (((scoped c).[canonical c key else (%{})]).[rest else ()])
         },
         false => match Configuration.here c {
-            () => (),
+            () => Result.error :not_an_option,
             k => match ((scoped c).[k else (%{})]).[name else ()] {
-                () => (),
-                v => [:ok, v],
+                () => Result.error :not_an_option,
+                v => Result.ok v,
             },
         },
     }
@@ -186,12 +187,12 @@ let rec eval c cond =
         // A package's own option first. One set to `false` is off, which is
         // how a `bool` option says so; one never set is off too.
         [:flag, name]   => match option c name {
-            [:ok, v] => v != () && v != "false",
+            Result.ok(v) => v != () && v != "false",
             // A setting that has a value counts as defined.
             _ => is_defined name c || map.has name (values c),
         },
         [:equals, k, v] => match option c k {
-            [:ok, found] => found == v,
+            Result.ok(found) => found == v,
             _ => value k c == v,
         },
         [:not, inner]   => not (eval c inner),

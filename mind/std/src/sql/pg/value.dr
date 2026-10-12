@@ -267,7 +267,7 @@ priv let float_of text = match num.parse_float text {
 /// Decode PostgreSQL JSON text into a Dream value.
 priv let json_of : :string -> :any;
 priv let json_of text = match js.parse text {
-    [:ok, v] => v,
+    Result.ok(v) => v,
     _ => text,
 };
 

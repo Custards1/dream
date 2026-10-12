@@ -253,7 +253,7 @@ console.warn! "Using the default configuration"
 | `error! value`, `error_write! value` | stderr, with/without a newline |
 | `print_to! handle value`, `write_to! handle value` | caller-supplied output |
 | `text values` | concatenate rendered values |
-| `format template values` | `[:ok, text]` or `[:error, message]`; `{}`, `{{`, `}}` |
+| `format template values` | `Result.ok text` or `Result.error message`; `{}`, `{{`, `}}` |
 | `format! template values` | formatted text, or `:bad_argument` |
 | `printf!`, `writef!`, `errorf!` | formatted output |
 | `read_line! ()`, `prompt! question` | a line, or `()` at EOF |
@@ -653,7 +653,7 @@ These report figures for the **calling** process.
 |------|-----------|-------------|
 | `share!` | `value → value` | The same value, forced all the way down and moved into the runtime's shared area. From then on a `spawn!`, `send!` or `join!` carrying it copies a pointer rather than the value. |
 | `wire_encode` | `value → string` | The value, forced all the way down, in `std.wire`'s format, byte for byte what `std.wire`'s Dream writer produces, and thousands of times faster: `std.wire.encode` is this. A map is written in the order `compare` puts its keys; what is not data is written as its `to_string`. |
-| `wire_decode` | `string → [:ok, value] \| [:error, string]` | One `std.wire` message, read whole. Never raises. Trailing bytes, a truncated field, an integer past 63 bits and an atom this program does not have are all `[:error, why]` -- an atom is looked up, never made. `std.wire.decode` is this. |
+| `wire_decode` | `string → Result.ok value \| Result.error string` | One `std.wire` message, read whole. Never raises. Trailing bytes, a truncated field, an integer past 63 bits and an atom this program does not have are all `Result.error why` -- an atom is looked up, never made. `std.wire.decode` is this. |
 | `regex_run` | `code:string → subject:string → from:integer → mode:integer → value` | Run a pattern `std.regex` compiled (`Regex.code`) over a string: mode 0 answers whether it matches, 1 the first match at or after `from` as an array of capture offsets (unit for none), 2 every match as a list of those, 3 how many there are, 4 the match starting exactly at `from`. A lazy DFA and a Pike VM, linear in the text; engines are cached per worker. `std.regex` is the interface; dream/src/regex.cpp is the design. |
 | `share_arenas` | `[funcs, parts, invented_from, filled, edges, runs, part_base] → [nodes, kids, funcs]` | The compiler's `opt.optimize_parts`: a program's parts, each an arena already shared within itself, hash-consed into one -- constants renamed through each part's pools, functions and invented globals moved past the parts before, a settled `comp` placeholder read from part 0. Step for step the walk `opt.optimize_parts_by_hand` writes in Dream, which `opt`'s tests hold it to; the opcode tables are the compiler's, handed in. |
 | `node_section` | `[nodes, op_codes] → string` | An image's NODE section: each node `[op, flags, a, b, c]` as `u8 opcode, u8 flags, u16 0` and three indices, `:none` as all ones, the opcode from the compiler's table. The bytes `emit.node_bytes` writes, which `emit`'s tests hold it to. |
@@ -692,12 +692,12 @@ no new compiler.
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `monitor!` | `process → :ok` | Be sent `[:down, p, outcome]` when `p` ends -- at once if it has -- where `outcome` is `[:ok, value]` or `[:error, e]`. A failure delivered this way counts as handled, as one delivered to a joiner does. |
+| `monitor!` | `process → :ok` | Be sent `[:down, p, outcome]` when `p` ends -- at once if it has -- where `outcome` is `Result.ok value` or `Result.error e`. A failure delivered this way counts as handled, as one delivered to a joiner does. |
 | `demonitor!` | `process → :ok` | Undo one `monitor!`. A report already sent stays in the mailbox. |
 | `kill!` | `process → value → :ok` | End the process as a failure of kind `:killed` whose payload is the value. It is not unwound and cannot catch it: it is not run again after its current slice. A parked process is woken to be stopped. A process can kill itself, and then the call does not return. |
 | `unique!` | `unit → integer` | An integer no other call in this VM has answered: the reference a request carries so its reply cannot be mistaken for another's. |
 | `mailbox_size!` | `unit → integer` | Messages waiting. |
-| `mailbox_peek!` | `integer → [:ok, value] \| :none` | The message at a position, left where it is. Only the owner ever removes a message, so a position keeps naming the same one until this process takes it. |
+| `mailbox_peek!` | `integer → Result.ok value \| :none` | The message at a position, left where it is. Only the owner ever removes a message, so a position keeps naming the same one until this process takes it. |
 | `mailbox_take!` | `integer → :ok` | Remove the message at a position; `:out_of_bounds` when there is none. |
 | `await_message!` | `integer → integer → :ok \| :timeout` | Wait until the mailbox holds more than `n` messages, or until `now_ns!` reaches the deadline; a negative deadline waits for ever. The deadline is absolute because a blocked native is re-entered from the top on every wake. |
 | `sleep_until!` | `integer → :ok` | Park until `now_ns!` reaches the deadline. |
@@ -736,7 +736,7 @@ argument.
 | `close_image!` | `integer → bool` | Free an open image. `false` when the handle named none; closing twice is not an error. |
 | `image_function` | `image → string → integer → fn` | A function in another image as a Dream function of that many arguments, named with a `!`; see [images.md](images.md). The image is opened once per runtime, on first use. |
 | `pure_image_function` | same | The same, named without one: for a function with no effects. |
-| `locate_image!` | `image → [:ok, file] \| [:error, why]` | Where an image descriptor is found, or why it is not. |
+| `locate_image!` | `image → Result.ok file \| Result.error why` | Where an image descriptor is found, or why it is not. |
 
 `eval_image!` is for one image and one question: the image *is* the expression.
 The other three are for one image and many questions — a package's macros,
@@ -783,7 +783,7 @@ let puts! = ffi.function () "puts" [:cstr] :int;
 | `function` | `library → symbol → [arg type] → result type → fn` | A C function as a Dream function of its arguments -- every one that is not `[:out, t]`. Named `symbol!`, so the runtime treats calling it as an effect; bind it to a `!` name. |
 | `pure_function` | same | The same, named `symbol`: for a C function with no effects, which a pure function may call. |
 | `call!` | `fn → [args] → value` | A foreign function applied to a list -- what lets a function and its arguments travel in one message. |
-| `locate!` | `library → [:ok, file] \| [:error, why]` | Open a library and say which file it came from, or what was tried. |
+| `locate!` | `library → Result.ok file \| Result.error why` | Open a library and say which file it came from, or what was tried. |
 
 Both constructors are pure and lazy: nothing is loaded until the function is
 made, and a library is opened once per VM. A library is a path, `()` or `""`
@@ -1076,7 +1076,7 @@ a member that was absent from one that was explicitly `null`. Neither can JSON.
 
 | Name | Description |
 |------|-------------|
-| `parse text` | `[:ok, value]`, or `[:error, message]`. Trailing characters after the value are an error. |
+| `parse text` | `Result.ok value`, or `Result.error message`. Trailing characters after the value are an error. |
 | `ok result` | `true` if a `parse` result succeeded. |
 | `value result` | The value out of a `parse` result. Meaningless unless `ok` is `true`. |
 | `parse_or default text` | The parsed value, or `default` if `text` is not valid JSON. The form to use when a fallback is more useful than a diagnosis. |
@@ -1086,7 +1086,7 @@ let r = json.parse "{\"a\": 1, \"b\": [true, null, 2.5]}";
 json.ok r                       // true
 json.value r                    // %{"a" => 1, "b" => [true, (), 2.5]}
 
-json.parse "{oops}"             // [:error, "not valid JSON"]
+json.parse "{oops}"             // Result.error("not valid JSON")
 json.parse_or %{} "not json"    // %{}
 ```
 
@@ -1173,7 +1173,7 @@ map — which is what lets a dependency carry `path`, `git`, `tag` and the rest.
 
 | Name | Description |
 |------|-------------|
-| `parse text` | `[:ok, table]`, or `[:error, message]`. |
+| `parse text` | `Result.ok table`, or `Result.error message`. |
 | `ok result` / `value result` | As `std.json` — did it parse, and the table out of it. |
 | `parse_or default text` | The parsed table, or `default`. |
 
@@ -1362,10 +1362,11 @@ thing here that imposes one, and it costs a sort every time.
 import std.result;
 ```
 
-`[:ok, value]` and `[:error, reason]`, and what to do with them. This shape is
-already the convention across the library — `json.parse`, `cli.parse`,
-`toml.parse` — for one reason: **raising is an effect**, so a pure parser cannot
-report a failure by raising and has to answer one instead.
+`Result.ok value` and `Result.error reason` -- the prelude's `Result`, which
+every module has without an import -- and what to do with them. It is how the
+library reports a failure -- `json.parse`, `cli.parse`, `toml.parse` -- for one
+reason: **raising is an effect**, so a pure parser cannot report a failure by
+raising and has to answer one instead.
 
 | Name | Description |
 |------|-------------|
@@ -1377,7 +1378,7 @@ report a failure by raising and has to answer one instead.
 | `map f r` · `map_error f r` | Change one side, leave the other. |
 | `and_then f r` | The next step, which may itself fail. This is what makes a pipeline read as one. |
 | `or_try other r` | The first if it is ok, otherwise the second. |
-| `all rs` | `[:ok, values]` when every one is ok, or the first error — and it stops there, so a lazy list of a thousand checks costs one when the first is wrong. |
+| `all rs` | `Result.ok values` when every one is ok, or the first error — and it stops there, so a lazy list of a thousand checks costs one when the first is wrong. |
 | `oks rs` · `errors rs` | The values, or the reasons, of the ones that were. |
 | `of_option reason v` · `to_option r` | Across from the other convention, where `()` means "nothing there". |
 
@@ -1438,13 +1439,13 @@ built here on the `std.vm` natives below it.
 | `start_all! thunks` | Start every one *now* and answer the processes. |
 | `start_each! start! xs` | Start `start! x` for each `x`, in parallel. |
 | `wait_all! ps` | Join every one, in list order. |
-| `outcome! p` · `outcomes! ps` | `[:ok, v]` or `[:error, e]` — what `join!` would raise, as a value. |
+| `outcome! p` · `outcomes! ps` | `Result.ok v` or `Result.error e` — what `join!` would raise, as a value. |
 | `parallel! thunks` | Run these at once and answer their values in order. |
 | `map! f xs` · `try_map! f xs` | `list.map` with one process per element; the second keeps failures as values. |
 | `call! target body` · `reply! m value` | Request and reply. The request carries the process to answer and a reference (`vm.unique!`); the reply is `[:reply, ref, value]`, picked out of the mailbox with everything else left in place. The target is monitored for the call, so one that dies first raises an error of kind `:down` whose payload is its outcome. |
-| `call_within! target body ms` | The same, giving up after `ms` milliseconds: `[:ok, reply]` or `:timeout`. A reply that comes later stays in the mailbox and is never taken for another call's answer. `std.server` has the same `call_within!`. |
+| `call_within! target body ms` | The same, giving up after `ms` milliseconds: `Result.ok reply` or `Result.error :timeout`. A reply that comes later stays in the mailbox and is never taken for another call's answer. `std.server` has the same `call_within!`. |
 | `recv_where! wanted` | The first message `wanted` accepts, taken out of the mailbox; the rest stay where they were, in order. Waits as long as it takes. |
-| `recv_within! ms` · `recv_where_within! wanted ms` | The same with a limit: `[:ok, message]`, or `:timeout`. |
+| `recv_within! ms` · `recv_where_within! wanted ms` | The same with a limit: `Result.ok message`, or `Result.error :timeout`. |
 | `recv_until! wanted deadline` | What the three above are: `deadline` is a reading of `vm.now_ns!` (`deadline_in! ms` makes one), `forever` waits for ever, and `0` only looks. |
 | `sleep! ms` | Wait. Messages that arrive meanwhile wait too. |
 | `monitor! p` · `demonitor! p` · `is_down_of p m` | Be sent `[:down, p, outcome]` when `p` ends (at once if it has), `outcome` as `outcome!` answers it; a failure reported this way counts as handled. `demonitor!` also takes back a report already sent. |

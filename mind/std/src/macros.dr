@@ -25,6 +25,15 @@ let atom n = [:atom, n, span];
 /// Build an AST function application from a function and argument expressions.
 let call : Syntax -> [Syntax] -> Syntax;
 let call f args = [:apply, f, args, span];
+
+/// `Result.ok` or `Result.error`, the prelude's constructor named by `tag`, as
+/// syntax. It resolves where the macro is expanded, as every name a macro
+/// writes does, so a module with a `Result` of its own gets that one.
+let result_ctor : :string -> Syntax;
+let result_ctor tag = [:field, name "Result", tag, span];
+/// `Result.ok(p)`, or `Result.error(p)`, as a pattern.
+let result_pattern : :string -> Syntax -> Syntax;
+let result_pattern tag p = [:record_p, result_ctor tag, [p], span];
 /// Build an AST binary operator expression.
 let binary : :atom -> Syntax -> Syntax -> Syntax;
 let binary op a b = [:binary, op, a, b, span];
@@ -50,8 +59,8 @@ let choose value arms = [:match, value, arms, span];
 let block : [Syntax] -> Syntax;
 let block statements = [:block, statements, span];
 /// Return a macro-expansion error prefixed with the module name.
-let invalid : :string -> [:error, :string];
-let invalid message = [:error, "std.macros: " + message];
+let invalid : :string -> Result a :string;
+let invalid message = Result.error ("std.macros: " + message);
 
 // Fresh relative to the supplied syntax, including trees made by another
 // macro. Checking every string also covers binders and pattern names. Reserved
@@ -102,14 +111,16 @@ macro or_any conditions = match conditions {
 };
 
 /// Build nested conditional expressions from condition/body pairs and a fallback.
-let conditional_arms : [Syntax] -> Syntax -> Syntax;
+let conditional_arms : [Syntax] -> Syntax -> Syntax | Result :never :string;
 let rec conditional_arms pairs fallback = match pairs {
     [] => fallback,
     [[:list, [condition, body], _], ..rest] => {
         let tail = conditional_arms rest fallback;
         match tail {
-            [:error, _] => tail,
-            _ => branch condition body tail,
+            Result.error(_) => tail,
+            // No value is a `Result.ok(:never)`; said, so the arm below is syntax.
+            Result.ok(_) => tail,
+            syntax => branch condition body syntax,
         }
     },
     _ => invalid "cond expects [condition, expression] pairs in a literal list",
@@ -140,12 +151,12 @@ macro if_some binder value body absent = match binder {
 /// Bind a present value in body; () propagates without evaluating body.
 macro with_some binder value body = if_some binder value body unit;
 
-/// Bind the payload of [:ok, value] in body; pass a non-ok result through.
+/// Bind the payload of `Result.ok value` in body; pass a non-ok result through.
 /// Body supplies the next result, as with std.result.and_then.
 macro with_ok binder result body = match binder {
     [:name, n, _] => {
         let saved = fresh "result" [binder, result, body];
-        let ok_pattern = [:list_p, [literal_pattern (atom "ok"), bind_pattern n], (), span];
+        let ok_pattern = result_pattern "ok" (bind_pattern n);
         choose result [arm ok_pattern body, arm (bind_pattern saved) (name saved)]
     },
     _ => invalid "with_ok expects a binding name as its first argument",
@@ -197,15 +208,15 @@ macro clamp value lower upper = {
 /// on failure. The expansion belongs in an impure context.
 macro assert condition message = branch condition unit (call (name "raise!") [message]);
 
-/// Deeply evaluate expression inside try!, returning [:ok, value] or
-/// [:error, exception]. Deep forcing is deliberate: a deferred error inside
+/// Deeply evaluate expression inside try!, returning `Result.ok value` or
+/// `Result.error exception`. Deep forcing is deliberate: a deferred error inside
 /// a list must be caught here, not escape after the result is returned.
 macro attempt expression = {
     let saved = fresh "attempt" expression;
     let error = fresh "exception" expression;
     let body = block [binding saved expression, call (name "strict!") [name saved],
-                      [:list, [atom "ok", name saved], span]];
-    [:try, body, error, [:list, [atom "error", name error], span], span]
+                      call (result_ctor "ok") [name saved]];
+    [:try, body, error, call (result_ctor "error") [name error], span]
 };
 
 /// Call observer with the shared value, force its result to weak head normal
@@ -266,12 +277,12 @@ when test {
         test.case "with_some preserves absence and shares its binding"
             $( test.eq! [(), 6] [expand with_some x () test.boom, expand with_some x 3 (x + x)] ),
         test.case "with_ok binds a success"
-            $( test.eq! [:ok, 8] (expand with_ok value [:ok, 4] [:ok, value + value]) ),
+            $( test.eq! (Result.ok 8) (expand with_ok value (Result.ok 4) (Result.ok (value + value))) ),
         test.case "with_ok propagates an error without evaluating its body"
-            $( test.eq! [:error, :bad] (expand with_ok value [:error, :bad] test.boom) ),
+            $( test.eq! (Result.error :bad) (expand with_ok value (Result.error :bad) test.boom) ),
         test.case "result bindings compose with distinct lexical scopes"
-            $( test.eq! [:ok, 10] (expand with_ok x [:ok, 4]
-                (expand with_ok y [:ok, 6] [:ok, x + y])) ),
+            $( test.eq! (Result.ok 10) (expand with_ok x (Result.ok 4)
+                (expand with_ok y (Result.ok 6) (Result.ok (x + y)))) ),
         test.case "pipe preserves argument-last pipeline order"
             $( test.eq! 14 (expand pipe 3 [add 4, double]) ),
         test.case "an empty pipe is the original expression"
@@ -315,15 +326,16 @@ when test {
         test.case "assert raises exactly its supplied message"
             $( test.eq! :failed (try! { expand assert false :failed } catch e { _error_payload e }) ),
         test.case "attempt returns a success result"
-            $( test.eq! [:ok, [1, 2]] (expand attempt [1, 2]) ),
+            $( test.eq! (Result.ok [1, 2]) (expand attempt [1, 2]) ),
         test.case "attempt catches errors deferred inside a collection"
             $({
                 let result = expand attempt [1, raise! :deferred];
-                test.eq! [:error, :deferred] [result.[0], _error_payload result.[1]]
+                test.eq! (Result.error :deferred)
+                         (match result { Result.error(e) => Result.error (_error_payload e), other => other })
             }),
         test.case "attempt evaluates and shares an effectful expression once"
             $({
-                test.eq! [:ok, 5] (expand attempt (mark! :value 5))
+                test.eq! (Result.ok 5) (expand attempt (mark! :value 5))
                 send! (self! ()) :end
                 test.eq! [:value, :end] [recv! (), recv! ()]
             }),

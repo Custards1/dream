@@ -20,7 +20,7 @@ let show_user req = match http.param "id" req {
     _ => http.not_found,
 };
 let create_user req = match http.body_json req {
-    [:ok, %{ "name" => name }] => http.json %{ "created" => name } |> http.with_status 201,
+    Result.ok(%{ "name" => name }) => http.json %{ "created" => name } |> http.with_status 201,
     _ => http.bad_request "expected {\"name\": ..}",
 };
 
@@ -45,20 +45,20 @@ let main! = {
 
     // POST a JSON body; the 201 and its body come back.
     match http.post_json! (base + "/users") %{ "name" => "Grace" } {
-        [:ok, resp] => console.print! [http.status resp, http.body_json resp],
-        [:error, e] => console.print! (error.describe e),
+        Result.ok(resp) => console.print! [http.status resp, http.body_json resp],
+        Result.error(e) => console.print! (error.describe e),
     }
 
     // Redirects are followed, and the response says where it ended up.
     match http.get! (base + "/old") {
-        [:ok, resp] => console.print! [http.status resp, str.ends_with "/users/1" (http.Response.url resp), http.body resp],
-        [:error, e] => console.print! (error.describe e),
+        Result.ok(resp) => console.print! [http.status resp, str.ends_with "/users/1" (http.Response.url resp), http.body resp],
+        Result.error(e) => console.print! (error.describe e),
     }
 
     // A method the route does not take is a 405 that says which it does.
     match http.send! (http.request "DELETE" (base + "/users")) {
-        [:ok, resp] => console.print! [http.status resp, http.header "allow" resp],
-        [:error, e] => console.print! (error.describe e),
+        Result.ok(resp) => console.print! [http.status resp, http.header "allow" resp],
+        Result.error(e) => console.print! (error.describe e),
     }
 
     server.stop! s

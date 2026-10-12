@@ -60,6 +60,18 @@ let span_start s = s.[0];
 let span_end : Span -> :integer;
 let span_end s = s.[1];
 
+/// Where the spans of syntax the compiler writes for itself begin: past the
+/// end of any file, so no name the programmer wrote starts there and none is
+/// ever confused with one. Each offset `o` of a file owns the 128 offsets from
+/// `generated_base + o * 128`, for whatever starts at `o` -- a `union`'s
+/// constructors (`syntax.union_decl`), a `let?`'s constructor (`parser.let_try_far`).
+/// Two of those never start at one offset, and what one writes is far smaller
+/// than 128 offsets for each byte of its own text, so it cannot run into the
+/// next one's. Every span stays under 2^32, which keys are packed against
+/// (`scope.ref_key`); `syntax.receive_e` has the quarter above this one.
+let generated_base : :integer;
+let generated_base = 2147483648;
+
 /// The span covering both, for a node built out of two others.
 let span_to : Span -> Span -> Span;
 let span_to a b = [span_start a, span_end b];

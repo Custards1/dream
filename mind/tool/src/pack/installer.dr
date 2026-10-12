@@ -68,13 +68,13 @@ let script sp assets = {
 };
 
 /// Write `install.sh` into `dest`, answering its path.
-let make! : Spec -> :string -> [:ok, :string] | [:error, :string];
+let make! : Spec -> :string -> Result :string :string;
 let make! sp dest = {
     let? assets = release.find! sp "installer" dest;
     let path = dest + "/install.sh";
     file.write! path (script sp assets)
     io.chmod! path 0o755
-    [:ok, path]
+    Result.ok path
 };
 
 when test {

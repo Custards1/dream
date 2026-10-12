@@ -137,14 +137,14 @@ let run! port app = { let s = serve! port app; join! (Server.acceptor s) };
 /// Accept incoming connections and dispatch their handlers.
 priv let accept_loop! : :any -> :any -> Options -> :atom;
 priv let rec accept_loop! listener handle options =
-    match try! { let sock = net.accept! listener; [:ok, sock] } catch e { [:error, e] } {
-        [:ok, sock] => {
+    match try! { let sock = net.accept! listener; Result.ok sock } catch e { Result.error e } {
+        Result.ok(sock) => {
             spawn! $( connection! sock handle options )
             accept_loop! listener handle options
         },
         // `stop!` closes the listener under the parked accept, which is how
         // this loop learns it is over.
-        [:error, _] => :stopped,
+        Result.error(_) => :stopped,
     };
 
 /// Serve one accepted connection using the configured protocol options.
@@ -166,8 +166,8 @@ priv let connection! sock handle options = {
     };
     if agreed_h2 {
         // HTTP/2 by ALPN: the client's preface comes first.
-        match try! { let got = http.read_exact! (http.reader sock) 24; strict! got; [:ok, got] } catch e { [:error, e] } {
-            [:ok, [p, r]] => if p == h2.preface { serve_h2! sock r handle options peer watchdog },
+        match try! { let got = http.read_exact! (http.reader sock) 24; strict! got; Result.ok got } catch e { Result.error e } {
+            Result.ok([p, r]) => if p == h2.preface { serve_h2! sock r handle options peer watchdog },
             _ => (),
         }
     } else if secured { requests! sock (http.reader sock) handle options peer watchdog }
@@ -183,8 +183,8 @@ priv let connection! sock handle options = {
 /// answered -- a request must be answered within `idle` too.
 priv let watch! : :any -> :integer -> :process -> :unit;
 priv let rec watch! sock idle conn = match proc.recv_within! (time.to_milliseconds idle) {
-    [:ok, :active] => watch! sock idle conn,
-    [:ok, _] => (),
+    Result.ok(:active) => watch! sock idle conn,
+    Result.ok(_) => (),
     _ => {
         try! { io.close! sock } catch e { () }
         proc.kill! conn :idle
@@ -198,10 +198,10 @@ priv let rec requests! sock r handle options peer watchdog =
     // Forced inside the `try!`: a request is built lazily, and a malformed
     // one must fail here, where it can be answered with a 400, rather than
     // in the handler, where it would be a 500.
-    match try! { let got = read_request! sock r options peer; strict! got; [:ok, got] } catch e { [:error, e] } {
-        [:ok, ()] => (),
-        [:ok, [:h2, r2]] => serve_h2! sock r2 handle options peer watchdog,
-        [:ok, [req, r2, body_proc]] => {
+    match try! { let got = read_request! sock r options peer; strict! got; Result.ok got } catch e { Result.error e } {
+        Result.ok(()) => (),
+        Result.ok([:h2, r2]) => serve_h2! sock r2 handle options peer watchdog,
+        Result.ok([req, r2, body_proc]) => {
             send! watchdog :active
             let resp = finish! (answer! handle req options) req options;
             let keep = keep_alive req resp;
@@ -229,7 +229,7 @@ priv let rec requests! sock r handle options peer watchdog =
                 requests! sock after handle options peer watchdog
             }
         },
-        [:error, e] => {
+        Result.error(e) => {
             // A malformed or oversized request gets an answer before the
             // connection closes; one that died mid-read (the client went, or
             // the watchdog closed it) does not, there being nobody to tell.
@@ -320,17 +320,17 @@ priv let read_request! sock r options peer = match http.read_head! r (Options.ma
 /// not, so the connection is ready for the next request.
 priv let body_server! : :any -> :any -> :integer -> :process -> :unit;
 priv let rec body_server! r state left owner = receive! {
-    [:next, from] => match try! { let got = http.next_piece! r state; strict! got; [:ok, got] } catch e { [:error, e] } {
-        [:ok, [(), st2, r2]] => { send! from [:body_piece, ()]; body_server! r2 st2 left owner },
-        [:ok, [piece, st2, r2]] => if len piece > left {
+    [:next, from] => match try! { let got = http.next_piece! r state; strict! got; Result.ok got } catch e { Result.error e } {
+        Result.ok([(), st2, r2]) => { send! from [:body_piece, ()]; body_server! r2 st2 left owner },
+        Result.ok([piece, st2, r2]) => if len piece > left {
             send! from [:body_error, error.new :too_large "a body larger than the limit"]
             body_server! r2 [:done] 0 owner
         } else { send! from [:body_piece, piece]; body_server! r2 st2 (left - len piece) owner },
-        [:error, e] => { send! from [:body_error, e]; body_server! r [:done] 0 owner },
+        Result.error(e) => { send! from [:body_error, e]; body_server! r [:done] 0 owner },
     },
-    [:finish, from] => match try! { let got = http.fold_body! r state left () (fn acc piece -> acc); strict! got; [:ok, got] } catch e { [:error, e] } {
-        [:ok, [_, r2]] => { send! from [:body_reader, r2]; () },
-        [:error, _] => { send! from [:body_failed]; () },
+    [:finish, from] => match try! { let got = http.fold_body! r state left () (fn acc piece -> acc); strict! got; Result.ok got } catch e { Result.error e } {
+        Result.ok([_, r2]) => { send! from [:body_reader, r2]; () },
+        Result.error(_) => { send! from [:body_failed]; () },
     },
 };
 
@@ -353,7 +353,7 @@ priv let or_empty v = match v { () => "", t => t };
 priv let split_target : :string -> [:string, :map];
 priv let split_target target = {
     let local = if str.starts_with "/" target || target == "*" { target }
-                else { match url.parse target { [:ok, u] => url.target u, _ => target } };
+                else { match url.parse target { Result.ok(u) => url.target u, _ => target } };
     let q = str.upto "?" 0 local;
     let path = str.slice 0 q local;
     let query = if q < len local { url.query_map (url.Url.new () |> url.Url.set_query (str.slice (q + 1) (len local) local)) } else { %{} };
@@ -659,13 +659,13 @@ when test {
             let s = serve! 0 app;
             let got = http.get_text! (local_url s + "/?name=dream");
             stop! s
-            test.eq! [:ok, "hello, dream"] got
+            test.eq! (Result.ok "hello, dream") got
         } ),
         test.case "a JSON round trip" $( {
             let s = serve! 0 app;
-            let got = match http.post_json! (local_url s + "/echo") %{ "a" => [1, 2] } { [:ok, r] => http.body_json r, e => e };
+            let got = match http.post_json! (local_url s + "/echo") %{ "a" => [1, 2] } { Result.ok(r) => http.body_json r, e => e };
             stop! s
-            test.eq! [:ok, %{ "a" => [1, 2] }] got
+            test.eq! (Result.ok %{ "a" => [1, 2] }) got
         } ),
         test.case "keep-alive answers two requests on one connection" $( {
             let s = serve! 0 app;
@@ -713,7 +713,7 @@ when test {
             let got = http.get! (local_url s + "/a");
             stop! s
             match got {
-                [:ok, r] => test.eq! ["at c 1", local_url s + "/c?x=1"] [http.body r, http.Response.url r],
+                Result.ok(r) => test.eq! ["at c 1", local_url s + "/c?x=1"] [http.body r, http.Response.url r],
                 other => test.fail! other,
             }
         } ),
@@ -749,7 +749,7 @@ when test {
             let got = http.get_text! (local_url s);
             stop! s
             agent.stop! counter
-            test.eq! [:ok, "piece 0;piece 1;piece 2;"] got
+            test.eq! (Result.ok "piece 0;piece 1;piece 2;") got
         } ),
         test.case "server-sent events" $( {
             let s = serve! 0 (router |> get "/events" (fn req -> http.event_stream ["hello", %{ "event" => "tick", "data" => "1\n2", "id" => 7 }]));
@@ -762,7 +762,7 @@ when test {
             let s = serve! 0 app;
             let got = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_stream ["one ", "two ", "three"]);
             stop! s
-            test.eq! [:ok, "one two three"] (result.map http.body got)
+            test.eq! (Result.ok "one two three") (result.map http.body got)
         } ),
         test.case "a request body streamed to the handler" $( {
             let measure! req = http.text (to_string (len (http.body_text! req)));
@@ -771,7 +771,7 @@ when test {
             let first = http.post! (local_url s) big;
             let chunked = http.send! (http.request "POST" (local_url s) |> http.with_stream (list.replicate 50 (str.repeat 1000 "z")));
             stop! s
-            test.eq! [[:ok, "1200000"], [:ok, "50000"]] [result.map http.body first, result.map http.body chunked]
+            test.eq! [Result.ok "1200000", Result.ok "50000"] [result.map http.body first, result.map http.body chunked]
         } ),
         test.case "a handler that ignores a streamed body leaves the connection usable" $( {
             let ignore req = http.text "ignored";
@@ -787,7 +787,7 @@ when test {
             let written = file.read! path;
             stop! s
             io.remove! path
-            test.eq! [[:ok, 65536], 65536] [got, len (match written { () => "", t => t })]
+            test.eq! [Result.ok 65536, 65536] [got, len (match written { () => "", t => t })]
         } ),
         test.case "a client reuses its connection" $( {
             let s = serve! 0 (router |> get "/who" (fn req -> http.text (http.Request.peer req)));
@@ -809,7 +809,7 @@ when test {
             let got = http.call! c (http.request "GET" "/users");
             http.close_client! c
             stop! s
-            test.eq! [:ok, "secret"] (result.map http.body got)
+            test.eq! (Result.ok "secret") (result.map http.body got)
         } ),
         test.case "a pooled connection the server closed is replaced" $( {
             let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_idle (time.milliseconds 100)) app;
@@ -819,7 +819,7 @@ when test {
             let second = http.call! c (http.request "GET" "/");
             http.close_client! c
             stop! s
-            test.eq! [:ok, :ok] [first.[0], second.[0]]
+            test.true! (result.is_ok first && result.is_ok second)
         } ),
         // HTTP/2, in clear text by prior knowledge so that no certificate is needed.
         test.case "HTTP/2: a request and its answer" $( {
@@ -829,14 +829,14 @@ when test {
             let boom = h2_get! "/boom";
             let missing = h2_get! "/nope";
             stop! s
-            test.eq! [[:ok, "HTTP/2"], [:ok, 500], [:ok, 404]] [result.map http.body ok, result.map http.status boom, result.map http.status missing]
+            test.eq! [Result.ok "HTTP/2", Result.ok 500, Result.ok 404] [result.map http.body ok, result.map http.status boom, result.map http.status missing]
         } ),
         test.case "HTTP/2: bodies past the flow-control window, both ways" $( {
             let s = serve! 0 app;
             let big = str.repeat 300000 "0123456789";
             let got = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_body big |> http.Request.set_options %{ :http2 => :prior_knowledge });
             stop! s
-            test.eq! [:ok, true] (result.map (fn r -> http.body r == big) got)
+            test.eq! (Result.ok true) (result.map (fn r -> http.body r == big) got)
         } ),
         test.case "HTTP/2: streams out and in" $( {
             let s = serve! 0 (router |> get "/" (fn req -> http.stream (list.map (fn n -> to_string n + ";") (list.range 0 300))) |> post "/echo" (fn req -> http.text (http.body req)));
@@ -844,7 +844,7 @@ when test {
             let down = http.send! (http.request "GET" (local_url s) |> http.Request.set_options opts);
             let up = http.send! (http.request "POST" (local_url s + "/echo") |> http.with_stream ["x", "y", "z"] |> http.Request.set_options opts);
             stop! s
-            test.eq! [[:ok, str.concat_all (list.map (fn n -> to_string n + ";") (list.range 0 300))], [:ok, "xyz"]]
+            test.eq! [Result.ok (str.concat_all (list.map (fn n -> to_string n + ";") (list.range 0 300))), Result.ok "xyz"]
                      [result.map http.body down, result.map http.body up]
         } ),
         test.case "HTTP/2: many requests at once over one connection" $( {
@@ -870,7 +870,7 @@ when test {
             let encoded = http.get! (local_url s + "/s/%2e%2e/%2e%2e/etc/passwd");
             stop! s
             io.remove_all! dir
-            test.eq! [[:ok, ["body {}", "text/css; charset=utf-8"]], [:ok, "<p>home</p>"], 404, 404]
+            test.eq! [Result.ok ["body {}", "text/css; charset=utf-8"], Result.ok "<p>home</p>", 404, 404]
                      [result.map (fn r -> [http.body r, http.header "content-type" r]) css, home,
                       result.or_else 0 (result.map http.status escape), result.or_else 0 (result.map http.status encoded)]
         } ),

@@ -36,8 +36,8 @@ console.errorf! "cannot open {}" [path]
 
 `{}` consumes one value, `{{` writes `{`, and `}}` writes `}`. Values are never
 interpreted as format strings. Missing values, extra values and unmatched braces
-are errors. `format template values` is pure and returns `[:ok, text]` or
-`[:error, explanation]`; `format!` returns the text or raises `:bad_argument`.
+are errors. `format template values` is pure and returns `Result.ok text` or
+`Result.error explanation`; `format!` returns the text or raises `:bad_argument`.
 The output helpers use `format!`, so a malformed template writes no partial text.
 
 ## Input and prompts
@@ -61,12 +61,12 @@ match console.confirm! "Overwrite?" false {
 
 `prompt_int! question` retries until input is an integer or reaches EOF.
 `ask! question parser` handles custom validation: the pure parser returns
-`[:ok, value]` or `[:error, help]`. For example:
+`Result.ok value` or `Result.error help`. For example:
 
 ```dream
 let port line = match console.integer line {
-    [:ok, n] if n >= 1 && n <= 65535 => [:ok, n],
-    _ => [:error, "Enter a port from 1 to 65535."],
+    Result.ok(n) if n >= 1 && n <= 65535 => Result.ok n,
+    _ => Result.error "Enter a port from 1 to 65535.",
 };
 let chosen = console.ask! "Port? " port;
 ```

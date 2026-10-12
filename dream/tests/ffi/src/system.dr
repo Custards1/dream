@@ -17,12 +17,12 @@ foreign sample from system "sample" {
 let main! = {
     let found = foreign.locate! (foreign.system "sample");
     match found {
-        [:ok, file] => {
+        Result.ok(file) => {
             console.print! ("found " + (if str.ends_with "libsample.so" file { "libsample.so" } else { file }))
             console.print! (to_string (sample.low_byte 513))
             console.print! (to_string (sample.scale 1.5 2.0))
         },
-        [:error, why] => {
+        Result.error(why) => {
             console.print! (if str.contains_str "cannot find the C library `sample`" why { "not found" } else { why })
             console.print! (if str.contains_str "$DREAM_LIB_SAMPLE" why { "says what to set" } else { why })
         },
@@ -30,7 +30,7 @@ let main! = {
     // A chain answers its first that opens, and the missing payload before
     // it is not an error.
     match foreign.locate! (foreign.any_of [foreign.embedded "absent", foreign.this_program]) {
-        [:ok, _] => console.print! "any_of takes the first that opens",
-        [:error, why] => console.print! why,
+        Result.ok(_) => console.print! "any_of takes the first that opens",
+        Result.error(why) => console.print! why,
     }
 };

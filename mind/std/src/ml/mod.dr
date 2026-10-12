@@ -474,18 +474,18 @@ let load! : :string -> :any;
 let load! path = match file.read! path {
     () => raise! ("cannot read " + path),
     text => match parse_saved text {
-        [:ok, t] => t,
-        [:error, why] => raise! (path + ": " + why),
+        Result.ok(t) => t,
+        Result.error(why) => raise! (path + ": " + why),
     },
 };
 
 /// The tree in text `save!` wrote: `[:ok, tree]` or `[:error, why]`.
-let parse_saved : :string -> [:ok, :any] | [:error, :string];
+let parse_saved : :string -> Result :any :string;
 let parse_saved text =
-    if not (str.starts_with "dream-ml 1\n" text) { [:error, "not a file save! wrote"] }
+    if not (str.starts_with "dream-ml 1\n" text) { Result.error "not a file save! wrote" }
     else {
         let total = str.byte_length text;
-        let rec read at acc = if at >= total { [:ok, build (list.reverse acc)] } else {
+        let rec read at acc = if at >= total { Result.ok (build (list.reverse acc)) } else {
             let eol = str.find_from at "\n" text;
             let header = str.slice at (eol - at) text;
             let tab = str.find "\t" header;
@@ -531,7 +531,7 @@ when test {
                     (if type_of x == :tensor { "t " } else { "n " }) + str.join_str "\u{1f}" (list.map key_text p) + "\t"
                         + str.join_str "," (list.map to_string (tensor.shape v)) + "\n" + tensor.to_bytes v
                 }) (tree.paths t)));
-                back == [:ok, t]
+                back == (Result.ok t)
             }) ),
         test.case "fit retains batch norm state for prediction and resuming"
             $( {

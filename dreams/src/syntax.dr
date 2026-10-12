@@ -359,16 +359,22 @@ let arrow a b = ast.list_e [ast.atom_e "fn" (ast.span b), a, b] (ast.span b);
 ///
 ///     {
 ///         let rec scan! !at !deadline = match _mailbox_peek! at {
-///             [:ok, m] => if (match m { arm patterns and guards => true, _ => false }) {
-///                             _mailbox_take! at; [:ok, m]
-///                         } else { scan! (at + 1) deadline },
-///             _ => match _await_message! at deadline { :ok => scan! at deadline, _ => :timeout },
+///             :none => match _await_message! at deadline { :ok => scan! at deadline, _ => :timeout },
+///             peeked => {
+///                 let m = _match_at peeked 0;
+///                 if (match m { arm patterns and guards => true, _ => false }) {
+///                     _mailbox_take! at; [:ok, m]
+///                 } else { scan! (at + 1) deadline }
+///             },
 ///         };
 ///         let start! ms = scan! 0 (if ms < 0 { -1 } else { _deadline_in! ms });
 ///         match start! ms { [:ok, m] => match m { the arms }, _ => timeout }
 ///     }
 ///
-/// with `ms` -1 when there is no `after`. The function around it makes one
+/// with `ms` -1 when there is no `after`. What `_mailbox_peek!` answers is
+/// the prelude's `Result.ok message` or `:none`, and it is taken apart by
+/// position rather than by `Result.ok(m)`: the scaffold's names resolve where
+/// the `receive!` is written, and a module may have a `Result` of its own. The function around it makes one
 /// impure call, `start!`, written where `receive!` is -- so a `receive!` in a
 /// pure function is reported once, there, and `scope` names it `receive!`.
 ///
@@ -398,9 +404,12 @@ let receive_e arms after span = {
     let waited = ast.match_e (call "_await_message!" [n pos, n deadline])
         [ast.arm (ast.literal_p (ast.atom_e "ok" at_) at_) () (call scan [n pos, n deadline]) at_,
          ast.arm (ast.wildcard_p at_) () (ast.atom_e "timeout" at_) at_] at_;
+    let peeked = "__receive_peeked";
     let body = ast.match_e (call "_mailbox_peek!" [n pos])
-        [ast.arm (ok_p (ast.bind_p m at_)) () (ast.if_e chooses take next at_) at_,
-         ast.arm (ast.wildcard_p at_) () waited at_] at_;
+        [ast.arm (ast.literal_p (ast.atom_e "none" at_) at_) () waited at_,
+         ast.arm (ast.bind_p peeked at_) ()
+                 (ast.block_e [ast.let_d m [] (call "_match_at" [n peeked, ast.int_e 0 at_]) false at_,
+                               ast.if_e chooses take next at_] at_) at_] at_;
     let never = ast.int_e (0 - 1) at_;
     let starts = call scan [ast.int_e 0 at_,
                             ast.if_e (ast.binary_e :lt (n "__receive_ms") (ast.int_e 0 at_) at_)
@@ -503,7 +512,7 @@ let union_decl owner name params variants members kind span = {
     // is not: each field type occurs in it once, so it keeps the spans it was
     // written at and a mistake in one is reported where it is, as a record's
     // description does.
-    let [generated, _] = fresh (constructors + [alias]) (2147483648 + ast.span_start span * 128);
+    let [generated, _] = fresh (constructors + [alias]) (ast.generated_base + ast.span_start span * 128);
     let written = list.map (fn m -> ast.let_d (ast.member_name m) (ast.member_params m)
                                               (own_names name (ast.member_body m)) true (ast.member_span m))
                            members;

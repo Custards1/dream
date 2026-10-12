@@ -452,7 +452,7 @@ let evaluate_round! base s session0 jobs = {
     /// it occupies recorded against the site it came from -- so a diagnostic
     /// in generated code is reported where the `expand` is written.
     let install! mi m st value at = match value {
-        [:error, message] if type_of message == :string => [fail st mi at message, ()],
+        Result.error(message) if type_of message == :string => [fail st mi at message, ()],
         _ => if syntax.expression value {
                  let [expression, after_expression] = syntax.fresh value (next st);
                  let si = modules.module_source m;
@@ -583,8 +583,8 @@ let evaluate_round! base s session0 jobs = {
                             (modules.module_name (modules.module_at staged target_mi))
                             target_name (call_args (list.head (list.nth i calls)));
                         strict! value
-                        [:ok, value]
-                    } catch e { [:error, to_string e] };
+                        Result.ok value
+                    } catch e { Result.error (to_string e) };
                     let ran = counted (charged st1 :vm (minus (reading! ()) started))
                                       :vm_starts 1;
                     match outcome {
@@ -594,14 +594,14 @@ let evaluate_round! base s session0 jobs = {
                         // one compile, so it is asked once: a call that fails
                         // against the whole program is reported and not asked
                         // again.
-                        [:error, why] if base.[:whole else false] =>
+                        Result.error(why) if base.[:whole else false] =>
                             [fail ran mi at ("macro evaluation failed: " + why),
                              handle, list.cons () answers],
                         // A session of its own, because the base is a
                         // different one: the whole program resolves to a
                         // different image, and this one must not be mistaken
                         // for the round's.
-                        [:error, _] => {
+                        Result.error(_) => {
                             let got = evaluate! (base.[:whole => true])
                                           (counted ran :one_by_one 1) () mi [list.nth i calls];
                             strict! got
@@ -612,7 +612,7 @@ let evaluate_round! base s session0 jobs = {
                             strict! spent
                             [list.head got, handle, list.cons (list.nth 2 got) answers]
                         },
-                        [:ok, value] => {
+                        Result.ok(value) => {
                             let installing = charge! (metering ran) (install! mi m ran value at);
                             let done = list.head installing;
                             [charged (list.head done) :install (list.nth 1 installing),

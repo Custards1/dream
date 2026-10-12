@@ -21,15 +21,15 @@ let line : :string -> :string -> :string;
 let line digest name = digest + "  " + name + "\n";
 
 /// Write `SHA256SUMS` into `dir`, answering its path.
-let make! : :string -> [:ok, :string] | [:error, :string];
+let make! : :string -> Result :string :string;
 let make! dir = match published! dir {
-    [] => [:error, "sums: nothing in " + dir + " to sum"],
+    [] => Result.error ("sums: nothing in " + dir + " to sum"),
     files => {
         let lines = list.map (fn f -> line (io.digest! (dir + "/" + f)) f) files;
         strict! lines
         let path = dir + "/SHA256SUMS";
         file.write! path (str.concat_all lines)
-        [:ok, path]
+        Result.ok path
     },
 };
 

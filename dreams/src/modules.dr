@@ -769,6 +769,22 @@ let dependencies items =
             _ => [],
         }) items);
 
+/// The module every other one may use without importing it. See the head of
+/// `std.prelude` for what earns a name a place there.
+let prelude_name : :string;
+let prelude_name = "std.prelude";
+
+/// `deps` with the prelude in front, for every module but the prelude itself.
+/// Only where there is one to load: a program compiled with no standard
+/// library on its search path still compiles, with no prelude, and `let?`
+/// is then the one thing in it that cannot resolve.
+let with_prelude! l name deps =
+    if name == prelude_name { deps }
+    else if is_visited l prelude_name || resolve_path! l prelude_name != () {
+        list.cons [prelude_name, ast.no_span] deps
+    }
+    else { deps };
+
 /// The same cycle, wherever it is noticed. `modules must form a tree` is the
 /// whole explanation: they are compiled together into one image, so there is no
 /// point at which a half-built module could be handed to the one that needs it.
@@ -1163,7 +1179,7 @@ let load_items! l source parsed display name file text = {
                 if local_module acc name dep != () { acc }
                 else { load_named! acc dep (list.nth 1 d) source }
             }) (list.head hoisted)
-               (dependencies items_out);
+               (with_prelude! (list.head hoisted) name (dependencies items_out));
 
             let recorded = leave followed;
             let index = module_count recorded;

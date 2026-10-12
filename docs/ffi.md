@@ -91,7 +91,7 @@ The same search is a value outside a declaration: `foreign.system "sqlite3"`,
 `foreign.system_version "sqlite3" "0"`. `foreign.any_of [foreign.embedded
 "sqlite", foreign.system "sqlite3"]` is the first of several that opens, so a
 program can carry its own copy for the machines that lack one. `foreign.locate!
-lib` answers `[:ok, file]` or `[:error, why]` without raising, for a program or
+lib` answers `Result.ok file` or `Result.error why` without raising, for a program or
 tool that wants to report where a library came from. The search is described
 in Dream (`foreign.library_files`, `foreign.library_dirs`) and carried out by
 the VM ("Finding a library" in dream/src/ffi.cpp).
@@ -314,7 +314,7 @@ it computed:
 let low_byte = foreign.pure_function (foreign.embedded "sample") "low_byte" [:u32] :u8;
 ```
 
-The vocabulary is `std.foreign`'s `Arg` and `Result` types: the same words as
+The vocabulary is `std.foreign`'s `Arg` and `Return` types: the same words as
 a declaration's, spelled as data -- `[:out, t]`, `[:own, tag, destructor]`,
 `[:handle, tag]`, `[:callback, [args], result]`, `[:cstr, destructor]`.
 `function` is signed with them, so a literal signature is still checked while

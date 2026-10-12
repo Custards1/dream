@@ -78,8 +78,8 @@ let package_modules! m = {
 let api_modules! m = {
     let own = if manifest.is_package m { package_modules! m } else { [] };
     let children = list.flat_map (fn member -> match manifest.find! (path.join (manifest.root m) member) {
-        [:ok, child] => package_modules! child,
-        [:error, why] => fail! why,
+        Result.ok(child) => package_modules! child,
+        Result.error(why) => fail! why,
     }) (manifest.members m) |> strict!;
     list.append own children
 };
@@ -176,11 +176,11 @@ let build! c m = {
     }
 };
 let run! args = match cli.parse opts args {
-    [:error, why] => fail! (why + "\n" + usage),
-    [:ok, c] => if cli.flag_set c "help" { console.print! usage }
+    Result.error(why) => fail! (why + "\n" + usage),
+    Result.ok(c) => if cli.flag_set c "help" { console.print! usage }
         else if cli.rest c != [] { fail! "unexpected arguments; try `mind docs --help`" }
         else { match manifest.find! (path.absolute! (cli.get (os.cwd! ()) c "dir")) {
-            [:error, why] => fail! why,
-            [:ok, m] => build! c m,
+            Result.error(why) => fail! why,
+            Result.ok(m) => build! c m,
         } },
 };

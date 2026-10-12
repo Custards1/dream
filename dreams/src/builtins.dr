@@ -196,7 +196,7 @@ let signatures = %{
     "_tensor_of_bytes" => "list|array -> string -> tensor",
     "_tensor_matmul" => "tensor|list|array -> tensor|list|array -> tensor|float",
     "_str_interp" => "list of any -> string, each rendered as `to_string` renders it",
-    "_mailbox_peek!" => "integer -> [:ok, message] | :none, the message at that position, left there",
+    "_mailbox_peek!" => "integer -> Result.ok message | :none, the message at that position, left there",
     "_mailbox_take!" => "integer -> :ok, removing the message at that position",
     "_await_message!" => "integer -> deadline -> :ok | :timeout, once the mailbox holds more than that many",
     "_deadline_in!" => "integer -> integer, the monotonic clock that many milliseconds from now",
@@ -280,7 +280,7 @@ let written_by_parser : :string -> :bool;
 let written_by_parser name =
     list.contains name ["_tensor_matmul", "_str_interp", "_mailbox_peek!", "_mailbox_take!",
                         "_await_message!", "_deadline_in!", "_match_fail", "_record_of",
-                        "_record_id"];
+                        "_record_id", "_match_at"];
 
 /// A builtin's signature, or its bare name for one that has none.
 let signature : :string -> :string;

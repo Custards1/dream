@@ -23,9 +23,9 @@ let packet = b.record [
 ];
 
 let message = %{ :version => 1, :flags => 0, :id => 42, :payload => "hello" };
-let encoded = b.encode packet message;  // [:ok, bytes] or [:error, problem]
+let encoded = b.encode packet message;  // Result.ok bytes or Result.error problem
 // Given the bytes from encoded:
-// b.decode packet bytes               // [:ok, message]
+// b.decode packet bytes               // Result.ok message
 ```
 
 No implicit machine byte order, integer truncation, skipped trailing data or
@@ -166,7 +166,7 @@ than relying on undocumented padding.
 | Function | Purpose |
 |---|---|
 | `where predicate message codec` | Validate in both directions |
-| `convert decode_value encode_value codec` | Bidirectional conversion; callbacks return `[:ok, v]` or `[:error, message]` |
+| `convert decode_value encode_value codec` | Bidirectional conversion; callbacks return `Result.ok v` or `Result.error message` |
 | `named name codec` | Add a name or index to error paths |
 | `lazy make` | Delay construction of a recursive layout; make receives unit |
 | `layout read write` | Construct a custom layout from reader and builder callbacks |
@@ -182,7 +182,7 @@ layout operations.
 |---|---|
 | `reader data` | Reader over the whole string |
 | `reader_at offset count data` | Checked, bounded reader over a byte range |
-| `read codec reader` | `[:ok, [value, next_reader]]` or error |
+| `read codec reader` | `Result.ok [value, next_reader]` or error |
 | `decode_prefix codec data` | Read once from a new reader |
 | `read_at codec offset data` | Read from a byte offset |
 | `position reader` | Absolute bit position |
@@ -209,7 +209,7 @@ and the existing VM primitives; it adds no native module or platform dependency.
 
 ## Errors
 
-Pure operations return `[:error, problem]`, where problem contains:
+Pure operations return `Result.error problem`, where problem contains:
 
 - `:kind`: `:truncated`, `:trailing_data`, `:unaligned`, `:out_of_range`,
   `:type_error`, `:invalid_argument`, `:invalid_value`, `:noncanonical`,

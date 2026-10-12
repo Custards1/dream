@@ -42,6 +42,18 @@ end.
 
 The collector has a document of its own, [../gc.md](../gc.md), and "Collecting under compiled code" there is where the JIT and the collector meet.
 
+## [Results became a union](results.md)
+
+`[:ok, v]` to the prelude's `Result`: the prelude, why `let?` has no bridge, the
+image flag and the two-step reseed it forced, and what a span-exact rewrite
+still got wrong.
+
+- The prelude
+- No bridge
+- Natives, and why the seed needed two steps
+- The rewrite, and what it could not tell
+- What is still a tagged list, and why
+
 ## [Bignums, and the cryptography beside them](bignums.md)
 
 Unbounded integers at no cost to fixnum code, why their limbs live outside the

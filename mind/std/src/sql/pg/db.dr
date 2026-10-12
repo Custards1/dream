@@ -86,7 +86,7 @@ mapping Conn {
 /// with two columns of the same name needs. Both are decoded as they are read.
 /// `count` is what the command tag says it did -- rows inserted, updated,
 /// deleted or selected -- or `()` for a command that does not count.
-mapping Result {
+mapping Reply {
     columns : [:any] = []
     tuples : [[:any]] = []
     rows : [:map] = []
@@ -323,8 +323,8 @@ priv let scram! conn = {
     write! conn (wire.sasl_initial "SCRAM-SHA-256" first)
     let server_first = sasl_step! conn 11;
     match crypto.scram_final (password! conn) nonce bare server_first {
-        [:error, why] => errors.fail! :protocol_violation ("SCRAM: " + why),
-        [:ok, [final, signature]] => {
+        Result.error(why) => errors.fail! :protocol_violation ("SCRAM: " + why),
+        Result.ok([final, signature]) => {
             write! conn (wire.sasl_response final)
             if crypto.scram_verified signature (sasl_step! conn 12) { () }
             else { errors.fail! :invalid_authorization_specification "SCRAM: the server could not prove it knows the password" }
@@ -536,7 +536,7 @@ let count_of tag = match num.parse_int (list.last (str.split " " tag)) {
 
 // --- querying ------------------------------------------------------------------------
 
-/// Run one statement and answer everything it said: a `Result`.
+/// Run one statement and answer everything it said: a `Reply`.
 ///
 /// `q` is a fragment -- from `expand sql.query`, or built with `std.sql.pg.sql` -- or
 /// a string with no parameters, which the compiler checks is one well-formed
@@ -565,7 +565,7 @@ priv let only results = match results {
 
 /// The rows, as maps.
 let rows! : Conn -> sql.Query -> [:map];
-let rows! conn q = Result.rows (query! conn q);
+let rows! conn q = Reply.rows (query! conn q);
 
 /// The one row a statement answers. None raises `:no_rows`, and more than one
 /// `:too_many_rows`, because a caller who says "one" has said something about
@@ -587,7 +587,7 @@ let first! conn q = match rows! conn q {
 /// The first column of the first row, or `()` when there are no rows:
 /// `db.scalar! conn "SELECT count(*) FROM users"`.
 let scalar! : Conn -> sql.Query -> :any;
-let scalar! conn q = match Result.tuples (query! conn q) {
+let scalar! conn q = match Reply.tuples (query! conn q) {
     [] => (),
     [[v, .._], .._] => v,
     _ => (),
@@ -595,7 +595,7 @@ let scalar! conn q = match Result.tuples (query! conn q) {
 
 /// The first column of every row.
 let column! : Conn -> sql.Query -> [:any];
-let column! conn q = list.map (fn t -> list.head t) (Result.tuples (query! conn q));
+let column! conn q = list.map (fn t -> list.head t) (Reply.tuples (query! conn q));
 
 /// Run a statement for what it does, and answer how many rows it did it to.
 let exec! : Conn -> sql.Query -> :integer;
@@ -724,12 +724,12 @@ priv let portal_step! conn step! acc columns raw = try! {
 /// names would happen whenever the list was read -- after a COMMIT, outside
 /// the `try!` -- which is the trap "A reply, a message or a list element is
 /// suspended unless forced" in CLAUDE.md describes.
-let attempt! : (a -> b) -> a -> [:ok, b] | [:error, :any];
+let attempt! : (a -> b) -> a -> Result b :any;
 let attempt! body! arg = try! {
     let v = body! arg;
     strict! v
-    [:ok, v]
-} catch e { [:error, e] };
+    Result.ok v
+} catch e { Result.error e };
 //
 // `body!` is what runs inside, given the connection: a lambda written in an
 // impure function -- `db.transaction! conn (fn c -> db.exec! c ..)` -- or,
@@ -754,11 +754,11 @@ let transaction_with! : Conn -> Transaction -> (Conn -> a) -> a;
 let transaction_with! conn options body! = {
     exec! conn (sql.raw (begin_statement options))
     match attempt! body! conn {
-        [:ok, v] => {
+        Result.ok(v) => {
             exec! conn "COMMIT"
             v
         },
-        [:error, e] => {
+        Result.error(e) => {
             rollback! conn
             raise! e
         },
@@ -791,9 +791,9 @@ let begin_statement options = str.join_str " " (list.filter (fn s -> s != "") [
 let serializable! : Conn -> :integer -> (Conn -> a) -> a;
 let rec serializable! conn attempts body! = {
     match attempt! (transaction_with! conn (Transaction.new () |> Transaction.set_isolation :serializable)) body! {
-        [:ok, v] => v,
-        [:error, e] if attempts > 1 && errors.is_retryable e => serializable! conn (attempts - 1) body!,
-        [:error, e] => raise! e,
+        Result.ok(v) => v,
+        Result.error(e) if attempts > 1 && errors.is_retryable e => serializable! conn (attempts - 1) body!,
+        Result.error(e) => raise! e,
     }
 };
 
@@ -804,11 +804,11 @@ let savepoint! : Conn -> (Conn -> a) -> a;
 let savepoint! conn body! = {
     exec! conn "SAVEPOINT dream_savepoint"
     match attempt! body! conn {
-        [:ok, v] => {
+        Result.ok(v) => {
             exec! conn "RELEASE SAVEPOINT dream_savepoint"
             v
         },
-        [:error, e] => {
+        Result.error(e) => {
             try! {
                 exec! conn "ROLLBACK TO SAVEPOINT dream_savepoint"
                 exec! conn "RELEASE SAVEPOINT dream_savepoint"
@@ -878,20 +878,20 @@ let copy_in! conn table columns rows = {
                 send_rows! conn rows
                 write! conn wire.copy_done
                 let n = counted (only (collect! conn (pending [])));
-                [:ok, n]
+                Result.ok n
             },
-            e => [:error, e],
+            e => Result.error e,
         }
     } catch e { raise! (lost e) };
     match outcome {
-        [:ok, n] => n,
-        [:error, e] => raise! e,
+        Result.ok(n) => n,
+        Result.error(e) => raise! e,
     }
 };
 
 /// Extract a command's affected-row count.
 priv let counted : :map -> :integer;
-priv let counted r = match Result.count r {
+priv let counted r = match Reply.count r {
     () => 0,
     n => n,
 };
@@ -945,7 +945,7 @@ priv let copy_escape text = str.escape_bytes "\\\t\n\r" (fn b -> match b {
 /// Copy out what `statement` -- a `COPY .. TO STDOUT` -- writes, each row as a
 /// list of its fields' text, `()` for NULL.
 let copy_out! : Conn -> sql.Statement -> [[:any]];
-let copy_out! conn statement = list.map copy_fields (Result.copy (only (script! conn statement)));
+let copy_out! conn statement = list.map copy_fields (Reply.copy (only (script! conn statement)));
 
 /// One line of COPY text as its fields.
 let copy_fields : :string -> [:any];
@@ -1019,7 +1019,7 @@ priv let forwarder! conn !to = spawn! $( forward! conn to );
 priv let forward! : Conn -> :process -> :atom;
 priv let rec forward! conn to = {
     match attempt! next_notification! conn {
-        [:ok, n] => {
+        Result.ok(n) => {
             send! to [:pg_notification, n]
             forward! conn to
         },

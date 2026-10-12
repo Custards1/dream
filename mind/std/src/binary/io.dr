@@ -18,9 +18,9 @@ let read_exact_with! count source! =
     if type_of count != :integer || count < 0 { failure :invalid_argument 0 "read size must be non-negative" }
     else {
         let rec go! !at parts = if at == count { result.ok (str.concat_all (list.reverse parts)) }
-            else { match try! { let chunk = source! (count - at); strict! chunk; [:ok, chunk] } catch e { [:error, e] } {
-                [:error, e] => failure :io_error at (to_string e),
-                [:ok, chunk] => if type_of chunk != :string { failure :io_error at "reader returned a non-string" }
+            else { match try! { let chunk = source! (count - at); strict! chunk; Result.ok chunk } catch e { Result.error e } {
+                Result.error(e) => failure :io_error at (to_string e),
+                Result.ok(chunk) => if type_of chunk != :string { failure :io_error at "reader returned a non-string" }
                     else if len chunk == 0 { failure :truncated at "stream ended inside the field" }
                     else if len chunk > count - at { failure :io_error at "reader exceeded the requested count" }
                     else { go! (at + len chunk) (chunk :: parts) },
@@ -30,16 +30,16 @@ let read_exact_with! count source! =
 
 /// Read exactly `count` bytes using `source!`, then decode them with `codec`.
 let read_with! codec count source! = match read_exact_with! count source! {
-    [:error, e] => result.error e,
-    [:ok, data] => binary.decode codec data,
+    Result.error(e) => result.error e,
+    Result.ok(data) => binary.decode codec data,
 };
 
 /// Encode completely before doing IO; an invalid value writes no bytes.
 /// Short writes are handled by std.streams. IO failure may have written a
 /// prefix: the caller owns recovery and must not blindly retry the message.
 let write_with! codec value sink! = match binary.encode codec value {
-    [:error, e] => result.error e,
-    [:ok, data] => try! {
+    Result.error(e) => result.error e,
+    Result.ok(data) => try! {
         streams.write_all_with! sink! data
         result.ok ()
     } catch e { failure :io_error 0 (to_string e) },

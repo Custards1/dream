@@ -109,9 +109,9 @@ let context! args = match flag_value "--context" args {
     f => match file.read! f {
         () => fail! ("cannot read the context " + f),
         text => match wire.decode text {
-            [:ok, ctx] if build.is_context ctx => ctx,
-            [:ok, _] => fail! ("the context " + f + " is not a build.Context"),
-            [:error, why] => fail! ("the context " + f + " is not one: " + to_string why),
+            Result.ok(ctx) if build.is_context ctx => ctx,
+            Result.ok(_) => fail! ("the context " + f + " is not a build.Context"),
+            Result.error(why) => fail! ("the context " + f + " is not one: " + to_string why),
         },
     },
 };
@@ -278,7 +278,7 @@ let keyed! ctx st s = {
 let record_of! : :string -> :any;
 let record_of! dir = match file.read! (dir + "/.record") {
     () => (),
-    text => match wire.decode text { [:ok, r] => r, _ => () },
+    text => match wire.decode text { Result.ok(r) => r, _ => () },
 };
 
 /// Do the files a step read last time still have the digests they had?
@@ -346,74 +346,74 @@ let op! dir ms o = try! {
     let target! name = { let t = dir + "/" + name; file.mkdir_all! (file.parent t); t };
     let env_list env = list.map (fn [k, v] -> k + "=" + v) (_map_pairs env);
     match o {
-        build.Op.write(name, text) => { file.write! (target! name) text; [:ok, ()] },
-        build.Op.copy(from, name) => { file.copy! from (target! name); [:ok, ()] },
-        build.Op.link(from, name) => { io.link! from (target! name); [:ok, ()] },
+        build.Op.write(name, text) => { file.write! (target! name) text; Result.ok () },
+        build.Op.copy(from, name) => { file.copy! from (target! name); Result.ok () },
+        build.Op.link(from, name) => { io.link! from (target! name); Result.ok () },
         build.Op.exec(program, args) => {
             let r = os.exec_in! dir program args ms;
-            if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
+            if r.[:code] == 0 && not r.[:timed_out] { Result.ok () } else { Result.error (exited program r) }
         },
         build.Op.run(where, env, program, args) => {
             let r = os.exec_with! where (env_list env) program args ms;
-            if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
+            if r.[:code] == 0 && not r.[:timed_out] { Result.ok () } else { Result.error (exited program r) }
         },
         build.Op.run_to(where, env, program, args, name) => {
             let r = os.exec_joined! (if str.is_empty where { dir } else { where }) (env_list env) program args ms;
             file.write! (target! name) r.[:out]
-            if r.[:code] == 0 && not r.[:timed_out] { [:ok, ()] } else { [:error, exited program r] }
+            if r.[:code] == 0 && not r.[:timed_out] { Result.ok () } else { Result.error (exited program r) }
         },
         build.Op.observe(where, env, program, args, name) => {
             let r = os.exec_joined! (if str.is_empty where { dir } else { where }) (env_list env) program args ms;
             file.write! (target! name) r.[:out]
-            if r.[:timed_out] { [:error, exited program r] } else { [:ok, ()] }
+            if r.[:timed_out] { Result.error (exited program r) } else { Result.ok () }
         },
-        build.Op.find(program, name) => { file.write! (target! name) (on_path! program); [:ok, ()] },
+        build.Op.find(program, name) => { file.write! (target! name) (on_path! program); Result.ok () },
         build.Op.capture(program, args, name) => {
             let r = asked! dir program args;
             file.write! (target! name) (if r.[:code] == 0 { r.[:out] } else { "" })
-            [:ok, ()]
+            Result.ok ()
         },
         build.Op.attempt(program, args, name) => {
             let r = asked! dir program args;
             file.write! (target! name) (if r.[:code] == 0 { "yes" } else { "no" })
-            [:ok, ()]
+            Result.ok ()
         },
         build.Op.list(from, suffix, name) => {
             file.write! (target! name) (str.join_str "\n" (list.filter (fn f -> str.ends_with suffix f) (file.walk! from)))
-            [:ok, ()]
+            Result.ok ()
         },
         build.Op.verify(name, digest) => match io.digest! (dir + "/" + name) {
-            d if d == digest => [:ok, ()],
-            d => [:error, name + " has the SHA-256 " + d + ", and the build pins it to " + digest],
+            d if d == digest => Result.ok (),
+            d => Result.error (name + " has the SHA-256 " + d + ", and the build pins it to " + digest),
         },
         build.Op.transform(from, name, f) => {
             let text = f (list.map (fn n -> match file.read! (dir + "/" + n) { () => "", t => t }) from);
             strict! text
             file.write! (target! name) text
-            [:ok, ()]
+            Result.ok ()
         },
         build.Op.expect(name, path, bless) => {
             let got = str.trim_end (match file.read! (dir + "/" + name) { () => "", t => t });
             let wanted = str.trim_end (match file.read! path { () => "", t => t });
             match [got == wanted, bless] {
-                [true, _] => [:ok, ()],
+                [true, _] => Result.ok (),
                 // The one operation that writes into the package, and only when
                 // a person asked for it with `--bless`.
-                [_, true] => { file.write! path (got + "\n"); [:ok, ()] },
-                _ => [:error, "what it printed is not " + path + ", from " + first_difference wanted got],
+                [_, true] => { file.write! path (got + "\n"); Result.ok () },
+                _ => Result.error ("what it printed is not " + path + ", from " + first_difference wanted got),
             }
         },
         build.Op.same(a, b) => match io.digest! a == io.digest! b {
-            true => [:ok, ()],
-            false => [:error, a + " and " + b + " differ"],
+            true => Result.ok (),
+            false => Result.error (a + " and " + b + " differ"),
         },
         build.Op.empty(name, why) => match file.read! (dir + "/" + name) {
-            () => [:ok, ()],
-            "" => [:ok, ()],
-            text => [:error, why + "\n" + tail text],
+            () => Result.ok (),
+            "" => Result.ok (),
+            text => Result.error (why + "\n" + tail text),
         },
     }
-} catch e { [:error, to_string e] };
+} catch e { Result.error (to_string e) };
 
 /// A program run to answer a question, where not being able to run it at all
 /// is an answer too: `exec_in!` raises for a program that is not there, and a
@@ -444,10 +444,10 @@ let perform! scratch outputs ms ops = {
     file.remove_all! scratch
     file.mkdir_all! scratch
     fold! (fn _ o -> file.mkdir_all! (file.parent (scratch + "/" + o))) () outputs
-    match fold! (fn acc o -> match acc { [:ok, _] => op! scratch ms o, failed => failed }) [:ok, ()] ops {
-        [:ok, _] => match list.filter (fn o -> io.stat! (scratch + "/" + o) == ()) outputs {
-            [] => [:ok, ()],
-            missing => [:error, "it did not make " + str.join_str ", " missing],
+    match fold! (fn acc o -> match acc { Result.ok(_) => op! scratch ms o, failed => failed }) (Result.ok ()) ops {
+        Result.ok(_) => match list.filter (fn o -> io.stat! (scratch + "/" + o) == ()) outputs {
+            [] => Result.ok (),
+            missing => Result.error ("it did not make " + str.join_str ", " missing),
         },
         failed => failed,
     }
@@ -462,7 +462,7 @@ let perform! scratch outputs ms ops = {
 let task : :any -> :string -> :string -> [:string] -> :integer -> [:any] -> :any;
 let task parent shape scratch outputs ms ops = $( {
     let started = os.monotonic! ();
-    let r = try! { perform! scratch outputs ms ops } catch e { [:error, to_string e] };
+    let r = try! { perform! scratch outputs ms ops } catch e { Result.error (to_string e) };
     strict! r
     send! parent [:build_step, shape, r, os.monotonic! () - started]
 } );
@@ -605,12 +605,12 @@ let rec drive! ctx run = {
             let st = Run.state running;
             let timed = State.set_ms ((State.ms st).[shape => ms]) st;
             match outcome {
-                [:ok, _] => {
+                Result.ok(_) => {
                     let committed = commit! ctx timed s key scratch;
                     strict! committed
                     drive! ctx (Run.set_state committed running)
                 },
-                [_, why] => {
+                Result.error(why) => {
                     let failed = timed |> State.set_failures
                         ((State.failures timed).[shape => [build.Step.name s,
                                                            "`" + build.Step.name s + "` (" + build.Step.tool s + ") failed: "
@@ -793,7 +793,7 @@ let stamps_file ctx = build.Context.cache ctx + "/stamps";
 let known_stamps! : :map -> :map;
 let known_stamps! ctx = match file.read! (stamps_file ctx) {
     () => %{},
-    text => match wire.decode text { [:ok, m] => m, _ => %{} },
+    text => match wire.decode text { Result.ok(m) => m, _ => %{} },
 };
 
 /// One script's plan, carried out from `known` stamps: `[outcome, stamps]`.
@@ -855,7 +855,7 @@ let run_all! scripts = {
         f => match file.read! f {
             () => fail! ("cannot read the contexts " + f),
             text => match wire.decode text {
-                [:ok, m] if list.all (fn [_, c] -> build.is_context c) (_map_pairs m) => m,
+                Result.ok(m) if list.all (fn [_, c] -> build.is_context c) (_map_pairs m) => m,
                 _ => fail! ("the contexts " + f + " are not a map of build.Context"),
             },
         },
@@ -870,8 +870,8 @@ let run_all! scripts = {
                                         (list.map (fn [key, plan_of] -> [contexts.[key], known, plan_of]) chosen);
             strict! results
             let [outcomes, stamps] = list.fold (fn [found, st] [[key, _], r] -> match r {
-                [:ok, [answer, more]] => [found.[key => answer], map.merge st more],
-                [:error, e] => fail! ("the build script of `" + key + "` failed: " + stopped_by e),
+                Result.ok([answer, more]) => [found.[key => answer], map.merge st more],
+                Result.error(e) => fail! ("the build script of `" + key + "` failed: " + stopped_by e),
             }) [%{}, known] (list.zip chosen results);
             strict! outcomes
             keep_stamps! (contexts.[first]) stamps
@@ -963,18 +963,19 @@ when test {
             } ),
         test.case "the questions a step can ask never fail, and verify can"
             $( {
+                let tag r = match r { Result.ok(_) => :ok, Result.error(_) => :error };
                 let dir = "dream-build-ops-" + to_string (os.pid! ());
                 file.mkdir_all! dir
                 let got = [op! dir 0 (build.Op.write "f" "abc"),
-                           list.head (op! dir 0 (build.Op.verify "f" (io.digest "abc"))),
-                           list.head (op! dir 0 (build.Op.verify "f" (io.digest "abd"))),
-                           list.head (op! dir 0 (build.Op.find "no-such-program-anywhere" "where")),
+                           tag (op! dir 0 (build.Op.verify "f" (io.digest "abc"))),
+                           tag (op! dir 0 (build.Op.verify "f" (io.digest "abd"))),
+                           tag (op! dir 0 (build.Op.find "no-such-program-anywhere" "where")),
                            file.read! (dir + "/where"),
-                           list.head (op! dir 0 (build.Op.attempt "no-such-program-anywhere" [] "tried")),
+                           tag (op! dir 0 (build.Op.attempt "no-such-program-anywhere" [] "tried")),
                            file.read! (dir + "/tried")];
                 strict! got
                 file.remove_all! dir
-                test.eq! [[:ok, ()], :ok, :error, :ok, "", :ok, "no"] got
+                test.eq! [Result.ok (), :ok, :error, :ok, "", :ok, "no"] got
             } ),
         test.case "transform writes a pure function of some files as another"
             $( {

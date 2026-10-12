@@ -200,8 +200,8 @@ let fail! message = {
 /// Load the project here or above, or stop with the reason.
 let project! () =
     match manifest.find! (os.cwd! ()) {
-        [:ok, m] => m,
-        [:error, why] => fail! why,
+        Result.ok(m) => m,
+        Result.error(why) => fail! why,
     };
 
 /// `-C DIR`: carry on as if `mind` had been started in DIR, as `git -C` and
@@ -285,11 +285,11 @@ let cmd_init! given = {
 /// capture what the program printed and nothing of ours.
 let report_build! m o label quiet = {
     match build.compile! m o {
-        [:error, why] => {
+        Result.error(why) => {
             console.error! why
             os.exit! 1
         },
-        [:ok, _] => {
+        Result.ok(_) => {
             let line = to_string label + " " + to_string (manifest.name m) + " v"
                        + to_string (manifest.version m);
             if quiet { console.error! line } else { console.print! line }
@@ -326,11 +326,11 @@ let cmd_goals! m o0 names = {
         _ => o0,
     };
     match build.goals! m o names {
-        [:error, why] => {
+        Result.error(why) => {
             console.error! why
             os.exit! 1
         },
-        [:ok, made] => strict! (list.map (fn [name, path] -> console.print! (name + "  " + path)) made),
+        Result.ok(made) => strict! (list.map (fn [name, path] -> console.print! (name + "  " + path)) made),
     }
 };
 
@@ -355,45 +355,45 @@ let cmd_run! m o args = {
 
 /// A test result: its name, whether it passed, how long it took and what it
 /// printed.
-group Result { name : :string, passed : :bool, ms : :integer, output : :string }
+group Report { name : :string, passed : :bool, ms : :integer, output : :string }
 
 /// Whether a person who asked for `asked` wants the test `name`.
 let picked : [:string] -> :string -> :bool;
 let picked asked name = list.is_empty asked || list.any (fn a -> a == name || str.starts_with (a + ".") name) asked;
 
 /// One package's units.
-let units! : :map -> :map -> [Result];
+let units! : :map -> :map -> [Report];
 let units! pm o = {
     let started = os.monotonic! ();
     let to = build.with_option :output (path.join (build.target_dir pm) ("test/" + manifest.name pm + ".dream"))
                  (build.with_option :entry (manifest.test_entry! pm)
                      (build.with_option :dev true (build.with_option :extra ["--test"] o)));
     let [passed, output] = match build.compile! pm to {
-        [:error, why] => [false, why],
-        [:ok, _] => match build.run_image! pm to [] {
+        Result.error(why) => [false, why],
+        Result.ok(_) => match build.run_image! pm to [] {
             [code, out, err] => [code == 0, out + err],
         },
     };
     strict! passed
-    [Result.make (manifest.name pm + ".units") passed (os.monotonic! () - started) output]
+    [Report.make (manifest.name pm + ".units") passed (os.monotonic! () - started) output]
 };
 
 /// One package's checks, narrowed to the ones asked for by name.
-let checks! : :map -> :map -> [:string] -> [Result];
+let checks! : :map -> :map -> [:string] -> [Report];
 let checks! pm o asked = {
     let prefix = manifest.name pm + ".";
     let named = list.flat_map (fn a -> if str.starts_with prefix a { [str.slice (str.byte_length prefix) (str.byte_length a - str.byte_length prefix) a] } else { [] })
                               asked;
     let only = if list.any (fn a -> a == manifest.name pm) asked { [] } else { named };
     match build.checks! pm (build.with_option :only only o) {
-        [:error, why] => [Result.make (manifest.name pm + ".checks") false 0 why],
-        [:ok, results] => list.map (fn [n, [passed, ms, output]] -> Result.make (prefix + n) passed ms output) results,
+        Result.error(why) => [Report.make (manifest.name pm + ".checks") false 0 why],
+        Result.ok(results) => list.map (fn [n, [passed, ms, output]] -> Report.make (prefix + n) passed ms output) results,
     }
 };
 
 /// A task, run in a process of its own: `[:units, manifest, options]` or
 /// `[:checks, manifest, options, asked]`.
-let test_task! : :list -> [Result];
+let test_task! : :list -> [Report];
 let test_task! t = match t {
     [:units, pm, o] => units! pm o,
     [:checks, pm, o, asked] => checks! pm o asked,
@@ -406,8 +406,8 @@ let seconds ms = to_string (ms / 1000) + "." + to_string (ms % 1000 / 100) + " s
 /// a workspace.
 let tested! : :map -> [:map];
 let tested! m = list.cons m (list.map (fn d -> match manifest.load! (path.join (manifest.root m) d) {
-    [:ok, pm] => pm,
-    [:error, why] => fail! ("workspace member `" + d + "`: " + why),
+    Result.ok(pm) => pm,
+    Result.error(why) => fail! ("workspace member `" + d + "`: " + why),
 }) (manifest.members m));
 
 let cmd_test! m o0 asked = {
@@ -429,27 +429,27 @@ let cmd_test! m o0 asked = {
     ]) packages;
     let outcomes = proc.try_map! test_task! tasks;
     strict! outcomes
-    let results = list.sort_on Result.name (list.flat_map (fn r -> match r {
-        [:ok, rs] => rs,
-        [:error, e] => [Result.make "mind" false 0 (to_string e)],
+    let results = list.sort_on Report.name (list.flat_map (fn r -> match r {
+        Result.ok(rs) => rs,
+        Result.error(e) => [Report.make "mind" false 0 (to_string e)],
     }) outcomes);
     match results {
         [] => fail! (match asked { [] => "nothing to test", _ => "no test is called " + str.join_str " or " asked }),
         // A package's units on their own are shown whole, as `mind test` in a
         // package with no build script always showed them.
-        [one] if str.ends_with ".units" (Result.name one) => {
-            console.write! (Result.output one)
-            if not (Result.passed one) { os.exit! 1 }
+        [one] if str.ends_with ".units" (Report.name one) => {
+            console.write! (Report.output one)
+            if not (Report.passed one) { os.exit! 1 }
         },
         _ => {
             strict! (list.map (fn r -> {
-                console.print! ((if Result.passed r { "ok   " } else { "FAIL " }) + Result.name r
-                                + "  (" + seconds (Result.ms r) + ")")
-                if not (Result.passed r) {
-                    console.print! (str.indent "    " (str.trim (Result.output r)))
+                console.print! ((if Report.passed r { "ok   " } else { "FAIL " }) + Report.name r
+                                + "  (" + seconds (Report.ms r) + ")")
+                if not (Report.passed r) {
+                    console.print! (str.indent "    " (str.trim (Report.output r)))
                 }
             }) results)
-            let failed = list.length (list.filter (fn r -> not (Result.passed r)) results);
+            let failed = list.length (list.filter (fn r -> not (Report.passed r)) results);
             console.print! ("\n" + to_string (list.length results - failed) + " passed, " + to_string failed + " failed")
             if failed > 0 { os.exit! 1 }
         },
@@ -466,8 +466,8 @@ let cmd_test! m o0 asked = {
 /// quickest thing here the most ceremonious.
 let cmd_repl! o =
     match manifest.find! (os.cwd! ()) {
-        [:ok, m] => match build.repl! m o { [:error, why] => fail! why },
-        [:error, _] => match build.bare_repl! o { [:error, why] => fail! why },
+        Result.ok(m) => match build.repl! m o { Result.error(why) => fail! why },
+        Result.error(_) => match build.bare_repl! o { Result.error(why) => fail! why },
     };
 
 /// What this build would do, without doing it. The compiler is chosen from
@@ -481,8 +481,8 @@ let cmd_info! m o = {
     console.print! ("  profile  " + to_string (build.profile_of o))
     console.print! ("  compiler " + to_string (build.choose_compiler! m (build.option o :compiler ())))
     match build.command_line! m o {
-        [:ok, line] => console.print! ("  command  " + line),
-        [:error, why] => console.error! ("  command  unavailable: " + to_string why),
+        Result.ok(line) => console.print! ("  command  " + line),
+        Result.error(why) => console.error! ("  command  unavailable: " + to_string why),
     }
 };
 
@@ -518,8 +518,8 @@ let cmd_options! m o = {
 /// Load the graph, or stop with the reason.
 let graph_of! m o =
     match build.resolve! m (build.with_option :dev true o) false {
-        [:error, why] => fail! why,
-        [:ok, g] => g,
+        Result.error(why) => fail! why,
+        Result.ok(g) => g,
     };
 
 /// One package, the way `deps` and `tree` show it: its key, what it calls
@@ -608,7 +608,7 @@ let cmd_fetch! m o = {
 let cmd_update! m o names = {
     // Not through the lock: the lock disagreeing is often why this is being
     // run, and this walk only decides what to fetch again.
-    let g = match build.graph! m (build.with_option :dev true o) { [:error, why] => fail! why, [:ok, g] => g };
+    let g = match build.graph! m (build.with_option :dev true o) { Result.error(why) => fail! why, Result.ok(g) => g };
     let wanted n =
         manifest.dep_kind (build.node_dep n) != :path
         && (list.is_empty names || list.contains (build.node_key n) names);
@@ -621,10 +621,10 @@ let cmd_update! m o names = {
     let unknown = list.filter (fn k -> not (list.any (fn n -> build.node_key n == k) every)) names;
     if not (list.is_empty unknown) { fail! ("no dependency is called " + str.join_str ", " unknown) }
     strict! (list.map (fn n -> match fetch.forget! (build.node_dep n) {
-                          [:error, why] => fail! why,
+                          Result.error(why) => fail! why,
                           _ => :ok,
                       }) chosen)
-    match build.resolve! m (build.with_option :dev true o) true { [:error, why] => fail! why, _ => () }
+    match build.resolve! m (build.with_option :dev true o) true { Result.error(why) => fail! why, _ => () }
     match chosen {
         [] => console.print! "nothing to update: every dependency is a directory",
         _ => strict! (list.map (fn n -> console.print! ("updated " + describe n)) chosen),
@@ -664,7 +664,7 @@ let guessed_name source =
 let add_name! source dir c =
     match cli.get () c "name" {
         () => match manifest.load_dependency! dir {
-            [:ok, dm] => if str.is_empty (manifest.name dm) { guessed_name source } else { manifest.name dm },
+            Result.ok(dm) => if str.is_empty (manifest.name dm) { guessed_name source } else { manifest.name dm },
             _ => guessed_name source,
         },
         n => n,
@@ -686,8 +686,8 @@ let cmd_add! m c args = {
     let section = if cli.flag_set c "dev" { "dev-dependencies" } else { "dependencies" };
     let probe = [guessed_name source, spec];
     match fetch.resolve! (manifest.root m) probe {
-        [:error, why] => fail! why,
-        [:ok, dir] => {
+        Result.error(why) => fail! why,
+        Result.ok(dir) => {
             let key = add_name! source dir c;
             let manifest_file = path.join (manifest.root m) "mind.toml";
             let text = match file.read! manifest_file { () => "", t => t };
@@ -697,11 +697,11 @@ let cmd_add! m c args = {
             // Reading it back through the whole graph is the check that
             // matters: a new dependency can bring a conflict with it.
             match manifest.load! (manifest.root m) {
-                [:ok, m2] => match build.graph! m2 (build.with_option :dev true (options_of! c)) {
-                    [:error, why] => console.error! ("warning: " + why),
+                Result.ok(m2) => match build.graph! m2 (build.with_option :dev true (options_of! c)) {
+                    Result.error(why) => console.error! ("warning: " + why),
                     _ => :ok,
                 },
-                [:error, why] => console.error! ("warning: " + why),
+                Result.error(why) => console.error! ("warning: " + why),
             }
         },
     }
@@ -882,12 +882,12 @@ let normal_main! args =
     match split_at_dashes args {
         [mine, theirs] =>
             match cli.commands opts command_spec mine {
-                [:error, why] => {
+                Result.error(why) => {
                     console.error! ("mind: " + to_string why)
                     console.error! "try `mind help`"
                     os.exit! 2
                 },
-                [:ok, c] =>
+                Result.ok(c) =>
                     if cli.flag_set c "help" { console.write! usage }
                     else if cli.flag_set c "version" { console.print! ("mind " + version) }
                     else { run_command! c theirs },
@@ -909,7 +909,7 @@ let rec dispatch! kept c args = match args {
     },
     [a, ..rest] if str.starts_with "-" a && a != "--" =>
         match cli.step opts c a rest {
-            [:ok, next, more] => {
+            Result.ok([next, more]) => {
                 let read = list.take (list.length args - list.length more) args;
                 match cli.get () next "dir" {
                     () => dispatch! (list.append (list.reverse read) kept) next more,

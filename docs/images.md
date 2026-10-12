@@ -63,7 +63,7 @@ effect, so an effect that takes nothing is `now! : :unit -> :integer`.
 | `(expression)` | Any `std.image` value. `image.any_of [image.installed "shapes", image.embedded "shapes"]` prefers the installed copy and falls back to the one it carries. |
 
 An image that cannot be found raises an `:image_error` that says where it
-looked. `image.locate! img` answers `[:ok, file]` or `[:error, why]` instead,
+looked. `image.locate! img` answers `Result.ok file` or `Result.error why` instead,
 for a program that wants to check first.
 
 ## What crosses

@@ -213,9 +213,9 @@ let shown! p = path.relative! (os.cwd! ()) p;
 /// with the same path.
 let rec walk! owner owner_key deps kind path g =
     match deps {
-        [] => [:ok, g],
+        [] => Result.ok g,
         [d, ..rest] => match edge_on! owner owner_key d g {
-            [:error, why] => [:error, why],
+            Result.error(why) => Result.error why,
             [:off, g2] => walk! owner owner_key rest kind path g2,
             [:on, g2] => follow! owner owner_key d rest kind path g2,
         },
@@ -226,27 +226,27 @@ let rec walk! owner owner_key deps kind path g =
 let follow! owner owner_key d rest kind trail g = {
     let key = manifest.dep_name d;
     match fetch.resolve! (manifest.root owner) d {
-        [:error, why] => [:error, why + " (required by " + asker owner_key + ")"],
-        [:ok, dir] => {
+        Result.error(why) => Result.error (why + " (required by " + asker owner_key + ")"),
+        Result.ok(dir) => {
             let abs = path.absolute! dir;
             let name = if str.is_empty key { "this project" } else { key };
             let on_path = list.any (fn st -> list.head st == abs) trail;
             let owner_at = shown! (manifest.path owner);
-            if on_path { [:error, cycle_message trail abs name kind] }
+            if on_path { Result.error (cycle_message trail abs name kind) }
             else {
                 match node g key {
                     () => match manifest.load_dependency! dir {
-                        [:error, why] => [:error, why],
+                        Result.error(why) => Result.error why,
                         loaded => {
-                            let dm = match loaded { [:ok, m] => m, _ => () };
+                            let dm = match loaded { Result.ok(m) => m, _ => () };
                             let n = (make_node key dir dm d owner_key).[:abs => abs].[:at => owner_at]
                                         .[:wants => match want_of d owner_key owner_at { () => [], w => [w] }];
                             let g2 = with_edge owner_key key kind (with_node key n g);
                             let inner = list.cons (step_of abs key (shown! (path.join abs "mind.toml")) kind)
                                                   trail;
                             match below! dm key inner g2 {
-                                [:error, why] => [:error, why],
-                                [:ok, g3] => walk! owner owner_key rest kind trail g3,
+                                Result.error(why) => Result.error why,
+                                Result.ok(g3) => walk! owner owner_key rest kind trail g3,
                             }
                         },
                     },
@@ -254,7 +254,7 @@ let follow! owner owner_key d rest kind trail g = {
                         true => walk! owner owner_key rest kind trail
                                       (with_want key (want_of d owner_key owner_at)
                                                  (with_edge owner_key key kind g)),
-                        false => [:error, conflict_message key seen d owner_key owner_at abs],
+                        false => Result.error (conflict_message key seen d owner_key owner_at abs),
                     },
                 }
             }
@@ -279,11 +279,11 @@ let edge_on! owner owner_key d g =
     match manifest.dep_condition d {
         () => [:on, g],
         text => match config.parse_condition text {
-            [:error, why] => [:error, shown! (manifest.path owner) + ": `when = \"" + text + "\"` on `"
-                                      + manifest.dep_name d + "`: " + why],
-            [:ok, cond] => {
+            Result.error(why) => Result.error (shown! (manifest.path owner) + ": `when = \"" + text + "\"` on `"
+                                      + manifest.dep_name d + "`: " + why),
+            Result.ok(cond) => {
                 let reads = list.fold (fn m n -> m.[n => option_read! owner g n]) (%{}) (config.names cond);
-                let option n = match reads.[n else ()] { () => (), r => [:ok, list.nth 2 r] };
+                let option n = match reads.[n else ()] { () => (), r => Result.ok (list.nth 2 r) };
                 let kept = g.[:reads => list.append (g.[:reads else []])
                                                     (list.compact (map.values reads))];
                 if config.holds option (g.[:settings else (%{})]) cond { [:on, kept] }
@@ -333,10 +333,10 @@ let steady assumed reads =
 /// manifest has neither.
 let below! dm key path g =
     match dm {
-        () => [:ok, g],
+        () => Result.ok g,
         _ => match walk! dm key (manifest.dependencies dm) :uses path g {
-            [:error, why] => [:error, why],
-            [:ok, g2] => builds! dm key path g2,
+            Result.error(why) => Result.error why,
+            Result.ok(g2) => builds! dm key path g2,
         },
     };
 
@@ -345,13 +345,13 @@ let below! dm key path g =
 /// build scripts anywhere is exactly the graph it was before they existed.
 let builds! m key path g =
     match manifest.build_dependencies m {
-        [] => [:ok, g],
+        [] => Result.ok g,
         bdeps => match walk! m key bdeps :builds path (inherit g) {
-            [:error, why] => [:error, why],
-            [:ok, sub] => match check_versions sub {
-                [:error, why] => [:error, why],
-                _ => [:ok, with_build_graph key sub
-                                (g.[:reads => list.append (g.[:reads else []]) (sub.[:reads else []])])],
+            Result.error(why) => Result.error why,
+            Result.ok(sub) => match check_versions sub {
+                Result.error(why) => Result.error why,
+                _ => Result.ok (with_build_graph key sub
+                                (g.[:reads => list.append (g.[:reads else []]) (sub.[:reads else []])])),
             },
         },
     };
@@ -368,34 +368,34 @@ let builds! m key path g =
 /// it does not accept.
 let check_versions g =
     list.fold (fn acc n -> match acc {
-        [:error, why] => acc,
+        Result.error(why) => acc,
         _ => check_node n,
-    }) [:ok, ()] (nodes g);
+    }) (Result.ok ()) (nodes g);
 
 let check_node n =
     match node_wants n {
-        [] => [:ok, ()],
+        [] => Result.ok (),
         wants => {
             let key = node_key n;
             let found = node_version n;
             let parsed = list.map (fn w -> [w, version.parse_requirement (list.head w)]) wants;
-            match list.filter (fn p -> list.head (list.nth 1 p) == :error) parsed {
-                [[w, [:error, why]], ..more] =>
-                    [:error, list.nth 2 w + ": the version required of `" + key + "` is not one: " + why],
+            match list.filter (fn p -> match list.nth 1 p { Result.error(_) => true, _ => false }) parsed {
+                [[w, Result.error(why)], ..more] =>
+                    Result.error (list.nth 2 w + ": the version required of `" + key + "` is not one: " + why),
                 _ => match found {
-                    () => [:error, "`" + key + "` has no manifest, so it has no version, but "
+                    () => Result.error ("`" + key + "` has no manifest, so it has no version, but "
                                    + asker (list.nth 1 (list.head wants)) + " requires "
                                    + list.head (list.head wants)
-                                   + ": give it a mind.toml, or drop the requirement"],
+                                   + ": give it a mind.toml, or drop the requirement"),
                     text => match version.parse text {
-                        [:error, _] => [:error, "`" + key + "` says its version is `" + text
+                        Result.error(_) => Result.error ("`" + key + "` says its version is `" + text
                                                 + "`, which is not a version ("
-                                                + manifest.path (node_manifest n) + ")"],
-                        [:ok, v] => {
-                            let misses = list.filter (fn p -> not (version.matches (list.nth 1 (list.nth 1 p)) v))
+                                                + manifest.path (node_manifest n) + ")"),
+                        Result.ok(v) => {
+                            let misses = list.filter (fn p -> not (version.matches (requirement p) v))
                                                      parsed;
-                            if list.is_empty misses { [:ok, ()] }
-                            else { [:error, version_message key text v n parsed] }
+                            if list.is_empty misses { Result.ok () }
+                            else { Result.error (version_message key text v n parsed) }
                         },
                     },
                 },
@@ -403,16 +403,20 @@ let check_node n =
         },
     };
 
+/// The requirement a `[want, parsed]` pair parsed, once it is known to have.
+priv let requirement pair = match list.nth 1 pair { Result.ok(r) => r, Result.error(_) => () };
+
 /// Every requirement on the package, the ones it misses marked, and whether
 /// any single version could have met them all -- which decides the advice.
 let version_message key text v n parsed = {
     let width = list.fold_strict (fn w p -> num.max w (str.byte_length (asker (list.nth 1 (list.head p))))) 0 parsed;
-    let reqs = list.map (fn p -> list.nth 1 (list.nth 1 p)) parsed;
+    let reqs = list.map requirement parsed;
     let req_width = list.fold_strict (fn w p -> num.max w (str.byte_length (list.head (list.head p)))) 0 parsed;
     let together = list.all (fn a -> list.all (fn b -> version.compatible a b) reqs) reqs;
     "`" + key + "` is " + text + " (" + manifest.dep_source (node_dep n) + "), but\n"
     + str.join_str "\n" (list.map (fn p -> {
-          let [w, [_, req]] = p;
+          let w = list.head p;
+          let req = requirement p;
           let who = asker (list.nth 1 w);
           "  " + who + str.repeat (width - str.byte_length who) " " + " requires "
           + list.head w + str.repeat (req_width - str.byte_length (list.head w)) " "
@@ -437,12 +441,12 @@ let walk_graph! m o assumed = {
     let path = [step_of root_abs name (shown! (manifest.path m)) :uses];
     let start = empty_graph.[:assumed => assumed].[:settings => settings! m o];
     let walked = list.fold (fn acc wk -> match acc {
-        [:error, why] => acc,
-        [:ok, g] => walk! m root_key (list.head wk) (list.nth 1 wk) path g,
-    }) [:ok, start] (root_deps m (option o :dev false));
+        Result.error(why) => acc,
+        Result.ok(g) => walk! m root_key (list.head wk) (list.nth 1 wk) path g,
+    }) (Result.ok start) (root_deps m (option o :dev false));
     match walked {
-        [:error, why] => [:error, why],
-        [:ok, g] => builds! m root_key path g,
+        Result.error(why) => Result.error why,
+        Result.ok(g) => builds! m root_key path g,
     }
 };
 
@@ -464,25 +468,25 @@ let max_rounds = 8;
 /// condition read a value that settling changed.
 let graph! m o =
     match has_profile m o {
-        false => [:error, "no profile is called `" + profile_of o + "`; this project has "
-                          + str.join_str ", " (list.unique (list.append ["debug", "release"] (manifest.profiles m)))],
+        false => Result.error ("no profile is called `" + profile_of o + "`; this project has "
+                          + str.join_str ", " (list.unique (list.append ["debug", "release"] (manifest.profiles m)))),
         true => settle_graph! m o (%{}) 1,
     };
 
 let rec settle_graph! m o assumed round =
     match walk_graph! m o assumed {
-        [:error, why] => [:error, why],
-        [:ok, g] => {
+        Result.error(why) => Result.error why,
+        Result.ok(g) => {
             let [values, errors] = settle! m o g;
             let next = by_dir! m g values;
             match [steady next (g.[:reads else []]), round >= max_rounds] {
                 [true, _] => match [errors, check_versions g] {
-                    [[_, .._], _] => [:error, str.join_str "\n" errors],
-                    [_, [:error, why]] => [:error, why],
-                    _ => [:ok, g.[:options => values]],
+                    [[_, .._], _] => Result.error (str.join_str "\n" errors),
+                    [_, Result.error(why)] => Result.error why,
+                    _ => Result.ok (g.[:options => values]),
                 },
-                [false, true] => [:error, "the options and the dependencies that hang on them do not settle: "
-                                          + "each way of building includes a package that configures it the other way"],
+                [false, true] => Result.error ("the options and the dependencies that hang on them do not settle: "
+                                          + "each way of building includes a package that configures it the other way"),
                 [false, false] => settle_graph! m o next (round + 1),
             }
         },
@@ -604,8 +608,8 @@ let settle_one m o packages at key pm addressed = {
             () => [vs, list.append errs [who + " has no option `" + name + "` (" + from + ")\n"
                                          + config.listing decls]],
             d => match config.check d raw {
-                [:ok, v] => [vs.[name => v], errs],
-                [:error, why] => [vs, list.append errs [why + " (" + from + ")"]],
+                Result.ok(v) => [vs.[name => v], errs],
+                Result.error(why) => [vs, list.append errs [why + " (" + from + ")"]],
             },
         };
     let entries table from = list.map (fn [n, v] -> [n, v, from]) (map.pairs table);
@@ -695,21 +699,21 @@ let short c = if str.byte_length c > 10 { str.slice 0 10 c } else { c };
 /// commits have moved because it moved them, and the lock follows.
 let resolve! m o accept =
     match graph! m o {
-        [:error, why] => [:error, why],
-        [:ok, g] => {
+        Result.error(why) => Result.error why,
+        Result.ok(g) => {
             let name = match manifest.name m { "" => "root", n => n };
             let now = lock_entries! g "program" name;
             let root = manifest.root m;
             let before = lock.load! root;
             match [accept, lock.drift before now] {
-                [false, [e, ..more]] => [:error, drift_message before (list.cons e more)],
+                [false, [e, ..more]] => Result.error (drift_message before (list.cons e more)),
                 _ => {
                     // A walk that left something out -- the dev dependencies,
                     // or an edge whose condition is off in this build -- keeps
                     // what the lock says about it.
                     let complete = option o :dev false && list.is_empty (g.[:off else []]);
                     lock.save! root (lock.merge before now complete)
-                    [:ok, g]
+                    Result.ok g
                 },
             }
         },
@@ -747,12 +751,12 @@ let payload_args m g = {
             let all = list.unique (list.flat_map manifest.payloads manifests);
             let clash = list.find (fn [n, p] -> list.any (fn [n2, p2] -> n2 == n && p2 != p) all) all;
             match clash {
-                () => [:ok, repeated "--payload" (list.map (fn [n, p] -> n + "=" + p) all)],
-                [n, _] => [:error, "two packages carry a payload named `" + n + "`: "
-                                   + str.join_str " and " (list.map (fn e -> list.nth 1 e) (list.filter (fn e -> list.head e == n) all))],
+                () => Result.ok (repeated "--payload" (list.map (fn [n, p] -> n + "=" + p) all)),
+                [n, _] => Result.error ("two packages carry a payload named `" + n + "`: "
+                                   + str.join_str " and " (list.map (fn e -> list.nth 1 e) (list.filter (fn e -> list.head e == n) all))),
             }
         },
-        why => [:error, why],
+        why => Result.error why,
     }
 };
 
@@ -809,8 +813,8 @@ let rec find_upwards! from name = {
 /// standard library, then every dependency in the order it was found.
 let search_paths! m o =
     match resolve! m o false {
-        [:error, why] => [:error, why],
-        [:ok, g] => [:ok, g, repeated "-L" (list.cons (stdlib_root! ())
+        Result.error(why) => Result.error why,
+        Result.ok(g) => [:ok, g, repeated "-L" (list.cons (stdlib_root! ())
                                                       (list.map package_arg (nodes g)))],
     };
 
@@ -1018,13 +1022,13 @@ let script_setting! m o g = {
 /// why they could not be run. `:only` narrows them to the names given.
 let checks! m o =
     match resolve! m o false {
-        [:error, why] => [:error, why],
-        [:ok, g] => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
-            [] => [:ok, []],
+        Result.error(why) => Result.error why,
+        Result.ok(g) => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
+            [] => Result.ok [],
             own => match script.run_all! (script_setting! m (with_option :testing true o) g) own {
-                [:error, why] => [:error, why],
-                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map.pairs (Outcome.checks outcome))],
-                [:ok, []] => [:ok, []],
+                Result.error(why) => Result.error why,
+                Result.ok([[_, outcome], .._]) => Result.ok (list.sort_on list.head (map.pairs (Outcome.checks outcome))),
+                Result.ok([]) => Result.ok [],
             },
         },
     };
@@ -1033,13 +1037,13 @@ let checks! m o =
 /// path]]]`, each where its result is -- or why they could not be.
 let goals! m o names =
     match resolve! m o false {
-        [:error, why] => [:error, why],
-        [:ok, g] => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
-            [] => [:error, "`" + manifest.name m + "` has no build script, so it has no goals"],
+        Result.error(why) => Result.error why,
+        Result.ok(g) => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
+            [] => Result.error ("`" + manifest.name m + "` has no build script, so it has no goals"),
             own => match script.run_all! (script_setting! m (with_option :goals names o) g) own {
-                [:error, why] => [:error, why],
-                [:ok, [[_, outcome], .._]] => [:ok, list.sort_on list.head (map.pairs (Outcome.goals outcome))],
-                [:ok, []] => [:ok, []],
+                Result.error(why) => Result.error why,
+                Result.ok([[_, outcome], .._]) => Result.ok (list.sort_on list.head (map.pairs (Outcome.goals outcome))),
+                Result.ok([]) => Result.ok [],
             },
         },
     };
@@ -1048,10 +1052,10 @@ let goals! m o names =
 /// when no package has a script.
 let script_args! m o g =
     match scripted! m o g {
-        [] => [:ok, []],
+        [] => Result.ok [],
         found => match script.run_all! (script_setting! m o g) found {
-            [:error, why] => [:error, why],
-            [:ok, outcomes] => script.compile_args outcomes,
+            Result.error(why) => Result.error why,
+            Result.ok(outcomes) => script.compile_args outcomes,
         },
     };
 
@@ -1116,11 +1120,11 @@ let forget_unit! path now = match io.stat! path {
 /// makes it win.
 let compile_args! m o =
     match search_paths! m o {
-        [:error, why] => [:error, why],
+        Result.error(why) => Result.error why,
         [:ok, g, paths] => match [script_args! m o g, payload_args m g] {
-            [[:error, why], _] => [:error, why],
-            [_, [:error, why]] => [:error, why],
-            [[:ok, from_scripts], [:ok, carried]] => [:ok, list.concat [
+            [Result.error(why), _] => Result.error why,
+            [_, Result.error(why)] => Result.error why,
+            [Result.ok(from_scripts), Result.ok(carried)] => Result.ok (list.concat [
               [match option o :entry () { () => manifest.entry! m, e => e }],
               paths,
               repeated "-L" (list.append (manifest.package_paths m) (option o :paths [])),
@@ -1138,7 +1142,7 @@ let compile_args! m o =
               manifest.profile_flags m (profile_of o),
               option o :extra [],
               option o :flags [],
-            ]],
+            ]),
         },
     };
 
@@ -1170,10 +1174,10 @@ let targets m o =
 /// The command as it would be typed, for `--verbose` and for a bug report.
 let command_line! m o =
     match compile_args! m o {
-        [:error, why] => [:error, why],
-        [:ok, args] =>
+        Result.error(why) => Result.error why,
+        Result.ok(args) =>
             match compiler_command! (choose_compiler! m (option o :compiler ())) {
-                [program, lead] => [:ok, str.join_str " " (list.cons program (list.append lead args))],
+                [program, lead] => Result.ok (str.join_str " " (list.cons program (list.append lead args))),
             },
     };
 
@@ -1181,8 +1185,8 @@ let command_line! m o =
 /// as `--test`.
 let compile! m o = {
     match compile_args! m o {
-        [:error, why] => [:error, why],
-        [:ok, args] => {
+        Result.error(why) => Result.error why,
+        Result.ok(args) => {
             file.mkdir_all! (path.dirname (output_of m o))
             match compiler_command! (choose_compiler! m (option o :compiler ())) {
                 [program, lead] => {
@@ -1195,11 +1199,11 @@ let compile! m o = {
                     // -- its bars reach the person watching (see std.progress).
                     let r = os.exec_with! (os.cwd! ()) (progress.child_env! ()) program (list.append lead args) 0;
                     let code = r.[:code else (0 - 1)];
-                    if code == 0 { [:ok, r.[:out else ""]] }
+                    if code == 0 { Result.ok (r.[:out else ""]) }
                     else {
                         let err = r.[:err else ""];
                         let out = r.[:out else ""];
-                        [:error, str.trim (err + out)]
+                        Result.error (str.trim (err + out))
                     }
                 },
             }
@@ -1250,9 +1254,9 @@ let become_repl! m o args = {
     match compiler_command! (choose_compiler! m (option o :compiler ())) {
         [program, lead] => {
             match try! { os.replace! program (list.append lead args) }
-                  catch e { [:error, "cannot start " + to_string program + ": " + to_string e] } {
-                [:error, why] => [:error, why],
-                _ => [:error, "the session did not start"],
+                  catch e { Result.error ("cannot start " + to_string program + ": " + to_string e) } {
+                Result.error(why) => Result.error why,
+                _ => Result.error "the session did not start",
             }
         },
     }
@@ -1268,7 +1272,7 @@ let become_repl! m o args = {
 let repl! m o = {
     let dev = with_option :dev true o;
     match search_paths! m dev {
-        [:error, why] => [:error, why],
+        Result.error(why) => Result.error why,
         [:ok, g, paths] =>
             become_repl! m o (list.concat [repl_args m o (setting_args m dev g), paths, ["-L", root_of m]]),
     }

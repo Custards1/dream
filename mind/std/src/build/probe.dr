@@ -56,7 +56,7 @@ let library ctx name = {
 /// What a probe answered as a value rather than text, for one whose answer is
 /// a record (`llvm`); `()` for no answer.
 let answer : :string -> :any;
-let answer text = match wire.decode text { [:ok, v] => v, _ => () };
+let answer text = match wire.decode text { Result.ok(v) => v, _ => () };
 
 /// `llvm-config`'s answers, as one record.
 let llvm_answer : [:string] -> :string;

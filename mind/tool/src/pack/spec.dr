@@ -110,7 +110,7 @@ type Overrides = %{:string => :string};
 /// A whole spec from a parsed manifest found in `root`. Everything about it
 /// that can be wrong is answered by `problems`, so this only fails where it
 /// cannot go on: a machine it does not know.
-let of_doc : :string -> :map -> Overrides -> %{:string => :string} -> [:ok, Spec] | [:error, :string];
+let of_doc : :string -> :map -> Overrides -> %{:string => :string} -> Result Spec :string;
 let of_doc root doc overrides scripts = {
     let pick = fn key default -> match overrides.[key else ""] { "" => own doc key default, v => v };
     let? arch = platform.parse_arch (pick "arch" "native");
@@ -120,7 +120,7 @@ let of_doc root doc overrides scripts = {
         "" => text_of (toml.get () doc "package" "description"),
         s => s,
     };
-    [:ok, Spec.new root doc (own doc "name" "") (pick "version" "") arch os
+    Result.ok (Spec.new root doc (own doc "name" "") (pick "version" "") arch os
           |> Spec.set_release release
           |> Spec.set_summary summary
           |> Spec.set_description (own doc "description" summary)
@@ -129,20 +129,20 @@ let of_doc root doc overrides scripts = {
           |> Spec.set_maintainer (own doc "maintainer" "")
           |> Spec.set_prefix (own doc "prefix" "/usr")
           |> Spec.set_url (own doc "url" "")
-          |> Spec.set_scripts scripts]
+          |> Spec.set_scripts scripts)
 };
 
 /// The scripts a manifest names, read; `[:error, why]` for one that is not
 /// there, since a package that silently lost its `postinst` installs and
 /// then does not work.
-let read_scripts! : :string -> :map -> [:ok, %{:string => :string}] | [:error, :string];
+let read_scripts! : :string -> :map -> Result %{:string => :string} :string;
 let read_scripts! root doc = {
     let rec go! names acc = match names {
-        [] => [:ok, acc],
+        [] => Result.ok acc,
         [hook, ..rest] => match text_of (toml.get () doc "ship.scripts" hook) {
             "" => go! rest acc,
             script => match file.read! (path.join root script) {
-                () => [:error, "[ship.scripts] " + hook + ": cannot read " + script],
+                () => Result.error ("[ship.scripts] " + hook + ": cannot read " + script),
                 body => go! rest acc.[hook => body],
             },
         },
@@ -151,12 +151,12 @@ let read_scripts! root doc = {
 };
 
 /// The manifest file `manifest`, read and made a spec.
-let load! : :string -> Overrides -> [:ok, Spec] | [:error, :string];
+let load! : :string -> Overrides -> Result Spec :string;
 let load! manifest overrides = match file.read! manifest {
-    () => [:error, "cannot read " + manifest],
+    () => Result.error ("cannot read " + manifest),
     source => match toml.parse source {
-        [:error, why] => [:error, manifest + ": " + why],
-        [:ok, doc] => {
+        Result.error(why) => Result.error (manifest + ": " + why),
+        Result.ok(doc) => {
             let root = path.dirname manifest;
             let? scripts = read_scripts! root doc;
             of_doc root doc overrides scripts
@@ -255,7 +255,7 @@ when test {
                    + "[ship.files]\n\"bin/demo\" = \"demo\"\n\n[ship.deb]\ndepends = [\"libc6\"]\n";
 
     let demo! () = match toml.parse manifest {
-        [:ok, doc] => match of_doc "." doc (%{}) (%{}) { [:ok, sp] => sp, other => raise! other },
+        Result.ok(doc) => match of_doc "." doc (%{}) (%{}) { Result.ok(sp) => sp, other => raise! other },
         other => raise! other,
     };
 
@@ -268,9 +268,9 @@ when test {
             } ),
         test.case "the command line wins"
             $( match toml.parse manifest {
-                [:ok, doc] => test.eq! [:ok, "2.0", :aarch64]
+                Result.ok(doc) => test.eq! [:ok, "2.0", :aarch64]
                     (match of_doc "." doc (%{ "version" => "2.0", "arch" => "arm64" }) (%{}) {
-                        [:ok, sp] => [:ok, Spec.version sp, Spec.arch sp],
+                        Result.ok(sp) => [:ok, Spec.version sp, Spec.arch sp],
                         other => other,
                     }),
                 other => raise! other,

@@ -3,6 +3,6 @@
 :missing
 ["a", "b"]
 [:atom, :float, :char]
-[:ok, [:error, :unknown]]
+Result.ok(Result.error(:unknown))
 ["a", "b", "kinds"]
 ["a", "b", "kinds"]

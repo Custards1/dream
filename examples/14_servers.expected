@@ -1,7 +1,7 @@
 1
 ["a", "b"]
 :missing
-[:error, :unknown]
+Result.error(:unknown)
 ["a", "b"]
 :ok ["x"]
 ["count", "store"]

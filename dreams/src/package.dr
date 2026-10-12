@@ -225,19 +225,19 @@ let dep_location spec =
 /// A manifest's `[vm]` table, read into a `Vm`. A key it does not know is an
 /// error rather than a warning: a misspelt setting would otherwise be a
 /// setting silently not made.
-let vm_settings : [[:any]] -> [:ok, Vm] | [:error, :string];
+let vm_settings : [[:any]] -> Result Vm :string;
 let vm_settings entries =
     list.fold (fn acc [key, value] -> match acc {
-        [:ok, settings] => match key {
+        Result.ok(settings) => match key {
             "nursery_max" => match size_of value {
-                () => [:error, "[vm] nursery_max takes a size such as 65536 or \"64M\", not "
-                               + to_string value],
-                n => [:ok, Vm.set_nursery_max n settings],
+                () => Result.error ("[vm] nursery_max takes a size such as 65536 or \"64M\", not "
+                               + to_string value),
+                n => Result.ok (Vm.set_nursery_max n settings),
             },
-            _ => [:error, "[vm] has no setting `" + key + "`; the one it has is nursery_max"],
+            _ => Result.error ("[vm] has no setting `" + key + "`; the one it has is nursery_max"),
         },
         failed => failed,
-    }) [:ok, Vm.new ()] entries;
+    }) (Result.ok (Vm.new ())) entries;
 
 /// A size in a manifest: a positive count of bytes, or text `num.parse_size`
 /// reads, so `65536` and `"64K"` mean the same.
@@ -255,14 +255,14 @@ priv let size_of v = match type_of v {
 /// normal layout -- a workspace root -- and not a mistake, so it is not
 /// reported as one. `[:error, message]` is a manifest that is meant to be a
 /// package and cannot be read as one.
-let load_manifest! : :string -> [:ok, Package] | [:none] | [:error, :string];
+let load_manifest! : :string -> Result Package :string | [:none];
 let load_manifest! filename =
     match file.read! filename {
-        () => [:error, "cannot read " + filename],
+        () => Result.error ("cannot read " + filename),
         text =>
             match toml.parse text {
-                [:error, why] => [:error, filename + ": " + why],
-                [:ok, doc] => {
+                Result.error(why) => Result.error (filename + ": " + why),
+                Result.ok(doc) => {
                     let root_dir = path.dirname filename;
                     match toml.get () doc "package" "name" {
                         () => [:none],
@@ -280,17 +280,17 @@ let load_manifest! filename =
                                             s  => path.join root_dir s,
                                         };
                                     match vm_settings (toml.entries doc "vm") {
-                                        [:ok, settings] =>
-                                            [:ok, make n (toml.get "0.0.0" doc "package" "version")
+                                        Result.ok(settings) =>
+                                            Result.ok (make n (toml.get "0.0.0" doc "package" "version")
                                                       root_dir src_dir
                                                       (list.map (fn [name, location] -> dep name (dep_location location))
                                                                 (toml.entries doc "dependencies"))
                                                       filename
-                                                  |> Package.set_vm settings],
-                                        [:error, why] => [:error, filename + ": " + why],
+                                                  |> Package.set_vm settings),
+                                        Result.error(why) => Result.error (filename + ": " + why),
                                     }
                                 },
-                                why => [:error, filename + ": " + why],
+                                why => Result.error (filename + ": " + why),
                             },
                     }
                 },
@@ -370,9 +370,9 @@ let add! p s =
 let add_manifest! : :string -> Packages -> [Packages, :integer | :unit];
 let add_manifest! file s =
     match load_manifest! file {
-        [:ok, p]      => add! p s,
+        Result.ok(p)      => add! p s,
         [:none]       => [s, ()],
-        [:error, why] => [note why s, ()],
+        Result.error(why) => [note why s, ()],
     };
 
 /// Every package sitting directly inside `dir`. Subdirectories only: a root
@@ -438,9 +438,9 @@ let add_named! n dir s = {
     match manifest_at! dir {
         () => as_bare! s,
         m => match load_manifest! m {
-            [:ok, p] => match add! p s { [s2, i] => alias! n i s2 },
+            Result.ok(p) => match add! p s { [s2, i] => alias! n i s2 },
             [:none] => as_bare! s,
-            [:error, why] => note why s,
+            Result.error(why) => note why s,
         },
     }
 };
@@ -516,8 +516,8 @@ let add_from_root! spec s =
                 () => packages_inside! dir s,
                 m =>
                     match load_manifest! m {
-                        [:ok, p]      => list.head (add! p s),
-                        [:error, why] => note why s,
+                        Result.ok(p)      => list.head (add! p s),
+                        Result.error(why) => note why s,
                         [:none]       => packages_inside! dir s,
                     },
             },
@@ -540,11 +540,11 @@ let rec find_enclosing! dir s =
         },
         m =>
             match load_manifest! m {
-                [:ok, p] => {
+                Result.ok(p) => {
                     let [added, i] = add! p s;
                     Packages.set_current i added
                 },
-                [:error, why] => note why s,
+                Result.error(why) => note why s,
                 [:none] => {
                     let up = path.dirname dir;
                     if up == dir || dir == "." { s }
@@ -605,7 +605,7 @@ let discover! file extra_roots = {
 when test {
     import std.test;
 
-    let doc text = match toml.parse text { [:ok, d] => d, _ => %{} };
+    let doc text = match toml.parse text { Result.ok(d) => d, _ => %{} };
 
     // `load_manifest!` reads a file, so what is tested here is everything that
     // does not: the naming rules, and the shapes read back out of a manifest.
@@ -630,15 +630,15 @@ when test {
 
     let tests = [
         test.case "no [vm] table leaves every setting to the VM"
-            $( test.eq! [:ok, Vm.new ()] (vm_of "[package]\nname = \"a\"") ),
+            $( test.eq! (Result.ok (Vm.new ())) (vm_of "[package]\nname = \"a\"") ),
         test.case "a nursery cap, as a size or a count of bytes"
-            $( test.eq! [[:ok, 67108864], [:ok, 65536]]
-                        [match vm_of "[vm]\nnursery_max = \"64M\"" { [:ok, v] => [:ok, Vm.nursery_max v], e => e },
-                         match vm_of "[vm]\nnursery_max = 65536" { [:ok, v] => [:ok, Vm.nursery_max v], e => e }] ),
+            $( test.eq! [Result.ok 67108864, Result.ok 65536]
+                        [match vm_of "[vm]\nnursery_max = \"64M\"" { Result.ok(v) => Result.ok (Vm.nursery_max v), e => e },
+                         match vm_of "[vm]\nnursery_max = 65536" { Result.ok(v) => Result.ok (Vm.nursery_max v), e => e }] ),
         test.case "a [vm] key it does not know is an error"
-            $( test.eq! :error (list.head (vm_of "[vm]\nnursery = \"64M\"")) ),
+            $( test.eq! :error (Result.tag (vm_of "[vm]\nnursery = \"64M\"")) ),
         test.case "a size that is not one is an error"
-            $( test.eq! :error (list.head (vm_of "[vm]\nnursery_max = \"lots\"")) ),
+            $( test.eq! :error (Result.tag (vm_of "[vm]\nnursery_max = \"lots\"")) ),
         test.case "a manifest names its package"
             $( test.eq! ["std", "0.1.0"]
                         { let m = parsed "[package]\nname = \"std\"\nversion = \"0.1.0\"";

@@ -666,8 +666,8 @@ let where_ok accept name p s at = match p s at {
 let try_map : (a -> result.Of b :string) -> Parser a -> Parser b;
 let try_map f p s at = match p s at {
     #[:ok, v, next, pr] => match f v {
-        [:ok, v2] => ok v2 next pr,
-        [:error, why] => #[:fail, #[at, [[:message, why]]]],
+        Result.ok(v2) => ok v2 next pr,
+        Result.error(why) => #[:fail, #[at, [[:message, why]]]],
     },
     #[:fail, pr] => #[:fail, pr],
 };
@@ -743,8 +743,8 @@ when test {
          [:right, [["^", fn a b -> num.pow a b]]],
          [:prefix, [["-", fn a -> 0 - a]]]] s at;
     let calc t = run (then expr spaces) t;
-    let message r = match r { [:error, e] => Error.message e, _ => "" };
-    let where r = match r { [:error, e] => [Error.line e, Error.column e], _ => [] };
+    let message r = match r { Result.error(e) => Error.message e, _ => "" };
+    let where r = match r { Result.error(e) => [Error.line e, Error.column e], _ => [] };
 
     // A JSON reader in a dozen lines: the test that the pieces compose.
     let rec json_value s at = lexeme (choice [
@@ -756,37 +756,37 @@ when test {
     ]) s at;
 
     let tests = [
-        test.case "a pipeline"                $( test.eq! [:ok, [3, 4]] (run pair "3, 4") ),
+        test.case "a pipeline"                $( test.eq! (Result.ok [3, 4]) (run pair "3, 4") ),
         test.case "a pipeline's error"        $( test.eq! "expected digit or \",\", found \";\"" (message (run pair "3; 4")) ),
-        test.case "precedence"                $( test.eq! [:ok, 7] (calc "1 + 2 * 3") ),
-        test.case "left associativity"        $( test.eq! [:ok, 4] (calc "10 - 3 - 3") ),
-        test.case "right associativity"       $( test.eq! [:ok, 512] (calc "2 ^ 3 ^ 2") ),
-        test.case "prefix and parentheses"    $( test.eq! [:ok, 0 - 9] (calc "-(1 + 2) * 3") ),
+        test.case "precedence"                $( test.eq! (Result.ok 7) (calc "1 + 2 * 3") ),
+        test.case "left associativity"        $( test.eq! (Result.ok 4) (calc "10 - 3 - 3") ),
+        test.case "right associativity"       $( test.eq! (Result.ok 512) (calc "2 ^ 3 ^ 2") ),
+        test.case "prefix and parentheses"    $( test.eq! (Result.ok (0 - 9)) (calc "-(1 + 2) * 3") ),
         test.case "where an error is"         $( test.eq! [1, 11] (where (calc "(1 + 2 * 3x")) ),
         test.case "what was expected there"   $( test.eq! "expected digit, \"^\", \"*\", \"/\", \"+\", \"-\" or \")\", found \"x\""
                                                    (message (calc "(1 + 2 * 3x")) ),
         test.case "the end is required"       $( test.eq! "expected digit, \"^\", \"*\", \"/\", \"+\", \"-\" or the end of the text, found \")\""
                                                    (message (calc "1 + 2)")) ),
         test.case "explain draws a caret"     $( test.eq! "line 2, column 3: expected white space or a number, found \"x\"\n  2 | 4 x\n    |   ^"
-                                                   (match run (sep_by1 spaces1 natural) "1\n4 x" { [:error, e] => explain e "1\n4 x", _ => "" }) ),
-        test.case "JSON"                      $( test.eq! [:ok, %{ "a" => [1, 2.5, true, ()], "b" => "x\ny" }]
+                                                   (match run (sep_by1 spaces1 natural) "1\n4 x" { Result.error(e) => explain e "1\n4 x", _ => "" }) ),
+        test.case "JSON"                      $( test.eq! (Result.ok %{ "a" => [1, 2.5, true, ()], "b" => "x\ny" })
                                                    (run (then json_value spaces) "{\"a\": [1, 2.5, true, null], \"b\": \"x\\ny\"}") ),
-        test.case "unicode is read as characters" $( test.eq! [:ok, "héllo"] (run (take_while1 "letter" is_letter) "héllo") ),
+        test.case "unicode is read as characters" $( test.eq! (Result.ok "héllo") (run (take_while1 "letter" is_letter) "héllo") ),
         test.case "columns count characters"  $( test.eq! [1, 3] (where (run (text "é" |> then (text "a") |> then (text "b")) "éaX")) ),
         test.case "keywords are whole words"  $( test.eq! [true, false] [matches (keyword "if") "if", matches (keyword "if") "iffy"] ),
-        test.case "many cannot loop"          $( test.eq! [:ok, []] (run (many (span "x")) "") ),
+        test.case "many cannot loop"          $( test.eq! (Result.ok []) (run (many (span "x")) "") ),
         test.case "label names what failed"   $( test.eq! "expected a port, found \"x\"" (message (run (label "a port" natural) "x")) ),
         test.case "where_ok checks a value"   $( test.eq! "expected a byte, found \"3\"" (message (run (where_ok (fn n -> n <= 255) "a byte" natural) "300")) ),
-        test.case "try_map reports a message" $( test.eq! "too big" (message (run (try_map (fn n -> if n > 9 { [:error, "too big"] } else { [:ok, n] }) natural) "10")) ),
-        test.case "until and capture"         $( test.eq! [:ok, ["key", "a = b"]]
+        test.case "try_map reports a message" $( test.eq! "too big" (message (run (try_map (fn n -> if n > 9 { Result.error "too big" } else { Result.ok n }) natural) "10")) ),
+        test.case "until and capture"         $( test.eq! (Result.ok ["key", "a = b"])
                                                    (run (seq [until " =", capture (seq [text " =", rest])] |> map (fn [k, r] -> [k, "a" + r])) "key = b") ),
-        test.case "many_till"                 $( test.eq! [:ok, ['a', 'b']] (run (many_till (text "-->") any_char) "ab-->") ),
-        test.case "numbers"                   $( test.eq! [:ok, [1, 0 - 2, 2.5, 100.0, 0.5]]
+        test.case "many_till"                 $( test.eq! (Result.ok ['a', 'b']) (run (many_till (text "-->") any_char) "ab-->") ),
+        test.case "numbers"                   $( test.eq! (Result.ok [1, 0 - 2, 2.5, 100.0, 0.5])
                                                    (run (sep_by (symbol ",") number) "1, -2, 2.5, 1e2, 5E-1") ),
-        test.case "a quoted string's escapes" $( test.eq! [:ok, "a\"b\u{e9}"] (run quoted "\"a\\\"b\\u00e9\"") ),
+        test.case "a quoted string's escapes" $( test.eq! (Result.ok "a\"b\u{e9}") (run quoted "\"a\\\"b\\u00e9\"") ),
         test.case "an unclosed string"        $( test.eq! "expected a closing quote, found the end of the text" (message (run quoted "\"abc")) ),
         test.case "lines and columns"         $( test.eq! [[1, 1], [2, 1], [2, 4]] [line_col "ab\ncd" 0, line_col "ab\ncd" 3, line_col "ab\ncde" 6] ),
-        test.case "spanned"                   $( test.eq! [:ok, ["ab", 1, 3]] (run (then (spanned (text "ab")) (text " ")) " ab") ),
-        test.case "postfix"                   $( test.eq! [:ok, 6] (run (operators natural [[:postfix, [["!", fn n -> n * 3]]]]) "2!") ),
+        test.case "spanned"                   $( test.eq! (Result.ok ["ab", 1, 3]) (run (then (spanned (text "ab")) (text " ")) " ab") ),
+        test.case "postfix"                   $( test.eq! (Result.ok 6) (run (operators natural [[:postfix, [["!", fn n -> n * 3]]]]) "2!") ),
     ];
 }

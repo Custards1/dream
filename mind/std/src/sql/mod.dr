@@ -324,8 +324,8 @@ priv let tagged : :string -> Syntax -> Syntax;
 priv let tagged tag e = list_s [atom_s tag, e];
 
 /// Return a SQL macro-expansion error with module context.
-priv let invalid : :string -> [:error, :string];
-priv let invalid message = [:error, "sql.query: " + message];
+priv let invalid : :string -> Result a :string;
+priv let invalid message = Result.error ("sql.query: " + message);
 
 /// `expand sql.query "SELECT .. {name} .."`, or a list of SQL string literals
 /// and values: a statement whose `{name}`s are the values those names hold,
@@ -1848,11 +1848,11 @@ let rec retrying! c attempts options work = {
     let outcome = try! {
         let v = transaction_with! c options work;
         strict! v
-        [:ok, v]
-    } catch e { [:error, e] };
+        Result.ok v
+    } catch e { Result.error e };
     match outcome {
-        [:ok, v] => v,
-        [:error, e] => if attempts > 1 && is_retryable e { retrying! c (attempts - 1) options work }
+        Result.ok(v) => v,
+        Result.error(e) => if attempts > 1 && is_retryable e { retrying! c (attempts - 1) options work }
                        else { raise! e },
     }
 };
@@ -2108,10 +2108,10 @@ priv let notification_process! c !target = spawn! $( forward_notifications! c ta
 /// Forward notifications to the receiving process until stopped.
 priv let forward_notifications! : Connection -> :process -> :atom;
 priv let rec forward_notifications! c target = {
-    let next = try! { let n = next_notification! c; strict! n; [:ok, n] } catch e { [:error, e] };
+    let next = try! { let n = next_notification! c; strict! n; Result.ok n } catch e { Result.error e };
     match next {
-        [:ok, n] => { send! target [:sql_notification, n]; forward_notifications! c target },
-        [:error, _] => :stopped,
+        Result.ok(n) => { send! target [:sql_notification, n]; forward_notifications! c target },
+        Result.error(_) => :stopped,
     }
 };
 

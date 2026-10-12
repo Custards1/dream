@@ -92,7 +92,7 @@ mod table {
                 let next = list.nth 1 pair;
                 reply (list.nth 0 pair) [next, watch_new! next watched]
             },
-            _ => reply [:error, :unknown_request] state,
+            _ => reply (Result.error :unknown_request) state,
         }
     };
 
@@ -147,17 +147,18 @@ let register! reg name pid = {
     server.call! reg [:get_and_update, fn m -> [map.get () name m, map.put name p m]]
 };
 
-/// Bind `name` only if nothing holds it: `[:ok, pid]`, or `[:taken, other]`.
+/// Bind `name` only if nothing holds it: `Result.ok pid`, or
+/// `Result.error [:taken, other]`.
 ///
 /// The check and the write happen in the registry, in one message, which is
 /// the difference between this and a `whereis!` followed by a `register!` --
 /// two processes claiming the same name would both find it free.
-let claim! : server.Handle -> :any -> :process -> ([:ok, :process] | [:taken, :process]);
+let claim! : server.Handle -> :any -> :process -> Result :process [:taken, :process];
 let claim! reg name pid = {
     let p = strict! pid;
     server.call! reg [:get_and_update, fn m -> match map.get () name m {
-        ()    => [[:ok, p], map.put name p m],
-        other => [[:taken, other], m],
+        ()    => [Result.ok p, map.put name p m],
+        other => [Result.error [:taken, other], m],
     }]
 };
 
@@ -290,7 +291,7 @@ when test {
         let handle_call! request from state = match request {
             :value    => reply state state,
             [:add, n] => reply (state + n) (state + n),
-            _         => reply [:error, :unknown] state,
+            _         => reply (Result.error :unknown) state,
         };
 
         let handle_cast! message state = match message {
@@ -391,7 +392,7 @@ when test {
                    let p = counter.start! 0;
                    let got = claim! reg "c" p;
                    counter.stop! p
-                   got == [:ok, p]
+                   got == (Result.ok p)
                })) ),
         test.case "claim! refuses a taken one, and names the holder"
             $( test.true! (with_registry! (fn reg -> {
@@ -402,7 +403,7 @@ when test {
                    let now = whereis! reg "c";
                    counter.stop! one
                    counter.stop! two
-                   got == [:taken, one] && now == one
+                   got == Result.error [:taken, one] && now == one
                })) ),
 
         test.case "unregister! forgets the name and answers the pid"

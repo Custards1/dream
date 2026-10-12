@@ -93,7 +93,7 @@ let recall! cache kind k = match cache {
         named => match file.read! (path dir kind named) {
             () => (),
             bytes => match wire.decode bytes {
-                [:ok, v] => {
+                Result.ok(v) => {
                     refresh! (path dir kind named) bytes
                     v
                 },
@@ -149,7 +149,7 @@ when test {
         test.case "laid over what it was taken from, it is the part again"
             $( test.eq! walked (restore base (delta base walked)) ),
         test.case "and it survives the wire"
-            $( test.eq! walked (restore base (match wire.decode (vm.wire_encode (delta base walked)) { [:ok, d] => d, _ => %{} })) ),
+            $( test.eq! walked (restore base (match wire.decode (vm.wire_encode (delta base walked)) { Result.ok(d) => d, _ => %{} })) ),
         test.case "positions shift and shift back"
             $( test.eq! [[3, :a], [5, :b, :c]] (shifted 3 (shifted (0 - 3) [[3, :a], [5, :b, :c]])) ),
     ];

@@ -52,6 +52,8 @@ Runtime::Runtime(bool owns_host_services)
     for (size_t i = 0; i < std::size(kTypeNames); ++i) {
         wk_->types[i] = intern_atom(kTypeNames[i]);
     }
+    wk_->result_ok = intern_atom("std.prelude.Result.ok");
+    wk_->result_error = intern_atom("std.prelude.Result.error");
 
     register_module(make_math_module());
     register_module(make_tensor_module());

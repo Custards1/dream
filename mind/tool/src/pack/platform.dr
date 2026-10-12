@@ -42,27 +42,27 @@ priv let os_names : %{:string => Os} = %{
 };
 
 /// A machine in any format's spelling, or `native` for this one.
-let parse_arch : :string -> [:ok, Arch] | [:error, :string];
+let parse_arch : :string -> Result Arch :string;
 let parse_arch name = match str.lower name {
     "native" => match native () {
-        () => [:error, "this VM does not know what machine it runs on; set `arch` in [ship] or pass --arch"],
-        a => [:ok, a],
+        () => Result.error "this VM does not know what machine it runs on; set `arch` in [ship] or pass --arch",
+        a => Result.ok a,
     },
     n => match arch_names.[n else ()] {
-        () => [:error, "unknown architecture `" + name + "`: say x86_64, aarch64, all or native"],
-        a => [:ok, a],
+        () => Result.error ("unknown architecture `" + name + "`: say x86_64, aarch64, all or native"),
+        a => Result.ok a,
     },
 };
 
-let parse_os : :string -> [:ok, Os] | [:error, :string];
+let parse_os : :string -> Result Os :string;
 let parse_os name = match str.lower name {
     "native" => match host_os () {
-        () => [:error, "this VM does not know what system it runs on; pass --os"],
-        o => [:ok, o],
+        () => Result.error "this VM does not know what system it runs on; pass --os",
+        o => Result.ok o,
     },
     n => match os_names.[n else ()] {
-        () => [:error, "unknown system `" + name + "`: say linux, macos or windows"],
-        o => [:ok, o],
+        () => Result.error ("unknown system `" + name + "`: say linux, macos or windows"),
+        o => Result.ok o,
     },
 };
 
@@ -87,10 +87,10 @@ when test {
 
     let tests = [
         test.case "every spelling of a machine"
-            $( test.eq! [[:ok, :x86_64], [:ok, :aarch64], [:ok, :all], [:ok, :x86_64]]
+            $( test.eq! [Result.ok :x86_64, Result.ok :aarch64, Result.ok :all, Result.ok :x86_64]
                         [parse_arch "amd64", parse_arch "ARM64", parse_arch "noarch", parse_arch "x86_64"] ),
         test.case "an unknown machine is an error"
-            $( test.eq! :error (list.head (parse_arch "sparc")) ),
+            $( test.eq! :error (Result.tag (parse_arch "sparc")) ),
         test.case "each format's name"
             $( test.eq! [["amd64", "x86_64", "x86_64"], ["all", "noarch", "any"]]
                         [[deb :x86_64, rpm :x86_64, pacman :x86_64], [deb :all, rpm :all, pacman :all]] ),

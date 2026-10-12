@@ -36,11 +36,21 @@ aligned. The sentinel `0xFFFFFFFF` (`NO_NODE`) marks an absent edge.
 | 0      | 8    | `magic`         | ASCII `DAGNCAAF`                             |
 | 8      | 2    | `version_major` | `0`; a mismatch must be rejected             |
 | 10     | 2    | `version_minor` | `1`; a higher minor is forward-compatible    |
-| 12     | 4    | `flags`         | bit 0: a `SPAN` debug section is present; bits 8-23: the target (below) |
+| 12     | 4    | `flags`         | bit 0: a `SPAN` debug section is present; bit 1: results are the prelude's `Result` records (below); bits 8-23: the target (below) |
 | 16     | 4    | `module_name`   | string-table index                           |
 | 20     | 4    | `source_name`   | string-table index; the original source path |
 | 24     | 4    | `entry`         | function index of `main!`, or `NO_NODE`      |
 | 28     | 4    | `section_count` |                                              |
+
+### Results
+
+Bit 1 of `flags` says the program reads a result as the prelude's `Result`
+record (`Result.ok v`, `Result.error e`), and every image the compiler writes
+now sets it. A native that answers a result -- the outcome in a `[:down, p,
+outcome]`, `vm.mailbox_peek!`, `wire_decode`, `locate!` -- makes the record for
+such an image and the older `[:ok, v]`/`[:error, e]` list for one without the
+bit, so an image written before results were records, a compiler's seed among
+them, runs unchanged.
 
 ### The image's target
 

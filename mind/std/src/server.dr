@@ -89,7 +89,7 @@ virtual let init! args;
 /// only takes casts should do: refuse clearly rather than hang.
 /// `from` is a `Handle`, or `:nobody` when `answer!` runs a handler in place.
 let handle_call! : :any -> :any -> :any -> Action :any :any;
-virtual let handle_call! request from state = reply [:error, :unhandled] state;
+virtual let handle_call! request from state = reply (Result.error :unhandled) state;
 
 /// A message that wants no answer. `noreply state` or `stop reason state`.
 let handle_cast! : :any -> :any -> Action :any :any;
@@ -286,19 +286,19 @@ let child_with! name args restart = supervisor.child_with name (started! args) r
 /// payload, instead of leaving the caller waiting for ever.
 let call! : Handle -> :any -> :any;
 let call! pid request = match await_reply! pid request proc.forever {
-    [:ok, value] => value,
+    Result.ok(value) => value,
     // Unreachable: there is no deadline to reach. Said, so the match is whole.
     other => raise! (error.new :timeout other),
 };
 
-/// `call!` that gives up after `ms` milliseconds: `[:ok, reply]` or
-/// `:timeout`. A reply that arrives afterwards stays in the caller's mailbox
+/// `call!` that gives up after `ms` milliseconds: `Result.ok reply` or
+/// `Result.error :timeout`. A reply that arrives afterwards stays in the caller's mailbox
 /// and is never taken for another call's.
-let call_within! : Handle -> :any -> :integer -> ([:ok, :any] | :timeout);
+let call_within! : Handle -> :any -> :integer -> Result :any :timeout;
 let call_within! pid request ms = await_reply! pid request (proc.deadline_in! ms);
 
 /// Send a monitored server request and await its correlated reply until the deadline.
-priv let await_reply! : Handle -> :any -> :integer -> ([:ok, :any] | :timeout);
+priv let await_reply! : Handle -> :any -> :integer -> Result :any :timeout;
 priv let await_reply! pid request deadline = {
     let ref = vm.unique! ();
     let from = [self! (), ref];
@@ -307,9 +307,9 @@ priv let await_reply! pid request deadline = {
     let answer = proc.recv_until! (fn m -> is_reply_to ref m || proc.is_down_of pid m) deadline;
     proc.demonitor! pid
     match answer {
-        [:ok, [:server_reply, _, value]] => [:ok, value],
-        [:ok, [:down, _, outcome]] => raise! (error.new :down outcome),
-        _ => :timeout,
+        Result.ok([:server_reply, _, value]) => Result.ok value,
+        Result.ok([:down, _, outcome]) => raise! (error.new :down outcome),
+        _ => Result.error :timeout,
     }
 };
 

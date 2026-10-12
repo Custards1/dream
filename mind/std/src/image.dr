@@ -75,7 +75,7 @@ let value img target = (vm.pure_image_function img target 0) ();
 
 /// Where `img` is found -- `[:ok, file]` -- or why it cannot be, `[:error,
 /// why]`, naming where it looked.
-let locate! : Image -> [:ok, :string] | [:error, :string];
+let locate! : Image -> Result :string :string;
 let locate! img = vm.locate_image! img;
 
 when test {

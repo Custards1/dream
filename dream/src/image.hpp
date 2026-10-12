@@ -279,6 +279,11 @@ public:
     uint16_t version_major() const { return version_major_; }
     uint16_t version_minor() const { return version_minor_; }
     bool has_debug_info() const { return (flags_ & 1) != 0; }
+    /// Bit 1: the program reads a result as the prelude's `Result` record,
+    /// so a native that answers one makes that (`make_result`). An image
+    /// written before results were records reads `[:ok, v]` lists, and gets
+    /// those -- which is what lets a seed older than the change still run.
+    bool results_are_records() const { return (flags_ & 2) != 0; }
     /// Where the image may run: bits 8-15 of the header's flags are a set of
     /// systems, 16-23 a set of architectures, and an empty set is any. See
     /// "The image's target" in docs/bytecode-format.md.

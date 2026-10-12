@@ -244,20 +244,20 @@ let rec parse_array cs acc first = match skip_ws cs {
 let parse : :string -> result.Of :any :string;
 let parse text = {
     let r = parse_value (str.chars text);
-    if r == () { [:error, "not valid JSON"] }
+    if r == () { Result.error "not valid JSON" }
     else {
         let rest = skip_ws (step_rest r);
-        if list.is_empty rest { [:ok, step_value r] }
-        else { [:error, "trailing characters after the JSON value"] }
+        if list.is_empty rest { Result.ok (step_value r) }
+        else { Result.error "trailing characters after the JSON value" }
     }
 };
 
 /// Test whether a parse result has the success tag.
 let ok : result.Of a e -> :bool;
-let ok r = list.head r == :ok;
+let ok r = result.is_ok r;
 /// Extract the payload from a parse result.
 let value : result.Of a e -> :any;
-let value r = list.nth 1 r;
+let value r = match r { Result.ok(v) => v, Result.error(why) => why };
 
 /// The parsed value, or `default` if the text is not valid JSON.
 let parse_or : :any -> :string -> :any;
@@ -529,7 +529,7 @@ when test {
         test.case "encode is write under the name every codec answers to"
             $( test.eq! (write [1, "a"]) (encode [1, "a"]) ),
         test.case "decode is parse under that name"
-            $( test.eq! [:ok, 1] (decode "1") ),
+            $( test.eq! (Result.ok 1) (decode "1") ),
         test.case "decode_or"   $( test.eq! :fallback (decode_or :fallback "{") ),
         test.case "format_name" $( test.eq! "json" (format_name ()) ),
 
@@ -537,9 +537,9 @@ when test {
         // front of the text is what lets a stream be split back into messages
         // without parsing to find where one ended.
         test.case "a framed message comes back"
-            $( test.eq! [:ok, %{ "a" => 1 }] (list.nth 0 (next_frame (frame %{ "a" => 1 }))) ),
+            $( test.eq! (Result.ok %{ "a" => 1 }) (list.nth 0 (next_frame (frame %{ "a" => 1 }))) ),
         test.case "two framed messages come back in order"
-            $( test.eq! [[:ok, 1], [:ok, "two"]] (list.nth 0 (frames (frame_all [1, "two"]))) ),
+            $( test.eq! [Result.ok 1, Result.ok "two"] (list.nth 0 (frames (frame_all [1, "two"]))) ),
         test.case "half a message is not an answer"
             $( test.eq! () (next_frame (_str_slice (frame "hello") 0 6)) ),
 

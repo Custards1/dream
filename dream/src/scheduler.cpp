@@ -407,12 +407,14 @@ void Scheduler::terminate(const std::shared_ptr<Process>& p) {
 }
 
 std::unique_ptr<Message> Scheduler::down_message(Process& p) {
-    const WellKnownAtoms& wk = well_known(rt_);
     auto msg = std::make_unique<Message>();
     msg->heap = std::make_unique<Heap>(1024);
     Heap& h = *msg->heap;
     Value value = Heap::copy_between(h, p.exit_value);
-    Value outcome = h.make_cons(make_atom(p.failed ? wk.error : wk.ok), h.make_cons(value, NIL));
+    // `Result.ok value` or `Result.error e`, the prelude's union, as a
+    // variant record of one field -- what `syntax.union_decl`'s constructor
+    // makes, so the joiner's `Result.ok(v)` pattern takes it apart.
+    Value outcome = make_result(h, rt_, !p.failed, value);
     Value pid = h.make_pid(p.id());
     msg->value = h.make_cons(make_atom(rt_.intern_atom("down")),
                              h.make_cons(pid, h.make_cons(outcome, NIL)));
