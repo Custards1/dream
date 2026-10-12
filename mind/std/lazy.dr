@@ -21,6 +21,19 @@
 let settled : :any -> :bool;
 let settled value = _settled value;
 
+/// True, once `value` has been forced as far as its outermost constructor --
+/// a list to its first cell, a map to its table -- and no further.
+///
+/// `settled` is for a value that is kept; this is for a value that is carried.
+/// A loop that threads a table through its steps answers a suspended put per
+/// step unless something forces each one, and forcing the last then walks a
+/// tower of them with every intermediate table live. Forcing each step as it
+/// is made collapses the one before it, and what is inside the table stays as
+/// lazy as it was: forcing that too, at every step, would walk the whole table
+/// each time. Asked in a condition, as `settled` is.
+let forced : :any -> :bool;
+let forced value = _forced value;
+
 when test {
     import std.test;
     import std.list;
@@ -32,5 +45,9 @@ when test {
             $( test.eq! true (settled (list.map (fn n -> n * 2) (list.range 0 100000))) ),
         test.case "what forcing raises is raised"
             $( test.raises! $( settled [1, test.boom] ) ),
+        test.case "forced reaches the outside and no further"
+            $( test.eq! true (forced [test.boom]) ),
+        test.case "forced raises what the outside raises"
+            $( test.raises! $( forced (list.head [test.boom]) ) ),
     ];
 }

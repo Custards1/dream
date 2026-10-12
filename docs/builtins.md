@@ -171,6 +171,7 @@ Persistent means *shared*, not copied: `m.[key => value]` rebuilds only the path
 | `_record_fields` | `types.record_fields v` | `record → array` | Its fields in declared order, unforced. |
 | `_record_of` | a constructor's body | `atom → bool → array → record` | A record with that id, a variant's when the bool is true, its fields the array's items, unforced. What `syntax.record` writes as a constructor, which lowering turns into `record_make`; `types.make_record` for a decoder. |
 | `_settled` | `lazy.settled v` | `value → bool` | `true`, once the value has been forced all the way down, as `strict!` forces it but pure. For a pure program that keeps what it makes, where a lazy value held in a persistent table would hold every version of the table it was made from. Vouches for the collector, so a deep force may collect, except under a compiled caller, which pins the heap as it does for every native. Raises what forcing raises. |
+| `_forced` | `lazy.forced v` | `value → bool` | `true`, once the value has been forced to its outermost constructor and no further. For a pure loop that carries a table, so each step's put is made rather than suspended. Costs what `type_of` costs. |
 | `_sort_keyed` | `list.sort_on key xs` | `keys:list -> array -> list` | The array's elements, as a list, in the order `compare` puts `keys` in, equal keys keeping their order. The keys are forced whole first; the elements are carried and never forced. `std.list.sort` and `sort_on` are this. |
 
 ### Large data
@@ -1416,6 +1417,7 @@ match error.kind e {
 | Name | What it does |
 |------|-------------|
 | `settled v` | `true`, once `v` has been forced all the way down: `strict!` for a pure program, which cannot say `!`. Asked in a condition (`if lazy.settled v { .. }`), because an argument is not evaluated and a call that hands the value back would be suspended with it. For a value about to be kept in a persistent table, where a suspension would hold every version of the table it was made from. |
+| `forced v` | `true`, once `v` has been forced to its outermost constructor and no further. For a value carried through a pure loop -- a table threaded through every step -- so each step is made rather than suspended on the one before, without walking what the table holds. |
 
 ### `std.proc`
 

@@ -19,6 +19,7 @@
 
 import std.atom;
 import std.list;
+import std.lazy;
 import std.map;
 import std.str;
 import std.macros;
@@ -1992,8 +1993,8 @@ let find_entry ld r = {
 /// of memory. Forced here, what is carried from one body to the next is an
 /// arena, and the one before it is garbage.
 let settle_body l =
-    if ir.node_count (prog l) >= 0 && ir.kid_count (prog l) >= 0
-       && len (func_bodies l) >= 0 { l } else { l };
+    if lazy.forced (ir.node_count (prog l)) && lazy.forced (ir.kid_count (prog l))
+       && lazy.forced (func_bodies l) { l } else { l };
 
 /// Lower a slice of the resolver's bodies into an arena that may already hold
 /// the rest of the program. The narrow heart of the walk in `lower_program`:
@@ -2312,9 +2313,9 @@ let lower_part r numbered = {
                     else { list.cons [list.head nb, said, waiting] notes };
         let next = opt.settle (list.head rebuilt);
         let found = list.nth 1 rebuilt;
-        // Forced before they are carried, the `ir.settled` way: a suspended one
-        // would hold the state of the body before it.
-        if type_of noted != :nothing && type_of done != :nothing && len found >= 0 {
+        // Forced before they are carried, for the reason `lazy.forced` gives: a
+        // suspended one would hold the state of the body before it.
+        if lazy.forced noted && lazy.forced done && lazy.forced found {
             [done, next, found, noted]
         } else { [done, next, found, noted] }
     }) [set_res r (lowering r ir.program 0), opt.state #[] #[], %{}, []] numbered;

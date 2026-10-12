@@ -445,7 +445,7 @@ let settled n = lazy.settled n;
 /// being a chain of its own versions, which is a different chain with a
 /// different cause and was worth four hundred megabytes.
 let settle : Program -> Program;
-let settle p = if len (nodes p) >= 0 && len (kids p) >= 0 { p } else { p };
+let settle p = if lazy.forced (nodes p) && lazy.forced (kids p) { p } else { p };
 
 /// The same program with an empty arena: no nodes, no kids. The constant pools
 /// and everything else are kept. A program lowered in parts starts each body

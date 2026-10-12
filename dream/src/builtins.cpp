@@ -953,6 +953,17 @@ NativeResult bi_settled(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::ok(make_bool(true));
 }
 
+/// `_forced value` -- true. Its argument is forced to weak head normal form
+/// by the machine before the call (mask 1), which is the whole of what it is
+/// for: `lazy.forced`, said where a pure program carries a table and must not
+/// let it become a chain of suspended puts. It was `type_of x != :nothing` and
+/// `len m >= 0`, which cost the same and read as questions nobody was asking;
+/// written as a Dream function with a strict parameter it read well and cost a
+/// self-compile 2.3%, a frame and an argument's suspension at every node.
+NativeResult bi_forced(Process&, Value, Value*, uint32_t) {
+    return NativeResult::ok(make_bool(true));
+}
+
 NativeResult bi_len(Process& p, Value, Value* args, uint32_t) {
     Value v = resolve(args[0]);
     int64_t n = 0;
@@ -4535,6 +4546,7 @@ const BuiltinDef BUILTINS[] = {
     // fast as `to_string` was, and std's test check fits in its heap either
     // way, since the deep chains it forces are met from interpreted code.
     {"_settled", 1, 0b0, bi_settled},
+    {"_forced", 1, 0b1, bi_forced},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

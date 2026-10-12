@@ -111,6 +111,8 @@ let names = [
     "_str_rfind",
     // `strict!` without the effect, answering true; see `lazy.settled`.
     "_settled",
+    // `type_of` without the answer: true, its argument forced to WHNF.
+    "_forced",
 
 ];
 
@@ -210,6 +212,7 @@ let signatures = %{
     "_str_span_back" => "string|bigstr -> until:integer -> set:string -> integer",
     "_str_rfind" => "haystack:string -> needle:string -> from:integer -> integer",
     "_settled" => "value -> true, once the value is forced all the way down",
+    "_forced" => "value -> true, once the value is forced to its outermost constructor",
 
 };
 
@@ -260,6 +263,7 @@ let wrappers = %{
     "_str_span_back" => "str.span_back set until s",
     "_str_rfind" => "str.find_last_from from needle s",
     "_settled" => "lazy.settled v",
+    "_forced" => "lazy.forced v",
 };
 
 /// The `std` call a primitive is written as, or `()`.

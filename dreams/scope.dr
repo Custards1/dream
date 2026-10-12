@@ -1318,8 +1318,7 @@ let forced v = lazy.settled v;
 /// resolution threads `r` through every name in the program, so a `map_put`
 /// nobody forces is a suspension holding the resolver before it -- twenty-five
 /// thousand of them stacked up, with every intermediate table live at once.
-/// `len` of a map is its stored count, so this is two loads.
-let settle_refs r = if len (refs r) >= 0 && len (binds r) >= 0 { r } else { r };
+let settle_refs r = if lazy.forced (refs r) && lazy.forced (binds r) { r } else { r };
 
 /// Record what a name occurrence means. This is the pass's real output: a
 /// diagnostic says what went wrong, but `refs` says what went *right*, which is
@@ -2737,8 +2736,8 @@ let walk_part l base numbered = {
         let said = r_diags done;
         let notes = if list.is_empty said { list.nth 1 acc }
                     else { list.cons [list.head np, said] (list.nth 1 acc) };
-        // Both forced before they are carried, the `ir.settled` way.
-        if type_of notes != :nothing && type_of done != :nothing { [done, notes] }
+        // Both forced before they are carried, for the reason `lazy.forced` gives.
+        if lazy.forced notes && lazy.forced done { [done, notes] }
         else { [done, notes] }
     }) [base, []] numbered;
     let r = list.head walked;

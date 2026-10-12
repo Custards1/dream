@@ -27,5 +27,9 @@ when test {
         test.case "an atom the program names" $( test.eq! :ok (existing "ok") ),
         test.case "one it never names"
             $( test.eq! () (existing "no atom anywhere is spelled like this") ),
+        test.case "a name is the atom without its colon" $( test.eq! "ok" (name :ok) ),
+        test.case "underscores and digits are part of the name"
+            $( test.eq! "out_of_memory2" (name :out_of_memory2) ),
+        test.case "a name finds its atom again" $( test.eq! :ready (existing (name :ready)) ),
     ];
 }
