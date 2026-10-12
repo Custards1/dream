@@ -680,7 +680,7 @@ let excluded c = per_dialect (fn d -> match d.[:upsert else :none] {
 //   :array, :json    literals -> an array literal, text -> a JSON literal,
 //                    for the dialects whose `:accepts` take lists and maps
 //   :begin, :commit, :rollback   transaction statements
-//   :begin_with      options -> the statements that begin a transaction with
+//   :begin_with      a Transaction -> the statements that begin a transaction with
 //                    an isolation level, or read only (`transaction_with!`)
 //   :savepoint, :release, :rollback_to   name -> statement; `release` may be ()
 //
@@ -736,11 +736,11 @@ let sqlite = extend ansi %{
     :true => "1", :false => "0", :default_in_values => false,
     // SQLite's transactions are serializable whatever is asked for, which is
     // at least as strong as any level a program can name. What it does have is
-    // when to take the lock: `%{ :lock => :immediate }` takes the write lock
-    // up front, so a transaction that will write is not refused part-way.
-    :begin_with => fn options -> match options.[:read_only else ()] {
-        true => [unsupported "sqlite has no read-only transaction; open the database with :readonly"],
-        _ => [raw (match options.[:lock else ()] {
+    // when to take the lock: `Transaction.set_lock :immediate` takes the write
+    // lock up front, so a transaction that will write is not refused part-way.
+    :begin_with => fn options -> match Transaction.read_only options {
+        true => [unsupported "sqlite has no read-only transaction; open the database read-only (`sqlite.Options.set_readonly`)"],
+        _ => [raw (match Transaction.lock options {
             () => "BEGIN",
             lock => "BEGIN " + str.upper (key_text lock),
         })],
@@ -764,7 +764,7 @@ let postgres = extend ansi %{
     :json => fn text -> "'" + doubled "'" text + "'::jsonb",
     :begin_with => fn options -> [raw (str.join_str " " (list.filter (fn w -> w != "") [
         "BEGIN", isolation_words options, read_only_words options,
-        match options.[:deferrable else ()] { true => "DEFERRABLE", false => "NOT DEFERRABLE", _ => "" },
+        match Transaction.deferrable options { true => "DEFERRABLE", false => "NOT DEFERRABLE", _ => "" },
     ]))],
     :limit => :limit_offset,
     :upsert => :on_conflict, :ilike => true,
@@ -811,7 +811,7 @@ let mssql = extend ansi %{
     },
     :add_column => "ADD ",
     :begin => "BEGIN TRANSACTION", :commit => "COMMIT TRANSACTION", :rollback => "ROLLBACK TRANSACTION",
-    :begin_with => fn options -> match options.[:read_only else ()] {
+    :begin_with => fn options -> match Transaction.read_only options {
         true => [unsupported "mssql has no read-only transaction"],
         _ => list.compact [
             match isolation_words options { "" => (), words => raw ("SET TRANSACTION " + words) },
@@ -823,16 +823,16 @@ let mssql = extend ansi %{
     :rollback_to => fn n -> "ROLLBACK TRANSACTION " + n,
 };
 
-/// `ISOLATION LEVEL ..` for `%{ :isolation => :repeatable_read }`, or "".
-priv let isolation_words : :map -> :string;
-priv let isolation_words options = match options.[:isolation else ()] {
+/// `ISOLATION LEVEL ..` for an isolation of `:repeatable_read`, or "".
+priv let isolation_words : Transaction -> :string;
+priv let isolation_words options = match Transaction.isolation options {
     () => "",
     level => "ISOLATION LEVEL " + str.join_str " " (str.split "_" (str.upper (key_text level))),
 };
 
 /// Render READ ONLY or READ WRITE from transaction options, or no clause when unspecified.
-priv let read_only_words : :map -> :string;
-priv let read_only_words options = match options.[:read_only else ()] {
+priv let read_only_words : Transaction -> :string;
+priv let read_only_words options = match Transaction.read_only options {
     true => "READ ONLY",
     false => "READ WRITE",
     _ => "",
@@ -1765,6 +1765,28 @@ let script! c text = match c.[:script else ()] {
     },
 };
 
+/// What a transaction is to be, for `transaction_with!` and `retrying!`:
+/// `Transaction.new () |> Transaction.set_isolation :serializable`, or a map
+/// of just the keys it sets. A field left `()` says nothing, so the
+/// database's own default stands -- which is not the same as `false`: a
+/// `read_only` of `false` is said, as `READ WRITE`. Each dialect spells the
+/// rest its own way (`:begin_with`), and says so when it cannot.
+mapping Transaction {
+    /// `:read_uncommitted`, `:read_committed`, `:repeatable_read` or
+    /// `:serializable`.
+    isolation : :atom | :unit = ()
+    read_only : :bool | :unit = ()
+    /// PostgreSQL's: a serializable, read-only transaction that waits for a
+    /// snapshot no concurrent write can fail it over.
+    deferrable : :bool | :unit = ()
+    /// SQLite's: when to take the write lock -- `:deferred`, `:immediate`
+    /// (up front, so a transaction that will write is not refused part-way)
+    /// or `:exclusive`.
+    lock : :atom | :unit = ()
+    /// Whether nothing is asked for, so a plain `BEGIN` will do.
+    plain self = isolation self == () && read_only self == () && deferrable self == () && lock self == ()
+}
+
 /// `work tx` in a transaction: committed if it answers, rolled back if it
 /// raises (and the error raised again). A transaction inside one is a
 /// savepoint, so `work` may itself call `transaction!` on `tx`.
@@ -1773,22 +1795,19 @@ let script! c text = match c.[:script else ()] {
 /// gives: a lazy answer that read the database would otherwise read it later,
 /// outside the transaction it was written in.
 let transaction! : Connection -> (Connection -> a) -> a;
-let transaction! c work = transaction_with! c %{} work;
+let transaction! c work = transaction_with! c (Transaction.new ()) work;
 
-/// The same, with what the transaction is to be:
-/// `%{ :isolation => :serializable, :read_only => true }`. The isolation is
-/// `:read_uncommitted`, `:read_committed`, `:repeatable_read` or
-/// `:serializable`; each dialect says it its own way (`:begin_with`), and
-/// says so when it cannot. Inside another transaction this is a savepoint, and
-/// the options are the outer one's.
-let transaction_with! : Connection -> :map -> (Connection -> a) -> a;
+/// The same, with what the transaction is to be (`Transaction`). Inside
+/// another transaction this is a savepoint, and the options are the outer
+/// one's.
+let transaction_with! : Connection -> Transaction -> (Connection -> a) -> a;
 let transaction_with! c options work = {
     let d = c.[:dialect];
     let depth = c.[:depth else 0];
     let point = "dream_tx_" + to_string depth;
     let inner = c.[:depth => depth + 1];
     if depth > 0 { exec! c (call_with d.[:savepoint] point) }
-    else if map.is_empty options { exec! c d.[:begin] }
+    else if Transaction.plain options { exec! c d.[:begin] }
     else {
         let begin_with = d.[:begin_with];
         exec_all! c (begin_with options)
@@ -1824,7 +1843,7 @@ priv let call_with f x = f x;
 /// mend -- `is_retryable`: a serialization failure, a deadlock, a lock held
 /// elsewhere -- up to `attempts` times in all. Any other failure, or the last
 /// retryable one, is raised.
-let retrying! : Connection -> :integer -> :map -> (Connection -> a) -> a;
+let retrying! : Connection -> :integer -> Transaction -> (Connection -> a) -> a;
 let rec retrying! c attempts options work = {
     let outcome = try! {
         let v = transaction_with! c options work;
@@ -1841,7 +1860,8 @@ let rec retrying! c attempts options work = {
 /// A serializable transaction, retried as `retrying!` does: the usual way to
 /// write one that must see a consistent world.
 let serializable! : Connection -> :integer -> (Connection -> a) -> a;
-let serializable! c attempts work = retrying! c attempts %{ :isolation => :serializable } work;
+let serializable! c attempts work =
+    retrying! c attempts (Transaction.new () |> Transaction.set_isolation :serializable) work;
 
 // --- streaming ----------------------------------------------------------------
 //

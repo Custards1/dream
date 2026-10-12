@@ -81,27 +81,33 @@ foreign libc {
 
 // --- opening ------------------------------------------------------------------
 
-/// How a database is opened. Every key may be left out:
-///
-///   :readonly       open it for reading only (false)
-///   :busy_timeout   how long to wait on a lock held elsewhere, in ms (5000)
-///   :foreign_keys   enforce `REFERENCES` -- SQLite does not unless asked (true)
-///   :place          `foreign.here`, or a `foreign.start!` server to own it
-type Options = %{ :atom => :any };
+/// How a database is opened: `Options.new () |> Options.set_readonly true`,
+/// or a map of just the keys it changes.
+mapping Options {
+    /// Open it for reading only.
+    readonly : :bool = false
+    /// How long to wait on a lock held elsewhere, in milliseconds.
+    busy_timeout : :integer = 5000
+    /// Enforce `REFERENCES`, which SQLite does not do unless asked.
+    foreign_keys : :bool = true
+    /// A `foreign.start!` server to own the database, or `()` for this
+    /// process (`foreign.here`).
+    place : :any = ()
+}
 
 /// The database at `path`, made if there is none. A `file:` URI is taken too.
 let open! : :string -> sql.Connection;
-let open! path = open_with! path %{};
+let open! path = open_with! path (Options.new ());
 
 /// A database in memory, gone when it is closed.
 let memory! : :unit -> sql.Connection;
-let memory! u = open_with! ":memory:" %{};
+let memory! u = open_with! ":memory:" (Options.new ());
 
-/// Open a SQLite database with explicit connection options.
+/// The database at `path`, opened as `options` says (`Options`).
 let open_with! : :string -> Options -> sql.Connection;
 let open_with! path options = {
-    let place = options.[:place else foreign.here];
-    let flags = (if options.[:readonly else false] { open_readonly } else { open_readwrite + open_create }) + open_uri;
+    let place = match Options.place options { () => foreign.here, p => p };
+    let flags = (if Options.readonly options { open_readonly } else { open_readwrite + open_create }) + open_uri;
     let db = foreign.run! place (fn () -> open_here! path flags options);
     let effects = %{ :run => run!, :run_many => run_many!, :script => script!, :close => close!,
         :prepare_statement => prepare_statement!, :execute_statement => execute_statement!,
@@ -140,8 +146,8 @@ priv let open_here! path flags options = {
                 foreign.release! db
                 sql.fail! message (code_of rc) path
             } else { () }
-            sqlite3.busy_timeout! db options.[:busy_timeout else 5000]
-            if options.[:foreign_keys else true] { exec_here! db "PRAGMA foreign_keys = ON" } else { () }
+            sqlite3.busy_timeout! db (Options.busy_timeout options)
+            if Options.foreign_keys options { exec_here! db "PRAGMA foreign_keys = ON" } else { () }
             db
         },
     }
@@ -624,7 +630,7 @@ when test {
         }) ),
         test.case "a transaction that takes the lock first" $( with_db! (fn db -> {
             seeded! db
-            test.eq! 3 (sql.transaction_with! db %{ :lock => :immediate }
+            test.eq! 3 (sql.transaction_with! db (sql.Transaction.new () |> sql.Transaction.set_lock :immediate)
                 (fn tx -> sql.scalar! tx (sql.select [sql.count_all] |> sql.from "people")))
         }) ),
         test.case "a serializable transaction answers" $( with_db! (fn db ->
@@ -715,7 +721,7 @@ when test {
         test.case "a database in a server" $( {
             if available! () {
                 let server = foreign.start! ();
-                let db = open_with! ":memory:" %{ :place => server };
+                let db = open_with! ":memory:" (Options.new () |> Options.set_place server);
                 sql.script! db "create table s (x); insert into s values (7);"
                 let seven = sql.scalar! db (sql.raw "select x from s");
                 sql.close! db

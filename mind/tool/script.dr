@@ -30,9 +30,10 @@
 import std.build.Context;
 import std.build.Outcome;
 import std.build.Target;
+import std.file;
+import std.path;
 import std.types;
 import std.console;
-import std.file;
 import std.io;
 import std.list;
 import std.map;
@@ -94,13 +95,13 @@ priv let here! () = Target.make (os.platform ()) (os.arch ());
 /// of one; and it is worth it because the same step asked for by two projects
 /// is done once.
 priv let steps_dir! : :map -> :string;
-priv let steps_dir! setting = util.absolute! (match util.env_path! "MIND_BUILD_CACHE" {
-    () => util.join (util.mind_home! ()) "build",
+priv let steps_dir! setting = path.absolute! (match path.from_env! "MIND_BUILD_CACHE" {
+    () => path.join (util.mind_home! ()) "build",
     dir => dir,
 });
 
 priv let dir_of : :map -> :map -> :string;
-priv let dir_of setting s = util.join (Setting.target_dir setting) ("build/" + Scripted.key s);
+priv let dir_of setting s = path.join (Setting.target_dir setting) ("build/" + Scripted.key s);
 
 /// The context a script is told, and nothing it was not meant to see: only the
 /// environment variables its manifest lists.
@@ -179,7 +180,7 @@ priv let group_dir setting group = {
     // write one driver over the other while both are compiling it.
     let named = list.append (Scripted.paths (list.head group))
                             (list.map (fn s -> Scripted.key s + "=" + Scripted.script s) group);
-    util.join (Setting.target_dir setting) ("build/_drivers/" + str.slice 0 16 (io.digest (str.join_str "\n" named)))
+    path.join (Setting.target_dir setting) ("build/_drivers/" + str.slice 0 16 (io.digest (str.join_str "\n" named)))
 };
 
 /// The driver's source. Its directory holds a manifest, so that the driver is
@@ -188,9 +189,9 @@ priv let group_dir setting group = {
 priv let write_driver! : :string -> [:map] -> :unit;
 priv let write_driver! dir group = {
     file.mkdir_all! dir
-    replace! (util.join dir "mind.toml") "[package]\nname = \"mind_build_driver\"\nversion = \"0.0.0\"\n"
+    replace! (path.join dir "mind.toml") "[package]\nname = \"mind_build_driver\"\nversion = \"0.0.0\"\n"
     let numbered = list.enumerate group;
-    replace! (util.join dir "main.dr")
+    replace! (path.join dir "main.dr")
                 (str.join_str "" (list.concat [
                     ["// Written by mind: runs these packages' build scripts.\nimport std.build.run;\n"],
                     list.map (fn [i, s] -> "import mind_script_" + to_string i + "." + script_module s
@@ -240,16 +241,16 @@ priv let script_sources! setting s = {
 
 priv let compile_driver! : :map -> :string -> [:map] -> :any;
 priv let compile_driver! setting dir group = {
-    write_driver! (util.join dir "driver") group
+    write_driver! (path.join dir "driver") group
     // Compiled beside the image and renamed into place, for the reason
     // `replace!` gives: a run that finds the image there must find a whole one.
-    let scratch = util.join dir ("script.dream.tmp-" + file.scratch_suffix! ());
-    let [program, args] = compiler_args setting (list.concat [[util.join dir "driver/main.dr"], driver_roots group,
+    let scratch = path.join dir ("script.dream.tmp-" + file.scratch_suffix! ());
+    let [program, args] = compiler_args setting (list.concat [[path.join dir "driver/main.dr"], driver_roots group,
                                                               ["-o", scratch]]);
     if Setting.verbose setting { console.error! (str.join_str " " (list.cons program args)) }
     let r = os.exec! program args;
     match r.[:code] {
-        0 => { io.rename! scratch (util.join dir "script.dream"); [:ok, ()] },
+        0 => { io.rename! scratch (path.join dir "script.dream"); [:ok, ()] },
         _ => [:error, "the build scripts of " + str.join_str ", " (list.map (fn s -> "`" + Scripted.key s + "`") group)
                       + " do not compile:\n" + str.trim (r.[:err] + r.[:out])],
     }
@@ -278,7 +279,7 @@ priv let run_group! : [:any] -> :any;
 priv let run_group! job = {
     let [setting, group] = job;
     let dir = group_dir setting group;
-    let image = util.join dir "script.dream";
+    let image = path.join dir "script.dream";
     // What the driver was compiled from besides the scripts: the compiler,
     // stamped, since a driver made by another compiler is another image --
     // or, if the compiler was being rewritten when it ran, not an image.
@@ -286,7 +287,7 @@ priv let run_group! job = {
                   stamps! (list.filter (fn w -> str.contains_str "/" w) (Setting.compiler setting))];
     let each = list.map (fn s -> {
         let ctx = context! setting s;
-        let record_file = util.join (dir_of setting s) "record";
+        let record_file = path.join (dir_of setting s) "record";
         [s, ctx, io.digest (wire.encode ctx), record_file, read_record! record_file]
     }) group;
     strict! each
@@ -296,7 +297,7 @@ priv let run_group! job = {
         [] => [:ok, list.map (fn [s, _, _, _, record] -> [Scripted.key s, record.[:outcome]]) each],
         _ => {
             file.mkdir_all! dir
-            let driver = read_record! (util.join dir "record");
+            let driver = read_record! (path.join dir "record");
             // A stale script whose sources moved (or were never listed) is why
             // the driver is compiled again; one whose context or reads moved
             // only has to be run.
@@ -311,13 +312,13 @@ priv let run_group! job = {
             match compiled {
                 [:error, why] => [:error, why],
                 [:ok, _] => {
-                    replace! (util.join dir "record") (wire.encode (%{ :scripts => listed }))
+                    replace! (path.join dir "record") (wire.encode (%{ :scripts => listed }))
                     let contexts = list.fold (fn m [s, ctx, _, _, _] -> m.[Scripted.key s => ctx]) (%{}) stale;
                     // This run's own: another run of the same group may be
                     // asking for other packages at the same moment.
                     let run_id = file.scratch_suffix! ();
-                    let ctx_file = util.join dir ("contexts-" + run_id);
-                    let out_file = util.join dir ("outcomes-" + run_id);
+                    let ctx_file = path.join dir ("contexts-" + run_id);
+                    let out_file = path.join dir ("outcomes-" + run_id);
                     file.write! ctx_file (wire.encode contexts)
                     let r = os.exec_for! (Setting.vm setting) [image, "--contexts", ctx_file, "--outcomes", out_file] deadline_ms;
                     let answer = file.read! out_file;

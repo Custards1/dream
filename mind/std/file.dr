@@ -9,11 +9,12 @@
 import std.io;
 import std.list;
 import std.os;
+import std.path as paths;
 import std.str;
 
 /// Read a handle in 64 KiB chunks, joining the accumulated chunks at end of file.
 let read_chunks! : :any -> [:string] -> :string;
-let rec read_chunks! h acc = {
+let rec read_chunks! h !acc = {
     let chunk = io.read! h 65536;
     if len chunk == 0 { str.join_str "" (list.reverse acc) } else { read_chunks! h (list.cons chunk acc) }
 };
@@ -57,17 +58,46 @@ let write! path text = {
     io.close! h
 };
 
-/// Everything before the last `/`, or "" when there is none.
+/// The directory `path` is in, or `""` for a bare name: where `mkdir_all!`
+/// has to start before a file can be written. It is `std.path.dirname` --
+/// trailing slashes, drives and shares included -- except that a name with
+/// no directory in it answers `""` rather than `.`, which is what a
+/// directory to create wants.
 let parent : :string -> :string;
-let parent path = {
-    let rec last i best =
-        if i >= str.byte_length path { best }
-        else if str.byte i path == 47 { last (i + 1) i }
-        else { last (i + 1) best };
-    match last 0 (0 - 1) {
-        n if n <= 0 => if n == 0 { "/" } else { "" },
-        n => str.slice 0 n path,
-    }
+let parent path = match paths.dirname path {
+    "." if str.find "/" (paths.slashes path) < 0 => "",
+    d => d,
+};
+
+/// Whether `path` is there and is not a directory.
+let is_file! : :string -> :bool;
+let is_file! path = match io.stat! path {
+    [_, _, :dir] => false,
+    () => false,
+    _ => true,
+};
+
+/// Whether `path` is there and is a directory.
+let is_dir! : :string -> :bool;
+let is_dir! path = match io.stat! path {
+    [_, _, :dir] => true,
+    _ => false,
+};
+
+/// A directory's entries as paths under it (`dir/name`, and just `name` for
+/// `.`, as `std.path.join` writes it), or `[]` when it cannot be read. A
+/// missing directory is an ordinary answer: a search path that does not exist
+/// simply holds nothing.
+let list! : :string -> [:string];
+let list! dir = {
+    let names = try! { os.list_dir! dir } catch e { [] };
+    let prefix = match dir {
+        "" => "",
+        "." => "",
+        _ if str.ends_with "/" dir => dir,
+        _ => dir + "/",
+    };
+    list.map (fn n -> prefix + n) names
 };
 
 // The three walks below are natives (`std.io`): each is one call where the
@@ -126,7 +156,19 @@ when test {
 
     let tests = [
         test.case "the parent of a path"
-            $( test.eq! ["a/b", "", "/", "/a"] [parent "a/b/c", parent "c", parent "/c", parent "/a/b"] ),
+            $( test.eq! ["a/b", "", "/", "/a", "a", "."]
+                        [parent "a/b/c", parent "c", parent "/c", parent "/a/b", parent "a/b/", parent "./x"] ),
+        test.case "a directory's entries are paths under it"
+            $( {
+                let d = scratch! () + "-list";
+                mkdir_all! (d + "/sub")
+                write! (d + "/f") ""
+                let got = [list.sort (list! d), is_file! (d + "/f"), is_file! (d + "/sub"),
+                           is_dir! (d + "/sub"), is_file! (d + "/none"), list! (d + "/none")];
+                strict! got
+                remove_all! d
+                test.eq! [[d + "/f", d + "/sub"], true, false, true, false, []] got
+            } ),
         test.case "a file written is the file read"
             $( {
                 let d = scratch! ();

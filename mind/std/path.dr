@@ -1,0 +1,714 @@
+// File paths, as text.
+//
+// A path is taken apart and put together far more often than the file it
+// names is opened: the compiler's loader asks for a module's extension, stem
+// and parent for every file it tries, and `mind` builds every directory it
+// hands on out of `join`. So everything here is pure, a question about
+// spelling rather than about the disk, and the scans are the runtime's
+// (`str.find_last`, `str.span`, `str.span_back`) rather than a walk of the
+// characters. The compiler and `mind` each grew their own copy of this before
+// it was here, and the two had come to disagree about `basename "a/b/"`.
+//
+// The rules are the ones the systems themselves define, not ones made up
+// here. `dirname` and `basename` are POSIX's (libgen): trailing slashes are
+// not a component, so `basename "a/b/"` is `b` and `dirname "a/b/"` is `a`.
+// An extension is `splitext`'s: a leading run of dots belongs to the name,
+// so `.bashrc` and `..` have none and `archive.tar.gz` has `gz`. And every
+// path is first split into a *drive*, a *root* and the rest, which is where
+// the two families differ:
+//
+//     POSIX     "/a/b"            ""                "/"   "a/b"
+//               "//a/b"           ""                "//"  "a/b"   exactly two
+//                                                                 slashes are
+//                                                                 their own root
+//     Windows   "C:/a/b"          "C:"              "/"   "a/b"
+//               "C:a/b"           "C:"              ""    "a/b"   drive-relative
+//               "/a/b"            ""                "/"   "a/b"   rooted, on the
+//                                                                 current drive
+//               "//srv/share/a"   "//srv/share"     "/"   "a"     UNC
+//               "//?/C:/a"        "//?/C:"          "/"   "a"     device path
+//               "//?/UNC/s/sh/a"  "//?/UNC/s/sh"    "/"   "a"
+//
+// That table is Python's `ntpath.splitroot`, and `join`, `normalize` and
+// `is_absolute` follow `ntpath` and `posixpath` from it -- the closest thing
+// either family has to a reference implementation. On Windows a backslash
+// is a separator, and an answer is written with `/`, which every Windows API
+// accepts; drives and names are compared without regard to (ASCII) case.
+//
+// Two departures, both deliberate. `join` drops an empty or `.` side rather
+// than keeping it, because these paths are read by people in diagnostics and
+// in `-L` flags and `././main.dr` helps nobody. And `extension` answers
+// without the dot, so `file.` has the extension `""` while `drop_extension`
+// still takes the dot away.
+//
+// Every function comes three ways: `path.join` for the system the program is
+// running on, decided at run time so an image built on one system runs
+// unchanged on another, and `path.posix.join` and `path.windows.join` for a
+// path that belongs to a particular system whatever this one is -- a path in
+// a tar header, say, or one read from a Windows manifest. The two families
+// are both pure data, so both are tested everywhere.
+//
+// The few answers that need the process -- where it is standing, where home
+// is -- are the `!` ones at the end. None of them asks the file system
+// whether anything exists; `std.file` is for that.
+
+import std.list;
+import std.macros;
+import std.num;
+import std.os;
+import std.str;
+
+/// The separator every path this module builds is written with.
+let separator : :string;
+let separator = "/";
+
+/// Which family of paths the running system has: `:windows` or `:posix`.
+let style : :unit -> :atom;
+let style () = match os.platform () {
+    :windows => :windows,
+    _ => :posix,
+};
+
+// --- the shared core ----------------------------------------------------------
+//
+// Each `_in` function takes the family first; the three public spellings at
+// the end of the file are one line each over these.
+
+/// `p` with every separator spelled `/`. A backslash is one only on Windows:
+/// on POSIX it is an ordinary byte of a name.
+priv let slashes_in : :atom -> :string -> :string;
+priv let slashes_in st p = match st {
+    :windows => if str.find "\\" p < 0 { p } else { str.replace "\\" "/" p },
+    _ => p,
+};
+
+/// The byte at `i`, or `-1` past the end: what lets the root rules below
+/// look ahead without a length check at each step.
+priv let byte_at : :integer -> :string -> :integer;
+priv let byte_at i p = if i < len p { str.byte i p } else { 0 - 1 };
+
+/// `[drive, root, rest]` of a path whose separators are already `/` (the
+/// table at the head of the file). Drive and root together are the anchor;
+/// the rest is relative to it.
+priv let split_root : :atom -> :string -> [:string];
+priv let split_root st p = match st {
+    :windows => windows_root p,
+    _ => match [byte_at 0 p, byte_at 1 p, byte_at 2 p] {
+        [47, 47, b] if b != 47 => ["", "//", str.slice 2 (len p - 2) p],
+        [47, _, _] => ["", "/", str.slice 1 (len p - 1) p],
+        _ => ["", "", p],
+    },
+};
+
+/// `split_root` for Windows, after Python's `ntpath.splitroot`.
+priv let windows_root : :string -> [:string];
+priv let windows_root p = match [byte_at 0 p, byte_at 1 p, byte_at 2 p] {
+    [47, 47, _] => {
+        // UNC (`//server/share`) or a device path (`//?/C:`, `//./pipe`):
+        // the drive runs to the separator after the second name, and the
+        // verbatim UNC form has two names before those.
+        let start = if str.upper (str.slice 0 8 p) == "//?/UNC/" { 8 } else { 2 };
+        let first = str.find_from start "/" p;
+        let second = if first < 0 { 0 - 1 } else { str.find_from (first + 1) "/" p };
+        match second {
+            _ if second < 0 => [p, "", ""],
+            _ => [str.slice 0 second p, "/", str.slice (second + 1) (len p - second - 1) p],
+        }
+    },
+    [47, _, _] => ["", "/", str.slice 1 (len p - 1) p],
+    [_, 58, 47] => [str.slice 0 2 p, "/", str.slice 3 (len p - 3) p],
+    [_, 58, _] => [str.slice 0 2 p, "", str.slice 2 (len p - 2) p],
+    _ => ["", "", p],
+};
+
+/// What two spellings of a name are compared by: themselves on POSIX, their
+/// lower case on Windows, whose file systems ignore case.
+priv let folded : :atom -> :string -> :string;
+priv let folded st s = match st { :windows => str.lower s, _ => s };
+
+/// The non-empty, non-`.` names in `rest`. `..` is kept: it names a place.
+priv let names : :string -> [:string];
+priv let names rest = list.filter (fn s -> s != "" && s != ".") (str.split "/" rest);
+
+/// `rest` without the separators it ends with.
+priv let trimmed : :string -> :string;
+priv let trimmed rest = str.slice 0 (str.span_back "/" (len rest) rest) rest;
+
+/// Drive and root together: what `anchor` answers.
+priv let anchor_in : :atom -> :string -> :string;
+priv let anchor_in st p = {
+    let [d, r, _] = split_root st (slashes_in st p);
+    d + r
+};
+
+/// Whether a path is anchored for this family: see `is_absolute`.
+priv let is_absolute_in : :atom -> :string -> :bool;
+priv let is_absolute_in st p = match st {
+    :windows => {
+        let q = slashes_in st p;
+        let [d, r, _] = split_root st q;
+        str.starts_with "//" q || (d != "" && r != "")
+    },
+    _ => str.starts_with "/" p,
+};
+
+/// The names after the anchor: see `segments`.
+priv let segments_in : :atom -> :string -> [:string];
+priv let segments_in st p = {
+    let [_, _, rest] = split_root st (slashes_in st p);
+    names rest
+};
+
+/// POSIX's `dirname`, with this family's anchors: see `dirname`.
+priv let dirname_in : :atom -> :string -> :string;
+priv let dirname_in st p = {
+    let [d, r, rest] = split_root st (slashes_in st p);
+    let body = trimmed rest;
+    let at = str.find_last "/" body;
+    let head = if at < 0 { "" } else { str.slice 0 (str.span_back "/" at body) body };
+    match [d + r, head] {
+        ["", ""] => ".",
+        [anchor, ""] => anchor,
+        [anchor, _] => anchor + head,
+    }
+};
+
+/// POSIX's `basename`, with this family's anchors: see `basename`.
+priv let basename_in : :atom -> :string -> :string;
+priv let basename_in st p = {
+    let [d, r, rest] = split_root st (slashes_in st p);
+    let body = trimmed rest;
+    match body {
+        // An anchor alone is its own name; POSIX lets `//` answer `/` or
+        // `//`, and `/` is what glibc's libgen says.
+        "" => if st == :posix && r == "//" { "/" } else { d + r },
+        _ => {
+            let at = str.find_last "/" body + 1;
+            str.slice at (len body - at) body
+        },
+    }
+};
+
+/// Two paths joined as this family joins them: see `join`.
+priv let join_in : :atom -> :string -> :string -> :string;
+priv let join_in st original_a original_b = {
+    let a = slashes_in st original_a;
+    let b = slashes_in st original_b;
+    match [a, b] {
+        [_, ""] => a,
+        [_, "."] => a,
+        ["", _] => b,
+        [".", _] => b,
+        _ => match st {
+            :windows => join_windows a b,
+            _ if str.starts_with "/" b => b,
+            _ if str.ends_with "/" a => a + b,
+            _ => a + "/" + b,
+        },
+    }
+};
+
+/// `ntpath.join` for two parts: a root on the right replaces everything but
+/// the left's drive, another drive replaces everything, the same drive in
+/// another case is the same drive, and a bare drive takes a name with no
+/// separator between (`C:` and `x` are `C:x`, relative to that drive).
+priv let join_windows : :string -> :string -> :string;
+priv let join_windows a b = {
+    let [ad, ar, ap] = split_root :windows a;
+    let [bd, br, bp] = split_root :windows b;
+    match [bd, br] {
+        [_, r] if r != "" => (if bd != "" || ad == "" { bd } else { ad }) + br + bp,
+        [d, _] if d != "" && str.lower d != str.lower ad => b,
+        _ => {
+            let drive = if bd != "" { bd } else { ad };
+            let rest = if ap != "" && not (str.ends_with "/" ap) { ap + "/" + bp } else { ap + bp };
+            if rest != "" && ar == "" && drive != "" && not (str.ends_with ":" drive || str.ends_with "/" drive) {
+                drive + "/" + rest
+            } else { drive + ar + rest }
+        },
+    }
+};
+
+/// The dot's offset, or `-1`: `splitext`'s rule, that the dot must be in the
+/// last name (after the drive, on Windows) and must follow something other
+/// than a dot there. So `.gitignore`, `..` and `...` have none and
+/// `..foo.dr` has `dr`.
+///
+/// It is three runtime scans and no allocation on POSIX: loading a program
+/// asks this of every path it tries, and the character walk it replaced was
+/// a visible part of a warm build's loading.
+priv let dot_at : :atom -> :string -> :integer;
+priv let dot_at st original = {
+    let p = slashes_in st original;
+    let after_sep = str.find_last "/" p + 1;
+    // On Windows the name starts after the drive too: the `.x` of `c:.x` is
+    // a hidden name, and the dots of `//srv.lan/share` are a server's.
+    let begin = match st {
+        :windows if str.starts_with "//" p => num.max after_sep (len (list.head (windows_root p))),
+        :windows if after_sep == 0 && byte_at 1 p == 58 => 2,
+        _ => after_sep,
+    };
+    let at = str.find_last "." p;
+    if at > begin && str.span "." begin p < at { at } else { 0 - 1 }
+};
+
+/// The extension without its dot, or `""`: see `dot_at`.
+priv let extension_in : :atom -> :string -> :string;
+priv let extension_in st p = {
+    let at = dot_at st p;
+    if at < 0 { "" } else { str.slice (at + 1) (len p - at - 1) p }
+};
+
+/// The path without its extension: see `dot_at`.
+priv let drop_extension_in : :atom -> :string -> :string;
+priv let drop_extension_in st p = {
+    let at = dot_at st p;
+    if at < 0 { p } else { str.slice 0 at p }
+};
+
+/// `normpath` for this family: see `normalize`.
+priv let normalize_in : :atom -> :string -> :string;
+priv let normalize_in st p = {
+    let [d, r, rest] = split_root st (slashes_in st p);
+    // A `..` against the root is the root, since `/..` is `/`; one at the
+    // front of a path with no root is kept, as there is nothing to cancel
+    // it against -- and that includes `C:..`, which climbs from the current
+    // directory on drive C.
+    let rooted = r != "";
+    let rec walk segs acc =
+        match segs {
+            [] => list.reverse acc,
+            ["..", ..more] => match acc {
+                [] => walk more (if rooted { [] } else { [".."] }),
+                ["..", .._] => walk more (list.cons ".." acc),
+                [_, ..up] => walk more up,
+            },
+            [s, ..more] => walk more (list.cons s acc),
+        };
+    match [d + r, walk (names rest) []] {
+        ["", []] => ".",
+        [anchor, []] => anchor,
+        [anchor, segs] => anchor + str.join_str "/" segs,
+    }
+};
+
+/// `segs` with `base` removed from the front, or `()` when they do not start
+/// with it; names compared as the family compares them.
+priv let strip_in : :atom -> [:string] -> [:string] -> [:string] | :unit;
+priv let rec strip_in st base segs =
+    match [base, segs] {
+        [[], more] => more,
+        [_, []] => (),
+        [[b, ..bs], [s, ..ss]] => if folded st b == folded st s { strip_in st bs ss } else { () },
+    };
+
+/// The names of `p` inside `base`, or `()`: see `relative_to`.
+priv let relative_to_in : :atom -> :string -> :string -> [:string] | :unit;
+priv let relative_to_in st base p = {
+    let b = normalize_in st base;
+    let f = normalize_in st p;
+    if folded st (anchor_in st b) != folded st (anchor_in st f) { () }
+    else { strip_in st (segments_in st b) (segments_in st f) }
+};
+
+/// `to` spelled from `from`: see `relative`.
+priv let relative_in : :atom -> :string -> :string -> :string;
+priv let relative_in st from to = {
+    let a = normalize_in st from;
+    let b = normalize_in st to;
+    let rec common xs ys =
+        match [xs, ys] {
+            [[x, ..xr], [y, ..yr]] if folded st x == folded st y => common xr yr,
+            _ => [xs, ys],
+        };
+    let [ups, downs] = common (segments_in st a) (segments_in st b);
+    // Climbing out of a `..` would need to know what it climbed into, which
+    // only the disk knows; different anchors have no relative spelling.
+    if folded st (anchor_in st a) != folded st (anchor_in st b) || list.contains ".." ups { b }
+    else {
+        match list.append (list.map (fn _ -> "..") ups) downs {
+            [] => ".",
+            segs => str.join_str "/" segs,
+        }
+    }
+};
+
+// --- the running system's paths ---------------------------------------------
+
+/// `p` with every separator spelled `/`: on Windows, backslashes become
+/// slashes; elsewhere a backslash is part of a name and `p` is unchanged.
+let slashes : :string -> :string;
+let slashes p = slashes_in (style ()) p;
+
+/// The part of `p` that anchors it -- drive and root together: `/`, `//`,
+/// `C:/`, `C:`, `//server/share/` -- or `""` for a relative path.
+let anchor : :string -> :string;
+let anchor p = anchor_in (style ()) p;
+
+/// Whether `p` names the same place from any working directory. On Windows
+/// that takes a drive and a root, or a UNC share: `/x` is on the current
+/// drive and `C:x` in drive C's current directory, so neither is absolute.
+let is_absolute : :string -> :bool;
+let is_absolute p = is_absolute_in (style ()) p;
+
+/// The names after the anchor, without empty ones or `.`: `["a", "b"]` for
+/// `/a//./b/`. `..` is kept, since it is not the same place as nothing.
+let segments : :string -> [:string];
+let segments p = segments_in (style ()) p;
+
+/// Everything before the last name, as POSIX's `dirname`: `a` for `a/b` and
+/// `a/b/`, `.` for a bare name, and the anchor for `/a`, `/` or `C:x`. So a
+/// walk up the tree stops: the parent of the root is the root.
+let dirname : :string -> :string;
+let dirname p = dirname_in (style ()) p;
+
+/// The last name, as POSIX's `basename`: `c` for `a/b/c` and `a/b/c/`. A
+/// path that is only an anchor answers the anchor (`//`, as glibc has it,
+/// answers `/`), and `""` answers `""`.
+let basename : :string -> :string;
+let basename p = basename_in (style ()) p;
+
+/// `a/b`. An empty or `.` side is dropped rather than kept; an absolute (or,
+/// on Windows, rooted or other-drive) right-hand side replaces the left as the
+/// system would read it. Nothing is normalised: `join "a" "../b"` is
+/// `a/../b`, which is what a path written relative to a manifest means.
+let join : :string -> :string -> :string;
+let join a b = join_in (style ()) a b;
+
+/// `base` joined to each of `parts` in turn: `join_all "src" ["a", "b.dr"]`.
+let join_all : :string -> [:string] -> :string;
+let join_all base parts = list.fold join base parts;
+
+/// The extension without its dot, or `""` (see `dot_at` for what counts).
+let extension : :string -> :string;
+let extension p = extension_in (style ()) p;
+
+/// The path with any extension, and its dot, removed.
+let drop_extension : :string -> :string;
+let drop_extension p = drop_extension_in (style ()) p;
+
+/// The path with its extension, if any, replaced by `ext` (no dot).
+let with_extension : :string -> :string -> :string;
+let with_extension ext p = drop_extension p + "." + ext;
+
+/// The last name without its extension: `a/b/list.dr` -> `list`.
+let stem : :string -> :string;
+let stem p = drop_extension (basename p);
+
+/// `.` and empty names folded away, and each `..` with the name before it.
+/// A `..` that would climb above a root is dropped, since `/..` is `/`; one
+/// at the front of a path with no root is kept. Textual, so a `..` after a
+/// symbolic link is taken as written, as every `normpath` takes it.
+let normalize : :string -> :string;
+let normalize p = normalize_in (style ()) p;
+
+/// `segs` with `base` removed from the front, or `()` when they do not start
+/// with it: `/a/bc` is not inside `/a/b`.
+let strip_segments : [:string] -> [:string] -> [:string] | :unit;
+let strip_segments base segs = strip_in (style ()) base segs;
+
+/// The names of `p` inside directory `base`, or `()` when it is not inside
+/// it. Both are normalised first, so this answers about places rather than
+/// about spelling.
+let relative_to : :string -> :string -> [:string] | :unit;
+let relative_to base p = relative_to_in (style ()) base p;
+
+/// `to` written relative to the directory `from`, climbing out with `..`
+/// where it has to: `relative "/w/app" "/w/util"` is `../util`. Both are
+/// normalised first. Paths with different anchors have no relative spelling,
+/// and neither has one that would need to climb back out of a `..` in
+/// `from`; then `to` is answered, normalised. `relative!` reads both against
+/// the working directory first, which removes the second case.
+let relative : :string -> :string -> :string;
+let relative from to = relative_in (style ()) from to;
+
+/// POSIX paths, whatever system this is: each function is the one of the
+/// same name above, for POSIX only.
+mod posix {
+    /// `p` with its separators spelled `/`.
+    let slashes : :string -> :string;
+    let slashes p = slashes_in :posix p;
+    /// Drive and root together, or `""`.
+    let anchor : :string -> :string;
+    let anchor p = anchor_in :posix p;
+    /// Whether `p` names the same place from any working directory.
+    let is_absolute : :string -> :bool;
+    let is_absolute p = is_absolute_in :posix p;
+    /// The names after the anchor, without empty ones or `.`.
+    let segments : :string -> [:string];
+    let segments p = segments_in :posix p;
+    /// Everything before the last name, as POSIX's `dirname`.
+    let dirname : :string -> :string;
+    let dirname p = dirname_in :posix p;
+    /// The last name, as POSIX's `basename`.
+    let basename : :string -> :string;
+    let basename p = basename_in :posix p;
+    /// `a/b`, an empty or `.` side dropped.
+    let join : :string -> :string -> :string;
+    let join a b = join_in :posix a b;
+    /// `base` joined to each of `parts` in turn.
+    let join_all : :string -> [:string] -> :string;
+    let join_all base parts = list.fold join base parts;
+    /// The extension without its dot, or `""`.
+    let extension : :string -> :string;
+    let extension p = extension_in :posix p;
+    /// The path with any extension removed.
+    let drop_extension : :string -> :string;
+    let drop_extension p = drop_extension_in :posix p;
+    /// The path with its extension replaced by `ext`.
+    let with_extension : :string -> :string -> :string;
+    let with_extension ext p = drop_extension p + "." + ext;
+    /// The last name without its extension.
+    let stem : :string -> :string;
+    let stem p = drop_extension (basename p);
+    /// `.` and `..` folded away, as `normpath` does.
+    let normalize : :string -> :string;
+    let normalize p = normalize_in :posix p;
+    /// `segs` without `base` in front, or `()`.
+    let strip_segments : [:string] -> [:string] -> [:string] | :unit;
+    let strip_segments base segs = strip_in :posix base segs;
+    /// The names of `p` inside `base`, or `()`.
+    let relative_to : :string -> :string -> [:string] | :unit;
+    let relative_to base p = relative_to_in :posix base p;
+    /// `to` written relative to the directory `from`.
+    let relative : :string -> :string -> :string;
+    let relative from to = relative_in :posix from to;
+}
+
+/// Windows paths, whatever system this is: each function is the one of the
+/// same name above, for Windows only.
+mod windows {
+    /// `p` with its separators spelled `/`.
+    let slashes : :string -> :string;
+    let slashes p = slashes_in :windows p;
+    /// Drive and root together, or `""`.
+    let anchor : :string -> :string;
+    let anchor p = anchor_in :windows p;
+    /// Whether `p` names the same place from any working directory.
+    let is_absolute : :string -> :bool;
+    let is_absolute p = is_absolute_in :windows p;
+    /// The names after the anchor, without empty ones or `.`.
+    let segments : :string -> [:string];
+    let segments p = segments_in :windows p;
+    /// Everything before the last name, as POSIX's `dirname`.
+    let dirname : :string -> :string;
+    let dirname p = dirname_in :windows p;
+    /// The last name, as POSIX's `basename`.
+    let basename : :string -> :string;
+    let basename p = basename_in :windows p;
+    /// `a/b`, an empty or `.` side dropped.
+    let join : :string -> :string -> :string;
+    let join a b = join_in :windows a b;
+    /// `base` joined to each of `parts` in turn.
+    let join_all : :string -> [:string] -> :string;
+    let join_all base parts = list.fold join base parts;
+    /// The extension without its dot, or `""`.
+    let extension : :string -> :string;
+    let extension p = extension_in :windows p;
+    /// The path with any extension removed.
+    let drop_extension : :string -> :string;
+    let drop_extension p = drop_extension_in :windows p;
+    /// The path with its extension replaced by `ext`.
+    let with_extension : :string -> :string -> :string;
+    let with_extension ext p = drop_extension p + "." + ext;
+    /// The last name without its extension.
+    let stem : :string -> :string;
+    let stem p = drop_extension (basename p);
+    /// `.` and `..` folded away, as `normpath` does.
+    let normalize : :string -> :string;
+    let normalize p = normalize_in :windows p;
+    /// `segs` without `base` in front, or `()`.
+    let strip_segments : [:string] -> [:string] -> [:string] | :unit;
+    let strip_segments base segs = strip_in :windows base segs;
+    /// The names of `p` inside `base`, or `()`.
+    let relative_to : :string -> :string -> [:string] | :unit;
+    let relative_to base p = relative_to_in :windows base p;
+    /// `to` written relative to the directory `from`.
+    let relative : :string -> :string -> :string;
+    let relative from to = relative_in :windows from to;
+}
+
+// --- asking the process -----------------------------------------------------
+
+/// The path as an absolute, normalised one, against the working directory:
+/// what stands in for `canonicalize`. It is exact for every layout a package
+/// can have, and differs only where a symbolic link points into one from
+/// outside -- the same file then has two names rather than anything being
+/// silently wrong. On Windows, a path relative to another drive's current
+/// directory (`D:x` with the working directory on C) stays as it is: only
+/// the system knows where that directory is.
+let absolute! : :string -> :string;
+let absolute! p = normalize (if is_absolute p { p } else { join (os.cwd! ()) p });
+
+/// `to` relative to the directory `from`, both read against the working
+/// directory: what `mind add ../util`, typed in one place, has to become in a
+/// manifest read from another.
+let relative! : :string -> :string -> :string;
+let relative! from to = relative (absolute! from) (absolute! to);
+
+/// Do these two paths name the same file? Compared after making both absolute
+/// and normalising, and without regard to case on Windows, so
+/// `./a/../b/list.dr` and `b/list.dr` are one file rather than two.
+let same_file! : :string -> :string -> :bool;
+let same_file! a b = folded (style ()) (absolute! a) == folded (style ()) (absolute! b);
+
+/// The home directory, or `()`: `$HOME`, and on Windows `$USERPROFILE` first,
+/// which is what Windows itself sets.
+let home! : :unit -> :string | :unit;
+let home! () = match style () {
+    :windows => match os.env! "USERPROFILE" { () => os.env! "HOME", h => h },
+    _ => os.env! "HOME",
+};
+
+/// A leading `~` means the home directory.
+///
+/// A shell expands a tilde it can see, and `export MINDV2_PATH="~/.mindv2"`
+/// hides it inside quotes, so what arrives is a literal `~`. Nothing on disk is
+/// called that, so a search path written that way silently finds nothing --
+/// which looks like a missing library rather than a quoted tilde. `~other`,
+/// which names another user's home, is left alone: guessing where that is would
+/// be worse than not answering.
+let expand_home! : :string -> :string;
+let expand_home! original = {
+    let p = slashes original;
+    if p == "~" || str.starts_with "~/" p {
+        expand macros.if_some home (home! ())
+            (home + str.slice 1 (len p - 1) p) original
+    }
+    else { original }
+};
+
+/// The path an environment variable holds, with a leading `~` expanded, or
+/// `()` when it is not set. Every path that comes out of the environment
+/// should come through here, for `expand_home!`'s reason.
+let from_env! : :string -> :string | :unit;
+let from_env! name = match os.env! name {
+    () => (),
+    v => expand_home! v,
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        // --- POSIX ---
+        test.case "posix: a path is absolute when it starts at the root"
+            $( test.eq! [true, true, false, false]
+                        [posix.is_absolute "/a/b", posix.is_absolute "//a", posix.is_absolute "a/b", posix.is_absolute ""] ),
+        test.case "posix: exactly two leading slashes are their own root"
+            $( test.eq! ["/", "//", "/", ""]
+                        [posix.anchor "/a", posix.anchor "//a", posix.anchor "///a", posix.anchor "a"] ),
+        test.case "posix: a backslash is part of a name"
+            $( test.eq! ["a\\b", "."] [posix.basename "a\\b", posix.dirname "a\\b"] ),
+        test.case "posix: segments drop empties and dots, keep .."
+            $( test.eq! [["a", "b"], ["..", "a"], []]
+                        [posix.segments "/a//./b/", posix.segments "../a", posix.segments "/"] ),
+        test.case "posix: dirname follows libgen"
+            $( test.eq! ["/a", "/", ".", "a", "a", "/", "/", ".", ".", "//", "/a", "a"]
+                        [posix.dirname "/a/b", posix.dirname "/a", posix.dirname "b", posix.dirname "a/b",
+                         posix.dirname "a/b/", posix.dirname "/", posix.dirname "///", posix.dirname "",
+                         posix.dirname "a//", posix.dirname "//x", posix.dirname "/a//b", posix.dirname "a//b//"] ),
+        test.case "posix: basename follows libgen"
+            $( test.eq! ["b", "a", "c", "/", "", "c", ".."]
+                        [posix.basename "/a/b", posix.basename "a", posix.basename "a/b/c//",
+                         posix.basename "/", posix.basename "", posix.basename "c", posix.basename "a/.."] ),
+        test.case "posix: join drops an empty or dot side"
+            $( test.eq! ["main.dr", "a/b", "a/b", "b", "a", "a", "."]
+                        [posix.join "." "main.dr", posix.join "a" "b", posix.join "a/" "b", posix.join "" "b",
+                         posix.join "a" "", posix.join "a" ".", posix.join "." "."] ),
+        test.case "posix: join does not normalise, and an absolute right side wins"
+            $( test.eq! ["a/../b", "/b", "//b", "/a/b/c"]
+                        [posix.join "a" "../b", posix.join "a" "/b", posix.join "/a" "//b",
+                         posix.join_all "/a" ["b", "c"]] ),
+        test.case "posix: extensions follow splitext"
+            $( test.eq! ["dr", "", "", "", "", "gz", "", "dr", "", "", "b"]
+                        [posix.extension "a/list.dr", posix.extension "a/list", posix.extension "a.b/c",
+                         posix.extension ".gitignore", posix.extension "..", posix.extension "a.tar.gz",
+                         posix.extension "file.", posix.extension "..foo.dr", posix.extension "...",
+                         posix.extension "a.d/", posix.extension "/x/.a.b"] ),
+        test.case "posix: drop_extension keeps dots that are not an extension"
+            $( test.eq! [".gitignore", "../lib", "a.tar", "file", "...", "a.b/c", "/x/.a"]
+                        [posix.drop_extension ".gitignore", posix.drop_extension "../lib",
+                         posix.drop_extension "a.tar.gz", posix.drop_extension "file.",
+                         posix.drop_extension "...", posix.drop_extension "a.b/c", posix.drop_extension "/x/.a.b"] ),
+        test.case "posix: with_extension and stem"
+            $( test.eq! ["a/list.dr", "a/list.dr", "list", ".bashrc", "a.tar"]
+                        [posix.with_extension "dr" "a/list", posix.with_extension "dr" "a/list.txt",
+                         posix.stem "a/b/list.dr", posix.stem "/home/.bashrc", posix.stem "a.tar.gz"] ),
+        test.case "posix: normalize folds . and .. as normpath does"
+            $( test.eq! ["/a/c", "b", "/a/c", "c", "../b", "../../x", "/", "/", ".", "/", "//b", "/b", "a/b"]
+                        [posix.normalize "/a/b/../c", posix.normalize "./a/../b", posix.normalize "/a/b/../c/.",
+                         posix.normalize "a/../c", posix.normalize "../b", posix.normalize "../a/../../x",
+                         posix.normalize "/a/../..", posix.normalize "/..", posix.normalize "a/..",
+                         posix.normalize "///", posix.normalize "//a/../b", posix.normalize "///b", posix.normalize "a//b/"] ),
+        test.case "posix: relative_to answers in segments"
+            $( test.eq! [["b", "c.dr"], (), (), [], (), ["x"], ["b"]]
+                        [posix.relative_to "/a" "/a/b/c.dr", posix.relative_to "/a/b" "/a/c",
+                         posix.relative_to "/a" "b", posix.relative_to "/a" "/a/",
+                         posix.relative_to "/a/b" "/a/bc", posix.relative_to "." "x", posix.relative_to "a/" "a/./b"] ),
+        test.case "posix: relative walks up and down"
+            $( test.eq! ["../util", "lib/x", ".", "../../c", "/b", "../b", "../a"]
+                        [posix.relative "/w/app" "/w/util", posix.relative "/w" "/w/lib/x",
+                         posix.relative "/w/a" "/w/a/", posix.relative "/w/a/b" "/w/c",
+                         posix.relative "a" "/b", posix.relative "x" "b", posix.relative "../x" "../a"] ),
+        test.case "posix: relative cannot climb back out of a .."
+            $( test.eq! "a" (posix.relative "../x" "a") ),
+        test.case "posix: names compare by case"
+            $( test.eq! () (posix.relative_to "/A" "/a/b") ),
+
+        // --- Windows ---
+        test.case "windows: the anchor of each kind of path"
+            $( test.eq! ["C:/", "C:", "/", "//srv/share/", "//srv/share", "//?/C:/", "//?/UNC/srv/share/", "", "//./pipe/"]
+                        [windows.anchor "C:\\a", windows.anchor "C:a", windows.anchor "\\a",
+                         windows.anchor "\\\\srv\\share\\a", windows.anchor "//srv/share",
+                         windows.anchor "\\\\?\\C:\\a", windows.anchor "\\\\?\\UNC\\srv\\share\\a",
+                         windows.anchor "a\\b", windows.anchor "//./pipe/x"] ),
+        test.case "windows: absolute takes a drive and a root, or a share"
+            $( test.eq! [true, false, false, true, true, false]
+                        [windows.is_absolute "C:\\a", windows.is_absolute "C:a", windows.is_absolute "\\a",
+                         windows.is_absolute "\\\\srv\\share", windows.is_absolute "//?/C:/x", windows.is_absolute "a"] ),
+        test.case "windows: backslashes are separators"
+            $( test.eq! [["a", "b", "c"], "C:/a/b", "c", "C:/x/y"]
+                        [windows.segments "a\\b/c\\", windows.dirname "C:\\a\\b\\c", windows.basename "C:\\a\\b\\c",
+                         windows.slashes "C:\\x\\y"] ),
+        test.case "windows: dirname and basename stop at the anchor"
+            $( test.eq! ["C:/", "C:", "C:/", "//srv/share/", "//srv/share/", "C:", "/"]
+                        [windows.dirname "C:\\a", windows.dirname "C:a", windows.dirname "C:\\",
+                         windows.dirname "\\\\srv\\share\\a", windows.basename "\\\\srv\\share\\",
+                         windows.basename "C:", windows.dirname "\\a"] ),
+        test.case "windows: join follows ntpath"
+            $( test.eq! ["C:/a/b", "D:/b", "C:/b", "C:x", "C:a/x", "C:/a/b", "D:b", "//srv/share/x", "C:/a/b", "c:/b"]
+                        [windows.join "C:\\a" "b", windows.join "C:\\a" "D:\\b", windows.join "C:\\a" "\\b",
+                         windows.join "C:" "x", windows.join "C:a" "x", windows.join "c:/a" "C:b",
+                         windows.join "C:/a" "D:b", windows.join "//srv/share" "x", windows.join "C:/a/" "b",
+                         windows.join "C:/a" "c:/b"] ),
+        test.case "windows: extensions stop at the drive"
+            $( test.eq! ["txt", "", "C:x", "dr", "", "", "dr"]
+                        [windows.extension "C:a.txt", windows.extension "C:.x", windows.drop_extension "C:x.y",
+                         windows.extension "a.b\\c.dr", windows.extension "//srv.lan/share",
+                         windows.extension "//./a.b", windows.extension "//srv.lan/share/x.dr"] ),
+        test.case "windows: normalize keeps the drive and drops .. at a root"
+            $( test.eq! ["C:/b", "C:/", "C:..", "C:b", "//srv/share/b", "/a", "C:/a/b", "//?/C:/b"]
+                        [windows.normalize "C:\\a\\..\\b", windows.normalize "C:\\..\\..", windows.normalize "C:a\\..\\..",
+                         windows.normalize "C:./b", windows.normalize "\\\\srv\\share\\a\\..\\b", windows.normalize "\\a\\.\\",
+                         windows.normalize "C:/a//b/", windows.normalize "\\\\?\\C:\\a\\..\\b"] ),
+        test.case "windows: names and drives compare without case"
+            $( test.eq! [["b"], "../B", (), "D:/x"]
+                        [windows.relative_to "C:\\A" "c:/a/b", windows.relative "c:/w/x" "C:/W/B",
+                         windows.relative_to "C:/a" "D:/a/b", windows.relative "C:/a" "D:/x"] ),
+
+        // --- the running system ---
+        test.case "the default family is the running system's"
+            $( test.eq! (if os.platform () == :windows { "C:/a" } else { "." }) (dirname "C:\\a\\b") ),
+        test.case "absolute! anchors at the working directory"
+            $( test.eq! (normalize (join (os.cwd! ()) "x")) (absolute! "./a/../x") ),
+        test.case "relative! reads both against the working directory"
+            $( test.eq! ["../x", "."] [relative! "a" "x", relative! "." (os.cwd! ())] ),
+        test.case "same_file! sees through spelling"
+            $( test.eq! [true, false] [same_file! "./a/../b/c" "b/c", same_file! "b/c" "b/d"] ),
+        test.case "a quoted tilde is the home directory"
+            $( test.eq! [true, "~other/x", "a/~"]
+                        [match home! () { () => true, h => expand_home! "~/x" == h + "/x" },
+                         expand_home! "~other/x", expand_home! "a/~"] ),
+    ];
+}

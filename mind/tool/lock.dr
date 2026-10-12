@@ -21,11 +21,12 @@
 // This module is pure but for reading and writing the file; what the entries
 // are is `build.dr`'s business.
 
+import std.file;
 import std.list;
+import std.path;
 import std.str;
 import std.toml;
 
-import util;
 import std.map;
 
 /// `[section, key, source, commit, version]`; `commit` and `version` may be
@@ -114,14 +115,14 @@ let merge old new complete =
         list.append new (list.filter (fn o -> not (seen.[at o else false])) old)
     };
 
-let load! root = match util.read_file! (util.join root file_name) { () => [], text => parse text };
+let load! root = match file.read! (path.join root file_name) { () => [], text => parse text };
 
 /// Write the lock when its text would change, and not otherwise: a build that
 /// resolved the same graph leaves the file, and its timestamp, alone.
 let save! root entries = {
-    let path = util.join root file_name;
+    let path = path.join root file_name;
     let text = render entries;
-    if util.read_file! path == text { () } else { util.write_file! path text }
+    if file.read! path == text { () } else { file.write! path text }
 };
 
 when test {

@@ -9,10 +9,9 @@
 //     let ds = data.spirals 1 200 3;                       // 600 points, 3 classes
 //     let [train, test] = data.split 0.8 7 ds;
 //     let model = nn.sequential [nn.dense 64, nn.relu, nn.dense 64, nn.relu, nn.dense 3];
-//     let fitted = ml.fit! model train %{
-//         :loss => :cross_entropy, :optimizer => optim.adam 0.01,
-//         :epochs => 50, :batch => 32, :metrics => [:accuracy], :validation => test,
-//     };
+//     let fitted = ml.fit! model train (ml.Fit.new ()
+//         |> ml.Fit.set_loss :cross_entropy |> ml.Fit.set_optimizer (optim.adam 0.01)
+//         |> ml.Fit.set_epochs 50 |> ml.Fit.set_metrics [:accuracy] |> ml.Fit.set_validation test);
 //     ml.evaluate fitted test                  // %{"loss" => 0.08, "accuracy" => 0.97}
 //     ml.classify fitted (data.x test)         // the predicted class of each row
 //     ml.save! "spirals.model" (ml.params fitted)
@@ -30,7 +29,7 @@
 // conveniences that need all of them: `fit!`, `predict`, `evaluate`,
 // `save!`, `load!`. A training loop of your own is `step` in a recursion.
 //
-// **Where it runs.** `fit!` takes `:device` -- `:gpu`, `:host`, or `:auto`,
+// **Where it runs.** `fit!` takes a `device` -- `:gpu`, `:host`, or `:auto`,
 // the default, which trains on the GPU when one is available and a step is
 // large enough to repay it: when the parameters times the batch size come to
 // four million or more (a 64 x 256 x 256 network at a batch of 64 is about
@@ -151,24 +150,47 @@ priv let metric_name m = match type_of m {
 priv let atom_text : :atom -> :string;
 priv let atom_text a = str.slice 1 (str.length (to_string a) - 1) (to_string a);
 
-/// Train `model` on `ds`. Options, all optional:
+/// How `fit!` trains. Every field has a default, so a caller says only what
+/// it changes -- by chaining setters onto `Fit.new ()`,
 ///
-/// | key | default | |
-/// |---|---|---|
-/// | `:loss` | `:mse` | a name `loss.of` knows, or a function |
-/// | `:optimizer` | `optim.adam 0.001` | |
-/// | `:epochs` | 10 | passes over the data |
-/// | `:batch` | 32 | examples per step |
-/// | `:metrics` | `[]` | names `metrics.of` knows, functions, or `[name, function]` |
-/// | `:validation` | none | a dataset scored after each epoch |
-/// | `:patience` | none | stop after this many epochs without a better validation loss (or training loss, with no validation set), and keep the best parameters |
-/// | `:seed` | 0 | initial weights, shuffling and dropout |
-/// | `:shuffle` | `true` | a new order each epoch |
-/// | `:params` | fresh | parameters to start from, to resume or fine-tune |
-/// | `:state` | fresh | non-trainable state to restore alongside parameters |
-/// | `:device` | `:auto` | `:gpu`, `:host`, or `:auto` (see the head of this file) |
-/// | `:verbose` | `true` | print a line per epoch |
-let fit! : nn.Layer -> data.Dataset -> %{:atom => :any} -> Fitted;
+///     ml.fit! model ds (ml.Fit.new () |> ml.Fit.set_epochs 50 |> ml.Fit.set_metrics [:accuracy])
+///
+/// or with a map holding just those keys (`%{ :epochs => 50 }`), which is the
+/// same value: a `mapping` reads a missing field as its default. Either way
+/// the types below are checked where the call is written.
+mapping Fit {
+    /// A name `loss.of` knows, or a function of the output and the target.
+    loss : :any = :mse
+    /// An `optim` optimizer; `()` is `optim.adam 0.001`.
+    optimizer : :any = ()
+    /// Passes over the data.
+    epochs : :integer = 10
+    /// Examples per step; a dataset smaller than this is one batch.
+    batch : :integer = 32
+    /// Names `metrics.of` knows, functions, or `[name, function]` pairs.
+    metrics : [:any] = []
+    /// A dataset scored after each epoch, or `()`.
+    validation : :any = ()
+    /// Stop after this many epochs without a better validation loss (or
+    /// training loss, with no validation set) and keep the best parameters;
+    /// `()` trains every epoch.
+    patience : :any = ()
+    /// Initial weights, shuffling and dropout.
+    seed : :integer = 0
+    /// A new order each epoch.
+    shuffle : :bool = true
+    /// Parameters to start from, to resume or fine-tune; `()` for fresh ones.
+    params : :any = ()
+    /// Non-trainable state to restore alongside `params`; `()` for fresh.
+    state : :any = ()
+    /// `:gpu`, `:host`, or `:auto` (see the head of this file).
+    device : :atom = :auto
+    /// Print a line per epoch.
+    verbose : :bool = true
+}
+
+/// Train `model` on `ds`, as `opts` says (`Fit`).
+let fit! : nn.Layer -> data.Dataset -> Fit -> Fitted;
 let fit! model ds opts = join! (spawn! (training! model ds opts));
 
 /// Training, as the thunk of a process of its own.
@@ -187,11 +209,11 @@ let fit! model ds opts = join! (spawn! (training! model ds opts));
 ///
 /// Made in a function of its own so the suspension carries only these
 /// three values, not the caller's frame.
-priv let training! : nn.Layer -> data.Dataset -> %{:atom => :any} -> :any;
+priv let training! : nn.Layer -> data.Dataset -> Fit -> :any;
 priv let training! model ds opts = $( guarded_train! model ds opts );
 
 /// Run training with cleanup and error handling around the training loop.
-priv let guarded_train! : nn.Layer -> data.Dataset -> %{:atom => :any} -> Fitted;
+priv let guarded_train! : nn.Layer -> data.Dataset -> Fit -> Fitted;
 priv let guarded_train! model ds opts = try! { train! model ds opts } catch e {
     // A model too large for the process's heap fails deep inside a step,
     // where the error says nothing about why. It is said here, with what to
@@ -200,30 +222,30 @@ priv let guarded_train! model ds opts = try! { train! model ds opts } catch e {
         error.raise_as! :out_of_memory ("this model needs more than one process's heap allows ("
             + to_string (error.payload e) + "): training holds the parameters, the gradient and the "
             + "optimizer's state, twice over while a step replaces them, as doubles on the host. Raise the "
-            + "limit with DREAM_MAX_HEAP, or train on the GPU (`:device => :gpu`), whose memory it does not count")
+            + "limit with DREAM_MAX_HEAP, or train on the GPU (`Fit.set_device :gpu`), whose memory it does not count")
     } else { error.rethrow! e }
 };
 
 /// Fit a layer to a dataset using the configured optimization and reporting options.
-priv let train! : nn.Layer -> data.Dataset -> %{:atom => :any} -> Fitted;
+priv let train! : nn.Layer -> data.Dataset -> Fit -> Fitted;
 priv let train! model ds opts = {
     let n = data.size ds;
     if n != ops.rows (data.y ds) {
         raise! ("fit! needs a target per example, but there are " + to_string n + " rows of x and "
                 + to_string (ops.rows (data.y ds)) + " of y")
     }
-    let loss_name = opts.[:loss else :mse];
-    let opt = opts.[:optimizer else optim.adam 0.001];
-    let epochs = opts.[:epochs else 10];
-    let batch = if opts.[:batch else 32] > n { n } else { opts.[:batch else 32] };
-    let seed = opts.[:seed else 0];
-    let wanted = opts.[:metrics else []];
+    let loss_name = Fit.loss opts;
+    let opt = match Fit.optimizer opts { () => optim.adam 0.001, o => o };
+    let epochs = Fit.epochs opts;
+    let batch = num.min n (Fit.batch opts);
+    let seed = Fit.seed opts;
+    let wanted = Fit.metrics opts;
     let measures = list.map (fn m -> [metric_name m, metric_fn loss_name m]) wanted;
-    let verbose = opts.[:verbose else true];
-    let shuffle = opts.[:shuffle else true];
-    let patience = opts.[:patience else ()];
-    let start_params = opts.[:params else nn.init model seed (data.example_shape ds)];
-    let device = match opts.[:device else :auto] {
+    let verbose = Fit.verbose opts;
+    let shuffle = Fit.shuffle opts;
+    let patience = Fit.patience opts;
+    let start_params = match Fit.params opts { () => nn.init model seed (data.example_shape ds), p => p };
+    let device = match Fit.device opts {
         :auto => auto_device start_params batch,
         :gpu => if tensor.gpu_available () { :gpu } else { raise! "fit! was asked for the GPU, but none is available" },
         d => d,
@@ -235,9 +257,9 @@ priv let train! model ds opts = {
     let whole = on_gpu && (tensor.size (data.x ds) + tensor.size (data.y ds)) * 4 < 1073741824;
     let train = if whole { data.to_gpu ds } else { ds };
     let place t = if on_gpu && not whole { tensor.gpu t } else { t };
-    let validation = match opts.[:validation else ()] { () => (), v => if on_gpu { data.to_gpu v } else { v } };
+    let validation = match Fit.validation opts { () => (), v => if on_gpu { data.to_gpu v } else { v } };
     let params0 = if on_gpu { tree.gpu start_params } else { start_params };
-    let layer_state = opts.[:state else nn.init_state model (data.example_shape ds)];
+    let layer_state = match Fit.state opts { () => nn.init_state model (data.example_shape ds), st => st };
     let model_state0 = if on_gpu { tree.gpu layer_state } else { tree.host layer_state };
     let state0 = optim.start opt params0;
     strict! model_state0
@@ -516,7 +538,7 @@ when test {
             }) ),
         test.case "fit retains batch norm state for prediction and resuming"
             $( {
-                let model = nn.sequential [nn.batch_norm_with %{:momentum => 1.0}, nn.dense 1];
+                let model = nn.sequential [nn.batch_norm_with (nn.BatchNorm.new () |> nn.BatchNorm.set_momentum 1.0), nn.dense 1];
                 let ds = data.of_lists [[1, 2], [3, 6]] [[0], [1]];
                 let fitted = fit! model ds %{:epochs => 1, :batch => 2, :shuffle => false, :verbose => false, :device => :host};
                 test.eq! (tensor.of_list [2, 4]) (state fitted).[0].["mean"]

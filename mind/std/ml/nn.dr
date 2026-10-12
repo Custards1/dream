@@ -189,22 +189,40 @@ let activation a = match a {
 
 /// A fully connected layer of `units` outputs: `x @ w + b`.
 let dense : :integer -> Layer;
-let dense units = dense_with units %{};
+let dense units = dense_with units (Dense.new ());
 
-/// `dense` with options: `:activation` (a name `activation` knows, or a
-/// function; none by default), `:bias` (`true`), `:init` for the weights
-/// (Glorot uniform, or He normal when the activation is a relu) and
-/// `:bias_init` (zeros).
+/// What `dense_with` takes beyond the width: `Dense.new () |>
+/// Dense.set_activation :relu`, or a map of just the keys it changes.
+mapping Dense {
+    /// A name `activation` knows, or a function.
+    activation : :any = :linear
+    bias : :bool = true
+    /// The weights' initializer; `()` is He normal after a relu and Glorot
+    /// uniform otherwise.
+    init : :any = ()
+    /// The bias's initializer; `()` is zeros.
+    bias_init : :any = ()
+}
+
+/// The initializer a layer's weights get when none is given: He normal ahead
+/// of a relu, which halves what passes, and Glorot uniform otherwise.
+priv let weight_init : :any -> :any -> :any;
+priv let weight_init act given = match given {
+    () => if act == :relu || act == :leaky_relu { initial.he_normal } else { initial.glorot_uniform },
+    f => f,
+};
+
+/// `dense` with an activation, no bias, or other initializers (`Dense`).
 ///
 /// An input of more than two axes -- a sequence of vectors -- is multiplied
 /// along its last axis, as every framework does it: `[n, s, d]` in, `[n, s,
 /// units]` out.
-let dense_with : :integer -> %{:atom => :any} -> Layer;
+let dense_with : :integer -> Dense -> Layer;
 let dense_with units opts = {
-    let act = opts.[:activation else :linear];
-    let use_bias = opts.[:bias else true];
-    let w_init = opts.[:init else (if act == :relu || act == :leaky_relu { initial.he_normal } else { initial.glorot_uniform })];
-    let b_init = opts.[:bias_init else initial.zeros];
+    let act = Dense.activation opts;
+    let use_bias = Dense.bias opts;
+    let w_init = weight_init act (Dense.init opts);
+    let b_init = match Dense.bias_init opts { () => initial.zeros, f => f };
     let f = activation act;
     let make seed shape = {
         let d = shape.[len shape - 1];
@@ -248,18 +266,27 @@ priv let pad_for padding k = match padding {
 /// A 2-D convolution of `filters` kernels `k x k`, stride 1, padded to keep
 /// the image's size.
 let conv2d : :integer -> :integer -> Layer;
-let conv2d filters k = conv2d_with filters k %{};
+let conv2d filters k = conv2d_with filters k (Conv2d.new ());
 
-/// `conv2d` with options: `:stride` (1), `:padding` (`:same`, `:valid`, or a
-/// number of zeros), `:activation` (none), `:bias` (`true`), `:init` (He
-/// normal for a relu, Glorot uniform otherwise).
-let conv2d_with : :integer -> :integer -> %{:atom => :any} -> Layer;
+/// What `conv2d_with` takes beyond the filters and the kernel's size.
+mapping Conv2d {
+    stride : :integer = 1
+    /// `:same`, `:valid`, or a number of zeros on each side.
+    padding : :any = :same
+    activation : :any = :linear
+    bias : :bool = true
+    /// `()` is He normal after a relu and Glorot uniform otherwise.
+    init : :any = ()
+}
+
+/// `conv2d` with a stride, padding, activation, or initializer (`Conv2d`).
+let conv2d_with : :integer -> :integer -> Conv2d -> Layer;
 let conv2d_with filters k opts = {
-    let stride = opts.[:stride else 1];
-    let pad = pad_for opts.[:padding else :same] k;
-    let act = opts.[:activation else :linear];
-    let use_bias = opts.[:bias else true];
-    let w_init = opts.[:init else (if act == :relu || act == :leaky_relu { initial.he_normal } else { initial.glorot_uniform })];
+    let stride = Conv2d.stride opts;
+    let pad = pad_for (Conv2d.padding opts) k;
+    let act = Conv2d.activation opts;
+    let use_bias = Conv2d.bias opts;
+    let w_init = weight_init act (Conv2d.init opts);
     let f = activation act;
     let out_size n = (n + 2 * pad - k) / stride + 1;
     let make seed shape = match shape {
@@ -342,13 +369,20 @@ let layer_norm_with eps = Layer.new "layer_norm"
 /// Running mean and population variance live in the layer state, never in
 /// the optimizer's parameter tree. Use `forward_state` to retain updates.
 let batch_norm : Layer;
-let batch_norm = batch_norm_with %{};
+let batch_norm = batch_norm_with (BatchNorm.new ());
 
-/// Options: `:epsilon` (1e-5), `:momentum` (0.1, the new batch's weight).
-let batch_norm_with : %{:atom => :any} -> Layer;
+/// What `batch_norm_with` takes.
+mapping BatchNorm {
+    epsilon : :float | :integer = 1.0e-5
+    /// The new batch's weight in the running statistics.
+    momentum : :float | :integer = 0.1
+}
+
+/// `batch_norm` with another epsilon or momentum (`BatchNorm`).
+let batch_norm_with : BatchNorm -> Layer;
 let batch_norm_with opts = {
-    let eps = opts.[:epsilon else 1.0e-5];
-    let momentum = opts.[:momentum else 0.1];
+    let eps = BatchNorm.epsilon opts;
+    let momentum = BatchNorm.momentum opts;
     let initialize shape = {
         let d = shape.[len shape - 1];
         %{"mean" => tensor.zeros [d], "variance" => tensor.ones [d]}
@@ -417,17 +451,23 @@ let embedding vocab dim = Layer.new ("embedding " + to_string vocab + "x" + to_s
 // product; its gradient comes back through the whole walk.
 
 /// Multi-head self-attention over sequences `[n, s, d]`: each step attends to
-/// every step (or, with `:causal`, to itself and the steps before it),
+/// every step (or, when causal, to itself and the steps before it),
 /// `heads` ways at once, each head `d / heads` wide. `d` must divide by
 /// `heads`.
 let attention : :integer -> Layer;
-let attention heads = attention_with heads %{};
+let attention heads = attention_with heads (Attention.new ());
 
-/// `attention` with options: `:causal` (`false`), a mask that stops a step
-/// seeing the steps after it, as a language model needs.
-let attention_with : :integer -> %{:atom => :any} -> Layer;
+/// What `attention_with` and `transformer_with` take.
+mapping Attention {
+    /// A mask that stops a step seeing the steps after it, as a language
+    /// model needs.
+    causal : :bool = false
+}
+
+/// `attention`, causal if `opts` says so (`Attention`).
+let attention_with : :integer -> Attention -> Layer;
 let attention_with heads opts = {
-    let causal = opts.[:causal else false];
+    let causal = Attention.causal opts;
     let make seed shape = {
         let d = shape.[len shape - 1];
         let w i = initial.glorot_uniform (initial.seed_for seed i) [d, d];
@@ -465,21 +505,21 @@ let causal_mask steps = {
 /// input added back after it -- the "pre-norm" arrangement, which trains
 /// without a warm-up.
 let transformer : :integer -> :integer -> Layer;
-let transformer heads hidden = transformer_with heads hidden %{};
+let transformer heads hidden = transformer_with heads hidden (Attention.new ());
 
-/// `transformer` with `attention_with`'s options.
-let transformer_with : :integer -> :integer -> %{:atom => :any} -> Layer;
+/// `transformer` with its attention configured (`Attention`).
+let transformer_with : :integer -> :integer -> Attention -> Layer;
 let transformer_with heads hidden opts = Layer.new "transformer"
     (fn seed shape -> {
         let d = shape.[len shape - 1];
         let [mix, _] = init_layer (sequential [layer_norm, attention_with heads opts]) (initial.seed_for seed 0) shape;
-        let [ff, _] = init_layer (sequential [layer_norm, dense_with hidden %{:activation => :gelu}, dense d]) (initial.seed_for seed 1) shape;
+        let [ff, _] = init_layer (sequential [layer_norm, dense_with hidden (Dense.new () |> Dense.set_activation :gelu), dense d]) (initial.seed_for seed 1) shape;
         [%{"attend" => mix, "feed" => ff}, shape]
     })
     (fn p x ctx -> {
         let h = ad.add x (forward (sequential [layer_norm, attention_with heads opts]) p.["attend"] x ctx);
         let d = (tensor.shape (ad.value x)).[2];
-        ad.add h (forward (sequential [layer_norm, dense_with hidden %{:activation => :gelu}, dense d]) p.["feed"] h ctx)
+        ad.add h (forward (sequential [layer_norm, dense_with hidden (Dense.new () |> Dense.set_activation :gelu), dense d]) p.["feed"] h ctx)
     });
 
 /// A learned vector for each position of a sequence of up to `steps`,
@@ -697,7 +737,7 @@ when test {
         test.case "embedding" $( test.eq! [2, 3, 8] (tensor.shape (apply (embedding 10 8) (init (embedding 10 8) 1 [3]) (tensor.of_list [[1, 2, 3], [4, 5, 9]]))) ),
         test.case "batch norm updates state and freezes it for inference"
             $( {
-                let layer = batch_norm_with %{:momentum => 1.0};
+                let layer = batch_norm_with (BatchNorm.new () |> BatchNorm.set_momentum 1.0);
                 let p = init layer 0 [2];
                 let x = tensor.of_list [[1, 2], [3, 6]];
                 let [out, state] = forward_state layer p (init_state layer [2]) x (training 0 0);
@@ -745,7 +785,7 @@ when test {
             $( test.eq! [2, 5, 8] (tensor.shape (apply (attention 2) (init (attention 2) 1 [5, 8]) (tensor.random 1 [2, 5, 8]))) ),
         test.case "causal attention ignores the future"
             $( test.true! ({
-                let layer = attention_with 2 %{:causal => true};
+                let layer = attention_with 2 (Attention.new () |> Attention.set_causal true);
                 let q = init layer 3 [4, 6];
                 let a = tensor.random 1 [1, 4, 6];
                 let b = tensor.concat [tensor.reshape [3, 6] (tensor.slice 0 3 (tensor.reshape [4, 6] a)), tensor.random 9 [1, 6]] |> tensor.reshape [1, 4, 6];

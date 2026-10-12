@@ -48,6 +48,12 @@ with tempfile.TemporaryDirectory(prefix='dream-warnings-') as directory:
           'division by a literal zero')
     check('let f x = [x / 1, x % 2, 0 / x];')
     check('let f x = { let g y = y / 0; g x };', 'division by a literal zero')
+    # A local named like an imported module hides it before a dot.
+    check('import std.str; let f str = str.length str;',
+          '`str` here is a local, not the module `str`')
+    check('import std.str; let f s = str.length s;')
+    check('import std.str; let f str = str;')
+    check('import std.io; let f! io = io.close! io;', '`io` here is a local, not the module `io`')
 
     # Warnings must not prevent emitting or running the program.
     source.write_text('import std.console;\n'

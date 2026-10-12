@@ -8,6 +8,7 @@ import std.json;
 import std.list;
 import std.os;
 import std.num;
+import std.path;
 import std.vm;
 import documentation.examples;
 import std.str;
@@ -15,7 +16,6 @@ import std.toml;
 import documentation.api;
 import documentation.markdown;
 import manifest;
-import util;
 
 let opts = [
     cli.value "C" "dir" "DIR" "the project (default: here, or above)",
@@ -48,11 +48,11 @@ let relative_root url = str.repeat (list.length (str.split "/" url) - 1) "../";
 let ignored path = list.any (fn p -> list.contains p ["target", "build", ".git", ".hg", ".svn", "node_modules", "tests", "examples"]) (str.split "/" path);
 let files! dir = if io.is_dir! dir { list.sort (list.filter (fn p -> not (ignored p)) (io.walk! dir)) } else { [] };
 let guide! ctx dir rel = {
-    let text = read! (util.join dir rel);
+    let text = read! (path.join dir rel);
     page ("guides/" + html_path rel) (markdown.title rel text) (examples.render! ctx text) text
 };
 let module_pages! ctx label dir rel = {
-    let text = read! (util.join dir rel);
+    let text = read! (path.join dir rel);
     console.error! ("documenting " + label + "/" + rel)
     let entries = api.extract text;
     let url = "api/" + label + "/" + html_path rel;
@@ -74,7 +74,7 @@ let package_pages! ctx m = {
 };
 let api_pages! ctx m = {
     let own = if manifest.is_package m { package_pages! ctx m } else { [] };
-    let children = list.flat_map (fn member -> match manifest.find! (util.join (manifest.root m) member) {
+    let children = list.flat_map (fn member -> match manifest.find! (path.join (manifest.root m) member) {
         [:ok, child] => package_pages! ctx child,
         [:error, why] => fail! why,
     }) (manifest.members m);
@@ -106,7 +106,7 @@ let shell title version pages p = {
         + "<script src=\"" + root + "assets/search.js\"></script><script src=\"" + root + "assets/docs.js\"></script></body></html>"
 };
 let write! out rel text = {
-    let path = util.join out rel;
+    let path = path.join out rel;
     file.mkdir_all! (file.parent path)
     file.write! path text
 };
@@ -114,16 +114,16 @@ let build! c m = {
     let cfg = manifest.doc m;
     let root = manifest.root m;
     let title = toml.get (manifest.name m + " documentation") cfg "docs" "title";
-    let guide_dir = util.absolute! (util.join root (cli.get (toml.get "docs" cfg "docs" "guides") c "guides"));
-    let out = util.absolute! (util.join root (cli.get (toml.get "target/docs" cfg "docs" "output") c "output"));
-    let src = util.absolute! (manifest.src! m);
-    if out == util.absolute! root || out == guide_dir || out == src || str.starts_with (out + "/") guide_dir || str.starts_with (guide_dir + "/") out {
+    let guide_dir = path.absolute! (path.join root (cli.get (toml.get "docs" cfg "docs" "guides") c "guides"));
+    let out = path.absolute! (path.join root (cli.get (toml.get "target/docs" cfg "docs" "output") c "output"));
+    let src = path.absolute! (manifest.src! m);
+    if out == path.absolute! root || out == guide_dir || out == src || str.starts_with (out + "/") guide_dir || str.starts_with (guide_dir + "/") out {
         fail! "output must be separate from the project root and guide directory"
     }
     let guide_files = files! guide_dir;
     let timeout = num.parse_int (cli.get (to_string (toml.get 10000 cfg "docs" "example-timeout")) c "example-timeout");
     if timeout == () || timeout <= 0 { fail! "example-timeout must be a positive number of milliseconds" }
-    let scratch = util.join root ("target/docs-examples/" + file.scratch_suffix! () + "-" + to_string (vm.wall_ms! ()));
+    let scratch = path.join root ("target/docs-examples/" + file.scratch_suffix! () + "-" + to_string (vm.wall_ms! ()));
     let ctx = examples.context m (cli.get () c "compiler") timeout scratch;
     let guides = list.map (guide! ctx guide_dir) (list.filter (str.ends_with ".md") guide_files) |> strict!;
     let apis = if cli.flag_set c "no-api" || toml.get true cfg "docs" "api" == false { [] } else { api_pages! ctx m };
@@ -139,9 +139,9 @@ let build! c m = {
     }) pages
     // Copy local images and downloadable guide assets alongside their pages.
     each! (fn rel -> {
-        let to = util.join out ("guides/" + rel);
+        let to = path.join out ("guides/" + rel);
         file.mkdir_all! (file.parent to)
-        file.copy! (util.join guide_dir rel) to
+        file.copy! (path.join guide_dir rel) to
     }) (list.filter (fn rel -> not (str.ends_with ".md" rel)) guide_files)
     write! out "assets/docs.css" css
     write! out "assets/docs.js" javascript
@@ -149,13 +149,13 @@ let build! c m = {
     write! out "assets/search.js" ("window.mindDocs=" + json.write search + ";\n")
     write! out "search-index.json" (json.write search)
     file.remove_all! scratch
-    console.print! ("made " + util.join out "index.html" + " (" + to_string (list.length guides) + " guides, " + to_string (list.length listed - list.length guides) + " API modules)")
+    console.print! ("made " + path.join out "index.html" + " (" + to_string (list.length guides) + " guides, " + to_string (list.length listed - list.length guides) + " API modules)")
 };
 let run! args = match cli.parse opts args {
     [:error, why] => fail! (why + "\n" + usage),
     [:ok, c] => if cli.flag_set c "help" { console.print! usage }
         else if cli.rest c != [] { fail! "unexpected arguments; try `mind docs --help`" }
-        else { match manifest.find! (util.absolute! (cli.get (os.cwd! ()) c "dir")) {
+        else { match manifest.find! (path.absolute! (cli.get (os.cwd! ()) c "dir")) {
             [:error, why] => fail! why,
             [:ok, m] => build! c m,
         } },

@@ -15,14 +15,15 @@
 // Adding appends, which is what makes an index into it stable while the set is
 // still growing -- the dependency walk below relies on that.
 
+import std.file;
 import std.io;
 import std.list;
 import std.macros;
 import std.os;
+import std.path;
 import std.str;
 import std.toml;
 
-import dreams.path;
 
 /// The names a manifest may have. `dusk.toml` is the older spelling, still
 /// accepted so that a project does not have to be renamed to keep building.
@@ -83,7 +84,7 @@ let first_file! : [:string] -> :string | :unit;
 let rec first_file! candidates =
     match candidates {
         [] => (),
-        [c, ..rest] => if path.is_file! c { c } else { first_file! rest },
+        [c, ..rest] => if file.is_file! c { c } else { first_file! rest },
     };
 
 /// Directories searched after `src` for this package's modules: what a build
@@ -134,7 +135,7 @@ let module_name base file =
 /// of their normal absolute forms: what the loader asks of every file it
 /// reads, against every package, with the packages' halves worked out once.
 let module_name_in : [:string] -> [:string] -> :string | :unit;
-let module_name_in base_segs file_segs = match path.strip_prefix_segs base_segs file_segs {
+let module_name_in base_segs file_segs = match path.strip_segments base_segs file_segs {
     () => (),
     segs => dotted_inside segs,
 };
@@ -159,7 +160,7 @@ let rec collect_modules! base dir acc =
                 n  => list.cons n found,
             }
         }
-        else { found }) acc (path.list_dir! dir);
+        else { found }) acc (file.list! dir);
 
 /// Every module this package provides, as dotted paths, sorted. Used to explain
 /// a failed import in terms of what the package actually has.
@@ -185,7 +186,7 @@ let rec manifest_in! dir names =
         [] => (),
         [n, ..rest] => {
             let candidate = path.join dir n;
-            if path.is_file! candidate { candidate } else { manifest_in! dir rest }
+            if file.is_file! candidate { candidate } else { manifest_in! dir rest }
         },
     };
 
@@ -211,14 +212,14 @@ let dep_location spec =
 /// reported as one. `[:error, message]` is a manifest that is meant to be a
 /// package and cannot be read as one.
 let load_manifest! : :string -> [:ok, Package] | [:none] | [:error, :string];
-let load_manifest! file =
-    match path.read_file! file {
-        () => [:error, "cannot read " + file],
+let load_manifest! filename =
+    match file.read! filename {
+        () => [:error, "cannot read " + filename],
         text =>
             match toml.parse text {
-                [:error, why] => [:error, file + ": " + why],
+                [:error, why] => [:error, filename + ": " + why],
                 [:ok, doc] => {
-                    let root_dir = path.dirname file;
+                    let root_dir = path.dirname filename;
                     match toml.get () doc "package" "name" {
                         () => [:none],
                         n =>
@@ -238,9 +239,9 @@ let load_manifest! file =
                                               root_dir src_dir
                                               (list.map (fn [name, location] -> dep name (dep_location location))
                                                         (toml.entries doc "dependencies"))
-                                              file]
+                                              filename]
                                 },
-                                why => [:error, file + ": " + why],
+                                why => [:error, filename + ": " + why],
                             },
                     }
                 },
@@ -336,7 +337,7 @@ let packages_inside! dir s =
                 m  => list.head (add_manifest! m acc),
             }
         }
-        else { acc }) s (path.list_dir! dir);
+        else { acc }) s (file.list! dir);
 
 // --- names a package is imported by ------------------------------------------
 //

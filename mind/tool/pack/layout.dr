@@ -36,6 +36,7 @@ import std.list;
 import std.map;
 import std.num;
 import std.os;
+import std.path;
 import std.result;
 import std.str;
 
@@ -106,9 +107,10 @@ let source_of [dest, value] = match type_of value {
 /// says it writes is not one anybody should install.
 let dest_path : Spec -> :string -> [:ok, :string] | [:error, :string];
 let dest_path sp dest = {
-    let names = list.filter (fn n -> n != "" && n != ".") (str.split "/" dest);
-    let under = if str.starts_with "/" dest { [] }
-                else { list.filter (fn n -> n != "") (str.split "/" (spec.prefix_path sp)) };
+    // `path.posix`, whatever the system: a destination is a path inside
+    // the package, which is installed on a POSIX system.
+    let names = path.posix.segments dest;
+    let under = if path.posix.is_absolute dest { [] } else { path.posix.segments (spec.prefix_path sp) };
     if list.contains ".." names { [:error, "\"" + dest + "\": `..` is not allowed in a destination"] }
     else if list.is_empty names { [:error, "\"" + dest + "\": install it somewhere below the root"] }
     else { [:ok, str.join_str "/" (under + names)] }
@@ -140,16 +142,14 @@ let is_native bytes =
                      [[207, 250, 237, 254], [254, 237, 250, 207], [206, 250, 237, 254], [202, 254, 186, 190]];
 
 let in_program_dir : :string -> :bool;
-let in_program_dir path = {
-    let names = str.split "/" path;
-    list.any (fn n -> n == "bin" || n == "sbin" || n == "libexec") (list.take (list.length names - 1) names)
-};
+let in_program_dir dest =
+    list.any (fn n -> n == "bin" || n == "sbin" || n == "libexec") (path.posix.segments (path.posix.dirname dest));
 
-/// The mode for a file installed at `path` from `source`, when none is given.
+/// The mode for a file installed at `dest` from `source`, when none is given.
 let guess_mode! : :string -> :string -> :integer;
-let guess_mode! path source = {
-    let name = list.last (str.split "/" path);
-    if in_program_dir path && not (is_library name) { item.executable }
+let guess_mode! dest source = {
+    let name = path.posix.basename dest;
+    if in_program_dir dest && not (is_library name) { item.executable }
     else {
         let first = head! source;
         if str.starts_with "#!" first || (is_native first && not (is_library name)) { item.executable }
@@ -179,7 +179,7 @@ let file_at! s path source = match io.stat! source {
 let expand! : Spec -> Source -> [:ok, [[Item, :integer]]] | [:error, :string];
 let expand! sp s = {
     let? dest = dest_path sp (Source.dest s);
-    let from = spec.join (Spec.root sp) (Source.src s);
+    let from = path.join (Spec.root sp) (Source.src s);
     match io.stat! from {
         () => [:error, "[ship.files] \"" + Source.dest s + "\": " + from + " is not there"],
         [_, _, :dir] => {

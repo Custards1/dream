@@ -62,6 +62,16 @@ mod dot {
     check('import bot.dot.name;', 'name')
     check('import bot; import sample.bot.dot;', 'dot.name')
     check('import bot.dot; import bot.dot.name;', 'name')
+    # A record or union brought in by `import a.{R}` is the namespace `import
+    # a.R` gives, before a dot: its accessors, setters and constructors.
+    (temp / 'shapes.dr').write_text(
+        'mapping Opts { depth : :integer = 3 }\n'
+        'union Shape { circle(r : :integer), empty }\n')
+    check('import shapes.{Opts};', 'Opts.depth (Opts.new () |> Opts.set_depth 7)', '7\n')
+    check('import shapes.{Opts as O};', 'O.depth %{}', '3\n')
+    check('import shapes.{Shape};',
+          'match Shape.circle 2 { Shape.circle(r) => r, Shape.empty => 0 }', '2\n')
+    check('import shapes.{Opts};', 'Opts.missing %{}', error='no member')
     print('module imports passed (interpreter and JIT)')
 
     # Behaviors use the same specialization for modules and collection records.

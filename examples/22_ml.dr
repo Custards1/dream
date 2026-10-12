@@ -26,10 +26,16 @@ let main! = {
     let [train, test] = data.split 0.8 7 ds;
     let model = nn.sequential [nn.dense 32, nn.relu, nn.dense 32, nn.relu, nn.dense 3];
     console.print! (nn.summary model [2])
-    let fitted = ml.fit! model train %{
-        :loss => :cross_entropy, :optimizer => optim.adam 0.01, :epochs => 60,
-        :batch => 16, :metrics => [:accuracy], :verbose => false, :seed => 3,
-    };
+    // Options are a record with a default for every field; a chain of
+    // setters says what changes.
+    let fitted = ml.fit! model train (ml.Fit.new ()
+        |> ml.Fit.set_loss :cross_entropy
+        |> ml.Fit.set_optimizer (optim.adam 0.01)
+        |> ml.Fit.set_epochs 60
+        |> ml.Fit.set_batch 16
+        |> ml.Fit.set_metrics [:accuracy]
+        |> ml.Fit.set_verbose false
+        |> ml.Fit.set_seed 3);
     let scores = ml.evaluate fitted test;
     console.print! ("test accuracy " + ml.fixed 2 scores.["accuracy"])
     console.print! (list.take 8 (ml.classify fitted (data.x test)))
@@ -38,6 +44,7 @@ let main! = {
 
     // A regression: the best fit of noisy linear data, scored by r2.
     let lin = data.linear 4 200 3 0.1;
+    // A map of just the keys that change is the same value, checked the same way.
     let reg = ml.fit! (nn.dense 1) lin %{ :optimizer => optim.sgd 0.1, :epochs => 40, :batch => 20, :verbose => false };
     console.print! ("r2 " + ml.fixed 3 (metrics.r2 (ml.predict reg (data.x lin)) (data.y lin)))
     console.print! (list.map (ml.fixed 2) (tensor.to_list (tensor.reshape [3] (ml.params reg).["w"])))

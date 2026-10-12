@@ -71,8 +71,8 @@ group Entry { tag : :integer, kind : :integer, count : :integer, data : :string,
 
 let entry : :integer -> Value -> Entry;
 let entry tag v = match v {
-    Value.int16s(xs) => Entry.make tag 3 (list.length xs) (str.concat_all (list.map (fn n -> bytes.be 2 n) xs)) 2,
-    Value.int32s(xs) => Entry.make tag 4 (list.length xs) (str.concat_all (list.map (fn n -> bytes.be 4 n) xs)) 4,
+    Value.int16s(xs) => Entry.make tag 3 (list.length xs) (str.concat_all (list.map (fn n -> str.of_int_be 2 n) xs)) 2,
+    Value.int32s(xs) => Entry.make tag 4 (list.length xs) (str.concat_all (list.map (fn n -> str.of_int_be 4 n) xs)) 4,
     Value.string(s) => Entry.make tag 6 1 (s + "\0") 1,
     Value.strings(xs) => Entry.make tag 8 (list.length xs) (str.concat_all (list.map (fn s -> s + "\0") xs)) 1,
     Value.i18n(s) => Entry.make tag 9 1 (s + "\0") 1,
@@ -97,12 +97,12 @@ let header region entries = {
     let [store_size, placements] = list.fold place [0, []] sorted;
     let laid = list.reverse placements;
     let count = list.length sorted + 1;
-    let index_entry = fn tag kind offset n -> bytes.be 4 tag + bytes.be 4 kind + bytes.be 4 offset + bytes.be 4 n;
+    let index_entry = fn tag kind offset n -> str.of_int_be 4 tag + str.of_int_be 4 kind + str.of_int_be 4 offset + str.of_int_be 4 n;
     let trailer = index_entry region 7 (0 - count * 16) 16;
     let store = str.concat_all (list.map (fn [gap, _, e] -> bytes.zeros gap + Entry.data e) laid) + trailer;
     let index = index_entry region 7 store_size 16
                 + str.concat_all (list.map (fn [_, at, e] -> index_entry (Entry.tag e) (Entry.kind e) at (Entry.count e)) laid);
-    str.of_bytes [142, 173, 232, 1] + bytes.zeros 4 + bytes.be 4 count + bytes.be 4 (str.byte_length store) + index + store
+    str.of_bytes [142, 173, 232, 1] + bytes.zeros 4 + str.of_int_be 4 count + str.of_int_be 4 (str.byte_length store) + index + store
 };
 
 /// The 96 bytes before everything: a magic, a format version, the package's
@@ -110,8 +110,8 @@ let header region entries = {
 let lead : Spec -> :string;
 let lead sp = {
     let archnum = match Spec.arch sp { :x86_64 => 1, :aarch64 => 19, :all => 0 };
-    str.of_bytes [237, 171, 238, 219, 3, 0] + bytes.be 2 0 + bytes.be 2 archnum
-    + bytes.field 66 (str.slice 0 65 (Spec.name sp + "-" + spec.full_version sp)) + bytes.be 2 1 + bytes.be 2 5
+    str.of_bytes [237, 171, 238, 219, 3, 0] + str.of_int_be 2 0 + str.of_int_be 2 archnum
+    + bytes.field 66 (str.slice 0 65 (Spec.name sp + "-" + spec.full_version sp)) + str.of_int_be 2 1 + str.of_int_be 2 5
     + bytes.zeros 16
 };
 

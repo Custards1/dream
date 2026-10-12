@@ -57,6 +57,7 @@ import std.str;
 import std.streams;
 import std.tls;
 import std.types;
+import std.sql.Transaction;
 import std.sql.pg.bytes;
 import std.sql.pg.config;
 import std.sql.pg.crypto;
@@ -742,12 +743,13 @@ let attempt! body! arg = try! {
 /// Run `body!` in a transaction: COMMIT if it answers, ROLLBACK and raise again
 /// if it raises.
 let transaction! : Conn -> (Conn -> a) -> a;
-let transaction! conn body! = transaction_with! conn %{} body!;
+let transaction! conn body! = transaction_with! conn (Transaction.new ()) body!;
 
-/// The same, with the transaction's characteristics:
-/// `%{ :isolation => :serializable, :read_only => true, :deferrable => true }`.
-/// The isolation is `:read_committed`, `:repeatable_read` or `:serializable`.
-let transaction_with! : Conn -> :map -> (Conn -> a) -> a;
+/// The same, with the transaction's characteristics (`std.sql.Transaction`,
+/// the one description every database's transactions are given in; `lock`
+/// is SQLite's and means nothing here). The isolation is `:read_committed`,
+/// `:repeatable_read` or `:serializable`.
+let transaction_with! : Conn -> Transaction -> (Conn -> a) -> a;
 let transaction_with! conn options body! = {
     exec! conn (sql.raw (begin_statement options))
     match attempt! body! conn {
@@ -768,18 +770,18 @@ priv let rollback! : Conn -> :unit;
 priv let rollback! conn = try! { exec! conn "ROLLBACK"; () } catch e { () };
 
 /// Construct the BEGIN statement for transaction options.
-let begin_statement : :map -> :string;
+let begin_statement : Transaction -> :string;
 let begin_statement options = str.join_str " " (list.filter (fn s -> s != "") [
     "BEGIN",
-    match options.[:isolation else ()] {
+    match Transaction.isolation options {
         () => "",
         :read_committed => "ISOLATION LEVEL READ COMMITTED",
         :repeatable_read => "ISOLATION LEVEL REPEATABLE READ",
         :serializable => "ISOLATION LEVEL SERIALIZABLE",
         other => "ISOLATION LEVEL " + str.upper (value.atom_name other),
     },
-    match options.[:read_only else ()] { true => "READ ONLY", false => "READ WRITE", _ => "" },
-    match options.[:deferrable else ()] { true => "DEFERRABLE", false => "NOT DEFERRABLE", _ => "" },
+    match Transaction.read_only options { true => "READ ONLY", false => "READ WRITE", _ => "" },
+    match Transaction.deferrable options { true => "DEFERRABLE", false => "NOT DEFERRABLE", _ => "" },
 ]);
 
 /// A serializable transaction, run again while it fails in the way PostgreSQL
@@ -787,7 +789,7 @@ let begin_statement options = str.join_str " " (list.filter (fn s -> s != "") [
 /// times in all. Any other failure, or the last retryable one, is raised.
 let serializable! : Conn -> :integer -> (Conn -> a) -> a;
 let rec serializable! conn attempts body! = {
-    match attempt! (transaction_with! conn %{ :isolation => :serializable }) body! {
+    match attempt! (transaction_with! conn (Transaction.new () |> Transaction.set_isolation :serializable)) body! {
         [:ok, v] => v,
         [:error, e] if attempts > 1 && errors.is_retryable e => serializable! conn (attempts - 1) body!,
         [:error, e] => raise! e,
@@ -929,21 +931,15 @@ priv let copy_field v = match value.encode v {
     text => copy_escape text,
 };
 
-/// Escape special characters in a text-format COPY field.
+/// Escape special characters in a text-format COPY field: the backslash, and
+/// the tab, newline and carriage return that would end a field or a row.
 priv let copy_escape : :string -> :string;
-priv let copy_escape text =
-    if str.upto "\\\t\n\r" 0 text >= len text { text }
-    else { str.concat_all (list.map escape_char (str.chars text)) };
-
-/// Escape one character according to PostgreSQL text COPY rules.
-priv let escape_char : :char -> :string;
-priv let escape_char c = match c {
-    '\\' => "\\\\",
-    '\t' => "\\t",
-    '\n' => "\\n",
-    '\r' => "\\r",
-    _ => str.of_chars [c],
-};
+priv let copy_escape text = str.escape_bytes "\\\t\n\r" (fn b -> match b {
+    92 => "\\\\",
+    9 => "\\t",
+    10 => "\\n",
+    _ => "\\r",
+}) text;
 
 /// Copy out what `statement` -- a `COPY .. TO STDOUT` -- writes, each row as a
 /// list of its fields' text, `()` for NULL.

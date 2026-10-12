@@ -119,7 +119,7 @@ its text does; a runtime value does not. [`repl.dr`](repl.dr) and
 | `main.dr` | the command line |
 | `compile.dr` | the pipeline, as a library |
 | `lexer.dr`, `parser.dr`, `ast.dr` | source to syntax trees |
-| `modules.dr`, `package.dr`, `path.dr` | finding and loading modules and packages |
+| `modules.dr`, `package.dr` | finding and loading modules and packages (paths are `std.path`) |
 | `syntax.dr`, `expand.dr` | records, `foreign`, unions, and macro expansion |
 | `config.dr`, `target.dr` | `when` conditions, and where an image may run |
 | `scope.dr` | name resolution, purity, and `virtual`/`derive` dispatch |

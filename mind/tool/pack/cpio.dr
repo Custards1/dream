@@ -10,6 +10,7 @@
 // list -- one number per file, the same one `rpm.dr` puts in FILEINODES.
 
 import std.list;
+import std.num;
 import std.str;
 
 import pack.bytes;
@@ -27,7 +28,7 @@ let type_bits i = match i {
 
 let header : :integer -> :integer -> :integer -> :integer -> :integer -> :string -> :string;
 let header ino mode nlink epoch size name = {
-    let f = fn n -> bytes.hex 8 n;
+    let f = fn n -> num.hex 8 n;
     let namesize = str.byte_length name + 1;
     let head = "070701" + f ino + f mode + f 0 + f 0 + f nlink + f epoch + f size + f 0 + f 0 + f 0 + f 0
                + f namesize + f 0 + name + "\0";

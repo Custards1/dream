@@ -56,6 +56,7 @@ import std.list;
 import std.log;
 import std.map;
 import std.net;
+import std.path;
 import std.proc;
 import std.str;
 import std.streams;
@@ -99,15 +100,15 @@ mapping Server {
     !acceptor : :any
 }
 
-let defaults : :map;
+let defaults : Options;
 let defaults = Options.new ();
 
 /// Serve `app` -- a handler or a router -- on `port`, in the background.
-let serve! : :integer -> :any -> :map;
+let serve! : :integer -> :any -> Server;
 let serve! port app = serve_with! (Options.set_port port defaults) app;
 
 /// Start an HTTP server using explicit listener and connection options.
-let serve_with! : :map -> :any -> :map;
+let serve_with! : Options -> :any -> Server;
 let serve_with! options app = {
     let listener = net.listen! (Options.port options);
     let handle = handler app;
@@ -117,15 +118,15 @@ let serve_with! options app = {
 
 /// The port a server is listening on: the one asked for, or the one the
 /// system chose for 0.
-let port : :map -> :integer;
+let port : Server -> :integer;
 let port s = Server.port s;
 
 /// `http://127.0.0.1:PORT`, for a client in the same program -- a test.
-let local_url : :map -> :string;
+let local_url : Server -> :string;
 let local_url s = "http://127.0.0.1:" + to_string (Server.port s);
 
 /// Stop accepting connections. Ones already open finish what they are doing.
-let stop! : :map -> :unit;
+let stop! : Server -> :unit;
 let stop! s = { try! { io.close! (Server.listener s) } catch e { () }; () };
 
 /// Serve in the foreground: what a program whose whole job is the server
@@ -134,7 +135,7 @@ let run! : :integer -> :any -> :any;
 let run! port app = { let s = serve! port app; join! (Server.acceptor s) };
 
 /// Accept incoming connections and dispatch their handlers.
-priv let accept_loop! : :any -> :any -> :map -> :atom;
+priv let accept_loop! : :any -> :any -> Options -> :atom;
 priv let rec accept_loop! listener handle options =
     match try! { let sock = net.accept! listener; [:ok, sock] } catch e { [:error, e] } {
         [:ok, sock] => {
@@ -147,7 +148,7 @@ priv let rec accept_loop! listener handle options =
     };
 
 /// Serve one accepted connection using the configured protocol options.
-priv let connection! : :any -> :any -> :map -> :unit;
+priv let connection! : :any -> :any -> Options -> :unit;
 priv let connection! sock handle options = {
     let peer = try! { net.peer! sock } catch e { "" };
     let me = self! ();
@@ -192,7 +193,7 @@ priv let rec watch! sock idle conn = match proc.recv_within! (time.to_millisecon
 };
 
 /// Read and serve consecutive requests on an HTTP connection.
-priv let requests! : :any -> :any -> :any -> :map -> :string -> :any -> :unit;
+priv let requests! : :any -> :any -> :any -> Options -> :string -> :any -> :unit;
 priv let rec requests! sock r handle options peer watchdog =
     // Forced inside the `try!`: a request is built lazily, and a malformed
     // one must fail here, where it can be answered with a 400, rather than
@@ -242,7 +243,7 @@ priv let rec requests! sock r handle options peer watchdog =
 
 /// HTTP/2 on this connection, answering each request as an HTTP/1.1 one would
 /// be: the same handler, the same 500 for a raise, the same headers added.
-priv let serve_h2! : :any -> :any -> :any -> :map -> :string -> :any -> :unit;
+priv let serve_h2! : :any -> :any -> :any -> Options -> :string -> :any -> :unit;
 priv let serve_h2! sock r handle options peer watchdog =
     h2.serve! sock r (respond_h2! handle options peer) (Options.max_body options) (still_going! watchdog);
 
@@ -276,7 +277,7 @@ priv let still_going! watchdog u = { send! watchdog :active; () };
 
 /// The next request, or `()` when the client closed the connection between
 /// requests: `[request, reader, body process or ()]`.
-priv let read_request! : :any -> :any -> :map -> :string -> :any;
+priv let read_request! : :any -> :any -> Options -> :string -> :any;
 priv let read_request! sock r options peer = match http.read_head! r (Options.max_header options) {
     () => (),
     // HTTP/2 with prior knowledge: its preface reads as a request line
@@ -512,10 +513,11 @@ let files! dir req = {
 
 /// The content type of a file, by its extension.
 let mime_type : :string -> :string;
-let mime_type path = {
-    let dot = str.find_last "." path;
-    let ext = if dot < 0 { "" } else { str.lower (str.slice (dot + 1) (len path) path) };
-    match ext {
+let mime_type file = {
+    // `path.posix`, whatever the system: a URL's path is slash-separated
+    // everywhere, and the dot has to be in the last name (`/a.b/readme` is
+    // not a `.b/readme`).
+    match str.lower (path.posix.extension file) {
         "html" => "text/html; charset=utf-8", "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8", "js" => "text/javascript; charset=utf-8", "mjs" => "text/javascript; charset=utf-8",
         "json" => "application/json", "txt" => "text/plain; charset=utf-8", "md" => "text/markdown; charset=utf-8",

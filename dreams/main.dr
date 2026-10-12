@@ -15,9 +15,11 @@
 
 import std.console;
 
+import std.file;
 import std.io;
 import std.list;
 import std.os;
+import std.path;
 import std.str;
 import std.streams;
 import std.vm;
@@ -38,7 +40,6 @@ import dreams.modules;
 import dreams.opt as optimizer;
 import dreams.package;
 import dreams.parser;
-import dreams.path;
 import dreams.repl;
 import dreams.scope;
 import dreams.target;
@@ -949,10 +950,10 @@ let usage! () = {
 /// Read the file and hand its text to `k`, or fail saying so. The parameter is
 /// `file` rather than `path` because `path` is a module here, and a parameter of
 /// that name would shadow it.
-let with_source! file k =
-    match path.read_file! file {
+let with_source! filename k =
+    match file.read! filename {
         () => {
-            console.error! ("dreams: cannot read " + file)
+            console.error! ("dreams: cannot read " + filename)
             1
         },
         text => k text,

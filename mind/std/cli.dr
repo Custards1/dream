@@ -510,10 +510,50 @@ let usage : :string -> :string -> :string -> [Option] -> :string;
 let usage program summary calling os =
     program + " -- " + summary + "\n\nusage: " + calling + "\n" + options_help os + "\n";
 
+// --- the other direction: arguments as a shell reads them ----------------------
+//
+// A tool that writes a script (an installer, a PKGBUILD) or shows the command
+// it is about to run has to spell each argument so that `sh` reads back the
+// same bytes. Single quotes are the one quoting POSIX makes exact: nothing
+// inside them is special, so the only character that needs care is the quote
+// itself, which closes the quoting, is escaped, and opens it again.
+
+/// `s` as one word of a POSIX shell, always quoted: `it's` is `'it'\''s'`.
+/// What a generated script wants, where every word looking the same is worth
+/// more than saving two characters.
+let shell_quote : :string -> :string;
+let shell_quote s = "'" + str.replace "'" "'\\''" s + "'";
+
+/// Bytes a shell word may hold without quoting: no glob, expansion,
+/// redirection, separator or quote among them.
+priv let shell_safe : :string;
+priv let shell_safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-";
+
+/// `s` as one word of a POSIX shell, quoted only when it has to be: `-o`
+/// and `a/b.c` as they are, `a b` and `""` quoted. What a command shown to a
+/// person wants. One runtime scan decides.
+let shell_word : :string -> :string;
+let shell_word s =
+    if s != "" && str.span shell_safe 0 s == str.byte_length s { s } else { shell_quote s };
+
+/// A whole command line as a shell would read it back into `argv`.
+let shell_line : [:string] -> :string;
+let shell_line argv = str.join_str " " (list.map shell_word argv);
+
 // --- tests -------------------------------------------------------------------
 
 when test {
     import std.test;
+
+    let shell_tests = [
+        test.case "a shell word is quoted only when it must be"
+            $( test.eq! ["-o", "a/b.c", "'a b'", "''", "'$HOME'", "'it'\\''s'"]
+                        (list.map shell_word ["-o", "a/b.c", "a b", "", "$HOME", "it's"]) ),
+        test.case "shell_quote always quotes"
+            $( test.eq! ["'a'", "'it'\\''s'"] [shell_quote "a", shell_quote "it's"] ),
+        test.case "a command line reads back as its words"
+            $( test.eq! "cc -o 'my prog' 'x;y'" (shell_line ["cc", "-o", "my prog", "x;y"]) ),
+    ];
 
     let specs = [
         flag "q" "quiet" "say less",
@@ -683,7 +723,7 @@ when test {
             $( test.true! (str.contains_str "one of pretty, json" (options_help rich)) ),
         test.case "usage shows the commands"
             $( test.true! (str.contains_str "build" (commands_help cmds)) ),
-    ];
+    ] + shell_tests;
 }
 // --- optional types ---------------------------------------------------------
 

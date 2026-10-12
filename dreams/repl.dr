@@ -29,10 +29,10 @@ import std.console;
 import std.io;
 import std.list;
 import std.os;
+import std.path;
 import std.str;
 
 import dreams.parser;
-import dreams.path;
 import dreams.session as session_mod;
 
 let prompt = "dream> ";

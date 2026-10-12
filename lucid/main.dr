@@ -33,10 +33,10 @@ import std.json;
 import std.list;
 import std.map;
 import std.os;
+import std.path;
 import std.str;
 
 import dreams.fmt;
-import dreams.path;
 
 import analysis;
 import complete;

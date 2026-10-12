@@ -59,6 +59,7 @@ import std.ml.ops;
 import std.ml.optim;
 import std.ml.tree;
 import std.num;
+import std.path;
 import std.payload;
 import std.macros;
 import std.parse;
@@ -100,7 +101,7 @@ let modules = ["std.agent", "std.array", "std.atom", "std.binary", "std.binary.i
                "std.build.run", "std.build.tool", "std.char", "std.cli",
                "std.codec", "std.console", "std.error", "std.file", "std.http", "std.http.h2", "std.http.hpack", "std.http.pool", "std.http.reader", "std.http.server", "std.http.stream", "std.http.url", "std.http.websocket",
                "std.json", "std.list", "std.log", "std.map", "std.macros", "std.ml", "std.ml.ad", "std.ml.data", "std.ml.init", "std.ml.loss",
-               "std.ml.metrics", "std.ml.nn", "std.ml.ops", "std.ml.optim", "std.ml.tree", "std.num", "std.parse", "std.payload", "std.proc",
+               "std.ml.metrics", "std.ml.nn", "std.ml.ops", "std.ml.optim", "std.ml.tree", "std.num", "std.parse", "std.path", "std.payload", "std.proc",
                "std.property", "std.random", "std.record", "std.regex", "std.registry", "std.remote",
                "std.result", "std.seq", "std.server", "std.sql", "std.sql.lint", "std.sql.pg", "std.sql.pool", "std.sql.sqlite", "std.str", "std.streams",
                "std.supervisor", "std.test", "std.time", "std.time.calendar", "std.time.zone", "std.toml", "std.types", "std.wire"];

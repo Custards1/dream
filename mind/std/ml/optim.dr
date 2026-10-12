@@ -4,7 +4,7 @@
 //     let state = optim.start opt params;
 //     let [params2, state2] = optim.step opt grads state params;
 //
-//     optim.sgd_with 0.1 %{ :momentum => 0.9, :nesterov => true }
+//     optim.sgd_with 0.1 (optim.Sgd.new () |> optim.Sgd.set_momentum 0.9 |> optim.Sgd.set_nesterov true)
 //     optim.adamw 0.001 0.01                        // decoupled weight decay
 //     optim.adam (optim.cosine 0.001 10000 0.0)     // a schedule for the rate
 //     optim.clip_norm 1.0 (optim.adam 0.001)        // gradients held to a length
@@ -63,15 +63,23 @@ let steps state = state.["t" else 0];
 
 /// Plain stochastic gradient descent: `p - lr * g`.
 let sgd : :any -> Optimizer;
-let sgd lr = sgd_with lr %{};
+let sgd lr = sgd_with lr (Sgd.new ());
 
-/// SGD with options: `:momentum` (0), `:nesterov` (false), `:weight_decay`
-/// (0, added to the gradient as `wd * p`, which is L2 regularization).
-let sgd_with : :any -> %{:atom => :any} -> Optimizer;
+/// What `sgd_with` takes beyond the rate: `Sgd.new () |> Sgd.set_momentum 0.9`,
+/// or a map of just the keys it changes.
+mapping Sgd {
+    momentum : :float | :integer = 0.0
+    nesterov : :bool = false
+    /// Added to the gradient as `wd * p`, which is L2 regularization.
+    weight_decay : :float | :integer = 0.0
+}
+
+/// SGD with momentum, Nesterov's correction or weight decay (`Sgd`).
+let sgd_with : :any -> Sgd -> Optimizer;
 let sgd_with lr opts = {
-    let mu = 1.0 * opts.[:momentum else 0.0];
-    let nesterov = opts.[:nesterov else false];
-    let wd = 1.0 * opts.[:weight_decay else 0.0];
+    let mu = 1.0 * Sgd.momentum opts;
+    let nesterov = Sgd.nesterov opts;
+    let wd = 1.0 * Sgd.weight_decay opts;
     let decayed g p = if wd > 0.0 { g + wd * p } else { g };
     Optimizer.make "sgd"
         (fn params -> %{"t" => 0, "v" => if mu > 0.0 { tree.zeros_like params } else { () }})
@@ -92,24 +100,33 @@ let sgd_with lr opts = {
 /// square, corrected for starting at zero. `beta1` 0.9, `beta2` 0.999,
 /// `eps` 1e-8.
 let adam : :any -> Optimizer;
-let adam lr = adam_with lr %{};
+let adam lr = adam_with lr (Adam.new ());
 
 /// AdamW: Adam with weight decay applied to the parameters directly
 /// (`p - lr * wd * p`), rather than through the gradient where Adam's
 /// scaling would undo it.
 let adamw : :any -> :float -> Optimizer;
-let adamw lr wd = adam_with lr %{:decay => wd};
+let adamw lr wd = adam_with lr (Adam.new () |> Adam.set_decay wd);
 
-/// Adam with options: `:beta1`, `:beta2`, `:eps`, `:decay` (decoupled
-/// weight decay, as AdamW; 0) and `:weight_decay` (L2, through the
-/// gradient; 0).
-let adam_with : :any -> %{:atom => :any} -> Optimizer;
+/// What `adam_with` takes beyond the rate.
+mapping Adam {
+    beta1 : :float | :integer = 0.9
+    beta2 : :float | :integer = 0.999
+    eps : :float | :integer = 1.0e-8
+    /// Decoupled weight decay, as AdamW.
+    decay : :float | :integer = 0.0
+    /// L2 regularization, through the gradient.
+    weight_decay : :float | :integer = 0.0
+}
+
+/// Adam with its moments, epsilon or either kind of weight decay changed (`Adam`).
+let adam_with : :any -> Adam -> Optimizer;
 let adam_with lr opts = {
-    let b1 = 1.0 * opts.[:beta1 else 0.9];
-    let b2 = 1.0 * opts.[:beta2 else 0.999];
-    let eps = 1.0 * opts.[:eps else 1.0e-8];
-    let decay = 1.0 * opts.[:decay else 0.0];
-    let l2 = 1.0 * opts.[:weight_decay else 0.0];
+    let b1 = 1.0 * Adam.beta1 opts;
+    let b2 = 1.0 * Adam.beta2 opts;
+    let eps = 1.0 * Adam.eps opts;
+    let decay = 1.0 * Adam.decay opts;
+    let l2 = 1.0 * Adam.weight_decay opts;
     Optimizer.make (if decay > 0.0 { "adamw" } else { "adam" })
         (fn params -> %{"t" => 0, "m" => tree.zeros_like params, "v" => tree.zeros_like params})
         (fn grads state params -> {
@@ -134,13 +151,19 @@ let adam_with lr opts = {
 /// RMSProp: each parameter's rate divided by a running root mean square of
 /// its gradients. `rho` 0.9, `eps` 1e-8.
 let rmsprop : :any -> Optimizer;
-let rmsprop lr = rmsprop_with lr %{};
+let rmsprop lr = rmsprop_with lr (RmsProp.new ());
 
-/// Construct RMSProp with explicit learning rate and optimizer options.
-let rmsprop_with : :any -> %{:atom => :any} -> Optimizer;
+/// What `rmsprop_with` takes beyond the rate.
+mapping RmsProp {
+    rho : :float | :integer = 0.9
+    eps : :float | :integer = 1.0e-8
+}
+
+/// RMSProp with its decay or epsilon changed (`RmsProp`).
+let rmsprop_with : :any -> RmsProp -> Optimizer;
 let rmsprop_with lr opts = {
-    let rho = 1.0 * opts.[:rho else 0.9];
-    let eps = 1.0 * opts.[:eps else 1.0e-8];
+    let rho = 1.0 * RmsProp.rho opts;
+    let eps = 1.0 * RmsProp.eps opts;
     Optimizer.make "rmsprop"
         (fn params -> %{"t" => 0, "s" => tree.zeros_like params})
         (fn grads state params -> {
@@ -239,8 +262,8 @@ when test {
 
     let tests = [
         test.case "sgd" $( test.true! (near (run (sgd 0.1) 100)) ),
-        test.case "momentum" $( test.true! (near (run (sgd_with 0.05 %{:momentum => 0.9}) 200)) ),
-        test.case "nesterov" $( test.true! (near (run (sgd_with 0.05 %{:momentum => 0.9, :nesterov => true}) 200)) ),
+        test.case "momentum" $( test.true! (near (run (sgd_with 0.05 (Sgd.new () |> Sgd.set_momentum 0.9)) 200)) ),
+        test.case "nesterov" $( test.true! (near (run (sgd_with 0.05 (Sgd.new () |> Sgd.set_momentum 0.9 |> Sgd.set_nesterov true)) 200)) ),
         test.case "adam" $( test.true! (near (run (adam 0.1) 300)) ),
         test.case "adamw" $( test.true! (near (run (adamw 0.1 0.0001) 300)) ),
         test.case "rmsprop" $( test.true! (near (run (rmsprop 0.01) 500)) ),

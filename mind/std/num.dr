@@ -201,14 +201,24 @@ priv let rec base_digits base !n !acc =
     if n == 0 { acc }
     else { base_digits base (n / base) (_list_cons (_str_slice digit_chars (n % base) 1) acc) };
 
+/// `n` in `base`, at least `width` digits, zero-filled on the left:
+/// `to_base_padded 8 7 493` is `"0000755"`, a tar header's mode field. A
+/// number too wide for `width` is answered whole -- cutting it would write a
+/// smaller number, which every reader would believe -- so a caller with a
+/// field to fill checks the length. A negative number keeps its `-` in front
+/// of the zeros.
+let to_base_padded : :integer -> :integer -> :integer -> :string;
+let to_base_padded base width n = {
+    let digits = to_base base (abs n);
+    let short = width - len digits - (if n < 0 { 1 } else { 0 });
+    let padded = if short > 0 { _str_concat (list.replicate short "0") + digits } else { digits };
+    if n < 0 { "-" + padded } else { padded }
+};
+
 /// `n` in lowercase hexadecimal, at least `width` digits, zeros in front:
 /// `hex 4 255` is `"00ff"`. What a byte dump or an escape wants.
 let hex : :integer -> :integer -> :string;
-let hex width n = {
-    let digits = to_base 16 n;
-    let short = width - len digits;
-    if short > 0 { _str_concat (list.replicate short "0") + digits } else { digits }
-};
+let hex width n = to_base_padded 16 width n;
 
 /// The integer `text` writes in `base`, from 2 to 36, either case, an optional
 /// sign in front -- or `()` for text that is not one. No prefix: the caller
@@ -285,6 +295,9 @@ when test {
         test.case "to_base of a bignum"  $( test.eq! ("1" + _str_concat (list.replicate 25 "0")) (to_base 16 (pow 2 100)) ),
         test.case "to_base refuses base 1" $( test.raises! $( strict! (to_base 1 5) ) ),
         test.case "hex pads"             $( test.eq! ["00ff", "1234"] [hex 4 255, hex 2 4660] ),
+        test.case "padded digits in any base"
+            $( test.eq! ["0000755", "17", "-0f", "0"]
+                        [to_base_padded 8 7 493, to_base_padded 8 1 15, to_base_padded 16 3 (0 - 15), to_base_padded 2 0 0] ),
         test.case "parse_base"           $( test.eq! [255, 255, 0 - 5, (), (), ()]
                                                      [parse_base 16 "ff", parse_base 16 "FF", parse_base 2 "-101",
                                                       parse_base 2 "102", parse_base 16 "", parse_base 16 "-"] ),

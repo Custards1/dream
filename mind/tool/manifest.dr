@@ -13,12 +13,13 @@
 // with it. `[build]` is for what is true of *this* package, never for making
 // somebody else's importable.
 
+import std.file;
 import std.io;
 import std.list;
+import std.path;
 import std.str;
 import std.toml;
 
-import util;
 import std.map;
 
 /// Where a package's manifest lives, and what it says.
@@ -37,7 +38,7 @@ let doc m = m.[:doc else (%{})];
 /// own checks are named under.
 let name m = match toml.get "" (doc m) "package" "name" {
     "" => match toml.get "" (doc m) "workspace" "name" {
-        "" => if is_workspace m { util.basename (root m) } else { "" },
+        "" => if is_workspace m { path.basename (root m) } else { "" },
         n => n,
     },
     n => n,
@@ -73,10 +74,10 @@ let version m = toml.get "0.0.0" (doc m) "package" "version";
 let src! m =
     match toml.get () (doc m) "package" "src" {
         () => {
-            let conventional = util.join (root m) "src";
+            let conventional = path.join (root m) "src";
             if io.is_dir! conventional { conventional } else { root m }
         },
-        s => util.join (root m) s,
+        s => path.join (root m) s,
     };
 
 /// The file a build starts from: what `[package] entry` says, relative to the
@@ -85,14 +86,14 @@ let src! m =
 let entry! m =
     match toml.get () (doc m) "package" "entry" {
         () => {
-            let beside_src = util.join (src! m) "main.dr";
-            let beside_root = util.join (root m) "main.dr";
+            let beside_src = path.join (src! m) "main.dr";
+            let beside_root = path.join (root m) "main.dr";
             match [io.exists! beside_src, io.exists! beside_root] {
                 [false, true] => beside_root,
                 _ => beside_src,
             }
         },
-        e => util.join (src! m) e,
+        e => path.join (src! m) e,
     };
 
 // --- `[build]`: how this package is compiled ---------------------------------
@@ -115,10 +116,10 @@ let build_list m key =
 let defines m = build_list m "defines";
 
 /// Extra directories to search for packages, relative to the manifest.
-let package_paths m = list.map (fn d -> util.join (root m) d) (build_list m "package-paths");
+let package_paths m = list.map (fn d -> path.join (root m) d) (build_list m "package-paths");
 
 /// Directories to search for loose modules: the compiler's `-I`.
-let includes m = list.map (fn d -> util.join (root m) d) (build_list m "includes");
+let includes m = list.map (fn d -> path.join (root m) d) (build_list m "includes");
 
 /// Modules the host registers at run time, so importing them compiles.
 let host_modules m = build_list m "host-modules";
@@ -133,7 +134,7 @@ let compiler_flags m = build_list m "flags";
 /// in it is; a bare name is looked up as the VM or the shell would.
 let compiler m = match toml.get () (doc m) "build" "compiler" {
     () => (),
-    c => if str.contains_str "/" c { util.join (root m) c } else { c },
+    c => if str.contains_str "/" c { path.join (root m) c } else { c },
 };
 
 /// Where the built image goes. `target/[<platforms>/]<profile>/<name>.dream`
@@ -156,13 +157,13 @@ let target m = build_list m "target";
 let script! m =
     match toml.get () (doc m) "build" "script" {
         () => {
-            let beside = util.join (root m) "build.dr";
-            match util.read_file! beside {
+            let beside = path.join (root m) "build.dr";
+            match file.read! beside {
                 () => (),
                 text => if declares_plan text { beside } else { () },
             }
         },
-        s => util.join (root m) s,
+        s => path.join (root m) s,
     };
 
 /// Whether a script's text declares `plan` at the top level: a line that
@@ -177,7 +178,7 @@ let declares_plan text =
 let test_entry! m =
     match toml.get () (doc m) "test" "entry" {
         () => entry! m,
-        e => util.join (src! m) e,
+        e => path.join (src! m) e,
     };
 
 /// The environment variables a build script may see, `[build] env`. Only
@@ -305,7 +306,7 @@ let dev_dependencies m = section_deps m "dev-dependencies";
 let build_dependencies m = section_deps m "build-dependencies";
 
 /// The manifest file itself, for a message that has to say where a line was.
-let path m = util.join (root m) "mind.toml";
+let path m = path.join (root m) "mind.toml";
 
 let dep_name d = list.head d;
 let dep_spec d = list.nth 1 d;
@@ -357,8 +358,8 @@ let dep_source d =
 
 /// Read the manifest in `dir`, or `[:error, message]`.
 let load! dir = {
-    let path = util.join dir "mind.toml";
-    match util.read_file! path {
+    let path = path.join dir "mind.toml";
+    match file.read! path {
         () => [:error, "no manifest at " + path],
         text => match toml.parse text {
             [:ok, d] => {
@@ -377,14 +378,14 @@ let load! dir = {
 /// `[:ok, m]`, `[:none]`, or `[:error, why]` for a manifest that is there and
 /// wrong -- that one is reported, because somebody meant it to say something.
 let load_dependency! dir =
-    match io.exists! (util.join dir "mind.toml") {
+    match io.exists! (path.join dir "mind.toml") {
         false => [:none],
-        true => match util.read_file! (util.join dir "mind.toml") {
-            () => [:error, "cannot read " + util.join dir "mind.toml"],
+        true => match file.read! (path.join dir "mind.toml") {
+            () => [:error, "cannot read " + path.join dir "mind.toml"],
             text => match toml.parse text {
                 [:ok, d] => [:ok, make dir d],
-                [:error, why] => [:error, util.join dir "mind.toml" + ": " + why],
-                _ => [:error, util.join dir "mind.toml" + ": could not be read"],
+                [:error, why] => [:error, path.join dir "mind.toml" + ": " + why],
+                _ => [:error, path.join dir "mind.toml" + ": could not be read"],
             },
         },
     };
@@ -392,9 +393,9 @@ let load_dependency! dir =
 /// Walk up from `dir` looking for a manifest, so `mind build` works from
 /// anywhere inside a project -- the same way `git` finds its root.
 let rec find! dir =
-    match util.read_file! (util.join dir "mind.toml") {
+    match file.read! (path.join dir "mind.toml") {
         () => {
-            let parent = util.dirname dir;
+            let parent = path.dirname dir;
             if parent == dir || dir == "." || dir == "/" { [:error, "no mind.toml here or above"] }
             else { find! parent }
         },

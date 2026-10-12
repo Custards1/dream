@@ -4,10 +4,10 @@ import std.io;
 import std.list;
 import std.map;
 import std.os;
+import std.path;
 import std.str;
 import build;
 import manifest;
-import util;
 import documentation.markdown;
 
 let context m compiler timeout scratch = %{ :manifest => m, :compiler => compiler, :timeout => timeout, :scratch => scratch };
@@ -20,10 +20,10 @@ let report phase r = {
     "<div class=\"example-result\"><p><strong>" + markdown.escape label + "</strong></p><pre><code>" + markdown.escape shown + "</code></pre></div>"
 };
 let run! ctx code = try! {
-    let dir = util.join ctx.[:scratch] (io.digest code);
+    let dir = path.join ctx.[:scratch] (io.digest code);
     file.mkdir_all! dir
-    let entry = util.join dir "example.dr";
-    let image = util.join dir "example.dream";
+    let entry = path.join dir "example.dr";
+    let image = path.join dir "example.dream";
     file.write! entry code
     let m = ctx.[:manifest];
     let opts = map.merge build.options (%{ :entry => entry, :output => image, :compiler => ctx.[:compiler] });
@@ -35,7 +35,7 @@ let run! ctx code = try! {
             if compiled.[:code else 1] != 0 || compiled.[:timed_out else false] { report "Compile" compiled }
             else {
                 let vm = build.vm_command! ();
-                let program = if str.contains_str "/" vm { util.absolute! vm } else { vm };
+                let program = if str.contains_str "/" vm { path.absolute! vm } else { vm };
                 let ran = os.exec_in! dir program [image] ctx.[:timeout];
                 // Successful compiler chatter only repeats temporary paths.
                 // Warnings are kept when present; execution always has a result.

@@ -374,25 +374,25 @@ let entries table name = _map_pairs (section table name);
 //   not a table is written before the first header, and so comes back inside
 //   `""`.
 
-/// A basic string's escapes: the five TOML names, and `\u00XX` for any other
-/// control character, which a basic string may not hold as itself.
-let escape_char : :char -> :string;
-let escape_char c = match c {
-    '"'  => "\\\"",
-    '\\' => "\\\\",
-    '\n' => "\\n",
-    '\t' => "\\t",
-    '\r' => "\\r",
-    _ => match _char_code c {
-        code if code < 32 || code == 127 =>
-            "\\u00" + num.hex 2 (code % 256),
-        _ => str.of_chars [c],
-    },
+/// What a basic string may not hold as itself: the quote, the backslash and
+/// every control character, DEL included.
+priv let specials : :string;
+priv let specials = str.of_bytes (list.range 0 32 + [127]) + "\"\\";
+
+/// One of `specials` escaped: the five TOML names, and `\u00XX` for the rest.
+priv let escape_byte : :integer -> :string;
+priv let escape_byte b = match b {
+    34 => "\\\"",
+    92 => "\\\\",
+    10 => "\\n",
+    9 => "\\t",
+    13 => "\\r",
+    code => "\\u" + num.hex 4 code,
 };
 
 /// Escape a string and surround it with double quotes for this format.
 let quote : :string -> :string;
-let quote s = "\"" + str.join_str "" (list.map escape_char (str.chars s)) + "\"";
+let quote s = "\"" + str.escape_bytes specials escape_byte s + "\"";
 
 /// Return an atom's name without its leading colon.
 priv let atom_name : :atom -> :string;

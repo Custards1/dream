@@ -71,6 +71,7 @@ learn.
 | | |
 |---|---|
 | `console` | printing, prompts, formatting, colour and logging, over `std.io` |
+| `path` | paths as text, POSIX's and Windows' rules both: drives, shares, `dirname`, extensions, `normalize`, `relative` ([below](#paths)) |
 | `file` | whole files, and the directories they go in |
 | `streams` | writing all of a string through a writer that may take less |
 | `cli` | command lines: one description of an option, read, checked and printed as usage |
@@ -100,6 +101,65 @@ learn.
 | `debug` | where the time goes and where the memory goes, in a running program |
 | `build` | what a package's `build.dr` is written in; `build.cc` builds C and C++ with GCC, Clang, MSVC or CMake ([docs/build.md](../../docs/build.md)) |
 | `all` | every module, so that `--test` collects every module's tests |
+
+## Options: a record with a default for every field
+
+A function with more than a couple of settings takes them as one `mapping`
+whose fields all have defaults, named after what it configures --
+`ml.Fit`, `optim.Adam`, `nn.Dense`, `sql.Transaction`, `sqlite.Options`,
+`http.server.Options`, `property.Options` -- beside a short form that uses
+the defaults (`fit!`/`adam`/`dense`, `serve!`, `check`). The caller says only
+what changes, as a chain of the setters the declaration generates:
+
+```dream
+ml.fit! model ds (ml.Fit.new () |> ml.Fit.set_epochs 50 |> ml.Fit.set_metrics [:accuracy])
+sql.transaction_with! db (sql.Transaction.new () |> sql.Transaction.set_isolation :serializable) work
+```
+
+or as a map of just those keys, `%{ :epochs => 50 }`, which is the same
+value: reading a field a `mapping` has not got answers its default. Both are
+checked where they are written -- `ml.Fit.set_epochs "ten"` and
+`%{ :epochs => "ten" }` are compile errors -- and a default costs nothing
+where it is not used, since an accessor is the one `c.[k else d]` opcode.
+
+Three rules keep these predictable:
+
+- **A default may not name anything** (the parser's rule; see
+  `names_something` in dreams/parser.dr), so a setting whose default is
+  computed -- an optimizer, an initializer that depends on the activation, a
+  server to run in -- defaults to `()`, and the field's comment says what
+  `()` stands for. The function resolves it with a `match`.
+- **`X.new ()` writes every default in.** So a map merged over defaults of
+  your own (`map.merge mine opts`) is undone by a caller who built `opts`
+  with `new`. A function that has defaults of its own takes a *configure
+  function* instead, `X -> X`, and hands it those defaults: a setter is
+  already one (`model.train! nights (ml.Fit.set_epochs 30)`), and
+  `fn o -> o |> .. |> ..` chains several. `sleep/model.dr`'s `train!` is
+  the example.
+- **A setting that may be left unsaid is `()`, not `false`.** In
+  `sql.Transaction`, `read_only = ()` says nothing and lets the database
+  decide; `false` says `READ WRITE`.
+
+Older modules still take a bare `%{:atom => :any}` here and there; turning
+one into a `mapping` changes nothing for a caller that passes a map, and gives
+every caller the checks.
+
+## Paths
+
+`std.path` is the one place a path is taken apart or put together. It
+follows the systems' own definitions rather than its own -- POSIX's
+`dirname` and `basename` (trailing slashes are not a name), `splitext`'s
+extensions (`.bashrc` has none, `a.tar.gz` has `gz`), `normpath`'s folding --
+and splits every path into drive, root and rest first, which is where
+Windows differs: `C:/x`, drive-relative `C:x`, rooted `/x`, UNC shares and
+`//?/` device paths. `path.posix` and `path.windows` answer for one family
+whatever the system; `path.join` and the rest answer for the running one.
+`dreams/tests/paths.py` holds the module to Python's `posixpath`, `ntpath`
+and `pathlib` and to glibc's libgen over thousands of generated paths.
+
+A local variable named like a module hides it: `let f path = path.join ..`
+reads a member of the string. The compiler warns about that now, but the
+cure is a different name for the local (`dir`, `file_name`, `dest`).
 
 ## Tests
 

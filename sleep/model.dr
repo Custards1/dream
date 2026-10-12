@@ -1,7 +1,7 @@
 // The stager: a network that reads a night's features and answers a stage
 // for every epoch.
 //
-//     let trained = model.train! nights %{ :epochs => 30 };
+//     let trained = model.train! nights (ml.Fit.set_epochs 30);
 //     model.stages_of (ml.params trained) night    // [:wake, :wake, :n1, ..]
 //     model.evaluate (ml.params trained) held_out  // %{:accuracy, :kappa, ..}
 //
@@ -49,7 +49,7 @@ let window = 64;
 /// The network.
 let network : nn.Layer;
 let network = nn.sequential [
-    nn.dense_with 64 %{:activation => :gelu},
+    nn.dense_with 64 (nn.Dense.new () |> nn.Dense.set_activation :gelu),
     nn.positional window,
     nn.transformer 4 128,
     nn.transformer 4 128,
@@ -116,25 +116,31 @@ let dataset nights = {
 
 // --- training -------------------------------------------------------------------------------
 
-/// Train on `nights` (the scored ones). Options are `ml.fit!`'s, and these
-/// defaults: 25 epochs, batches of 32 windows, AdamW at 0.002 with cosine
-/// decay, gradients clipped, and a tenth of the windows held out.
-let train! : [Recording] -> %{:atom => :any} -> ml.Fitted;
-let train! nights opts = {
+/// Train on `nights` (the scored ones), as `configure` says. It is handed
+/// this model's defaults for `ml.fit!` -- 25 epochs, batches of 32 windows,
+/// a seed of 1 -- and answers what to train with, so a setter is a
+/// configuration (`model.train! nights (ml.Fit.set_epochs 30)`) and
+/// `fn o -> o` keeps them all. An optimizer or validation set it leaves
+/// unset is AdamW at 0.002 with cosine decay over the whole run and
+/// gradients clipped, and a tenth of the windows held out.
+///
+/// A function rather than a map merged over the defaults, because a map
+/// built with `ml.Fit.new ()` holds every field, and would put `ml.fit!`'s
+/// defaults back over these.
+let train! : [Recording] -> (ml.Fit -> ml.Fit) -> ml.Fitted;
+let train! nights configure = {
     let ds = dataset nights;
-    let [fit_on, held] = data.split 0.9 opts.[:seed else 1] ds;
-    let epochs = opts.[:epochs else 25];
-    let steps = epochs * ((data.size fit_on + 31) / 32);
-    let defaults = %{
-        :loss => loss_of,
-        :optimizer => optim.clip_norm 1.0 (optim.adamw (optim.cosine 0.002 steps 0.0001) 0.01),
-        :epochs => epochs,
-        :batch => 32,
-        :metrics => [["accuracy", epoch_accuracy]],
-        :validation => held,
-        :seed => 1,
-    };
-    ml.fit! network fit_on (map.merge defaults opts)
+    let chosen = configure (ml.Fit.new ()
+        |> ml.Fit.set_loss loss_of
+        |> ml.Fit.set_epochs 25
+        |> ml.Fit.set_metrics [["accuracy", epoch_accuracy]]
+        |> ml.Fit.set_seed 1);
+    let [fit_on, held] = data.split 0.9 (ml.Fit.seed chosen) ds;
+    let steps = ml.Fit.epochs chosen * ((data.size fit_on + ml.Fit.batch chosen - 1) / ml.Fit.batch chosen);
+    let schedule = optim.clip_norm 1.0 (optim.adamw (optim.cosine 0.002 steps 0.0001) 0.01);
+    ml.fit! network fit_on (chosen
+        |> ml.Fit.set_optimizer (match ml.Fit.optimizer chosen { () => schedule, o => o })
+        |> ml.Fit.set_validation (match ml.Fit.validation chosen { () => held, v => v }))
 };
 
 // --- staging -------------------------------------------------------------------------------

@@ -497,6 +497,14 @@ unit alternative would require unrelated caller changes. Force finite loop
 accumulators with `!acc`; forcing a list's spine does not force its elements.
 See [Static types](docs/notes/static-types.md) for the migration and measurements.
 
+A function with several settings takes a `mapping` whose fields all have
+defaults (`ml.Fit`, `optim.Adam`, `sql.Transaction`, `sqlite.Options`), and
+callers chain its setters onto `X.new ()` or pass a map of just the keys
+that change; a function with defaults of its own takes `X -> X`. Paths go
+through `std.path` (POSIX and Windows rules, held to Python's and libc's by
+`dreams/tests/paths.py`), never `str.split "/"`. "Options: a record with a
+default for every field" in [mind/std/README.md](mind/std/README.md) says why.
+
 Comments in this codebase explain *why a thing is the way it is*, usually in
 full sentences, often several lines at the head of a section. Match that. The
 existing prose is the style guide — read the top of

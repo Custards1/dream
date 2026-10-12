@@ -12,6 +12,7 @@ import std.io;
 import std.list;
 import std.num;
 import std.os;
+import std.path;
 import std.str;
 import std.toml;
 import std.vm;
@@ -201,7 +202,7 @@ let want_of d owner_key where =
 
 /// A file as a person at this prompt would type it: relative to the working
 /// directory, and without the `../a/..` a walk accumulates.
-let shown! p = util.relative! (os.cwd! ()) p;
+let shown! p = path.relative! (os.cwd! ()) p;
 
 /// `[:ok, graph]` or `[:error, why]`.
 ///
@@ -221,16 +222,16 @@ let rec walk! owner owner_key deps kind path g =
 
 /// Add one dependency that is in the graph, and everything below it, then go
 /// on with the rest.
-let follow! owner owner_key d rest kind path g = {
+let follow! owner owner_key d rest kind trail g = {
     let key = manifest.dep_name d;
     match fetch.resolve! (manifest.root owner) d {
         [:error, why] => [:error, why + " (required by " + asker owner_key + ")"],
         [:ok, dir] => {
-            let abs = util.absolute! dir;
+            let abs = path.absolute! dir;
             let name = if str.is_empty key { "this project" } else { key };
-            let on_path = list.any (fn st -> list.head st == abs) path;
+            let on_path = list.any (fn st -> list.head st == abs) trail;
             let owner_at = shown! (manifest.path owner);
-            if on_path { [:error, cycle_message path abs name kind] }
+            if on_path { [:error, cycle_message trail abs name kind] }
             else {
                 match node g key {
                     () => match manifest.load_dependency! dir {
@@ -240,16 +241,16 @@ let follow! owner owner_key d rest kind path g = {
                             let n = (make_node key dir dm d owner_key).[:abs => abs].[:at => owner_at]
                                         .[:wants => match want_of d owner_key owner_at { () => [], w => [w] }];
                             let g2 = with_edge owner_key key kind (with_node key n g);
-                            let inner = list.cons (step_of abs key (shown! (util.join abs "mind.toml")) kind)
-                                                  path;
+                            let inner = list.cons (step_of abs key (shown! (path.join abs "mind.toml")) kind)
+                                                  trail;
                             match below! dm key inner g2 {
                                 [:error, why] => [:error, why],
-                                [:ok, g3] => walk! owner owner_key rest kind path g3,
+                                [:ok, g3] => walk! owner owner_key rest kind trail g3,
                             }
                         },
                     },
                     seen => match node_abs seen == abs {
-                        true => walk! owner owner_key rest kind path
+                        true => walk! owner owner_key rest kind trail
                                       (with_want key (want_of d owner_key owner_at)
                                                  (with_edge owner_key key kind g)),
                         false => [:error, conflict_message key seen d owner_key owner_at abs],
@@ -308,7 +309,7 @@ let option_read! owner g name = {
     } else {
         match (declared owner).[name else ()] {
             () => (),
-            _ => read_of (util.absolute! (manifest.root owner)) owner name g,
+            _ => read_of (path.absolute! (manifest.root owner)) owner name g,
         }
     }
 };
@@ -430,7 +431,7 @@ let root_deps m dev =
 
 /// One walk of the whole graph, reading options as `assumed` says.
 let walk_graph! m o assumed = {
-    let root_abs = util.absolute! (manifest.root m);
+    let root_abs = path.absolute! (manifest.root m);
     let name = match manifest.name m { "" => "this project", n => n };
     let path = [step_of root_abs name (shown! (manifest.path m)) :uses];
     let start = empty_graph.[:assumed => assumed].[:settings => settings! m o];
@@ -489,7 +490,7 @@ let rec settle_graph! m o assumed round =
 /// Settled values by package directory, which is how a walk reads them.
 let by_dir! m g values =
     list.fold (fn acc [key, vs] -> {
-        let abs = if key == root_key { util.absolute! (manifest.root m) }
+        let abs = if key == root_key { path.absolute! (manifest.root m) }
                   else { node_abs (node g key) };
         acc.[abs => vs]
     }) (%{}) (map.pairs values);
@@ -755,11 +756,11 @@ let dep_hosts g =
 /// being worked on -- an installed `std` older than the checkout's `dreams` is
 /// a compiler that cannot build itself.
 let stdlib_root! () = {
-    let named = util.env_path! "MIND_STDLIB";
+    let named = path.from_env! "MIND_STDLIB";
     if named != () { named }
     else {
         let home = util.mind_home! ();
-        let installed = util.join home "std";
+        let installed = path.join home "std";
         if io.is_dir! installed { home }
         else {
             match find_upwards! (os.cwd! ()) "mind" {
@@ -776,10 +777,10 @@ let stdlib_root! () = {
 /// The nearest `name` directory at or above `from`, or `()`. Holds a library
 /// whose `std` is a package, so it is the *parent* that becomes a `-L` root.
 let rec find_upwards! from name = {
-    let candidate = util.join from name;
-    if io.is_dir! (util.join candidate "std") { candidate }
+    let candidate = path.join from name;
+    if io.is_dir! (path.join candidate "std") { candidate }
     else {
-        let up = util.dirname from;
+        let up = path.dirname from;
         if up == from || up == "." { () } else { find_upwards! up name }
     }
 };
@@ -793,7 +794,7 @@ let search_paths! m o =
                                                       (list.map package_arg (nodes g)))],
     };
 
-let target_dir m = util.join (manifest.root m) "target";
+let target_dir m = path.join (manifest.root m) "target";
 
 // --- what one build is --------------------------------------------------------
 //
@@ -828,11 +829,11 @@ let output_of m o =
             () => {
                 let under = match target_subdir (targets m o) {
                     () => target_dir m,
-                    dir => util.join (target_dir m) dir,
+                    dir => path.join (target_dir m) dir,
                 };
-                util.join (util.join under (profile_of o)) (manifest.name m + ".dream")
+                path.join (path.join under (profile_of o)) (manifest.name m + ".dream")
             },
-            p  => util.join (manifest.root m) p,
+            p  => path.join (manifest.root m) p,
         },
         p => p,
     };
@@ -896,7 +897,7 @@ let target_subdir specs = {
     }
 };
 
-let vm_command! () = match util.env_path! "DREAM" { () => "dream", v => v };
+let vm_command! () = match path.from_env! "DREAM" { () => "dream", v => v };
 
 /// Which compiler to run, in the order a person would expect to be obeyed:
 /// what this build asked for, then what the package asks for, then the
@@ -911,7 +912,7 @@ let default_compiler = "dreams.dream";
 let choose_compiler! m explicit =
     match explicit {
         () => match manifest.compiler m {
-            () => match util.env_path! "DREAMS" { () => default_compiler, d => d },
+            () => match path.from_env! "DREAMS" { () => default_compiler, d => d },
             c => c,
         },
         c => c,
@@ -942,7 +943,7 @@ let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
 let scripted! m o g = {
     let one! key dm root = match manifest.script! dm {
         () => [],
-        file => [script.Scripted.make key (manifest.version dm) (util.absolute! root) (util.absolute! file)
+        file => [script.Scripted.make key (manifest.version dm) (path.absolute! root) (path.absolute! file)
                                       (manifest.script_env dm)
                                       ((g.[:options else (%{})]).[(if key == manifest.name m { root_key } else { key }) else (%{})])
                                       (list.cons (stdlib_root! ())
@@ -982,7 +983,7 @@ let script_target o m = match targets m o {
 /// What every script in this build shares.
 let script_setting! m o g = {
     // Absolute, since a check runs them from a directory of its own.
-    let placed! p = if str.contains_str "/" p { util.absolute! p } else { p };
+    let placed! p = if str.contains_str "/" p { path.absolute! p } else { p };
     script.Setting.make (target_dir m)
         (match compiler_command! (choose_compiler! m (option o :compiler ())) {
              [program, lead] => list.map placed! (list.cons program lead),
@@ -1040,8 +1041,8 @@ let script_args! m o g =
 /// compiler, since a unit's key holds the compiler's digest and everything the
 /// unit was computed from: `$MIND_UNITS`, or `units` in `mind`'s own
 /// directory, and `MIND_UNITS=off` for none.
-let units_args! () = match util.env_path! "MIND_UNITS" {
-    () => kept_units! (util.join (util.mind_home! ()) "units"),
+let units_args! () = match path.from_env! "MIND_UNITS" {
+    () => kept_units! (path.join (util.mind_home! ()) "units"),
     "off" => [],
     dir => kept_units! dir,
 };
@@ -1070,13 +1071,13 @@ let day_ms = 86400000;
 let forget_units! : :string -> :unit;
 let forget_units! dir = {
     let now = vm.wall_ms! ();
-    let stamp = util.join dir "forgotten";
+    let stamp = path.join dir "forgotten";
     match io.stat! stamp {
         [_, at, _] if now - at / 1000000 < day_ms => (),
         _ => {
             file.mkdir_all! dir
             file.write! stamp ""
-            strict! (list.map (fn name -> forget_unit! (util.join dir name) now) (os.list_dir! dir))
+            strict! (list.map (fn name -> forget_unit! (path.join dir name) now) (os.list_dir! dir))
             ()
         },
     }
@@ -1160,7 +1161,7 @@ let compile! m o = {
     match compile_args! m o {
         [:error, why] => [:error, why],
         [:ok, args] => {
-            util.mkdir_p! (util.dirname (output_of m o))
+            file.mkdir_all! (path.dirname (output_of m o))
             match compiler_command! (choose_compiler! m (option o :compiler ())) {
                 [program, lead] => {
                     if option o :verbose false {

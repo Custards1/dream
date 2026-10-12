@@ -366,8 +366,12 @@ priv let value_text v = {
 
 /// Escape and quote a structured field value, including whitespace and control characters.
 priv let quote_always : :string -> :string;
-priv let quote_always t = "\"" + str.concat_all (list.map (fn c -> match c { '"' => "\\\"", '\\' => "\\\\", '\n' => "\\n", '\t' => "\\t",
-                                                                             other => str.of_chars [other] }) (str.chars t)) + "\"";
+priv let quote_always t = "\"" + str.escape_bytes "\"\\\n\t" (fn b -> match b {
+    34 => "\\\"",
+    92 => "\\\\",
+    10 => "\\n",
+    _ => "\\t",
+}) t + "\"";
 
 // --- capturing, for tests -------------------------------------------------------------------
 

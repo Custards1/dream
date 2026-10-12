@@ -32,6 +32,7 @@ import std.file;
 import std.list;
 import std.map;
 import std.num;
+import std.path;
 import std.str;
 import std.toml;
 
@@ -140,8 +141,8 @@ let read_scripts! root doc = {
         [] => [:ok, acc],
         [hook, ..rest] => match text_of (toml.get () doc "ship.scripts" hook) {
             "" => go! rest acc,
-            path => match file.read! (join root path) {
-                () => [:error, "[ship.scripts] " + hook + ": cannot read " + path],
+            script => match file.read! (path.join root script) {
+                () => [:error, "[ship.scripts] " + hook + ": cannot read " + script],
                 body => go! rest acc.[hook => body],
             },
         },
@@ -149,24 +150,19 @@ let read_scripts! root doc = {
     go! hooks (%{})
 };
 
-/// The manifest at `path`, read and made a spec.
+/// The manifest file `manifest`, read and made a spec.
 let load! : :string -> Overrides -> [:ok, Spec] | [:error, :string];
-let load! path overrides = match file.read! path {
-    () => [:error, "cannot read " + path],
+let load! manifest overrides = match file.read! manifest {
+    () => [:error, "cannot read " + manifest],
     source => match toml.parse source {
-        [:error, why] => [:error, path + ": " + why],
+        [:error, why] => [:error, manifest + ": " + why],
         [:ok, doc] => {
-            let root = match file.parent path { "" => ".", d => d };
+            let root = path.dirname manifest;
             let? scripts = read_scripts! root doc;
             of_doc root doc overrides scripts
         },
     },
 };
-
-/// `path` relative to the manifest, unless it is absolute already.
-let join : :string -> :string -> :string;
-let join root path =
-    if str.starts_with "/" path || root == "." { path } else { root + "/" + path };
 
 // --- naming --------------------------------------------------------------------------
 

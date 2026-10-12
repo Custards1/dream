@@ -55,7 +55,7 @@ mapping Options {
     shrink_budget : :integer = 2000
 }
 
-let defaults : :map;
+let defaults : Options;
 let defaults = Options.new ();
 
 /// A test case: `holds` checked against `runs` values from `gen`.
@@ -63,15 +63,15 @@ let check : :string -> random.Gen :any -> (:any -> :any) -> test.Case;
 let check name gen holds = check_with defaults name gen holds;
 
 /// Create a named property test using explicit generation and shrinking options.
-let check_with : :map -> :string -> random.Gen :any -> (:any -> :any) -> test.Case;
+let check_with : Options -> :string -> random.Gen :any -> (:any -> :any) -> test.Case;
 let check_with options name gen holds = test.case name $( for_all_with! options gen holds );
 
 /// `options` with a different number of runs: `property.runs 1000`.
-let runs : :integer -> :map;
+let runs : :integer -> Options;
 let runs n = Options.set_runs n defaults;
 
 /// `options` with a fixed seed.
-let seeded : :any -> :map;
+let seeded : :any -> Options;
 let seeded s = Options.set_seed s defaults;
 
 /// Check the property here, raising with the smallest counterexample when it
@@ -80,7 +80,7 @@ let for_all! : random.Gen :any -> (:any -> :any) -> :ok;
 let for_all! gen holds = for_all_with! defaults gen holds;
 
 /// Run a generated property with explicit options, shrinking and reporting a failing case.
-let for_all_with! : :map -> random.Gen :any -> (:any -> :any) -> :ok;
+let for_all_with! : Options -> random.Gen :any -> (:any -> :any) -> :ok;
 let for_all_with! options gen holds = {
     let base = match Options.seed options {
         () => match os.env! "DREAM_SEED" {
@@ -93,7 +93,7 @@ let for_all_with! options gen holds = {
 };
 
 /// Generate and check cases, carrying the random state and remaining test count.
-priv let run_cases! : :map -> random.Gen :any -> (:any -> :any) -> :any -> :integer -> :ok;
+priv let run_cases! : Options -> random.Gen :any -> (:any -> :any) -> :any -> :integer -> :ok;
 priv let rec run_cases! options gen holds base i =
     if i >= Options.runs options { :ok }
     else {

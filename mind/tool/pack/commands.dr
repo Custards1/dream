@@ -25,10 +25,10 @@ import std.file;
 import std.io;
 import std.list;
 import std.os;
+import std.path;
 import std.str;
 import std.toml;
 import manifest;
-import util;
 
 import pack.arch;
 import pack.aur;
@@ -364,7 +364,7 @@ let run! args = {
 // -m remains relative to the working directory, for release automation.
 let manifest_path! c = match cli.get () c "manifest" {
     () => match manifest.find! (cli.get (os.cwd! ()) c "dir") {
-        [:ok, m] => util.join (manifest.root m) "mind.toml",
+        [:ok, m] => path.join (manifest.root m) "mind.toml",
         [:error, why] => fail! why,
     },
     p => p,

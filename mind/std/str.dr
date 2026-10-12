@@ -86,6 +86,14 @@ let of_bytes bs = _str_of_bytes bs;
 let of_int_le : :integer -> :integer -> :string;
 let of_int_le width n = _str_le n width;
 
+/// `n` as `width` bytes, most significant first: network order, and what
+/// RPM, PNG and most other formats written for people store.
+let of_int_be : :integer -> :integer -> :string;
+let of_int_be width n = {
+    let le = _str_le n width;
+    _str_of_bytes (list.map (fn i -> _str_byte le (width - 1 - i)) (list.range 0 width))
+};
+
 /// `count` bytes from byte offset `from`. Clamped rather than raising: running
 /// off the end is how a loop over a string finishes, and an error there would
 /// be noise. Slicing through the middle of a multi-byte character will split
@@ -348,6 +356,28 @@ let replace old new s = {
     if step == 0 || _str_find s old 0 < 0 { s } else { _str_concat (go 0 []) }
 };
 
+/// `s` with each byte from `set` replaced by `f` of it: how a format escapes
+/// its specials. The runs between them are found by the runtime (`upto`) and
+/// copied whole, so a string with nothing to escape is one scan and answered
+/// as it is. Bytes, not characters: every escape a format asks for is ASCII,
+/// and no byte of a multi-byte UTF-8 character is, so the rest passes through
+/// untouched.
+///
+/// ```dream
+/// str.escape_bytes "\"\\" (fn b -> "\\" + str.of_bytes [b]) "say \"hi\""   // say \"hi\"
+/// ```
+let escape_bytes : :string -> (:integer -> :string) -> :string -> :string;
+let escape_bytes set f s = {
+    let n = len s;
+    let rec go !from !acc = {
+        let at = _str_upto s from set;
+        let kept = if at > from { _list_cons (_str_slice s from (at - from)) acc } else { acc };
+        if at >= n { list.reverse kept }
+        else { go (at + 1) (_list_cons (f (_str_byte s at)) kept) }
+    };
+    if _str_upto s 0 set >= n { s } else { _str_concat (go 0 []) }
+};
+
 /// Every line of `s` with `prefix` in front, joined by `\n` -- how a block of
 /// output is set under a heading. Lines as `lines` finds them, so a final line
 /// ending is not kept and does not make an indented empty line.
@@ -488,6 +518,12 @@ when test {
         test.case "bytes spell a string" $( test.eq! "AB" (of_bytes [65, 66]) ),
         test.case "little-endian"        $( test.eq! [1, 2, 0] (list.map (fn i -> byte i (of_int_le 3 513)) [0, 1, 2]) ),
         test.case "two's complement"     $( test.eq! [255, 255] [byte 0 (of_int_le 2 (0 - 1)), byte 1 (of_int_le 2 (0 - 1))] ),
+        test.case "escape_bytes copies the runs between specials"
+            $( test.eq! ["a\\\"b\\\\", "plain", "", "é\\\"é"]
+                        (list.map (escape_bytes "\"\\" (fn b -> "\\" + of_bytes [b])) ["a\"b\\", "plain", "", "é\"é"]) ),
+        test.case "big-endian"           $( test.eq! [[0, 0, 1, 2], [255, 255]]
+                                                     [list.map (fn i -> byte i (of_int_be 4 258)) [0, 1, 2, 3],
+                                                      list.map (fn i -> byte i (of_int_be 2 (0 - 1))) [0, 1]] ),
 
         // --- size, and the character/byte distinction ---
         test.case "length"           $( test.eq! 5 (length "hello") ),

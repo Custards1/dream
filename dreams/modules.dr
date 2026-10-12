@@ -22,10 +22,12 @@
 // happen in. Nothing has to be undone, and there is no point at which half a
 // module is registered.
 
+import std.file;
 import std.install;
 import std.io;
 import std.list;
 import std.os;
+import std.path;
 import std.str;
 import std.vm;
 
@@ -35,7 +37,6 @@ import dreams.config;
 import dreams.diag;
 import dreams.package;
 import dreams.parser;
-import dreams.path;
 import dreams.unit;
 import std.map;
 
@@ -424,8 +425,8 @@ let rec search_for! bases rel =
             // `std/list/mod.dr` lets a module grow into a directory later
             // without any of its importers changing.
             let as_dir = path.join (path.join_all base rel) "mod.dr";
-            if path.is_file! direct { direct }
-            else if path.is_file! as_dir { as_dir }
+            if file.is_file! direct { direct }
+            else if file.is_file! as_dir { as_dir }
             else { search_for! rest rel }
         },
     };
@@ -884,18 +885,18 @@ let rec load_package! l dotted at from_source =
         },
     };
 
-let rec load_file! l file name at from_source =
+let rec load_file! l filename name at from_source =
     if is_visited l name { l }
     else {
         // The overlay first: a file that is open in an editor is whatever the
         // editor says it is, and what is on disk is out of date by definition.
-        let text = match ((overlay l)).[file else ()] {
-            () => path.read_file! file,
+        let text = match ((overlay l)).[filename else ()] {
+            () => file.read! filename,
             t => t,
         };
         match text {
-            () => complain at ("cannot read " + file) from_source l,
-            text0 => load_text! l text0 file name file
+            () => complain at ("cannot read " + filename) from_source l,
+            text0 => load_text! l text0 filename name filename
         }
     };
 
@@ -977,8 +978,8 @@ let rec hoist_mod! l parent source m =
 let fetched l = Loader.prefetch l;
 
 /// The text a file would be loaded with: the editor's buffer, then the disk.
-let text_of! l file = match ((overlay l)).[file else ()] {
-    () => path.read_file! file,
+let text_of! l filename = match ((overlay l)).[filename else ()] {
+    () => file.read! filename,
     t => t,
 };
 

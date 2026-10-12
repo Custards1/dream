@@ -8,15 +8,8 @@
 
 import std.build.cc;
 import std.list;
+import std.path;
 import std.str;
-
-/// The directory part of a path, `.` when there is none.
-let dir_of : :string -> :string;
-let dir_of path = {
-    let cut = list.fold (fn at [i, c] -> if c == '/' || c == '\\' { i } else { at })
-                        (0 - 1) (list.enumerate (str.chars path));
-    if cut < 0 { "." } else { str.slice 0 cut path }
-};
 
 /// Format a preprocessor value; an absent value becomes an empty string.
 let value_text v = match v { () => "", s if type_of s == :string => s, x => to_string x };
@@ -103,7 +96,7 @@ let link_program tc t =
 let shared_flags tc t out =
     match cc.Toolchain.os tc {
         :macos => ["-dynamiclib", "-Wl,-install_name,@rpath/" + list.last (str.split "/" out)],
-        :windows => ["-shared", "-Wl,--out-implib," + dir_of out + "/" + cc.import_name tc (cc.name t)],
+        :windows => ["-shared", "-Wl,--out-implib," + path.windows.dirname out + "/" + cc.import_name tc (cc.name t)],
         _ => ["-shared", "-Wl,-soname," + list.last (str.split "/" out)],
     };
 

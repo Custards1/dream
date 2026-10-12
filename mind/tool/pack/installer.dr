@@ -12,6 +12,7 @@
 // It is POSIX sh, with curl or wget, and sha256sum or shasum: what a fresh
 // Debian, Fedora, Alpine or macOS has without installing anything.
 
+import std.cli;
 import std.file;
 import std.io;
 import std.list;
@@ -22,15 +23,11 @@ import pack.release.Asset;
 import pack.spec;
 import pack.spec.Spec;
 
-/// A shell single-quoted word.
-let quote : :string -> :string;
-let quote s = "'" + str.replace "'" "'\\''" s + "'";
-
 /// The `case` arm choosing one tarball.
 let arm : Asset -> :string;
 let arm a = {
     let pattern = if Asset.machine a == "any" { "*" } else { Asset.os a + "-" + Asset.machine a };
-    "  " + pattern + ") file=" + quote (Asset.file a) + "; url=" + quote (Asset.url a) + "; sum=" + quote (Asset.sha256 a) + " ;;\n"
+    "  " + pattern + ") file=" + cli.shell_quote (Asset.file a) + "; url=" + cli.shell_quote (Asset.url a) + "; sum=" + cli.shell_quote (Asset.sha256 a) + " ;;\n"
 };
 
 let script : Spec -> [Asset] -> :string;
@@ -44,7 +41,7 @@ let script sp assets = {
     + "#   sh install.sh ./" + (match assets { [a, ..] => Asset.file a, [] => "tarball" }) + "     # one already downloaded\n"
     + "#\n# It installs into $PREFIX, or /usr/local as root, or ~/.local, and checks\n"
     + "# the tarball against the SHA-256 written below before unpacking anything.\nset -eu\n\n"
-    + "name=" + quote name + "\nversion=" + quote (Spec.version sp) + "\n\n"
+    + "name=" + cli.shell_quote name + "\nversion=" + cli.shell_quote (Spec.version sp) + "\n\n"
     + "fail() { echo \"$name: $*\" >&2; exit 1; }\n\n"
     + "if [ -n \"${PREFIX:-}\" ]; then prefix=$PREFIX\n"
     + "elif [ \"$(id -u)\" = 0 ]; then prefix=/usr/local\n"

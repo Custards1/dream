@@ -1664,11 +1664,28 @@ let submodule c r target field =
 
 /// If this expression names a module or a namespace rather than a value, which
 /// one -- and the spelling to show in a diagnostic. `[ref, shown]`, or `()`.
+///
+/// A record or a union brought in by `import a.{R}` is a namespace too, the
+/// same one `import a.R` gives. What that import binds is `a`'s global `R`,
+/// the description that makes `R` a type; before a dot it used to stay that
+/// value, so `R.field x` asked a list for a member and failed at run time,
+/// while the same line after `import a.R` worked.
 let rec as_namespace c r e =
     match e {
         [:name, n, _] =>
             if in_scope r n { () }
-            else { match alias_of (ctx_env c r) n { () => (), m => [m, n] } },
+            else {
+                match alias_of (ctx_env c r) n {
+                    () => match only_of (ctx_env c r) n {
+                        [Ref.dream(target), member, _] => match submodule c r target member {
+                            () => (),
+                            inner => [inner, n],
+                        },
+                        _ => (),
+                    },
+                    m => [m, n],
+                }
+            },
         [:field, obj, field, _] =>
             match as_namespace c r obj {
                 () => (),
@@ -1690,6 +1707,31 @@ let rec as_namespace c r e =
             },
         _ => (),
     };
+
+/// `path.join` where `path` is a local as well as an imported module that has
+/// a `join`. The local wins -- a name in scope is a value before it is a
+/// namespace -- so this reads a member of whatever the local holds, and the
+/// program fails at run time with "a string has no member `join`", nowhere
+/// near the parameter that caused it. The names that collide are the common
+/// ones (`path`, `file`, `list`, `map`, `str`), so this was easy to write and
+/// hard to see; it is a warning rather than an error because the program
+/// means something, just very probably not what was meant. A host module has
+/// no member table to check against, so any member of one counts.
+let shadowed_module c r obj field span r1 =
+    match obj {
+        [:name, n, _] if in_scope r n =>
+            match alias_of (ctx_env c r) n {
+                Ref.dream(target) if has_global (env_of c r target) field =>
+                    shadow_warning c n field span r1,
+                Ref.native(_, _) => shadow_warning c n field span r1,
+                _ => r1,
+            },
+        _ => r1,
+    };
+
+let shadow_warning c n field span r =
+    warn_note c span ("`" + n + "` here is a local, not the module `" + n + "`")
+        ("so `" + n + "." + field + "` reads a member of the local's value; rename the local") r;
 
 /// A warning for each parameter of `let n ps = body` that is an accumulator
 /// nothing forces -- grown by a call of `n` itself and otherwise only answered
@@ -1852,7 +1894,7 @@ let rec check_expr c e r =
         [:field, obj, field, span] =>
             match as_namespace c r obj {
                 () => {
-                    let r1 = check_expr c obj r;
+                    let r1 = shadowed_module c r obj field span (check_expr c obj r);
                     if builtins.is_impure_name field {
                         note_effect c span ("the impure member `" + field + "`") r1
                     }

@@ -26,6 +26,7 @@ derive std.codec;
 
 import std.char;
 import std.list;
+import std.num;
 import std.result;
 import std.str;
 
@@ -278,32 +279,31 @@ let parse_or default text = {
 // array comes back a list. `std.wire` is the format for when that matters; the
 // tests at the foot of this file say exactly which values survive this one.
 
-/// Escape a character for inclusion inside a JSON string.
-let escape_char : :char -> :string;
-let escape_char c = match c {
-    '"'  => "\\\"",
-    '\\' => "\\\\",
-    '\n' => "\\n",
-    '\t' => "\\t",
-    '\r' => "\\r",
-    _ => match _char_code c {
-        8  => "\\b",
-        12 => "\\f",
-        // The only characters JSON insists on escaping, and the only ones that
-        // need the `\u` form: everything else is legal as itself, including
-        // any non-ASCII, which stays as UTF-8 rather than becoming escapes.
-        code =>
-            if code >= 32 { str.of_chars [c] }
-            else {
-                let digits = "0123456789abcdef";
-                "\\u00" + str.slice ((code / 16) % 16) 1 digits + str.slice (code % 16) 1 digits
-            },
-    },
+/// The bytes JSON insists on escaping: the quote, the backslash, and the
+/// control characters. Everything else is legal as itself, including any
+/// non-ASCII, which stays UTF-8 rather than becoming `\u` escapes.
+priv let specials : :string;
+priv let specials = str.of_bytes (list.range 0 32) + "\"\\";
+
+/// One of `specials`, escaped.
+priv let escape_byte : :integer -> :string;
+priv let escape_byte b = match b {
+    34 => "\\\"",
+    92 => "\\\\",
+    10 => "\\n",
+    9 => "\\t",
+    13 => "\\r",
+    8 => "\\b",
+    12 => "\\f",
+    code => "\\u" + num.hex 4 code,
 };
 
-/// Escape a string and surround it with double quotes for this format.
+/// Escape a string and surround it with double quotes for this format. The
+/// unescaped runs are copied whole (`str.escape_bytes`), which is what every
+/// string a JSON writer emits goes through, so it is one runtime scan for a
+/// string with nothing to escape where it was a list cell per character.
 let quote : :string -> :string;
-let quote s = "\"" + str.join_str "" (list.map escape_char (str.chars s)) + "\"";
+let quote s = "\"" + str.escape_bytes specials escape_byte s + "\"";
 
 // --- the holes std.codec declares --------------------------------------------
 

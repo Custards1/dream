@@ -11,9 +11,11 @@
 // credentials and certificate stores, and none of that is a build tool's
 // business.
 
+import std.file;
 import std.io;
 import std.list;
 import std.os;
+import std.path;
 import std.str;
 
 import manifest;
@@ -40,7 +42,7 @@ let dep_dir! d = {
         :url => manifest.spec_get d "url",
         _ => manifest.dep_name d,
     };
-    util.join (util.join (cache_root! ()) "cache") (slug (to_string source) + at)
+    path.join (path.join (cache_root! ()) "cache") (slug (to_string source) + at)
 };
 
 /// Run a command, and answer `[:ok, out]` or `[:error, message]`.
@@ -89,7 +91,7 @@ let url_fetch! d dir = {
     match run! "curl" "curl" ["--fail", "--silent", "--show-error", "--location", "--output", archive, url] {
         [:error, why] => [:error, why],
         _ => {
-            util.mkdir_p! dir
+            file.mkdir_all! dir
             // `--strip-components 1`, because a release tarball is
             // conventionally one directory holding the project.
             match run! "tar" "tar" ["-xzf", archive, "-C", dir, "--strip-components", "1"] {
@@ -110,7 +112,7 @@ let url_fetch! d dir = {
 let marker = ".mind-fetched";
 
 let is_fetched! dir =
-    io.exists! (util.join dir marker) || io.exists! (util.join dir "mind.toml");
+    io.exists! (path.join dir marker) || io.exists! (path.join dir "mind.toml");
 
 /// Throw away a fetched copy so that the next resolve fetches it again. What
 /// `mind update` does, and the only way a branch-pinned dependency moves.
@@ -131,7 +133,7 @@ let resolve! from_root d = {
         :path => {
             // Relative to the manifest that named it, so moving a project
             // does not change what its dependencies mean.
-            let p = util.join from_root (to_string (manifest.spec_get d "path"));
+            let p = path.join from_root (to_string (manifest.spec_get d "path"));
             if io.is_dir! p { [:ok, p] }
             else { [:error, manifest.dep_name d + ": no directory at " + p] }
         },
@@ -143,12 +145,12 @@ let resolve! from_root d = {
                 // A partial copy from a fetch that died is in the way of
                 // `git clone`, which refuses a directory that is not empty.
                 run! "rm" "rm" ["-rf", dir]
-                util.mkdir_p! (util.dirname dir)
+                file.mkdir_all! (path.dirname dir)
                 let got = match kind { :git => git_fetch! d dir, _ => url_fetch! d dir };
                 match got {
                     [:error, why] => [:error, manifest.dep_name d + ": " + why],
                     _ => {
-                        util.write_file! (util.join dir marker) (manifest.dep_source d + "\n")
+                        file.write! (path.join dir marker) (manifest.dep_source d + "\n")
                         commit! d dir
                         [:ok, dir]
                     },
@@ -169,11 +171,11 @@ let commit_file = ".mind-commit";
 /// the answer kept.
 let commit! d dir =
     match manifest.dep_kind d {
-        :git => match util.read_file! (util.join dir commit_file) {
+        :git => match file.read! (path.join dir commit_file) {
             () => match run! "git rev-parse" "git" ["-C", dir, "rev-parse", "HEAD"] {
                 [:ok, out] => {
                     let c = str.trim out;
-                    util.write_file! (util.join dir commit_file) (c + "\n")
+                    file.write! (path.join dir commit_file) (c + "\n")
                     c
                 },
                 _ => (),

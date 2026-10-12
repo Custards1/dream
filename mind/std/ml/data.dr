@@ -218,11 +218,16 @@ priv let field text = {
     }
 };
 
-/// A dataset from a CSV file of numbers. `opts` takes `:target`, the column
-/// that is the target (the last, by default; `-1` counts from the end);
-/// every other column is an input.
-let of_csv! : :string -> %{:atom => :any} -> Dataset;
-let of_csv! path opts = of_rows (read_csv! path) opts.[:target else -1];
+/// What `of_csv!` takes.
+mapping Csv {
+    /// The column that is the target; a negative one counts from the end,
+    /// so the default is the last. Every other column is an input.
+    target : :integer = -1
+}
+
+/// A dataset from a CSV file of numbers, split as `opts` says (`Csv`).
+let of_csv! : :string -> Csv -> Dataset;
+let of_csv! path opts = of_rows (read_csv! path) (Csv.target opts);
 
 /// A dataset from rows of numbers, column `target` the target.
 let of_rows : [[:float]] -> :integer -> Dataset;

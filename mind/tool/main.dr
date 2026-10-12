@@ -20,11 +20,13 @@
 import std.cli;
 import std.console;
 
+import std.file;
 import std.io;
 import std.num;
 import std.list;
 import std.map;
 import std.os;
+import std.path;
 import std.proc;
 import std.str;
 import std.toml;
@@ -213,17 +215,17 @@ let project! () = project_in! ()
 let cmd_new! name = {
     if str.is_empty name { fail! "new needs a project name" }
     if io.exists! name { fail! (name + " already exists") }
-    util.mkdir_p! name
-    util.write_file! (util.join name "mind.toml")
+    file.mkdir_all! name
+    file.write! (path.join name "mind.toml")
         ("[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\n\n"
          + "# Each dependency's key is the name it is imported by:\n"
          + "#   util = \"../util\"\n"
          + "#   json = \"https://github.com/u/dream-json#v1.0\"\n"
          + "# or run `mind add <directory or URL>`.\n"
          + "[dependencies]\n")
-    util.write_file! (util.join name "main.dr")
+    file.write! (path.join name "main.dr")
         ("import std.console;\n\nlet main! = {\n    console.print! \"Hello from " + name + "\"\n};\n")
-    util.write_file! (util.join name ".gitignore") "target/\n*.dream\n"
+    file.write! (path.join name ".gitignore") "target/\n*.dream\n"
     console.print! ("created " + to_string name)
     console.print! ("  cd " + to_string name + " && mind run")
 };
@@ -313,7 +315,7 @@ let picked asked name = list.is_empty asked || list.any (fn a -> a == name || st
 let units! : :map -> :map -> [Result];
 let units! pm o = {
     let started = os.monotonic! ();
-    let to = build.with_option :output (util.join (build.target_dir pm) ("test/" + manifest.name pm + ".dream"))
+    let to = build.with_option :output (path.join (build.target_dir pm) ("test/" + manifest.name pm + ".dream"))
                  (build.with_option :entry (manifest.test_entry! pm)
                      (build.with_option :dev true (build.with_option :extra ["--test"] o)));
     let [passed, output] = match build.compile! pm to {
@@ -353,7 +355,7 @@ let seconds ms = to_string (ms / 1000) + "." + to_string (ms % 1000 / 100) + " s
 /// The packages `mind test` covers: the project, and its members when it is
 /// a workspace.
 let tested! : :map -> [:map];
-let tested! m = list.cons m (list.map (fn d -> match manifest.load! (util.join (manifest.root m) d) {
+let tested! m = list.cons m (list.map (fn d -> match manifest.load! (path.join (manifest.root m) d) {
     [:ok, pm] => pm,
     [:error, why] => fail! ("workspace member `" + d + "`: " + why),
 }) (manifest.members m));
@@ -607,7 +609,7 @@ let add_spec! source c = {
 let guessed_name source =
     str.trim_prefix "dream-"
         (str.trim_suffix ".tgz" (str.trim_suffix ".tar.gz" (str.trim_suffix ".git"
-            (util.basename (str.trim_suffix "/" (list.head (manifest.split_ref source)))))));
+            (path.basename (str.trim_suffix "/" (list.head (manifest.split_ref source)))))));
 
 let add_name! source dir c =
     match cli.get () c "name" {
@@ -629,7 +631,7 @@ let cmd_add! m c args = {
     // the manifest, which is where it will be read from.
     let spec = match raw.["path" else ()] {
         () => raw,
-        p => raw.["path" => util.relative! (manifest.root m) p],
+        p => raw.["path" => path.relative! (manifest.root m) p],
     };
     let section = if cli.flag_set c "dev" { "dev-dependencies" } else { "dependencies" };
     let probe = [guessed_name source, spec];
@@ -637,9 +639,9 @@ let cmd_add! m c args = {
         [:error, why] => fail! why,
         [:ok, dir] => {
             let key = add_name! source dir c;
-            let file = util.join (manifest.root m) "mind.toml";
-            let text = match util.read_file! file { () => "", t => t };
-            util.write_file! file (manifest.with_dependency section key spec text)
+            let manifest_file = path.join (manifest.root m) "mind.toml";
+            let text = match file.read! manifest_file { () => "", t => t };
+            file.write! manifest_file (manifest.with_dependency section key spec text)
             console.print! ("added " + key + " = " + manifest.dep_source [key, spec]
                             + " to [" + section + "]")
             // Reading it back through the whole graph is the check that
@@ -657,8 +659,8 @@ let cmd_add! m c args = {
 
 let cmd_remove! m names = {
     if list.is_empty names { fail! "remove needs the name of a dependency" }
-    let file = util.join (manifest.root m) "mind.toml";
-    let text = match util.read_file! file { () => fail! ("cannot read " + file), t => t };
+    let manifest_file = path.join (manifest.root m) "mind.toml";
+    let text = match file.read! manifest_file { () => fail! ("cannot read " + manifest_file), t => t };
     let step acc key = match acc {
         [t, missing] => match manifest.without_dependency "dependencies" key t {
             [t2, true] => [t2, missing],
@@ -671,7 +673,7 @@ let cmd_remove! m names = {
     match list.fold step [text, []] names {
         [_, [_, .._] as missing] => fail! ("no dependency is called " + str.join_str ", " missing),
         [after, []] => {
-            util.write_file! file after
+            file.write! manifest_file after
             strict! (list.map (fn k -> console.print! ("removed " + k)) names)
             :ok
         },
