@@ -6,12 +6,13 @@
 import std.os;
 import std.console;
 import std.vm;
+import std.proc;
 
 let slow! u = os.exec_for! "sleep" ["2"] 5000;
 
 let main! = {
     let p = spawn! $( slow! () );
-    vm.sleep_until! (vm.wall_ms! () + 100)
+    proc.sleep! 100
     let t0 = vm.wall_ms! ();
     let quick = os.exec_for! "echo" ["quick"] 1000;
     let took = vm.wall_ms! () - t0;

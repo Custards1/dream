@@ -87,6 +87,9 @@ union Meaning {
     // `import a.{x}`. `index` is the global for a Dream module and `()` for a
     // host's, whose table is looked up at run time.
     member(ref, field, index)
+    // Several standard members share this unqualified name. Types select one
+    // before lowering; the candidates are [module, field, global].
+    overloaded(name, candidates)
     // A block, and whether effects were allowed where it was written: lowering
     // forces its statements only inside an impure function.
     block(impure)
@@ -114,6 +117,8 @@ mapping Resolution {
     frames = []
     diags = []
     refs = %{}
+    overload_uses = %{}
+    selections = %{}
     binds = %{}
     funcs = %{}
     func_count = 0
@@ -124,6 +129,8 @@ mapping Resolution {
     module_recs = []
     wrappers = %{}
     roles = %{}
+    result_roles = %{}
+    result_slots = %{}
     role_names = %{}
     fusions = %{}
     fused = []
@@ -150,10 +157,11 @@ mapping Environment {
     // The names in `only` that were lent by the prelude rather than imported
     // (`lend_prelude`), each mapped to `true`.
     lent = %{}
+    overloads = %{}
 }
 
 let env : :string -> :integer -> Environment;
-let env name source = Environment.make name source %{} %{} %{} () %{};
+let env name source = Environment.make name source %{} %{} %{} () %{} %{};
 
 let env_name : Environment -> :string;
 let env_name e = Environment.name e;
@@ -1834,8 +1842,19 @@ let check_name c name span r = {
                     match only_of e name {
                         // A member brought in by `import path.{ .. }` resolves
                         // exactly as `path.member` would.
-                        () =>
-                            match alias_of e name {
+                        () => match (Environment.overloads e).[name else ()] {
+                            candidates if candidates != () => {
+                                let key = ref_key (ctx_mi c) (ctx_source c) (ast.span_start span);
+                                match (Resolution.selections r0).[key else ()] {
+                                    () => {
+                                        let uses = (Resolution.overload_uses r0).[key => [ctx_mi c, ctx_source c, span]];
+                                        record (ctx_mi c) (ctx_source c) span (Meaning.overloaded name candidates)
+                                            (r0 |> Resolution.set_overload_uses uses)
+                                    },
+                                    chosen => record (ctx_mi c) (ctx_source c) span chosen r0,
+                                }
+                            },
+                            _ => match alias_of e name {
                                 // A Dream module is a compile-time namespace,
                                 // not a value, so say that rather than claiming
                                 // the name does not exist.
@@ -1843,6 +1862,7 @@ let check_name c name span r = {
                                 _ => report c span
                                          ("cannot find `" + name + "` in this scope") r0,
                             },
+                        },
                         sel => check_member c (list.nth 0 sel) (list.nth 2 sel) (list.nth 1 sel)
                                             span r0,
                     }
@@ -1959,12 +1979,30 @@ let rec check_expr c e r =
         // between them is never built -- see "deforestation" below. Asked
         // first, because a fused call walks its pieces into different frames
         // than an ordinary one does.
-        [:apply, callee, args, _] =>
+        [:apply, callee, args, span] =>
             match fuse_shape c r callee args {
-                () => list.fold (fn acc a -> check_expr c a acc) (check_expr c callee r) args,
+                () => {
+                    let walked = list.fold (fn acc a -> check_expr c a acc) (check_expr c callee r) args;
+                    match result_role c r callee {
+                        [_, _, arity] if list.length args == arity =>
+                            reserve_result c callee walked,
+                        _ => walked,
+                    }
+                },
                 shape => check_fused c e shape r,
             },
-        [:pipe, l, rhs, _] => check_expr c rhs (check_expr c l r),
+        [:pipe, l, rhs, _] => {
+            let walked = check_expr c rhs (check_expr c l r);
+            let [callee, arity] = match rhs {
+                [:apply, f, args, _] => [f, list.length args + 1],
+                _ => [rhs, 1],
+            };
+            match result_role c r callee {
+                [_, _, needed] if arity == needed =>
+                    reserve_result c callee walked,
+                _ => walked,
+            }
+        },
         [:unary, _, x, _] => check_expr c x r,
         [:binary, _, l, rhs, _] => check_expr c rhs (check_expr c l r),
         [:if, cond, t, el, _] => {
@@ -2439,8 +2477,42 @@ let encloses e mi target = target == mi || list.contains target (within e);
 /// root on top of the carried result for a warm start.
 let declare! : modules.Loader -> State;
 let declare! l =
-    inherit_enclosing l (list.fold (fn acc mi -> declare_module l mi acc) state
-                                   (list.range 0 (modules.module_count l)));
+    lend_shorthands (inherit_enclosing l (list.fold (fn acc mi -> declare_module l mi acc) state
+                                   (list.range 0 (modules.module_count l))));
+
+/// The union members are always available. Collection members join them when
+/// their standard module is imported, including an enclosing module's imports.
+/// This is a table of declarations, so new public members need no second list
+/// in the compiler. Own definitions and explicit selective imports win.
+let lend_shorthands s = {
+    let supported = ["std.prelude.Result", "std.prelude.Option", "std.list", "std.array", "std.map"];
+    let sources = list.filter (fn [_, e] -> list.contains (env_name e) supported) (map.pairs (envs s));
+    let es = list.fold (fn table [mi, e] -> {
+        let visible target = list.any (fn [_, ref] -> ref == Ref.dream target) (map.pairs (aliases e));
+        let candidates = list.fold (fn names [target, te] -> {
+            let prelude = str.starts_with "std.prelude." (env_name te);
+            if not prelude && not (visible target) && mi != target { names }
+            else {
+                list.fold (fn acc n -> {
+                    if not (list.contains (global_kind te n) [:pure, :impure]) && not prelude { acc }
+                    else if n == "Result" || n == "Option" { acc }
+                    else { acc.[n => list.append (acc.[n else []]) [[target, n, global_index te n]]] }
+                }) names (exports te)
+            }
+        }) %{} sources;
+        let lent = list.fold (fn acc [n, choices] -> {
+            if has_global acc n || only_of acc n != () || builtins.is_builtin n { acc }
+            else { match choices {
+                [[target, field, _]] =>
+                    Environment.set_lent ((Environment.lent acc).[n => true])
+                        (with_only n [Ref.dream target, field, env_name (table.[target])] acc),
+                _ => Environment.set_overloads ((Environment.overloads acc).[n => choices]) acc,
+            } }
+        }) e (map.pairs candidates);
+        table.[mi => lent]
+    }) (envs s) (map.pairs (envs s));
+    State.set_envs es s
+};
 
 /// The one body every declaration the reachability walk did not reach shares:
 /// the same `1 / 0` an unexpanded `expand` is staged as, declared once.
@@ -2648,6 +2720,7 @@ let walk_base l declared r0 from = {
             let base_roles = list_roles l (envs declared);
             (base0
                 |> Resolution.set_roles (alias_roles (envs declared) (pending declared) base_roles)
+                |> Resolution.set_result_roles (alias_roles (envs declared) (pending declared) (prelude_roles (envs declared)))
                 |> Resolution.set_role_names (role_spellings (envs declared) (pending declared) base_roles)
                 |> Resolution.set_next_global (next_global declared)
                 |> Resolution.set_fused ([]))
@@ -2719,12 +2792,15 @@ let finish_walk declared r0 s_pre walked bs candidates = {
 /// which function holds each module's globals. Lowering reads all of that
 /// rather than deriving it a second time.
 let resolve! : modules.Loader -> Resolution;
-let resolve! l = {
+let resolve! l = resolve_chosen! l %{};
+
+let resolve_chosen! l selections = {
     let declared = declare! l;
     let r0 = ((resolver (envs declared))
         |> Resolution.set_imports (s_imports declared)
         |> Resolution.set_module_recs (s_module_recs declared)
         |> Resolution.set_diags (diags declared)
+        |> Resolution.set_selections selections
         |> Resolution.set_fuse true);
     // What expansion already resolved, before the walk begins. An `expand`'s
     // own name is a name occurrence like any other, but the only pass that
@@ -2866,12 +2942,15 @@ let merge_parts declared r0 base walked = {
 /// between processes is pointers; see "resolving in parts" for what the
 /// answer does and does not hold.
 let resolve_parts! : modules.Loader -> :any -> Resolution;
-let resolve_parts! l cache = {
+let resolve_parts! l cache = resolve_parts_chosen! l cache %{};
+
+let resolve_parts_chosen! l cache selections = {
     let declared = declare! l;
     let r0 = ((resolver (envs declared))
         |> Resolution.set_imports (s_imports declared)
         |> Resolution.set_module_recs (s_module_recs declared)
         |> Resolution.set_diags (diags declared)
+        |> Resolution.set_selections selections
         |> Resolution.set_fuse true);
     let seeded = list.fold (fn r e ->
         (r |> Resolution.set_refs ((refs r).[(ref_key (list.nth 0 e) (list.nth 1 e) (list.nth 2 e)) => (list.nth 3 e)])))
@@ -3421,7 +3500,13 @@ let alias_roles es pend base =
 
 /// Which global a callee names, asked without recording anything -- the call
 /// is walked normally afterwards whether or not it fuses.
-let callee_global c r e =
+let callee_global c r e = match (Resolution.selections r).[(ref_key (ctx_mi c) (ctx_source c) (ast.span_start (ast.span e))) else ()] {
+    Meaning.member(Ref.dream(_), _, gi) => gi,
+    Meaning.global(_, _, gi) => gi,
+    _ => callee_global_written c r e,
+};
+
+let callee_global_written c r e =
     match e {
         [:name, n, _] =>
             if in_scope r n { () }
@@ -3449,6 +3534,48 @@ let callee_global c r e =
     };
 
 let role_at c r e = match callee_global c r e { () => (), g => (roles r).[g else ()] };
+
+/// These are scratch slots, not source binders. A pipe shares its starting
+/// offset with its input, and an enclosing index can share it with a call.
+/// Keep them in their own table, keyed by the callee's ending offset so each
+/// stage has its own entry even when the whole pipeline starts at one place.
+let reserve_result : Context -> ast.Expr -> Resolution -> Resolution;
+let reserve_result c callee r = {
+    let slot = next_slot (list.head (frames r));
+    let key = ref_key (ctx_mi c) (ctx_source c) (ast.span_end (ast.span callee));
+    let slots = (Resolution.result_slots r).[key => slot];
+    if lazy.forced slots { (reserve_slot slot r) |> Resolution.set_result_slots slots }
+    else { r }
+};
+
+let result_slot : Resolution -> :integer -> :integer -> ast.Span -> :integer | :unit;
+let result_slot r ctx source span =
+    (Resolution.result_slots r).[(ref_key ctx source (ast.span_end span)) else ()];
+
+let prelude_roles es = list.fold (fn acc kv -> {
+    let e = list.nth 1 kv;
+    let kind = match env_name e {
+        "std.prelude.Result" => "Result", "std.prelude.Option" => "Option", _ => (),
+    };
+    if kind == () { acc } else {
+        list.fold (fn m name -> match fuse.result_member kind name {
+            [tag, arity] => match global_index e name {
+                () => m, gi => m.[gi => [kind, tag, arity]],
+            },
+            _ => m,
+        }) acc (map.keys fuse.result_members)
+    }
+}) (%{}) (map.pairs es);
+
+let result_role c r callee =
+    if not (match callee {
+        [:field, _, n, _] => map.has n fuse.result_members,
+        [:name, _, _] => true,
+        _ => false,
+    }) { () }
+    else { match callee_global c r callee {
+        () => (), g => (Resolution.result_roles r).[g else ()],
+    } };
 
 /// A pipeline this pass can fuse: what its source is, what its sink does with
 /// each element, and the stages between, in the order the elements meet them.

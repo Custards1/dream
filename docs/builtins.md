@@ -25,6 +25,7 @@ These are resolved by the compiler without any import. They can be shadowed by a
 | `to_string` | `value → string` | Renders any value as a human-readable string. Lists print as `[a, b, c]`, arrays as `#[a, b, c]`, maps as `%{:k => v}`, strings are quoted, chars as `'c'`. Raises `:type_error` on a bigstr, which by definition may not fit in a string; one nested inside a larger value renders as `<big string, N bytes>` rather than losing the rest of the structure. |
 | `len` | `list\|array\|map\|string\|bigstr\|tensor → integer` | Returns the number of elements (list), slots (array), entries (map), bytes (string or bigstr), or the length of a tensor's first axis. Raises `:type_error` for anything else. For lists, walks the entire spine. |
 | `strict!` | `value → value` | Forces `value` all the way to normal form (deeply, not just to weak head normal form), then returns it unchanged. Use this when laziness would defer an effect — `list.map (fn x -> spawn! ..) xs` builds thunks; `strict! (list.map ...)` runs the spawns immediately. |
+| `defer! expression` | `expression → unit` | A direct block statement: evaluate the expression when that block exits, including on errors and kills. Defers run in reverse order. See [Blocks](language-spec.md#blocks). |
 
 ### Pattern-match internals
 
@@ -63,7 +64,7 @@ the column says which.
 Saturated calls compile directly to opcodes; partial applications and function
 values retain ordinary builtin semantics. `_str_of_chars`, `_str_of_bytes`,
 `_str_concat`, and `_array_of_list` remain builtin calls because they traverse
-lazy lists. None of the twelve language builtins above is a primitive, and
+lazy lists. None of the language builtins above is a primitive, and
 neither is anything a native module (`std.vm`, `std.math`, `std.io`, ..)
 provides: those are called by their own names.
 
@@ -892,7 +893,9 @@ A lazy singly-linked list. Most operations work on infinite lists. Functions tha
 | `replicate n x` | `x` repeated `n` times. |
 | `map f xs` | Apply `f` to every element. Lazy. |
 | `filter keep xs` | Elements for which `keep` returns `true`. |
-| `fold f acc xs` | Left fold. Forces the entire spine. |
+| `fold f acc xs` | Left fold. Forces the entire spine and each accumulator step to its outer value; elements and accumulator contents stay lazy. The seed reaches the first callback unforced. |
+| `fold_lazy f acc xs` | Left fold with suspended accumulator steps, so later steps can discard earlier ones. Also available on arrays and maps. |
+| `fold_strict f acc xs` | Compatible spelling for `fold`. |
 | `fold_right f acc xs` | Right fold. |
 | `take n xs` | The first `n` elements. Terminates on infinite lists. |
 | `drop n xs` | Everything after the first `n` elements. |
@@ -1371,16 +1374,16 @@ raising and has to answer one instead.
 | Name | Description |
 |------|-------------|
 | `ok v` · `error r` | Make one. |
-| `is_ok r` · `is_error r` | Which it is. |
-| `or_else default r` | The value, or `default`. The usual way out. |
-| `reason default r` | The reason, or `default`. |
+| `is_ok r` · `is_err r` | Which it is. |
+| `unwrap_or default r` · `unwrap_or_else f r` | The value, or a fallback for an error. |
 | `unwrap! r` | The value, raising the reason. Impure, because raising is. |
-| `map f r` · `map_error f r` | Change one side, leave the other. |
+| `map f r` · `map_err f r` | Change one side, leave the other. |
 | `and_then f r` | The next step, which may itself fail. This is what makes a pipeline read as one. |
-| `or_try other r` | The first if it is ok, otherwise the second. |
+| `or_else f r` · `otherwise other r` | Recover with a callback receiving the reason, or use a fallback result. |
 | `all rs` | `Result.ok values` when every one is ok, or the first error — and it stops there, so a lazy list of a thousand checks costs one when the first is wrong. |
+| `and other self` · `or other self` | Continue with `other` on success, or use it as a fallback on failure. An unused `other` stays lazy. |
 | `oks rs` · `errors rs` | The values, or the reasons, of the ones that were. |
-| `of_option reason v` · `to_option r` | Across from the other convention, where `()` means "nothing there". |
+| `flatten r` · `to_option r` | Unnest a result, or turn its success into an option. |
 
 ### `std.error`
 

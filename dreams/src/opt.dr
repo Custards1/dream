@@ -91,6 +91,7 @@ let node_edges = [
     [:bind, [1]],
     /// `a` is the body and `b` the handler; `c` is the slot the error binds to.
     [:try, [0, 1]],
+    [:ensure, [0, 1]],
     [:force, [0]],
     [:type_is, [0]],
     [:cons, [0, 1]], [:list_tail, [0]], [:list_is_empty, [0]],

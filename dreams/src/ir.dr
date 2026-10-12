@@ -143,6 +143,7 @@ let ops = [
     /// to -- a pipeline of setters -- so a record is copied once rather than
     /// once per key. See `lower.fuse_set`.
     [:set_many, 82, "set_many"],
+    [:ensure, 83, "ensure"],
 
 ];
 

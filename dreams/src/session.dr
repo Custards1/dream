@@ -55,6 +55,7 @@ import dreams.lower;
 import dreams.modules;
 import dreams.parser;
 import dreams.scope;
+import dreams.typecheck;
 
 // --- writing and naming ---------------------------------------------------------
 
@@ -200,7 +201,7 @@ let pre s_pre resolver low root_globals_from funcs globals imports modules boote
 /// entry.
 let rec compile_slice! l mi state1 pre base_next base_text source = {
     let from = scope.pending_count (pre_s_pre pre);
-    let r1 = scope.resolve_from! l state1 (pre_resolver pre) from (pre_s_pre pre);
+    let r1 = typecheck.select_overloads l (scope.resolve_from! l state1 (pre_resolver pre) from (pre_s_pre pre));
     let n_low = lower.lower_from r1 (pre_low pre)
         (list.drop (scope.bodies_count (pre_resolver pre)) (scope.bodies r1));
     let lf = lower.link_funcs_from r1 (lower.func_bodies n_low) n_low
@@ -231,13 +232,14 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
         Result.error (as_session source (diag.render_all (modules.files l) ds))
     }
     else {
-        let deps_recs =
+        let [linked, deps_recs] =
             if pre_booted pre {
-                let lmb = lower.link_modules l r1 (list.head li);
-                list.nth 1 lmb
+                // Keep the pools that these module records index, including
+                // constants added while settling compile-time expressions.
+                lower.link_modules l r1 low1
             }
-            else { pre_modules pre };
-        Result.ok (engine l state1 r1 low1 base_next (pre_root_from pre) funcs1 globals1
+            else { [low1, pre_modules pre] };
+        Result.ok (engine l state1 r1 linked base_next (pre_root_from pre) funcs1 globals1
                     imports1 deps_recs base_text)
     }
 };
@@ -249,8 +251,8 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
 /// own.
 let rec main_step! l mi main_item en source image = {
     let state2 = scope.declare_items! l mi [main_item] (engine_state en);
-    let r2 = scope.resolve_from! l state2 (engine_resolver en)
-                (scope.pending_count (engine_state en)) (engine_state en);
+    let r2 = typecheck.select_overloads l (scope.resolve_from! l state2 (engine_resolver en)
+                (scope.pending_count (engine_state en)) (engine_state en));
     let n_main = lower.lower_from r2 (engine_low en)
         (list.drop (scope.bodies_count (engine_resolver en)) (scope.bodies r2));
     let lm = lower.link_funcs_from r2 (lower.func_bodies n_main) n_main
@@ -307,7 +309,8 @@ let boot! roots cfg source image text base_text engine base = {
     let part = entry_partition (modules.module_items (modules.module_at l mi)) 0;
     let slice = list.head part;
     let main_item = list.nth 1 part;
-    let state1 = scope.declare_items! l mi slice state_deps;
+    let state1 = scope.lend_shorthands (scope.inherit_enclosing l
+        (scope.declare_items! l mi slice state_deps));
     // The seed a fresh resolution starts from -- the resolver gets this
     // module's envs and the imports the declarations handed out, but not their
     // diagnostics: those are checked from the scope state itself, which is how

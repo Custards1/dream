@@ -2392,6 +2392,11 @@ void step_eval(Process& p) {
             eval_node(p, n.a, frame);
             return;
 
+        case Op::Ensure:
+            push_cont(p, ContKind::Finalize, n.b, 0, uint32_t(p.stack.size()), frame);
+            eval_node(p, n.a, frame);
+            return;
+
         case Op::Force: eval_node(p, n.a, frame); return;
 
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
@@ -2644,6 +2649,19 @@ void step_return(Process& p, size_t floor) {
             ret(p, p.result);
             return;
 
+        case ContKind::Finalize:
+            push_cont(p, ContKind::Finalized, 0, 0, c.c, p.result);
+            ++p.cleanup_depth;
+            eval_node(p, c.a, c.v1);
+            return;
+
+        case ContKind::Finalized:
+            --p.cleanup_depth;
+            p.stack.resize(c.c);
+            if (c.a) do_raise(p, c.v1);
+            else ret(p, c.v1);
+            return;
+
         case ContKind::FieldOf:
             resolve_field(p, p.result, c.a, c.b);
             return;
@@ -2800,7 +2818,7 @@ void locate_error(Process& p) {
                 break;
             }
             case ContKind::IfBranch: case ContKind::BinRight: case ContKind::LogicRight:
-            case ContKind::BlockNext: case ContKind::Catch: case ContKind::NativeArgs:
+            case ContKind::BlockNext: case ContKind::Catch: case ContKind::Finalize: case ContKind::NativeArgs:
             case ContKind::ClosureArgs:
             case ContKind::IndexKey: case ContKind::IndexApply: case ContKind::GetWalk:
             case ContKind::SetWalk: case ContKind::SwitchOn: case ContKind::SwitchKey:
@@ -2841,7 +2859,7 @@ bool unwind(Process& p, size_t floor) {
             // A process being killed is not unwound to a handler: `kill!`
             // ends it, and a `try!` that could catch that would be a process
             // that could refuse. Its stack goes with the frame.
-            if (p.kill_requested.load(std::memory_order_relaxed)) {
+            if (p.kill_unwinding && p.cleanup_depth == 0) {
                 p.stack.resize(c.c);
                 continue;
             }
@@ -2851,6 +2869,20 @@ bool unwind(Process& p, size_t floor) {
             p.heap().remember_if_old(fo, p.result);
             eval_node(p, c.a, c.v1);
             return true;
+        }
+        if (c.kind == ContKind::Finalize) {
+            p.stack.resize(c.c);
+            push_cont(p, ContKind::Finalized, 1, 0, c.c, p.result);
+            ++p.cleanup_depth;
+            eval_node(p, c.a, c.v1);
+            return true;
+        }
+        if (c.kind == ContKind::Finalized) {
+            --p.cleanup_depth;
+            p.stack.resize(c.c);
+            // Keep the original failure; an error on normal exit becomes
+            // the failure and still unwinds through the remaining cleanups.
+            if (c.a) p.result = c.v1;
         }
     }
     return false;
@@ -3480,7 +3512,9 @@ bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* o
             // a list that never stops. So the kill is raised here, where the
             // slice would have ended; `unwind` passes every handler, and the
             // natives above give the raise back as they would any other.
-            if (p.mode != Mode::Raise && p.kill_requested.load(std::memory_order_relaxed)) {
+            if (p.mode != Mode::Raise && !p.kill_unwinding && p.cleanup_depth == 0 &&
+                p.kill_requested.load(std::memory_order_relaxed)) {
+                p.kill_unwinding = true;
                 do_raise(p, p.kill_error());
                 continue;
             }

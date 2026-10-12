@@ -13,7 +13,7 @@
 // Three rules decide everything below, and every one of them is about not
 // rejecting a program that works:
 //
-//   1. **Nothing unannotated is ever an error.** A name with no signature is
+//   1. **Unannotated ordinary calls remain gradual.** A name with no signature is
 //      `:any`, and `:any` fits everywhere in both directions. So a program
 //      with no signatures checks exactly as it compiled before, and adding the
 //      first signature to a large one reports only what touches that name.
@@ -25,7 +25,7 @@
 //      cannot see into (an unannotated call, a thunk, a refinement's
 //      predicate) passes.
 //
-//   3. **The checker never changes what a program means.** Checking only
+//   3. **Qualified calls keep their meaning.** Checking them only
 //      produces diagnostics, and no signature changes a single node. The one
 //      thing a signature adds to an image is a *hint* -- which parameters are
 //      declared `:float`, in the `TYPE` section, see "what a signature tells
@@ -33,6 +33,11 @@
 //      describes, so a wrong one costs speed and never an answer. A program
 //      whose signatures declare no float compiles to the image it compiled to
 //      before.
+//
+// Unqualified standard members are the exception: `map`, `and_then` and
+// similar spellings select a member from their argument and expected types.
+// A unique choice resolves before lowering. Ambiguity requires an explicit
+// member, even in otherwise unannotated code; there is no runtime dispatch.
 //
 // The types are the ones `std.types` describes, read from the same grammar,
 // so a `type` declaration means the same thing to this pass and to
@@ -232,6 +237,8 @@ mapping Checker {
     // Whether a `let` says what it bound, for an editor (see "what each
     // binding is").
     hints = false
+    // Candidate trials also require callbacks to return the promised shape.
+    dispatch = false
     // Every parameterless named type, unfolded (see `unfold`).
     unfolded = %{}
 }
@@ -830,6 +837,7 @@ let builtin_type n = match n {
     "to_string" => Ty.arrow :any :string,
     "type_of" => Ty.arrow :any :atom,
     "strict!" => Ty.arrow (Ty.flex "a") (Ty.flex "a"),
+    "defer!" => Ty.arrow (Ty.flex "a") :unit,
     "raise!" => Ty.arrow :any :never,
     "spawn!" => Ty.arrow :any :process,
     "self!" => Ty.arrow :any :process,
@@ -861,7 +869,10 @@ let global_type k h gi = match (Here.narrowed h).[gi else ()] {
 /// The arms are in the order nodes are common in, most first: a `match` tries
 /// them in turn, and names and calls are most of any program.
 let rec infer k h e ds = match e {
-    [:name, n, sp] => [name_type k h n sp, ds],
+    [:name, n, sp] => match overload_form k h e {
+        () => [name_type k h n sp, ds],
+        form => infer_overload k h form () ds,
+    },
     [:apply, f, args, sp] => infer_apply k h f args sp ds,
     [:field, _, _, sp] => [name_type k h "" sp, ds],
     [:str, v, _] => [Ty.lit :string v, ds],
@@ -984,7 +995,10 @@ let element k ct kt = match [peel k ct 8, kt] {
 /// statement of a block -- each part is held to it, so a mistake is reported
 /// at the branch that made it rather than at the whole.
 let rec check k h e expected why ds =
-    if expected == :any { list.nth 1 (infer k h e ds) }
+    if expected != :any && overload_form k h e != () {
+        list.nth 1 (infer_overload k h (overload_form k h e) expected ds)
+    }
+    else if expected == :any { list.nth 1 (infer k h e ds) }
     else {
         match e {
             [:lambda, ps, body, sp] => list.nth 1 (lambda k h ps body expected sp ds),
@@ -1327,16 +1341,88 @@ let not_a_function t = match t {
 let is_lambda e = match e { [:lambda, _, _, _] => true, _ => false };
 
 let infer_apply k h f args sp ds = {
-    let [ft, ds1] = infer k h f ds;
-    match ft {
+    match overload_form k h (ast.apply_e f args sp) {
+        form if form != () => infer_overload k h form () ds,
+        _ => {
+            let [ft, ds1] = infer k h f ds;
+            match ft {
         // Nearly every call in a program is to something no signature
         // describes, and there is nothing to hold its arguments to -- only
         // their own insides to check. This is most of the calls the checker
         // sees, and the bookkeeping below is most of what a call costs it.
         :any => [:any, list.fold (fn d a -> list.nth 1 (infer k h a d)) ds1 args],
         _ => typed_apply k h f ft args sp ds1,
+            }
+        },
     }
 };
+
+/// Like editor hints, choices travel with the walk's diagnostics until the
+/// whole body's context is known. A choice is never a runtime type test.
+struct Choice { key, meaning }
+struct Unresolved { key, diagnostic }
+
+let is_choice x = match x { Choice(_, _) => true, _ => false };
+let is_unresolved x = match x { Unresolved(_, _) => true, _ => false };
+let is_dispatch x = is_choice x || is_unresolved x;
+
+/// A curried application or pipe may supply the argument that distinguishes
+/// members after the name was first written. Keep the whole application here.
+let rec overload_form k h e = match e {
+    [:name, _, sp] => match scope.resolution (res k) (Here.mi h) (Here.source h) sp {
+        scope.Meaning.overloaded(n, choices) => [n, choices, e, []],
+        _ => (),
+    },
+    [:apply, f, args, _] => match overload_form k h f {
+        [n, choices, callee, before] => [n, choices, callee, before + args],
+        _ => (),
+    },
+    [:pipe, x, rhs, _] => match overload_form k h rhs {
+        [n, choices, callee, before] => [n, choices, callee, before + [x]],
+        _ => (),
+    },
+    _ => (),
+};
+
+let dispatch_key h callee = scope.ref_key (Here.mi h) (Here.source h) (ast.span_start (ast.span callee));
+
+let infer_overload k h form expected ds = {
+    let [n, choices, callee, args] = form;
+    let tried = list.map (fn candidate -> {
+        let [mi, field, gi] = candidate;
+        let ft = global_type k h gi;
+        let [t, found] = if list.is_empty args { [ft, []] }
+                        else { typed_apply (Checker.set_dispatch true k) h callee ft args (ast.span callee) [] };
+        let errors = list.any (fn d -> is_unresolved d
+            || (not (is_dispatch d) && not (is_contract d) && not (is_hint d) && diag.is_error d)) found;
+        [candidate, t, found, not errors && (expected == () || fits k t expected)]
+    }) choices;
+    let viable = list.filter (fn trial -> list.nth 3 trial) tried;
+    match viable {
+        [[[mi, field, gi], t, found, _]] =>
+            [t, list.cons (Choice.make (dispatch_key h callee) (scope.Meaning.member (scope.Ref.dream mi) field gi)) (found + ds)],
+        _ => {
+            let qualified = str.join_str ", " (list.map (fn [mi, field, _] -> {
+                let aliases = list.filter (fn [_, ref] -> ref == scope.Ref.dream mi)
+                    (map.pairs (scope.aliases (scope.r_env_at (res k) (Here.mi h))));
+                let prefix = match aliases {
+                    [] => list.last (str.split "." (scope.env_name (scope.r_env_at (res k) mi))),
+                    names => list.head (list.head names),
+                };
+                "`" + prefix + "." + field + "`"
+            }) choices);
+            let message = if list.is_empty viable { "no overload of `" + n + "` matches the known types" }
+                          else { "cannot choose an overload of `" + n + "` from the known types" };
+            let diagnostic = diag.in_source (Here.source h)
+                (diag.with_note ("write the member explicitly: " + qualified)
+                    (diag.error (ast.span callee) message));
+            let inside = list.nth 1 (infer_all k h args ds);
+            [:any, list.cons (Unresolved.make (dispatch_key h callee) diagnostic) inside]
+        },
+    }
+};
+
+let deferred_argument k h a = is_lambda a || overload_form k h a != ();
 
 let typed_apply k h f ft args sp ds1 = {
     let who = callee_name f;
@@ -1366,7 +1452,7 @@ let typed_apply k h f ft args sp ds1 = {
     // what `x` is from `xs`, which is written after it.
     let [plain, subst, ds3] = list.fold (fn acc ia -> {
         let [i, a] = ia;
-        if is_lambda a { [list.cons () (list.nth 0 acc), list.nth 1 acc, list.nth 2 acc] }
+        if deferred_argument k h a { [list.cons () (list.nth 0 acc), list.nth 1 acc, list.nth 2 acc] }
         else {
             let [t, d] = infer k h a (list.nth 2 acc);
             let s = if generic && i < given { solve k (list.nth i params) t (list.nth 1 acc) } else { list.nth 1 acc };
@@ -1380,23 +1466,34 @@ let typed_apply k h f ft args sp ds1 = {
         let [i, a] = ia;
         let [s, admitted, d] = acc;
         if i >= given {
-            if is_lambda a { [s, admitted, list.nth 1 (infer k h a d)] } else { acc }
+            if deferred_argument k h a { [s, admitted, list.nth 1 (infer k h a d)] } else { acc }
         }
         else {
             let param = list.nth i params;
             let p = if generic { solved s param false } else { param };
-            if is_lambda a {
+            if deferred_argument k h a {
                 // What has been solved tells the lambda what its parameters
                 // are, but not what it must answer: a variable solved from
                 // `list.fold`'s seed `[]` is not a promise that the fold's
                 // function answers an empty list.
                 let inputs = if generic { solved_inputs s param (lambda_arity a) } else { param };
-                let [lt, d2] = infer_lambda_at k h a inputs d;
+                let [lt, d2] = if is_lambda a { infer_lambda_at k h a inputs d }
+                              else { infer_overload k h (overload_form k h a) p d };
                 if generic {
                     let s2 = solve k param lt s;
-                    [s2, admit_unit s2, d2]
+                    let a2 = admit_unit s2;
+                    let wanted = solved s2 param true;
+                    let d3 = if Checker.dispatch k && not (fits k lt wanted) {
+                        mismatch k h lt wanted (ast.span a) ("argument " + to_string (i + 1) + " of " + who) d2
+                    } else { d2 };
+                    [s2, a2, d3]
                 }
-                else { [s, admitted, d2] }
+                else {
+                    let d3 = if Checker.dispatch k && not (fits k lt p) {
+                        mismatch k h lt p (ast.span a) ("argument " + to_string (i + 1) + " of " + who) d2
+                    } else { d2 };
+                    [s, admitted, d3]
+                }
             }
             // Checked against the variables admitting `()` and reported
             // against them as solved, so a message never gains a `| :unit`
@@ -2952,7 +3049,7 @@ let checker : modules.Loader -> scope.Resolution -> [Checker, [:any]];
 let checker l r = {
     let named = named_table l r;
     let [sigs, ds] = sig_table l r;
-    let k0 = Checker.make l r named sigs %{} %{} %{} %{} false %{};
+    let k0 = Checker.make l r named sigs %{} %{} %{} %{} false false %{};
     let evaluated = list.fold (fn acc kv -> {
         let [owner, t, _] = list.nth 1 kv;
         acc.[list.nth 0 kv => eval_type k0 (in_module owner) t]
@@ -3214,7 +3311,7 @@ let inferring k found = {
 let warned : [:any] -> [:any] -> [:map];
 let warned first second =
     list.fold (fn acc d ->
-        if is_contract d || not (diag.is_error d) || list.contains d first { acc }
+        if is_dispatch d || is_contract d || not (diag.is_error d) || list.contains d first { acc }
         else {
             let w = as_inferred d;
             if list.contains w acc { acc } else { list.cons w acc }
@@ -3317,6 +3414,35 @@ let tables k = [Checker.named k, Checker.sigs k, Checker.uses k, Checker.comps k
 let with_resolution : Checker -> scope.Resolution -> Checker;
 let with_resolution k r = Checker.set_r (r |> scope.Resolution.set_wrappers (scope.wrappers (Checker.r k))) k;
 
+/// Resolve overloaded spellings before lowering. All members remain ordinary
+/// functions; the choice is made once from signatures and inferred arguments.
+let rec has_overloads r = len (scope.Resolution.overload_uses r) > 0
+    || (scope.parts r != () && list.any has_overloads (scope.parts r));
+
+let select_overloads l r = if not (has_overloads r) { r } else {
+    let [k, _] = prepared l r %{};
+    let parts = match scope.parts r { () => [r], ps => ps };
+    let body_of p = if scope.parts r == () { scope.bodies p }
+                    else { list.map (fn pb -> list.nth 1 pb) (scope.part_bodies p) };
+    let first = list.map (fn p -> list.map (fn b -> check_decl_inferring (with_resolution k p) b []) (body_of p)) parts;
+    let k2 = match inferring k (list.map (fn one -> list.nth 1 one) (list.concat first)) { () => k, next => next };
+    let found = list.concat (list.map (fn p ->
+        if len (scope.Resolution.overload_uses p) == 0 { [] }
+        else { list.concat (list.map (fn b -> check_decl (with_resolution k2 p) b []) (body_of p)) }) parts);
+    let choices = list.fold (fn acc x -> match x {
+        Choice(key, meaning) => acc.[key => meaning], _ => acc,
+    }) (scope.Resolution.selections r) found;
+    let errors = list.fold (fn acc x -> match x {
+        Unresolved(key, d) if not (map.has key choices) => if list.contains d acc { acc } else { list.cons d acc },
+        _ => acc,
+    }) [] found;
+    let selected p = p |> scope.Resolution.set_selections choices
+        |> scope.Resolution.set_refs (list.fold (fn acc [key, meaning] ->
+            if map.has key acc { acc.[key => meaning] } else { acc }) (scope.refs p) (map.pairs choices));
+    selected r |> scope.Resolution.set_parts (if scope.parts r == () { () } else { list.map selected (scope.parts r) })
+        |> scope.Resolution.set_diags (errors + scope.r_diags r)
+};
+
 /// The analysis, given what each body said on its own -- `check_decl k b []`,
 /// in the order the resolver queued the bodies -- and what each said in the
 /// second check, against what the first inferred (`checked_twice`). Checking
@@ -3328,7 +3454,13 @@ let concluded k r ds0 said again = {
     let inferred = list.map (fn pair -> warned (list.head pair) (list.nth 1 pair)) (list.zip said again);
     let found = list.fold (fn ds c -> c + ds) ds0 (said + inferred);
     let contracts = list.filter (fn x -> is_contract x) found;
-    let diags = list.filter (fn x -> not (is_contract x)) found;
+    let dispatch = list.concat (list.map (fn [first, second] -> if list.is_empty second { first } else { second }) (list.zip said again));
+    let chosen = list.fold (fn acc x -> match x { Choice(key, _) => acc.[key => true], _ => acc }) %{} dispatch;
+    let unresolved = list.fold (fn acc x -> match x {
+        Unresolved(key, d) if not (map.has key chosen) => list.cons d acc,
+        _ => acc,
+    }) [] dispatch;
+    let diags = unresolved + list.filter (fn x -> not (is_contract x) && not (is_dispatch x)) found;
     let once = list.fold (fn acc d -> if list.contains d acc { acc } else { list.cons d acc }) [] diags;
     let settled = list.fold (fn acc c -> if list.contains c acc { acc } else { list.cons c acc }) [] contracts;
     Analysis.make (list.sort_by (fn a b -> place a < place b) once)

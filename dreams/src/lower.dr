@@ -247,6 +247,8 @@ let lower_apply : ast.Expr -> [ast.Expr] -> ast.Span -> Lowering -> [Lowering, :
 let lower_apply callee args span l = {
     let found = callee_resolution callee l;
     match [found, args] {
+        [scope.Meaning.builtin("defer!"), _] =>
+            emit_leaf :unit (complain span "`defer!` needs one expression and must be a block statement" l),
         // A record, as its constructor writes it: one `record_make`, and no
         // array of fields made only to be copied out of.
         [scope.Meaning.builtin("_record_of"), [[:atom, id, _], [:bool, variant, _], [:array, fields, _]]] =>
@@ -551,6 +553,132 @@ let emit_resolution found l =
 
 // --- expressions -----------------------------------------------------------------
 
+/// The resolver reserves one scratch slot for each saturated prelude member.
+/// Identity comes from its resolved global, so a user's `Result.map` is left
+/// alone. Partial applications keep their ordinary call frames.
+let result_call e l = match e {
+    [:pipe, x, rhs, sp] => match rhs {
+        [:apply, f, args, _] => result_call (ast.apply_e f (list.append args [x]) sp) l,
+        _ => result_call (ast.apply_e rhs [x] sp) l,
+    },
+    [:apply, f, args, sp] => {
+        let g = match callee_resolution f l {
+            scope.Meaning.global(_, _, gi) => gi,
+            scope.Meaning.member(scope.Ref.dream(_), _, gi) => gi,
+            _ => (),
+        };
+        let slot = scope.result_slot (res l) (ctx l) (source l) (ast.span f);
+        match (scope.Resolution.result_roles (res l)).[g else ()] {
+            [kind, tag, arity] if list.length args == arity && slot != () =>
+                [kind, tag, args, slot],
+            _ => (),
+        }
+    },
+    _ => (),
+};
+
+let result_id kind ok = "std.prelude." + kind + "." +
+    if kind == "Result" { if ok { "ok" } else { "error" } }
+    else { if ok { "some" } else { "none" } };
+
+let node_block nodes l = {
+    let placed = kids nodes l;
+    let made = emit (ir.node :block (list.nth 1 placed) (list.length nodes) ir.no_node) (list.head placed);
+    [inherit (list.nth 1 made) nodes (list.head made), list.nth 1 made]
+};
+
+let node_if cond yes no l = {
+    let made = emit (ir.node :if cond yes no) l;
+    [inherit (list.nth 1 made) [cond, yes, no] (list.head made), list.nth 1 made]
+};
+
+/// Peel maps of this union into each region. A stage that can choose another
+/// variant starts a new region, so its following stages are emitted once.
+/// A stage is [tag, argument node (or absent), scratch slot].
+let rec lower_result_chain e kind stages l = match result_call e l {
+    [k, tag, args, slot] if k == kind && (list.is_empty stages || fuse.result_maps tag) => {
+        let argument = if list.length args == 1 { [l, ir.no_node] }
+                       else { lower_expr (list.head args) l };
+        lower_result_chain (list.last args) kind
+            (list.cons [tag, list.nth 1 argument, slot] stages) (list.head argument)
+    },
+    _ => {
+        let value = lower_expr e l;
+        result_branch (list.nth 1 value) kind stages
+                      (list.nth 2 (list.head stages)) (list.head value)
+    },
+};
+
+/// Evaluate a union once, checking both ids just as the original match did.
+let rec result_branch value kind stages slot l = {
+    let bound = emit (ir.node :bind slot value ir.no_node) l;
+    let sequenced = set_flag (list.nth 1 bound) ir.f_strict (inherit (list.nth 1 bound) [value] (list.head bound));
+    let local = emit (ir.node :local slot ir.no_node ir.no_node) sequenced;
+    let self = list.nth 1 local;
+    let index = const_int 0 (list.head local);
+    let payload = call_builtin "_match_at" [self, list.nth 1 index] (list.head index);
+    let yes = result_continue kind true (list.nth 1 payload) self stages (list.head payload);
+    let no = result_continue kind false (list.nth 1 payload) self stages (list.head yes);
+    let good_id = const_atom (result_id kind true) (list.head no);
+    let good = call_builtin "_record_is" [list.nth 1 good_id, self] (list.head good_id);
+    let bad_id = const_atom (result_id kind false) (list.head good);
+    let bad = call_builtin "_record_is" [list.nth 1 bad_id, self] (list.head bad_id);
+    let failure = match_failure self [0, 0] (list.head bad);
+    let checked = node_if (list.nth 1 bad) (list.nth 1 no) (list.nth 1 failure) (list.head failure);
+    let branch = node_if (list.nth 1 good) (list.nth 1 yes) (list.nth 1 checked) (list.head checked);
+    node_block [list.nth 1 bound, list.nth 1 branch] (list.head branch)
+};
+
+/// `original` is the whole union when no mapping has changed its payload.
+/// Passing that node through preserves the input record on either untouched
+/// branch, including the differently typed failure of `Result.map`.
+let rec result_continue kind ok payload original stages l = match stages {
+    [] => if ir.is_node original { [l, original] } else {
+        let placed = kids (if kind == "Option" && not ok { [] } else { [payload] }) l;
+        let [program, id] = ir.intern_atom (result_id kind ok) (prog (list.head placed));
+        emit (ir.node :record_make (list.nth 1 placed) (if kind == "Option" && not ok { 0 } else { 1 })
+                     (id + ir.record_variant)) (set_prog program (list.head placed))
+    },
+    [[tag, arg, slot], ..rest] => match tag {
+        :map => if ok {
+            let mapped = emit_apply arg [payload] l;
+            result_continue kind ok (list.nth 1 mapped) ir.no_node rest (list.head mapped)
+        } else { result_continue kind ok payload original rest l },
+        :map_error => if not ok {
+            let mapped = emit_apply arg [payload] l;
+            result_continue kind ok (list.nth 1 mapped) ir.no_node rest (list.head mapped)
+        } else { result_continue kind ok payload original rest l },
+        :and_then => if ok {
+            let next = emit_apply arg [payload] l;
+            if list.is_empty rest { next }
+            else { result_branch (list.nth 1 next) kind rest (list.nth 2 (list.head rest)) (list.head next) }
+        } else { result_continue kind ok payload original rest l },
+        :and => if ok {
+            if list.is_empty rest { [l, arg] } else { result_branch arg kind rest (list.nth 2 (list.head rest)) l }
+        } else { result_continue kind ok payload original rest l },
+        :or_else => if not ok {
+            let argument = if kind == "Result" { [l, payload] } else { emit_leaf :unit l };
+            let next = emit_apply arg [list.nth 1 argument] (list.head argument);
+            if list.is_empty rest { next }
+            else { result_branch (list.nth 1 next) kind rest (list.nth 2 (list.head rest)) (list.head next) }
+        } else { result_continue kind ok payload original rest l },
+        :otherwise => if not ok {
+            if list.is_empty rest { [l, arg] } else { result_branch arg kind rest (list.nth 2 (list.head rest)) l }
+        } else { result_continue kind ok payload original rest l },
+        :flatten => if ok {
+            if list.is_empty rest { [l, payload] } else { result_branch payload kind rest (list.nth 2 (list.head rest)) l }
+        } else { result_continue kind ok payload original rest l },
+        :unwrap_or => [l, if ok { payload } else { arg }],
+        :unwrap_or_else => if ok { [l, payload] }
+            else if kind == "Result" { emit_apply arg [payload] l }
+            else {
+                let unit = emit_leaf :unit l;
+                emit_apply arg [list.nth 1 unit] (list.head unit)
+            },
+        _ => result_continue kind ok payload original rest l,
+    },
+};
+
 let lower_expr : ast.Expr -> Lowering -> [Lowering, :integer];
 let rec lower_expr e l =
     match e {
@@ -578,7 +706,10 @@ let rec lower_expr e l =
         // because everything below is about a call that still happens.
         [:apply, callee, args, span] =>
             match scope.fusion (res l) (ctx l) (source l) span {
-                () => lower_apply callee args span l,
+                () => match result_call e l {
+                    () => lower_apply callee args span l,
+                    [kind, _, _, _] => lower_result_chain e kind [] l,
+                },
                 p  => lower_fused p l,
             },
 
@@ -886,6 +1017,31 @@ let rec lower_field e span l =
             },
     };
 
+/// Only a direct statement registers cleanup; aliases and nested calls do not.
+let deferred st l = match st {
+    [:apply, callee, [body], _] =>
+        if callee_resolution callee l == scope.Meaning.builtin "defer!" { [body] } else { [] },
+    _ => [],
+};
+
+let rec cleanup_block pairs l = match pairs {
+    [] => emit_leaf :unit l,
+    [pair, ..rest] => {
+        let k = list.head pair;
+        if not (list.is_empty (deferred (list.nth 1 pair) l)) {
+            let body = cleanup_block rest l;
+            let made = emit (ir.node :ensure (list.nth 1 body) k ir.no_node) (list.head body);
+            [set_flag (list.nth 1 made) ir.f_impure (list.head made), list.nth 1 made]
+        } else if list.is_empty rest { [l, k] }
+        else {
+            let tail = cleanup_block rest l;
+            let placed = kids [k, list.nth 1 tail] (list.head tail);
+            let made = emit (ir.node :block (list.nth 1 placed) 2 ir.no_node) (list.head placed);
+            [inherit (list.nth 1 made) [k, list.nth 1 tail] (list.head made), list.nth 1 made]
+        }
+    },
+};
+
 let rec lower_block stmts span l = {
     // A statement lowers to one node, except a destructuring `let`, which
     // lowers to several binds. So each node travels with the statement it came
@@ -924,7 +1080,10 @@ let rec lower_block stmts span l = {
                      (list.map (fn k -> [k, st]) (list.cons (list.nth 1 bound) (list.nth 1 parts)))]
             },
             _ => {
-                let got = lower_expr st (list.head acc);
+                let got = match deferred st (list.head acc) {
+                    [body] => lower_expr body (list.head acc),
+                    _ => lower_expr st (list.head acc),
+                };
                 [list.head got, list.append (list.nth 1 acc) [[list.nth 1 got, st]]]
             },
         }) [l, []] stmts;
@@ -944,7 +1103,8 @@ let rec lower_block stmts span l = {
                 let st = list.nth 1 pair;
                 // A bind stays lazy: the ones whose value is effectful were
                 // already forced where they were bound.
-                if ir.node_op (ir.node_at k (prog acc)) == :bind { acc }
+                if not (list.is_empty (deferred st acc)) { acc }
+                else if ir.node_op (ir.node_at k (prog acc)) == :bind { acc }
                 else if impure_here { set_flag k ir.f_strict acc }
                 else if is_impure_node k acc { acc }
                 else {
@@ -954,10 +1114,14 @@ let rec lower_block stmts span l = {
                 }
             }) (list.head done) (list.take (list.length pairs - 1) pairs)
         };
-    let placed = kids stmt_nodes sequenced;
-    let made = emit (ir.node :block (list.nth 1 placed) (list.length stmt_nodes) ir.no_node)
-                    (list.head placed);
-    [inherit (list.nth 1 made) stmt_nodes (list.head made), list.nth 1 made]
+    if list.any (fn pair -> not (list.is_empty (deferred (list.nth 1 pair) sequenced))) pairs {
+        cleanup_block pairs sequenced
+    } else {
+        let placed = kids stmt_nodes sequenced;
+        let made = emit (ir.node :block (list.nth 1 placed) (list.length stmt_nodes) ir.no_node)
+                        (list.head placed);
+        [inherit (list.nth 1 made) stmt_nodes (list.head made), list.nth 1 made]
+    }
 };
 
 /// A block's bind: `[lowering, node]`. Lazy, unless the value has effects --

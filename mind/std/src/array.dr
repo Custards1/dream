@@ -26,6 +26,10 @@ let fold f init xs = {
     if n == 0 { init } else { go 1 (f init (xs.[0])) }
 };
 
+/// A left fold whose accumulator steps remain suspended until needed.
+let fold_lazy : (b -> a -> b) -> b -> #[a] -> b;
+let fold_lazy f init xs = list.fold_lazy f init (_array_to_list xs);
+
 /// Return the sequence type name, `array`.
 let name : :any -> :string;
 let name xs = "array";

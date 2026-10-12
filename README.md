@@ -90,7 +90,9 @@ cd hello
 mind run
 ```
 
-`just repl` (or `mind repl` inside a project) is an interactive session.
+The interactive REPL (`just repl`, `mind repl`, or `dreams --repl` / `-i`)
+is deprecated and warns on startup. Use source files with `just run FILE`
+or `mind run` instead.
 
 ## What is here
 

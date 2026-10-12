@@ -146,7 +146,7 @@
         {
           "comment": "The parser's list, exactly. `try!`, `comp!` and the rest carry their bang.",
           "name": "keyword.control.dream",
-          "match": "\\b(if|else|match|catch|when)\\b|\\b(try!|comp!)"
+          "match": "\\b(if|else|match|catch|when)\\b|\\b(try!|defer!|comp!)"
         },
         {
           "comment": "Contextual: `receive!` is syntax only before a brace, and a function may still be called that.",

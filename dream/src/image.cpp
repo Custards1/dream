@@ -97,7 +97,7 @@ void node_children(const Node& n, const uint32_t* kids, std::vector<uint32_t>& o
         case Op::Bind:
             out.push_back(n.b);
             break;
-        case Op::Try:
+        case Op::Try: case Op::Ensure:
             out.push_back(n.a);
             out.push_back(n.b);
             break;
@@ -144,6 +144,7 @@ const char* op_name(Op op) {
         case Op::MakeClosure: return "closure";
         case Op::MakeThunk: return "thunk";
         case Op::Try: return "try";
+        case Op::Ensure: return "ensure";
         case Op::Force: return "force";
         case Op::TypeIs: return "type_is";
         case Op::StrChars: return "str_chars";
@@ -680,6 +681,9 @@ bool Image::validate(std::string& error) {
             case Op::Bind: if (!node_ok(n.b)) return fail("bad bind value"); break;
             case Op::Try:
                 if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad try body or handler");
+                break;
+            case Op::Ensure:
+                if (!node_ok(n.a) || !node_ok(n.b)) return fail("bad ensure body or cleanup");
                 break;
             case Op::Force: case Op::Neg: case Op::Not: case Op::BitNot: case Op::TypeIs: case Op::ListTail: case Op::ListIsEmpty:
                 if (!node_ok(n.a)) return fail("bad unary operand");

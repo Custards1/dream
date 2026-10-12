@@ -113,6 +113,7 @@ let names = [
     "_settled",
     // `type_of` without the answer: true, its argument forced to WHNF.
     "_forced",
+    "defer!",
 
 ];
 
@@ -151,6 +152,7 @@ let signatures = %{
     "to_string" => "value -> string",
     "len"       => "list|array|map|string -> integer",
     "strict!"   => "value -> the same value, forced all the way down",
+    "defer!"    => "expression -> unit, evaluated when the enclosing block exits",
 
     "_match_is_cons" => "value -> bool, true for a non-empty list",
     "_match_head"    => "list -> its head, unforced",

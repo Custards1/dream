@@ -204,6 +204,7 @@ lazy VM cannot work out for itself:
 | 80 | `shr` | left node | count node | — |
 | 81 | `record_make` | kids offset | field count | atom index, top bit set for a variant |
 | 82 | `set_many` | container node | kids offset | pair count |
+| 83 | `ensure` | body node | cleanup node | |
 
 `record_make` builds a value of a declared `group`, `struct` or union variant
 (`RecordObj`): the fields in a lazy position, as `array`'s items are, and the
@@ -232,6 +233,11 @@ The JIT tests tags and guarded object headers directly; a value already carried
 as an unboxed double has a known type, but its computation still runs.
 
 A `block` evaluates to its last statement. An empty block evaluates to unit.
+
+`ensure` evaluates its body, saves the answer or error, then evaluates cleanup
+in the same frame. It returns the saved answer, or propagates the saved error.
+A cleanup error replaces a normal answer but preserves an existing error.
+Nested ensures unwind from the inside out, including when a process is killed.
 
 `get` and `set` are generic over containers: a map by key, an array or a list by
 position. Both force the container and then the key. A `get` enters the element

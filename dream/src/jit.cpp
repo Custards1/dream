@@ -3225,7 +3225,7 @@ void Emitter::mark_refs(uint32_t idx, int depth) {
         case Op::Bind:
             mark_refs(n.b, depth + 1);
             return;
-        case Op::Try: case Op::Cons:
+        case Op::Try: case Op::Ensure: case Op::Cons:
         case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
         case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
@@ -3949,7 +3949,13 @@ Emitter::JV Emitter::node(uint32_t idx, bool tail) {
         case Op::And: case Op::Or: return logic(n);
         case Op::Neg: case Op::Not: case Op::BitNot: return unary(n);
         DREAM_PRIMITIVE_CASES
-        case Op::Apply: return apply(idx, n);
+        case Op::Apply:
+            // A pure higher-order callee may reach an effectful callback.
+            // Return a tail call to the machine instead of forcing it under
+            // this frame: a park would retry it and repeat earlier effects.
+            if (tail && root_loop_ && !accumulate_ && !ahead_first_ &&
+                kind_at(idx) == CallKind::Closure) return lazy(idx);
+            return apply(idx, n);
         case Op::ConstStr: return tag(b_.CreateCall(rt_literal_str_, {proc_, i32c(int(n.a))}));
         case Op::Global: return tag(force(b_.CreateCall(rt_global_, {proc_, i32c(int(n.a))})));
         case Op::ListIsEmpty: return list_is_empty(n);

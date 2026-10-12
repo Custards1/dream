@@ -1,15 +1,14 @@
 // Public API tests: wire vectors, malformed inputs, composition and cursors.
-import std.binary as b;
-import std.binary.word as word;
-import std.binary.io as bio;
-import std.agent;
-import std.crypto;
-import std.list;
-import std.str;
-import std.wire;
-
 when test {
     import std.test;
+    import std.binary as b;
+    import std.binary.word as word;
+    import std.binary.io as bio;
+    import std.agent;
+    import std.crypto;
+    import std.list;
+    import std.str;
+    import std.wire;
 
     let value : :any -> :any;
     let value r = Result.unwrap_or :failed r;

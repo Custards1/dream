@@ -82,7 +82,7 @@ What to do (the default is `--check`):
 | `--symbols`, `--at LINE:COL` | what a file defines, and what is at a position -- the questions an editor asks |
 | `--stats` | count what the program contains |
 | `--time` | compile the whole way and say what each stage cost |
-| `--repl` | an interactive session |
+| `--repl`, `-i` | deprecated interactive session; use source files |
 | `--fmt FILE..`, `--fmt-check FILE..` | lay files out in the house style in place, or name the ones that would change |
 
 Where to look, and what to compile it as:
@@ -104,6 +104,10 @@ Where to look, and what to compile it as:
 `dreams --help` is the full list.
 
 ## The REPL
+
+The REPL is deprecated. `dreams --repl` / `-i`, `just repl`, and `mind repl`
+remain available and warn on startup. Use `just run FILE` or `mind run`
+with source files instead.
 
 `dreams --repl` (or `just repl`, or `mind repl`) is not the usual loop. A Dream
 program is compiled whole, so there is no environment to extend one binding at

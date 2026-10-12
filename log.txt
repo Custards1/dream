@@ -1,0 +1,1983 @@
+-- Dream: JIT enabled against LLVM 21.1.8, static components (/nix/store/9scby1rz3gvhmvaawwd6valqwlq3jxyy-llvm-21.1.8-dev/bin/llvm-config)
+-- Dream: FFI enabled, static (/nix/store/as6hj5afgp0z80vw019ri7p1iw6jdxhb-libffi-3.8.0/lib/libffi.a)
+-- Dream: TLS through OpenSSL 3.6.3
+-- Configuring done (0.3s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/blake/project/dream/build-dream
+[ 81%] Built target dream
+[ 87%] Built target dream_embed_example
+[ 93%] Built target dream_tests
+[100%] Built target dream_cli
+
+std.list
+  ok    length of empty
+  ok    length
+  ok    head
+  ok    head of empty raises
+  ok    tail
+  ok    first_or on empty
+  ok    first_or
+  ok    nth
+  ok    nth past the end
+  ok    nth of empty
+  ok    nth below zero
+  ok    last
+  ok    append
+  ok    append to empty
+  ok    append nothing
+  ok    append keeps the right lazy
+  ok    reverse
+  ok    reverse of empty
+  ok    range
+  ok    empty range
+  ok    replicate
+  ok    map
+  ok    map over empty
+  ok    filter
+  ok    fold
+  ok    fold is left to right
+  ok    fold_right
+  ok    fold_strict agrees with fold
+  ok    fold_strict is left to right
+  ok    fold_strict over empty is the seed
+  ok    fold_strict survives a list a lazy fold would not
+  ok    fold_strict does not stop at a unit accumulator
+  ok    take
+  ok    take more than there is
+  ok    drop
+  ok    drop more than there is
+  ok    take_while
+  ok    drop_while
+  ok    zip
+  ok    concat
+  ok    flat_map
+  ok    enumerate
+  ok    zip_with
+  ok    unzip
+  ok    scan
+  ok    scan of empty
+  ok    scan's last is fold's answer
+  ok    scan over an infinite list
+  ok    iterate
+  ok    cycle
+  ok    cycle of empty
+  ok    intersperse
+  ok    intersperse short
+  ok    chunks
+  ok    chunks of nothing
+  ok    chunks below one
+  ok    chunks of an infinite list
+  ok    windows
+  ok    windows too wide
+  ok    split_at
+  ok    split_while
+  ok    filter_map
+  ok    compact
+  ok    unique_on
+  ok    transpose
+  ok    transpose of ragged rows
+  ok    transpose of nothing
+  ok    take_last
+  ok    drop_last
+  ok    remove_at
+  ok    insert_at
+  ok    any
+  ok    any on empty
+  ok    all
+  ok    all on empty
+  ok    contains
+  ok    count
+  ok    index_of
+  ok    index_of missing
+  ok    find
+  ok    find in an infinite list
+  ok    find_index
+  ok    starts_with
+  ok    minimum_on
+  ok    maximum_on
+  ok    minimum_on of empty
+  ok    sum
+  ok    sum of empty
+  ok    product
+  ok    minimum
+  ok    maximum
+  ok    partition
+  ok    unique
+  ok    sort
+  ok    sort is stable
+  ok    sort strings
+  ok    sort of empty
+  ok    sort on a list key
+  ok    a prefix sorts first
+  ok    sort_by descending
+  ok    to_array and back
+  ok    take from an infinite list
+  ok    map over an infinite list
+  ok    filter an infinite list
+  ok    take_while on an infinite list
+  ok    repeat is infinite
+  ok    zip stops at the shorter
+  ok    last_or
+  ok    range_step up
+  ok    range_step down
+  ok    range_step of zero
+  ok    range_step past the end
+  ok    update_at
+  ok    update_at out of range
+  ok    update_at on an infinite list
+  ok    rotate
+  ok    rotate of empty
+  ok    interleave
+  ok    interleave the shorter first
+  ok    interleave infinite lists
+  ok    dedup
+  ok    dedup of empty
+  ok    dedup an infinite list
+  ok    chunk_by
+  ok    chunk_by of empty
+  ok    chunk_by is lazy in its runs
+  ok    zip3
+  ok    none
+  ok    find_map
+  ok    find_map stops early
+  ok    is_sorted
+  ok    each! runs in order
+  ok    each_index! counts from zero
+  ok    is_sorted stops at the first descent
+  134 passed
+
+std.char
+  ok    a character's code
+  ok    and back
+  ok    a surrogate is not a character
+  ok    digits
+  ok    letters
+  ok    letters and digits
+  ok    case tests
+  ok    space
+  ok    hex digits
+  ok    upper and lower
+  ok    digit_value
+  11 passed
+
+std.str
+  ok    seq count
+  ok    seq any
+  ok    seq all
+  ok    seq contains
+  ok    seq minimum
+  ok    seq maximum
+  ok    seq describe
+  ok    bytes spell a string
+  ok    little-endian
+  ok    two's complement
+  ok    escape_bytes copies the runs between specials
+  ok    big-endian
+  ok    length
+  ok    length of empty
+  ok    byte_length
+  ok    span skips the class
+  ok    span of nothing stays put
+  ok    span off the end
+  ok    span past the end
+  ok    upto finds the delimiter
+  ok    upto with no delimiter
+  ok    upto takes any of the set
+  ok    length counts characters
+  ok    byte_length counts bytes
+  ok    is_empty
+  ok    chars
+  ok    of_chars
+  ok    of_chars round trip
+  ok    first_or
+  ok    first_or of empty
+  ok    find
+  ok    find missing
+  ok    find_from
+  ok    find_from skips a match
+  ok    contains_str
+  ok    starts_with
+  ok    starts_with fails
+  ok    ends_with
+  ok    ends_with fails
+  ok    slice
+  ok    slice clamps
+  ok    concat
+  ok    repeat
+  ok    repeat none
+  ok    join_str
+  ok    join_str of empty
+  ok    split
+  ok    split_n keeps the rest whole
+  ok    split without separator
+  ok    split on empty separator
+  ok    split round trip
+  ok    map
+  ok    filter
+  ok    reverse
+  ok    upper
+  ok    lower
+  ok    case leaves non-ASCII alone
+  ok    trim
+  ok    trim_start
+  ok    trim_end
+  ok    trim of blank
+  ok    trim of empty
+  ok    trim keeps inner multibyte text
+  ok    trim_prefix
+  ok    trim_suffix
+  ok    span_back
+  ok    find_last
+  ok    find_last_from
+  ok    lines
+  ok    lines drops a final ending
+  ok    lines of nothing
+  ok    lines of one ending
+  ok    words
+  ok    words of blank
+  ok    split_once
+  ok    split_once at the ends
+  ok    replace
+  ok    replace does not overlap
+  ok    replace nothing
+  ok    replace with a longer text
+  ok    split_last
+  ok    occurrences
+  ok    indent
+  ok    is_blank
+  ok    capitalize
+  ok    pad_start
+  ok    pad_end counts characters
+  ok    center
+  ok    truncate
+  ok    truncate counts characters
+  ok    common_prefix
+  ok    common_prefix keeps whole characters
+  ok    distance
+  ok    distance is symmetric
+  ok    distance on long strings
+  ok    wrap
+  ok    wrap keeps a long word whole
+  ok    wrap of nothing
+  ok    dedent
+  ok    dedent of flush text
+  100 passed
+
+std.error
+  ok    the runtime's own kind is readable
+  ok    a raised value is wrapped in the catch-all kind
+  ok    the payload comes back
+  ok    a kind can be matched on
+  ok    is_kind
+  ok    is_kind of something that is not an error
+  ok    is_any
+  ok    is_error
+  ok    a value is not an error
+  ok    kind of a non-error is unit
+  ok    payload of a non-error is unit
+  ok    a typed failure keeps its kind
+  ok    and its payload
+  ok    new makes one without raising it
+  ok    message of a string payload has no quotes
+  ok    message of another payload is rendered
+  ok    describe
+  ok    describe of an empty payload is just the kind
+  ok    an error never raised has no trace
+  ok    a raised one names the function it was raised in
+  ok    and the one that made the value being forced
+  ok    a place reads as a line
+  ok    a place the image does not know reads without one
+  23 passed
+
+std.num
+  ok    to and from a float
+  ok    toward zero
+  ok    a numeral
+  ok    a float numeral
+  ok    a size, as the VM reads one
+  ok    not a size
+  ok    eight bytes and back
+  ok    an integer power is exact
+  ok    a bignum to a power
+  ok    a float base is a float
+  ok    an integer to a negative power raises
+  ok    a huge exponent of 1 and -1
+  ok    a huge exponent of anything else raises
+  ok    abs
+  ok    sign
+  ok    min and max
+  ok    clamp
+  ok    div_floor
+  ok    modulo takes the divisor's sign
+  ok    div_floor and modulo agree
+  ok    even and odd
+  ok    gcd
+  ok    lcm
+  ok    bit_length
+  ok    ilog2
+  ok    ilog10
+  ok    ilog10 around powers of ten
+  ok    ilog10 refuses zero
+  ok    ilog10 refuses negative integers
+  ok    ilog10 at a large size
+  ok    ilog2 refuses zero
+  ok    isqrt
+  ok    isqrt of a bignum
+  ok    isqrt is the floor everywhere
+  ok    isqrt refuses a negative
+  ok    mod_pow
+  ok    mod_pow agrees with pow
+  ok    mod_pow refuses a zero modulus
+  ok    is_prime
+  ok    is_prime agrees with trial division
+  ok    is_prime on strong pseudoprimes
+  ok    factorial
+  ok    factorial of a bignum
+  ok    factorial refuses a negative
+  ok    binomial
+  ok    binomial is a row of Pascal's triangle
+  ok    digits
+  ok    ceil
+  ok    round
+  ok    to_base
+  ok    to_base of a bignum
+  ok    to_base refuses base 1
+  ok    hex pads
+  ok    padded digits in any base
+  ok    parse_base
+  ok    parse_base round trip
+  56 passed
+
+std.console
+  ok    format values, escapes, Unicode, and empty templates
+  ok    format errors keep missing and extra values visible
+  ok    confirmation normalizes text and honors the empty-line default
+  ok    nested styles restore their outer style
+  ok    plain styles and rendered pieces
+  5 passed
+
+std.debug
+  ok    a duration reads in the unit that suits it
+  ok    bytes read in the unit that suits them
+  ok    a count is grouped in threes
+  ok    a negative count keeps its sign
+  ok    a reading of nothing is a reading of nothing
+  ok    time only goes forwards
+  ok    allocating shows up as allocation
+  ok    measuring hands back what it measured
+  ok    a trace returns its value unchanged
+  9 passed
+
+std.proc
+  ok    parallel! answers in order
+  ok    map! is a map
+  ok    map_limit! answers in order however they finish
+  ok    map_limit! runs no more than it is allowed
+  ok    map_limit! of nothing
+  ok    map_limit! below one runs one at a time
+  ok    map_limit! forces the answers where they are made
+  ok    map_limit! raises the first failure
+  ok    map_reporting! counts every finish, in the caller
+  ok    outcome! of a value
+  ok    outcome! of a failure is a value, not a raise
+  ok    try_map! keeps going past a failure
+  ok    call! gets an answer back
+  ok    a server stops when it is told to
+  ok    recv_where! leaves what it skips, in order
+  ok    recv_within! times out
+  ok    recv_within! answers a message that is there
+  ok    recv_where_within! waits for a late message
+  ok    kill! stops a loop that reads nothing
+  ok    monitor! reports how a process ended
+  ok    demonitor! takes back a report already sent
+  ok    call! raises when the target dies first
+  ok    call_within! times out on a target that never answers
+  ok    a reply after a timeout is not the next call's answer
+  ok    kill! reaches a force that never ends, through a try!
+  ok    call! keeps messages that are not the reply
+  ok    a server keeps its state between messages
+  27 passed
+
+std.map
+  ok    empty has nothing
+  ok    from_pairs
+  ok    a later pair wins
+  ok    a missing key answers the default
+  ok    size
+  ok    is_empty
+  ok    sorted_keys
+  ok    values follow the sorted keys
+  ok    put leaves the original alone
+  ok    remove
+  ok    update an existing key
+  ok    update a missing key starts from the default
+  ok    put_strict forces the value
+  ok    put leaves the value suspended
+  ok    update_strict forces what f answers
+  ok    update_strict
+  ok    upsert stores the first value as given
+  ok    put_new keeps the first
+  ok    map_values
+  ok    filter
+  ok    fold sums the values
+  ok    merge, the second winning
+  ok    without
+  ok    a set remembers members
+  ok    a set has no others
+  ok    add
+  ok    a pipe of puts
+  ok    members
+  ok    intersect
+  ok    sorted_pairs
+  ok    group_by keeps order
+  ok    group_by of nothing
+  ok    from_keys
+  ok    count_by
+  ok    index_by, the later winning
+  35 passed
+
+std.supervisor
+  ok    a supervisor starts its children
+  ok    a child that dies is restarted
+  ok    a temporary child is not restarted
+  ok    a watcher is told when a child goes down
+  ok    a permanent child that returns is restarted until the limit
+  ok    restarting too often stops the supervisor
+  ok    which! reports the running children
+  ok    a child that ignores shutdown is killed
+  ok    stop! takes the children down with it
+  ok    one_for_one affects only the one
+  ok    one_for_all affects everything
+  ok    rest_for_one affects it and what follows
+  ok    a transient child is restarted only when it fails
+  ok    a permanent child is restarted either way
+  ok    the window drops old restarts
+  15 passed
+
+std.agent
+  ok    an agent holds what it was started with
+  ok    update! changes it
+  ok    get! computes in the agent
+  ok    a call that times out does not answer the next one
+  ok    get_and_update! answers the old and keeps the new
+  ok    send_update! arrives, in order, from one sender
+  ok    stop! answers the final value
+  ok    an unknown request is refused rather than ignored
+  ok    a cast it does not understand leaves it alone
+  ok    a raw send! reaches handle_info!, which ignores it
+  ok    two callers each get their own answer
+  ok    answer! runs a request with no mailbox
+  ok    answer! reads too
+  ok    timed_call! answers the value and a duration
+  ok    an agent is a supervisor child
+  ok    a call keeps a message that is not its reply
+  ok    and keeps several, in order
+  ok    a server can call another server
+  ok    server_name
+  19 passed
+
+std.array
+  ok    seq sum
+  ok    seq sum of empty
+  ok    seq product
+  ok    seq count
+  ok    seq any
+  ok    seq any misses
+  ok    seq all
+  ok    seq all fails
+  ok    seq contains
+  ok    seq minimum
+  ok    seq maximum
+  ok    seq extremes of empty
+  ok    seq minimum_by
+  ok    seq join
+  ok    seq join of empty
+  ok    seq describe
+  ok    length
+  ok    length of empty
+  ok    is_empty
+  ok    get
+  ok    get_or in range
+  ok    get_or past end
+  ok    get_or negative
+  ok    first_or
+  ok    last_or
+  ok    last_or of empty
+  ok    new
+  ok    of_list
+  ok    to_list
+  ok    build
+  ok    build of zero
+  ok    set copies
+  ok    map
+  ok    filter
+  ok    reverse
+  ok    sort
+  ok    sort_by
+  ok    append
+  ok    slice
+  39 passed
+
+std.atom
+  ok    an atom the program names
+  ok    one it never names
+  ok    a name is the atom without its colon
+  ok    underscores and digits are part of the name
+  ok    a name finds its atom again
+  5 passed
+
+std.result
+  ok    is_ok
+  ok    is_error
+  ok    tag
+  ok    unwrap_or takes the value
+  ok    unwrap_or takes the default
+  ok    unwrap_or_else
+  ok    reason
+  ok    to_option
+  ok    map
+  ok    map leaves an error
+  ok    map_error
+  ok    and_then chains
+  ok    and_then stops at the first error
+  ok    or_else recovers
+  ok    otherwise
+  ok    a chain through |>
+  ok    flatten
+  ok    both
+  ok    all, every one ok
+  ok    all, the first error wins
+  ok    all of nothing
+  ok    oks
+  ok    errors
+  ok    unwrap! raises the reason
+  ok    unwrap! answers the value
+  ok    Option.of
+  ok    Option.or_unit
+  ok    Option.map
+  ok    Option.and_then
+  ok    Option.filter
+  ok    Option.unwrap_or
+  ok    Option.ok_or
+  ok    Option.flatten
+  ok    Option.all
+  ok    Option.values
+  ok    Option.contains
+  ok    Option.unwrap! raises
+  ok    let? chains options
+  ok    let? .. else answers the alternative
+  ok    let? takes a pattern
+  ok    validate_ok keeps an error
+  ok    ok_as
+  ok    the short spellings
+  43 passed
+
+std.wire
+  ok    tensor wire bytes match the reference writer
+  ok    malformed tensor shapes and payloads are refused
+  ok    unit
+  ok    true
+  ok    false
+  ok    integer
+  ok    zero
+  ok    negative
+  ok    float
+  ok    negative float
+  ok    string
+  ok    empty string
+  ok    atom
+  ok    char
+  ok    list
+  ok    empty list
+  ok    array
+  ok    map
+  ok    empty map
+  ok    an array does not come back a list
+  ok    an atom does not come back a string
+  ok    an integer does not come back a float
+  ok    a float that is whole stays a float
+  ok    nested list
+  ok    map of lists
+  ok    list of maps
+  ok    map with mixed keys
+  ok    a map value keeps its kind
+  ok    the largest fixnum
+  ok    the smallest fixnum
+  ok    past a fixnum, inside eight bytes
+  ok    eight bytes, and no more, up to 2^63
+  ok    a bignum
+  ok    a byte boundary
+  ok    a word boundary
+  ok    minus one
+  ok    a string with a newline
+  ok    a string with a quote
+  ok    a string of non-ascii
+  ok    empty input
+  ok    an unknown tag
+  ok    a truncated integer
+  ok    a truncated string
+  ok    a truncated list
+  ok    trailing bytes
+  ok    a truncated bignum
+  ok    a name this program has no atom for
+  ok    the VM writes what the walk above writes
+  ok    and reads what the reader above reads
+  ok    and refuses what it refuses
+  ok    decode_or on a bad message
+  ok    decode_or on a good one
+  ok    a frame is longer than its body
+  ok    one frame
+  ok    a frame leaves nothing over
+  ok    half a frame is not an answer
+  ok    half a body is not an answer either
+  ok    two frames come back in order
+  ok    a partial frame is left for later
+  ok    a frame whose body is nonsense still says where the next one starts
+  ok    nothing at all frames to nothing
+  ok    frame_all of nothing is nothing
+  ok    format_name
+  63 passed
+
+std.binary.tests
+  ok    unsigned integer byte order
+  ok    signed integer two's complement
+  ok    integer boundaries through 128 bits
+  ok    overflow never truncates
+  ok    width and order are checked
+  ok    whole decoding requires whole input
+  ok    raw bytes and byte reversal preserve invalid UTF8
+  ok    fixed bytes require exact lengths
+  ok    readers support checkpoints and bounded ranges
+  ok    range checks include negative offsets
+  ok    a prefix reader points to the next value
+  FAIL  builders are reusable values
+          <error :loop value depends on itself>
+            in `<thunk>` (binary/tests.dr:67:13)
+            forcing a value made in `<thunk>` (binary/tests.dr:67:13)
+            in `finish` (binary/mod.dr:94:1)
+            forcing a value made in `<thunk>` (binary/tests.dr:67:13)
+            in `<thunk>` (binary/tests.dr:67:13)
+            forcing a value made in `<thunk>` (binary/tests.dr:67:13)
+  ok    patch preserves the surrounding bytes
+  ok    patch cannot extend a destination
+  ok    varint published examples
+  ok    varints span the full unsigned range
+  ok    varints support wider caller-selected bounds
+  ok    varints reject redundant, truncated and overflowing spellings
+  ok    ZigZag signed boundaries
+  ok    IEEE float vectors
+  FAIL  IEEE signed zero is preserved
+          <error :loop value depends on itself>
+            in `<thunk>` (binary/tests.dr:94:13)
+            forcing a value made in `<thunk>` (binary/tests.dr:94:13)
+            in `to_bits` (binary/ieee.dr:23:1)
+            forcing a value made in `<lambda>` (binary/mod.dr:192:6)
+            in `<lambda>` (binary/mod.dr:192:6)
+            forcing a value made in `encode` (binary/mod.dr:112:1)
+  ok    binary16 smallest subnormal
+  ok    binary16 rounds ties to even
+  ok    binary16 overflow rounds to infinity
+  ok    bit fields cross byte boundaries
+  ok    least significant value bit first is explicit
+  ok    unfilled final bytes are errors
+  ok    byte fields cannot silently align
+  ok    reserved padding bits must match
+  ok    bit errors locate the exact bit
+  ok    records share one layout for both directions
+  ok    record writer refuses missing and extra keys
+  ok    record error paths agree in both directions
+  ok    record constants and padding need no placeholder values
+  ok    duplicate field names are invalid
+  ok    nested paths include sequence indices
+  ok    vector enforces its limit before reading its body
+  ok    vector bounds even an infinite input list
+  ok    bounded list round trip
+  ok    sized sections enforce exact consumption
+  ok    section errors preserve absolute offsets
+  ok    section alignment is relative to the section
+  ok    sections cannot consume the next field
+  ok    bounded strings include zero bytes
+  ok    terminated fields round trip
+  ok    terminated fields reject missing and embedded terminators
+  ok    overlapping delimiters cannot change the decoded value
+  ok    tagged variants are explicit
+  ok    unknown variant tags are failures
+  ok    dependent layouts inspect a header
+  ok    constraints run both ways
+  ok    boolean bytes reject noncanonical truth
+  ok    layouts execute at compile time
+  ok    wire framing remains compatible
+  ok    a binary layout can describe existing wire framing
+  ok    signed LEB128 vectors and boundaries
+  ok    signed LEB128 rejects redundant sign extension and overflow
+  ok    word wrapping is explicit
+  ok    rotations wrap counts and width
+  ok    bit extraction and insertion preserve neighboring bits
+  ok    word counts and bit reversal
+  ok    word operations validate widths before shifts
+  ok    checksummed layouts verify their exact body
+  ok    corruption is a checksum error
+  ok    IO assembles short reads and reports truncated input
+  ok    IO refuses callbacks that over-read or make no write progress
+  ok    IO writes all short chunks and validates before writing
+  65 passed, 2 FAILED
+
+std.build
+  ok    a name for the target's shared library
+  ok    a bare string is a file
+  ok    encoding does not depend on the order a map was built in
+  ok    encoding tells a string from the text of another value
+  ok    a function is not data
+  ok    the shape ignores the name and follows the config
+  ok    the shape follows the step an artifact comes from
+  ok    contributions chain
+  ok    two payloads under one name are a conflict
+  ok    the same payload twice is not
+  ok    targets meet
+  ok    writing is keyed on the text
+  12 passed
+
+std.build.cc
+  ok    a source's settings are the target's, its public ones, what it uses, and its own
+  ok    a user of a library gets its public settings and not its private ones
+  ok    files are named for where they run
+  ok    a DLL is linked through its import library
+  ok    an object is named by its source, so every step agrees on it
+  ok    a selector is a family or one compiler
+  ok    a standard belongs to one language
+  7 passed
+
+std.macros
+  ok    when_true takes its body only when true
+  ok    unless skips its body when true
+  ok    and_all short circuits
+  ok    or_any short circuits
+  ok    empty boolean chains have their identities
+  ok    single boolean chains still produce booleans
+  ok    cond picks the first successful branch
+  ok    cond falls back, including for no branches
+  ok    coalesce distinguishes absence from false, zero and empty
+  ok    coalesce evaluates a present expression once
+  ok    if_some binds only in the present branch
+  ok    with_some preserves absence and shares its binding
+  ok    with_ok binds a success
+  ok    with_ok propagates an error without evaluating its body
+  ok    result bindings compose with distinct lexical scopes
+  ok    pipe preserves argument-last pipeline order
+  ok    an empty pipe is the original expression
+  ok    update works on lists, arrays and maps
+  ok    update shares collection and key and leaves the input unchanged
+  ok    an update does not force its replacement too early
+  ok    between includes both endpoints
+  ok    between shares the value and skips the unused upper bound
+  ok    clamp covers below, within, and above the range
+  ok    clamp shares bounds and skips the unused upper bound
+  ok    assert does not evaluate the message on success
+  ok    assert raises exactly its supplied message
+  ok    attempt returns a success result
+  ok    attempt catches errors deferred inside a collection
+  ok    attempt evaluates and shares an effectful expression once
+  ok    tap observes once and returns the original value
+  ok    tap evaluates even a pure observer
+  ok    tap only forces the observer result to weak head normal form
+  ok    nested generated temporaries do not capture caller bindings
+  ok    fresh names avoid names in syntax supplied by another macro
+  34 passed
+
+std.path
+  ok    posix: a path is absolute when it starts at the root
+  ok    posix: exactly two leading slashes are their own root
+  ok    posix: a backslash is part of a name
+  ok    posix: segments drop empties and dots, keep ..
+  ok    posix: dirname follows libgen
+  ok    posix: basename follows libgen
+  ok    posix: join drops an empty or dot side
+  ok    posix: join does not normalise, and an absolute right side wins
+  ok    posix: extensions follow splitext
+  ok    posix: drop_extension keeps dots that are not an extension
+  ok    posix: with_extension and stem
+  ok    posix: normalize folds . and .. as normpath does
+  ok    posix: relative_to answers in segments
+  ok    posix: relative walks up and down
+  ok    posix: relative cannot climb back out of a ..
+  ok    posix: names compare by case
+  ok    windows: the anchor of each kind of path
+  ok    windows: absolute takes a drive and a root, or a share
+  ok    windows: backslashes are separators
+  ok    windows: dirname and basename stop at the anchor
+  ok    windows: join follows ntpath
+  ok    windows: extensions stop at the drive
+  ok    windows: normalize keeps the drive and drops .. at a root
+  ok    windows: names and drives compare without case
+  ok    the default family is the running system's
+  ok    absolute! anchors at the working directory
+  ok    relative! reads both against the working directory
+  ok    same_file! sees through spelling
+  ok    a quoted tilde is the home directory
+  29 passed
+
+std.build.cc.gnu
+  ok    a C++ source of a shared library, with GCC
+  ok    Clang leaves out what only GCC takes
+  ok    a C source is compiled as C, and a C++ standard does not reach it
+  ok    one source's own settings come last
+  ok    a shared library on Linux names itself
+  ok    on macOS it is found through the run path
+  ok    an executable gets its libraries, what they need, and a run path
+  ok    MinGW links Windows' libraries and leaves an import library
+  ok    a static library is archived
+  ok    what MinGW cannot do is said before anything runs
+  10 passed
+
+std.build.cc.msvc
+  ok    the same target as GCC compiles it, in MSVC's words
+  ok    a C source gets no C++ exception model
+  ok    a DLL leaves an import library and exports through its .def
+  ok    an executable links the import library of what it uses
+  ok    a static library is made by lib.exe
+  ok    headers are taken out of what cl prints, whatever its language
+  ok    a .def exports what the objects define, functions and data
+  ok    what MSVC cannot do is said before anything runs
+  8 passed
+
+std.build.cc.cmake
+  ok    each compiler gets what cc would have given it, and alike ones share
+  ok    what CMake has words for is said in them
+  ok    optimization is left to the build type
+  ok    paths are placed from the file's directory
+  ok    an executable named like a library gives way, and keeps its file name
+  ok    one source's own settings are its own
+  6 passed
+
+std.build.cc.steps
+  ok    files are laid out as they will be installed
+  ok    a program carries the shared libraries it uses
+  ok    two programs compiling one file alike share the object
+  ok    but not when its settings differ
+  ok    a program using a shared library finds it by a run path
+  ok    the C compiler that goes with a C++ one
+  ok    the compilers are the context's, or the platform's
+  ok    a toolchain is what its compiler says it is
+  ok    a GNU compile runs in the package and writes into the step
+  ok    what cl printed becomes a depfile
+  10 passed
+
+std.build.check
+  ok    a check reads what its arguments and its variables name
+  ok    it runs from the package, and what it only reads is not an argument
+  ok    the key follows the arguments
+  3 passed
+
+std.build.command
+  ok    inputs and outputs come from the argument list
+  ok    an artifact is an input
+  ok    the key follows the program and the arguments
+  3 passed
+
+std.build.dream
+  ok    an image compiler is run by the VM, and both are inputs
+  ok    the compiler compiled by itself is another step
+  ok    an image is told from a program by its name
+  ok    the compile runs in the package and names what it read
+  4 passed
+
+std.build.fetch
+  ok    a fetch is keyed by its pin, not its URL
+  1 passed
+
+std.build.probe
+  ok    a probe asks one question and never fails
+  ok    llvm's answers are one record, or none
+  ok    LLVM headers without linkable libraries are not an LLVM answer
+  ok    static and shared LLVM questions have different keys
+  ok    two questions are two steps
+  5 passed
+
+std.file
+  ok    the parent of a path
+  ok    a directory's entries are paths under it
+  ok    a file written is the file read
+  3 passed
+
+std.progress
+  ok    an empty bar
+  ok    half way
+  ok    full has no arrow
+  ok    past the end is the end
+  ok    a note follows
+  ok    a long note is cut to the width
+  ok    no room, no note
+  ok    nothing to count is complete
+  ok    join_all! answers in order
+  ok    join_all! of nothing
+  ok    an unlabelled bar
+  11 passed
+
+std.build.run
+  ok    a run builds everything once, and a second builds nothing
+  ok    a changed discovered input runs its step again, and what reads it
+  ok    the questions a step can ask never fail, and verify can
+  ok    transform writes a pure function of some files as another
+  ok    a test run builds what its checks read, runs each, and goes on past a failure
+  ok    a goal is made and placed
+  ok    a make rule's prerequisites, continued and escaped
+  ok    a failure says where the two texts part
+  8 passed
+
+std.cli
+  ok    a long flag is set
+  ok    a short flag is set
+  ok    an absent flag is not set
+  ok    an option with no short form still parses long
+  ok    a flag given a value is refused
+  ok    a value follows its option
+  ok    a value may be attached to the long form
+  ok    a value may be attached to the short form
+  ok    the last value wins
+  ok    an empty value is a value, not a mistake
+  ok    a list option collects
+  ok    a list option is empty when never given
+  ok    positionals keep their order
+  ok    `--` ends the options
+  ok    a bare dash is a positional
+  ok    an unknown long option is named
+  ok    an unknown short option is named
+  ok    an option that runs out of line says what it wanted
+  ok    a long option that runs out of line says so too
+  ok    a choices option accepts a member
+  ok    a choices option refuses a stranger, naming it
+  ok    a choice may come attached
+  ok    an absent option reads its default
+  ok    a written value beats the default
+  ok    the default shows in the help
+  ok    a missing required option is named
+  ok    writing a required option satisfies it
+  ok    the help marks a required option
+  ok    a count option counts its repeats
+  ok    a count option counts the long form
+  ok    a count option accepts the attached short form
+  ok    a count option reads zero when never given
+  ok    a toggle reads true when spelled on
+  ok    a toggle reads false when spelled off
+  ok    a toggle's short form spells on
+  ok    a toggle given a value is refused
+  ok    negating a plain flag is unknown
+  ok    a subcommand parses its own options
+  ok    a subcommand's rest is the rest
+  ok    global options before the command still parse
+  ok    global options after the command still parse
+  ok    the chosen command is recorded
+  ok    an unknown command is named
+  ok    no command chooses nothing, for the tool to say
+  ok    an unknown option before the command is named
+  ok    a command's choices still apply
+  ok    usage shows both spellings and the value's name
+  ok    usage indents an option with no short form to line up
+  ok    a section becomes a heading
+  ok    usage spells a toggle's negation
+  ok    usage lists the choices
+  ok    usage shows the commands
+  ok    a shell word is quoted only when it must be
+  ok    shell_quote always quotes
+  ok    a command line reads back as its words
+  55 passed
+
+std.foreign
+  ok    a field waits for its alignment, and the whole is padded to the widest
+  ok    fields keep the order they were written in
+  ok    small fields pack together
+  ok    an empty struct is empty
+  ok    a library is searched for under every name its platform gives it
+  ok    and in the directories its package managers use
+  ok    C's own names are the platform's widths
+  7 passed
+
+std.json
+  ok    a struct is its fields
+  ok    a variant is its tag and fields, or its tag
+  ok    integer
+  ok    negative
+  ok    float
+  ok    exponent
+  ok    true
+  ok    false
+  ok    null is unit
+  ok    string
+  ok    escaped newline
+  ok    escaped quote
+  ok    escaped solidus
+  ok    unicode escape
+  ok    non-ascii escape
+  ok    surrogate pair
+  ok    lone high surrogate
+  ok    high then not low
+  ok    lone low surrogate
+  ok    empty array
+  ok    array
+  ok    nested array
+  ok    mixed array
+  ok    empty object
+  ok    object member
+  ok    two members
+  ok    nested object
+  ok    leading space
+  ok    spaces everywhere
+  ok    newlines
+  ok    unquoted key
+  ok    trailing comma
+  ok    unclosed
+  ok    trailing text
+  ok    empty input
+  ok    bare word
+  ok    parse_or
+  ok    write integer
+  ok    write null
+  ok    write bool
+  ok    write string
+  ok    write escapes
+  ok    write control
+  ok    write array
+  ok    write empty
+  ok    write atom drops the colon
+  ok    write object
+  ok    round trip array
+  ok    round trip quotes
+  ok    round trip object
+  ok    pretty round trips
+  ok    an object's members are ordered
+  ok    and indented output agrees about the order
+  ok    encode is write under the name every codec answers to
+  ok    decode is parse under that name
+  ok    decode_or
+  ok    format_name
+  ok    a framed message comes back
+  ok    two framed messages come back in order
+  ok    half a message is not an answer
+  ok    a list round trips
+  ok    a string round trips
+  ok    an atom does not
+  ok    an array comes back a list
+  64 passed
+
+std.time.calendar
+  ok    the epoch is day 0
+  ok    and back
+  ok    the day before the epoch
+  ok    a leap day
+  ok    far in the past
+  ok    a known day number
+  ok    every day of 400 years round-trips
+  ok    floor division
+  ok    leap years
+  ok    month lengths
+  ok    the epoch was a Thursday
+  ok    2025-10-04 is a Saturday
+  ok    day of year
+  ok    second Sunday in March 2025
+  ok    last Sunday in October 2025
+  ok    ISO weeks at the edges of a year
+  16 passed
+
+std.time.zone
+  ok    a rule parses
+  ok    winter in Denver
+  ok    summer in Denver
+  ok    the change is at 2am local
+  ok    the southern hemisphere
+  ok    a rule with no daylight time
+  ok    a quoted name
+  ok    abbreviations
+  ok    nonsense is refused
+  ok    UTC needs no database
+  ok    paths are not names
+  ok    a fixed zone
+  ok    a skipped local time moves forward
+  ok    a repeated local time takes the first
+  ok    an ordinary local time
+  15 passed
+
+std.time
+  ok    durations add
+  ok    fractional constructors
+  ok    whole units
+  ok    format a duration
+  ok    parse a duration
+  ok    a duration round-trips
+  ok    a bad unit is said
+  ok    rounding
+  ok    humanize
+  ok    relative
+  ok    an instant in UTC
+  ok    and back
+  ok    before the epoch
+  ok    fields carry
+  ok    an offset
+  ok    a rule zone in summer
+  ok    a rule zone in winter
+  ok    localize finds the offset
+  ok    a day across the change keeps the clock
+  ok    weekdays
+  ok    add months clamps
+  ok    months between
+  ok    days between
+  ok    truncate
+  ok    comparisons across offsets
+  ok    RFC 3339
+  ok    an HTTP date
+  ok    strftime
+  ok    composites and escapes
+  ok    parse a pattern
+  ok    parse names and 12 hours
+  ok    parse refuses a bad day
+  ok    parse says what it wanted
+  ok    format and parse agree
+  ok    epoch seconds
+  ok    RFC 3339 parses
+  ok    ISO's other forms
+  ok    no offset, no instant
+  ok    a local time in a zone
+  ok    HTTP dates, all three forms
+  ok    a zone from a rule
+  ok    the clock is after 2025
+  ok    measure forces what it times
+  ok    sleep sleeps
+  ok    within, in time
+  ok    within, too slow
+  ok    a real zone, when the machine has one
+  ok    the far future uses the zone's rule
+  48 passed
+
+std.http.url
+  ok    the parts
+  ok    written out again
+  ok    default ports
+  ok    the request target
+  ok    the Host header
+  ok    IPv6
+  ok    a bad port
+  ok    a mailto
+  ok    query pairs
+  ok    query map
+  ok    encode a query
+  ok    a query round-trips
+  ok    add to a query
+  ok    percent-encoding
+  ok    decoding
+  ok    resolving, as the RFC's examples do
+  ok    dots past the root
+  17 passed
+
+std.http.hpack
+  ok    integers, as the RFC's examples have them
+  ok    and back
+  ok    the Huffman tree has every symbol
+  ok    a Huffman string, from the RFC
+  ok    bad padding is refused
+  ok    blocks a real encoder made, in order, through the dynamic table
+  ok    what this encodes decodes
+  ok    static hits are one byte
+  ok    the table evicts its oldest
+  ok    an index past the tables
+  10 passed
+
+std.http.h2
+  ok    a frame's header
+  ok    padding and priority come off
+  ok    a request from its headers
+  ok    connection headers are left out
+  4 passed
+
+std.http
+  ok    headers are case-insensitive
+  ok    with_header replaces
+  ok    line breaks are taken out of values
+  ok    content type without parameters
+  ok    a JSON response
+  ok    a redirect
+  ok    a cookie
+  ok    reading cookies
+  ok    a request with JSON and a query
+  ok    basic auth
+  ok    a form body
+  ok    encode a request
+  ok    encode a response
+  ok    a HEAD response keeps its length but not its body
+  ok    no length where there can be no body
+  ok    canonical names
+  ok    expect_ok
+  ok    reasons
+  ok    a bad URL is an error
+  ok    a refused connection is an error
+  20 passed
+
+std.log
+  ok    a text line
+  ok    colour paints the level
+  ok    logfmt
+  ok    JSON
+  ok    an error field is described
+  ok    a custom format
+  ok    timestamps in a zone
+  ok    the spec
+  ok    filters by name
+  ok    names nest
+  ok    below the level is dropped
+  ok    context and event fields merge
+  ok    suppressed fields are never computed
+  ok    timed logs the duration and answers the value
+  ok    timed logs a failure and raises it
+  ok    a function sink gets the line
+  ok    levels
+  17 passed
+
+std.http.server
+  ok    routing and params
+  ok    404 and 405
+  ok    HEAD falls back to GET
+  ok    a raising handler is a 500
+  ok    a string is text
+  ok    cors answers a preflight
+  ok    basic auth
+  ok    mime types
+  ok    a real exchange
+  ok    a JSON round trip
+  ok    keep-alive answers two requests on one connection
+  ok    a chunked request body
+  ok    a malformed request is a 400
+  ok    an oversized body is a 413
+  ok    HTTP/1.0 closes by default
+  ok    an idle connection is closed
+  ok    redirects are followed
+  ok    too many redirects
+  ok    a client timeout
+  ok    a streamed response arrives whole, chunked
+  ok    a stream made by a function, with effects
+  ok    server-sent events
+  ok    a streamed upload
+  ok    a request body streamed to the handler
+  ok    a handler that ignores a streamed body leaves the connection usable
+  ok    download! writes a file a piece at a time
+  ok    a client reuses its connection
+  ok    a client's base URL and headers
+  ok    a pooled connection the server closed is replaced
+  ok    HTTP/2: a request and its answer
+  ok    HTTP/2: bodies past the flow-control window, both ways
+  ok    HTTP/2: streams out and in
+  ok    HTTP/2: many requests at once over one connection
+  ok    static files, and nothing outside them
+  34 passed
+
+std.http.websocket
+  ok    the accept key, as the RFC's example has it
+  ok    masking is its own inverse
+  ok    frame lengths
+  ok    echo, text and binary, small and large
+  ok    the server's close reaches the client
+  ok    a subprotocol is agreed
+  ok    a plain request is refused
+  ok    recv_within times out
+  ok    a handshake refused
+  9 passed
+
+std.image
+  ok    an image is described as data, so a declaration's `from` is a value
+  1 passed
+
+std.lazy
+  ok    a settled value is forced all the way down
+  ok    a long list nothing else has forced is forced
+  ok    what forcing raises is raised
+  ok    forced reaches the outside and no further
+  ok    forced raises what the outside raises
+  5 passed
+
+std.ml.ops
+  ok    softmax rows sum to one
+  ok    softmax does not overflow
+  ok    softmax of a vector
+  ok    log_softmax is the log of softmax
+  ok    logsumexp of a large row
+  ok    mean and variance along an axis
+  ok    where chooses
+  ok    clip
+  ok    a permutation has every position once
+  ok    flatten
+  10 passed
+
+std.ml.tree
+  ok    size counts numbers and skips settings
+  ok    a record is a branch, and comes back the record it was
+  ok    a record's fields are walked by position
+  ok    map2 rebuilds a record from two
+  ok    at reaches into a record
+  ok    map_numeric leaves a setting alone
+  ok    map2 pairs leaves
+  ok    map3 sees three trees
+  ok    leaves in a fixed order
+  ok    paths reach what at reads
+  ok    paths name the keys
+  ok    norm
+  ok    an autodiff variable is a leaf
+  ok    zeros_like
+  14 passed
+
+std.ml.ad
+  ok    a constant is not a variable
+  ok    value_and_grad of a sum
+  ok    tensor sum accepts a scalar backward seed
+  ok    the gradient of x * x is 2x
+  ok    a node used twice gets both gradients
+  ok    an unused parameter has zeros
+  ok    a dense layer
+  ok    the activations
+  ok    exp, log, sqrt, pow, abs
+  ok    division and subtraction with broadcasting
+  ok    softmax
+  ok    log_softmax and logsumexp
+  ok    sum_axis and max_axis along each axis
+  ok    a middle axis
+  ok    take, slice, concat
+  ok    reshape, transpose, repeat
+  ok    matrix by vector and vector by matrix
+  ok    im2col, through a convolution
+  ok    the gradient of im2col with a stride
+  ok    max along a middle axis
+  ok    a batch of products
+  ok    a batch by one matrix
+  ok    permute
+  ok    normalize
+  ok    maximum, minimum, clip
+  ok    scalars
+  ok    a function of a number
+  27 passed
+
+std.ml.data
+  ok    size
+  ok    rows keep x and y together
+  ok    batches cover everything
+  ok    a shuffle keeps the pairs
+  ok    split
+  ok    folds hold out everything once
+  ok    standard scaling
+  ok    unscale undoes scale
+  ok    minmax reaches 0 and 1
+  ok    csv with a header
+  ok    a bad field names its line
+  ok    csv rows to a dataset
+  ok    spirals
+  ok    blobs
+  ok    one-hot targets
+  15 passed
+
+std.ml.init
+  ok    fans of a matrix
+  ok    fans of a kernel
+  ok    glorot stays inside its limit
+  ok    he normal has the right spread
+  ok    the same seed, the same weights
+  ok    orthogonal columns
+  ok    truncated normal stays inside
+  ok    derived seeds differ
+  8 passed
+
+std.ml.loss
+  ok    mse keeps scalar values and gradients
+  ok    device losses agree in value and gradient
+  ok    mse
+  ok    mae of a list target
+  ok    cross entropy of classes equals one-hot rows
+  ok    cross entropy against the definition
+  ok    cross entropy's gradient
+  ok    smoothed cross entropy's gradient
+  ok    binary cross entropy's gradient
+  ok    huber's gradient
+  ok    nll of log_softmax is cross entropy
+  ok    hinge
+  ok    a loss by name
+  13 passed
+
+std.ml.metrics
+  ok    accuracy of classes
+  ok    accuracy of one-hot rows
+  ok    accuracy of a list
+  ok    top 2
+  ok    binary accuracy of a column
+  ok    logits at zero
+  ok    confusion counts
+  ok    precision, recall, f1
+  ok    r2 of a perfect fit
+  ok    r2 of the mean
+  ok    rmse
+  11 passed
+
+std.ml.nn
+  ok    shapes are inferred
+  ok    a prediction
+  ok    parameters are a list of maps
+  ok    dropout is off while predicting
+  ok    dropout zeroes while training
+  ok    gradients reach every parameter
+  ok    a dense layer over a sequence
+  ok    embedding
+  ok    batch norm updates state and freezes it for inference
+  ok    batch norm gradients through nested stateful layers
+  ok    layer norm
+  ok    residual keeps the shape
+  ok    a function layer
+  ok    a convolution keeps a :same size
+  ok    a strided valid convolution
+  ok    max pooling
+  ok    average pooling
+  ok    global average pooling
+  ok    a convolutional network's gradient
+  ok    attention keeps the shape
+  ok    causal attention ignores the future
+  ok    a transformer's gradient
+  ok    recurrent shapes
+  ok    the recurrent layers' gradients
+  ok    summary counts parameters
+  25 passed
+
+std.ml.optim
+  ok    sgd
+  ok    momentum
+  ok    nesterov
+  ok    adam
+  ok    adamw
+  ok    rmsprop
+  ok    adagrad
+  ok    clipped
+  ok    a tree of parameters
+  ok    the first step of adam moves by the rate
+  ok    cosine ends at its floor
+  ok    cosine is half way at half way
+  ok    warmup rises
+  ok    step decay
+  ok    a schedule as the rate
+  15 passed
+
+std.ml
+  ok    fixed
+  ok    a saved tree reads back
+  ok    fit retains batch norm state for prediction and resuming
+  ok    auto picks the host for a small model
+  4 passed
+
+std.payload
+  ok    an image built for tests carries none
+  ok    nothing is found by a name it does not carry
+  2 passed
+
+std.parse
+  ok    a pipeline
+  ok    a pipeline's error
+  ok    precedence
+  ok    left associativity
+  ok    right associativity
+  ok    prefix and parentheses
+  ok    where an error is
+  ok    what was expected there
+  ok    the end is required
+  ok    explain draws a caret
+  ok    JSON
+  ok    unicode is read as characters
+  ok    columns count characters
+  ok    keywords are whole words
+  ok    many cannot loop
+  ok    label names what failed
+  ok    where_ok checks a value
+  ok    try_map reports a message
+  ok    until and capture
+  ok    many_till
+  ok    numbers
+  ok    a quoted string's escapes
+  ok    an unclosed string
+  ok    lines and columns
+  ok    spanned
+  ok    postfix
+  26 passed
+
+std.random
+  ok    a seed is a stream
+  ok    different seeds differ
+  ok    the reference stream
+  ok    a die lands on every face, fairly
+  ok    int covers its ends
+  ok    an empty range is its end
+  ok    a range past a word
+  ok    floats stay in [0, 1)
+  ok    floats average a half
+  ok    normals have their moments
+  ok    exponentials have their mean
+  ok    the logarithm
+  ok    a shuffle keeps everything
+  ok    a shuffle moves things
+  ok    shuffles are uniform
+  ok    a sample is distinct
+  ok    pick from a string
+  ok    weights are honoured
+  ok    bytes are bytes
+  ok    a UUID's version and variant
+  ok    split streams differ
+  ok    a tape replays
+  ok    zeros make the simplest value
+  ok    combinators
+  ok    such_that filters
+  ok    recursive generators end
+  ok    lists average seven
+  ok    secure ints are in range
+  ok    secure ints reach both ends
+  ok    secure floats
+  ok    tokens are URL-safe
+  ok    secure UUIDs differ
+  ok    hex
+  ok    draw! runs a generator
+  ok    new! seeds differ
+  35 passed
+
+std.property
+  ok    reversing twice changes nothing
+  ok    sorting is idempotent
+  ok    a false claim shrinks to the boundary
+  ok    a list shrinks to one element
+  ok    an assertion's message is kept
+  ok    a mapped generator shrinks through the map
+  ok    the seed is in the report
+  ok    a broken generator is said to be
+  ok    examples
+  9 passed
+
+std.regex
+  ok    literals
+  ok    dot and classes
+  ok    greedy and lazy
+  ok    leftmost-first alternation
+  ok    counted repetition
+  ok    anchors
+  ok    word boundaries
+  ok    ignore case
+  ok    scoped flags
+  ok    dot and newlines
+  ok    groups
+  ok    named groups
+  ok    a group that took no part
+  ok    nothing to find
+  ok    spans are bytes
+  ok    unicode is characters
+  ok    whole-string matches
+  ok    find all
+  ok    empty matches advance
+  ok    count
+  ok    replace with groups
+  ok    replace the first only
+  ok    templates
+  ok    replace with a function
+  ok    split
+  ok    escape
+  ok    no catastrophic case
+  ok    an empty loop terminates
+  ok    problems are explained
+  ok    lookaround is refused
+  ok    backreferences are refused
+  ok    a backwards range is refused
+  ok    parse is a result
+  ok    compile-time compiling
+  ok    inside a parser
+  ok    the literal prefix
+  ok    the bytes a match starts with
+  ok    skipping still finds matches
+  ok    classes with escapes
+  ok    a dash at the end of a class
+  ok    a bracket first in a class
+  41 passed
+
+std.registry
+  ok    a name answers the process registered under it
+  ok    a name goes when its process ends
+  ok    a name nothing holds is ()
+  ok    has! says so without naming the process
+  ok    a process registers itself, not the registry
+  ok    register! replaces, and answers what it replaced
+  ok    and answers () when it replaced nothing
+  ok    claim! takes a free name
+  ok    claim! refuses a taken one, and names the holder
+  ok    unregister! forgets the name and answers the pid
+  ok    forget! drops every name one process holds
+  ok    names! lists them in order
+  ok    all! is the table itself
+  ok    a call by name reaches the server
+  ok    a cast by name arrives
+  ok    a call to a name nobody holds raises rather than answering
+  ok    a cast to one is a message into a void
+  ok    a supervised child registers itself
+  ok    and a restarted one registers again, under the same name
+  ok    and the name still answers afterwards
+  ok    a registered child keeps the name it was given
+  ok    and the restart policy it was given
+  ok    a finder answers whoever holds the name now
+  23 passed
+
+std.remote
+  ok    a call goes out and an answer comes back
+  ok    the state is still there for the next call
+  ok    a cast arrives, and in order
+  ok    two connections reach the same server
+  ok    a connection made after the first one closed still works
+  ok    a request the server refuses is still a reply
+  ok    and reaches call! as the value it is
+  ok    an atom comes back an atom
+  ok    a nested structure survives
+  ok    a port is reported, and it is a real one
+  ok    calling a connection that is closed is an error, not an answer
+  ok    a restarted server is still reachable, on the same connection
+  ok    a listener serving a name nobody holds answers, rather than waiting
+  13 passed
+
+std.sql.lint
+  ok    quotes, comments and dollar bodies are not code
+  ok    E strings escape, plain strings double
+  ok    a backquoted name is one token
+  ok    a $ inside a name is part of it
+  ok    what the lint accepts
+  ok    what the lint refuses
+  ok    one statement, and no numbered parameters without values
+  ok    a piece of a statement is checked only for what is wrong anywhere
+  8 passed
+
+std.sql
+  ok    a hole takes a parameter
+  ok    postgres numbers its parameters
+  ok    a fragment fills a hole as SQL
+  ok    ?? is a question mark
+  ok    too few arguments is a problem, not a crash
+  ok    names are quoted per dialect
+  ok    a quote in a name is doubled
+  ok    a star stays bare
+  ok    a map is not a value
+  ok    inline writes literals
+  ok    booleans are the dialect's
+  ok    blobs are hex
+  ok    mysql escapes backslashes
+  ok    an empty IN is false
+  ok    conditions are parenthesized against each other
+  ok    ilike is lowered where it does not exist
+  ok    per_dialect sees the dialect
+  ok    an extended dialect keeps the rest
+  ok    a select, whole
+  ok    an empty select list is a star
+  ok    sql server fetches, and needs an order to
+  ok    an offset alone in sqlite
+  ok    joins
+  ok    a query in a hole is a subquery
+  ok    a subquery source
+  ok    a union has no parentheses of its own
+  ok    a recursive CTE
+  ok    parameters are numbered across a subquery
+  ok    an insert, from maps with atom keys
+  ok    sql server outputs where others return
+  ok    mysql cannot return
+  ok    an upsert, on conflict
+  ok    an upsert, on duplicate key
+  ok    skip a conflict
+  ok    an update
+  ok    a delete
+  ok    an insert of nothing
+  ok    a table in sqlite
+  ok    and in postgres
+  ok    a default is never a parameter
+  ok    a type no dialect knows is written as given
+  ok    indexes
+  ok    adding a column
+  ok    statements of one text run together
+  ok    () in an insert is the default, and a column nobody gives is left out
+  ok    sql.null is NULL even in an insert
+  ok    sqlite cannot say DEFAULT for one value
+  ok    postgres takes lists, maps and atoms
+  ok    and sqlite does not
+  ok    q leaves quoted question marks alone and rejects arity mistakes
+  ok    numbered SQL is renumbered for the dialect
+  ok    a value piece is a parameter, or a fragment spliced
+  ok    a splice piece is SQL
+  ok    beginning a transaction, per dialect
+  ok    a column is read by atom when the program has one
+  ok    a statement is checked
+  56 passed
+
+std.sql.sqlite
+  (no libsqlite3 here: the std.sql.sqlite tests are skipped)
+  ok    the library
+  ok    values come back as they went in
+  ok    a row is keyed by atom where the program has the atom
+  ok    a template's names are its parameters
+  ok    a template's list form
+  ok    a record goes in as it is, and comes out as one
+  ok    fold reads in batches
+  ok    a transaction that takes the lock first
+  ok    a serializable transaction answers
+  ok    a missing table is :undefined_table
+  ok    inserts in one prepared statement
+  ok    a default is filled
+  ok    blobs, empty and not
+  ok    a query with every clause
+  ok    returning
+  ok    an update counts what it changed
+  ok    an upsert
+  ok    a duplicate is a :unique error
+  ok    bad SQL the compiler did not see is a :syntax error
+  ok    a transaction that raises leaves nothing
+  ok    a nested transaction is a savepoint
+  ok    one! wants one
+  ok    migrations run once
+  ok    a script runs every statement
+  ok    an empty statement is nothing
+  ok    a database in a server
+  26 passed
+
+std.sql.pg.bytes
+  ok    network order, both ways
+  ok    a C string and where the next field starts
+  ok    hex round trip, and what is not hex
+  ok    base64 against RFC 4648's vectors
+  ok    base64 decodes what it encodes, and refuses the rest
+  ok    exclusive-or by table
+  6 passed
+
+std.sql.pg.errors
+  ok    a code is its condition, or its class's
+  ok    a server error carries its fields and its condition
+  ok    an error that is not ours has no condition
+  ok    what can be retried, and what lost the connection
+  ok    described for a person
+  5 passed
+
+std.sql.pg.config
+  ok    an empty configuration is every default
+  ok    a whole URL
+  ok    a URL with less in it
+  ok    a keyword string, with quoting
+  ok    what is refused, and why
+  ok    TLS, in libpq's words
+  ok    the parameters a startup sends
+  ok    described without its password
+  8 passed
+
+std.sql.pg.crypto
+  ok    SHA-256 is the VM's, as bytes
+  ok    HMAC-SHA-256 against RFC 4231's second case
+  ok    HMAC with a key longer than a block hashes it first
+  ok    PBKDF2-HMAC-SHA-256, one round and many
+  ok    MD5 against RFC 1321's suite
+  ok    SCRAM-SHA-256 against RFC 7677's exchange
+  ok    a SCRAM server whose nonce is not ours is refused
+  7 passed
+
+std.sql.pg.value
+  ok    parameters by kind
+  ok    a float that is not a number is spelled as PostgreSQL spells it
+  ok    nested arrays, and the quoting an element needs
+  ok    a typed value declares its type and is sent as written
+  ok    columns by type
+  ok    numeric is an integer only when nothing is lost
+  ok    json and bytea
+  ok    arrays, nested, quoted and with NULLs
+  ok    a program's own decoder wins
+  ok    what goes in comes back out
+  10 passed
+
+std.sql.pg.sql
+  ok    a fragment renders its values as numbered parameters
+  ok    fragments nest, and are numbered across the nesting
+  ok    a plain string is a statement with no values
+  ok    splicing text where a fragment belongs is refused
+  ok    identifiers are quoted, quotes doubled
+  ok    equality, and NULL
+  ok    conditions from a map, a fragment or a list
+  ok    an insert from a map
+  ok    many rows in one insert, DEFAULT for what a row lacks
+  ok    in an insert, nothing is DEFAULT
+  ok    update, delete, select, returning
+  ok    values as a list of parameters
+  ok    numbered text becomes a fragment, and renumbers when it composes
+  ok    the lexer knows quotes, comments and dollar bodies
+  ok    E strings escape, plain strings double
+  ok    a $ inside a name is part of it
+  ok    what the lint accepts
+  ok    what the lint refuses
+  ok    one statement, and no numbered parameters without values
+  ok    a template's placeholders become its parameters
+  ok    a piece of a statement is checked only for what is wrong anywhere
+  ok    a placeholder that names nothing is a complaint
+  22 passed
+
+std.sql.pg.wire
+  ok    a frame's length counts itself and not its type
+  ok    startup is length, version, then terminated pairs
+  ok    a NULL parameter is a length of -1 and no bytes
+  ok    ready, by what the status byte says
+  ok    a data row keeps NULL apart from the empty string
+  ok    a row description, column by column
+  ok    a column is keyed by atom when the program knows the name
+  ok    an error's fields, by name
+  ok    a notification
+  ok    a message nobody knows is kept, not guessed at
+  10 passed
+
+std.sql.pg.db
+  ok    a command tag's count
+  ok    a version string as a number
+  ok    BEGIN with characteristics
+  ok    COPY text, both ways
+  4 passed
+
+std.sql.pg.driver
+  ok    PostgreSQL errors use shared codes and retain SQLSTATE and fields
+  ok    retry and connection conditions
+  ok    bytea, its arrays and NULL
+  3 passed
+
+std.sql.pg.pool
+  ok    an idle connection is handed out first
+  ok    with room and nothing idle, the caller is told to open one
+  ok    a full pool keeps the caller waiting
+  ok    a lost connection frees its place
+  ok    a connection back with nobody waiting is idle
+  5 passed
+
+std.toml
+  ok    string
+  ok    literal string
+  ok    escape
+  ok    integer
+  ok    negative
+  ok    underscores
+  ok    float
+  ok    true
+  ok    false
+  ok    array
+  ok    empty array
+  ok    trailing comma
+  ok    array over lines
+  ok    nested array
+  ok    inline table
+  ok    empty inline table
+  ok    inline table, two keys
+  ok    section
+  ok    dotted section
+  ok    two sections
+  ok    keys before any header
+  ok    a repeated header keeps what it had
+  ok    missing section is empty
+  ok    missing key
+  ok    comment line
+  ok    trailing comment
+  ok    blank lines
+  ok    comment only
+  ok    empty document
+  ok    unclosed header
+  ok    key with no value
+  ok    key with no equals
+  ok    junk after value
+  ok    unclosed array
+  ok    unclosed string
+  ok    parse_or
+  ok    a package manifest
+  ok    a dependency table
+  ok    \u escape
+  ok    \U escape
+  ok    \b and \f
+  ok    a surrogate is refused
+  ok    write an integer
+  ok    a whole float keeps its point
+  ok    a string is quoted and escaped
+  ok    an inline table
+  ok    () is left out of a table
+  ok    a document
+  ok    a manifest round trips
+  ok    keys before a header round trip
+  ok    control characters round trip
+  ok    a table that is not a section lands in ""
+  ok    a value is not a document
+  ok    an atom comes back its name
+  ok    frames
+  55 passed
+
+std.version
+  ok    a version may be short, or spelled as a tag
+  ok    what is not a version is said to be one
+  ok    versions order by number, a pre-release before its release
+  ok    a caret accepts what is compatible
+  ok    below 1.0 the caret is narrower
+  ok    a bare version is a caret
+  ok    a tilde accepts patch releases
+  ok    comparisons joined by commas must all hold
+  ok    a star accepts anything released
+  ok    a pre-release is accepted only when asked for
+  ok    a requirement that is not one says where
+  ok    a requirement reads back as its comparisons
+  ok    two requirements are compatible when one version meets both
+  13 passed
+
+std.all
+  ok    a record crosses std.wire as itself
+  ok    and is still a record on the far side
+  ok    to_map names the fields
+  ok    of_map is its inverse
+  ok    and is a User again
+  ok    a group is itself again
+  ok    a mapping keeps its backing
+  ok    a missing field is ()
+  ok    a record survives JSON
+  ok    JSON writes the field names
+  ok    a string key reads as its field
+  ok    an atom key still does
+  ok    a framed record comes back
+  ok    a default is read through the accessor
+  ok    and survives the trip
+  ok    arity
+  ok    the right shape fits
+  ok    a named map fits
+  ok    a JSON object fits
+  ok    the wrong length does not
+  ok    a missing member does not
+  ok    a number is not a record
+  ok    with_field
+  ok    and leaves the rest
+  ok    with_fields patches only what it names
+  ok    and takes a patch that came through JSON
+  ok    describe
+  ok    record_name
+  ok    core scalar types compose
+  ok    collection type constructors check their members
+  ok    nonempty and byte types describe actual bounds
+  ok    generic sequence types specialize against their fold
+  ok    a checked array retains its backing
+  ok    map checks reject bad values
+  ok    recursive JSON type checks decoded data
+  ok    wire type preserves more kinds than JSON
+  ok    TOML document type covers sections
+  ok    result types distinguish payloads and errors
+  ok    result validation preserves an existing error
+  ok    typed errors remain inspectable values
+  ok    compile time option schemas are reusable runtime data
+  ok    derived option schemas keep optional fields optional
+  ok    derived option schemas validate defaults
+  ok    option choices survive compilation into a schema
+  ok    compiled codec checks keep the decoded value
+  ok    runtime decode uses the same schema as comp
+  ok    codec syntax errors are preserved
+  ok    typed wire framing can be compiled
+  ok    TOML can validate caller schemas without raising
+  ok    compiled numeric ranges reject wrong kinds
+  ok    sized schemas check the container too
+  ok    lazy checks work on infinite lists
+  ok    lazy checks leave later failures alone
+  ok    lazy checks reject a demanded bad element
+  ok    function contracts preserve unused arguments
+  ok    function contracts check the result
+  ok    server action types describe replies and transitions
+  ok    protocol descriptions compose with application messages
+  ok    supervisor types reject misspelled policies
+  ok    typed agent update rejects without changing state or killing the agent
+  60 passed
+
+2 test(s) failed

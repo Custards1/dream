@@ -126,3 +126,51 @@ an `Option` now), and `std.result` keeps short spellings -- `result.ok`,
 
 The library's own "nothing there" is still `()` (`list.find`, `map` lookups
 with `else ()`); `Option.of` and `Option.or_unit` cross between the two.
+
+## Fusion and block cleanup
+
+2026-10-12. Saturated prelude members are lowered into the caller's frame:
+`map`, `map_error`, `and_then`, `or_else`, `otherwise`, `flatten`,
+`unwrap_or`, and `unwrap_or_else`, where the union provides them. Resolution
+records roles by global identity, including direct aliases; a local parameter
+or a different union's member stays an ordinary call. Adjacent maps carry
+lazy payload expressions to the final variant, and unchanged branches keep
+the input record. Calls that can choose a new variant start another region,
+so lowering does not copy the remaining chain into both branches at each
+callback. Doubling an alternating callback chain grows its image linearly.
+
+Scratch slots must remain distinct from source bindings and from each other.
+The first attempt reused a slot while an `and_then` answer still carried a
+lazy read of it: assigning the answer to that slot made it depend on itself.
+Two binary tests caught it. A pipe also starts where its input starts, so
+keying its scratch binding by the whole expression's start overwrote the
+input's. Scratch slots now have their own resolution table, keyed by the
+callee's ending offset, and each region reserves its own slot for the lifetime
+of the frame. A single-character alias inside an index fallback exercises
+the remaining case where a source binder shares the call's start.
+
+The prelude also lends `ok value` and `err reason` as typed functions for
+the two Result constructors. They work as values and through `let?` and `?`,
+and a module's or local binding with either name wins in the usual way.
+
+One interpreter run over 20,000 two-map results, comparing the fused function
+with the same members passed through a parameter, answered 400060000 in both
+cases. Fusion used 500049 reductions and 7232648 allocated bytes, against
+880049 and 15796624 for the ordinary calls. These are a workload comparison,
+not a promise about compiler throughput or wall time.
+
+`defer! expression;` is a direct block statement. Lowering wraps the statements
+after it in `ensure` (opcode 83), whose cleanup is the deferred expression.
+Nested ensures give reverse registration order and register only after the
+earlier statements have run. A final defer has a unit body. The interpreter
+saves the body's answer or error in a rooted continuation while cleanup runs;
+a cleanup error replaces a normal answer but preserves an existing error.
+Both edges belong to image validation, sharing, and the JIT's reference walk.
+
+Kills now unwind through ensures instead of discarding the machine state.
+The kill is injected once, and a cleanup-depth counter lets deferred code
+park and handle its own errors without allowing an enclosing body handler to
+catch the kill. A pending kill waits through normal cleanup as well. The same
+rule applies in a native's nested forcing loop, where an endless `strict!`
+may never return to the scheduler. The process finishes and notifies its
+joiners and monitors after its registered cleanup has run.

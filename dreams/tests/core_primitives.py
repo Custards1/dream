@@ -103,4 +103,51 @@ with tempfile.TemporaryDirectory(prefix='dream-primitives-') as directory:
         result = subprocess.run([vm, compiler, str(src), '-o', str(image)],
                                 text=True, capture_output=True, timeout=30)
         assert result.returncode > 0, name
-print('primitive opcodes, lazy/first-class parity, validation, and module removal passed')
+
+    # Cleanup edges must survive sharing, and malformed ensure bodies must
+    # be rejected before the interpreter sees them.
+    fixture = root / 'dream/tests/programs/defer.dr'
+    expected = fixture.with_suffix('.expected').read_text()
+    for options in ([], ['--no-opt']):
+        run(vm, compiler, str(fixture), '-o', str(image), *options)
+        assert run(vm, '--no-jit', str(image)) == expected
+        assert run(vm, '--jit-threshold', '1', str(image)) == expected
+    data = image.read_bytes()
+    offset, length = section(data, b'NODE')
+    nodes = list(struct.iter_unpack('<BBHIII', data[offset:offset + length]))
+    index = next(i for i, node in enumerate(nodes) if node[0] == 83)
+    for field, value in ((4, 0xFFFFFFFF), (8, 0xFFFFFFFF), (8, index)):
+        corrupt = bytearray(data)
+        struct.pack_into('<I', corrupt, offset + index * 16 + field, value)
+        bad.write_bytes(corrupt)
+        result = subprocess.run([vm, str(bad)], capture_output=True, timeout=30)
+        assert result.returncode > 0, result.stderr
+    for source in ('let main! = defer! ();',
+                   'let main! = { let x = defer! (); x };',
+                   'let f () = { defer! (); 1 }; let main! = f ();'):
+        src.write_text(source)
+        result = subprocess.run([vm, compiler, str(src), '-o', str(image)],
+                                text=True, capture_output=True, timeout=30)
+        assert result.returncode > 0 and 'defer!' in result.stderr, result.stderr
+
+    for name in ('result_fusion', 'result_short'):
+        fixture = root / f'dream/tests/programs/{name}.dr'
+        expected = fixture.with_suffix('.expected').read_text()
+        for options in ([], ['--no-opt']):
+            run(vm, compiler, str(fixture), '-o', str(image), *options)
+            assert run(vm, '--no-jit', str(image)) == expected
+            assert run(vm, '--jit-threshold', '1', str(image)) == expected
+    # Callback chains that choose new variants must grow with their source,
+    # rather than copying the remaining stages into both arms at each step.
+    sizes = []
+    for count in (8, 16):
+        chain = 'r' + ' |> Result.and_then step |> Result.or_else step' * count
+        src.write_text('import std.console; let step x = Result.ok (x + 1);\n'
+                       f'let probe r = {chain};\n'
+                       'let main! = console.print! (probe (Result.ok 0));\n')
+        run(vm, compiler, '-L', str(root / 'mind'), str(src), '-o', str(image))
+        _, length = section(image.read_bytes(), b'NODE')
+        sizes.append(length)
+        assert run(vm, '--no-jit', str(image)) == f'Result.ok({count})\n'
+    assert sizes[1] < sizes[0] * 2, sizes
+print('primitive opcodes, cleanup, Result fusion/constructors, validation, and module removal passed')

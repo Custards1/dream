@@ -68,6 +68,7 @@ const cases = [
   ['let a = #[1, 2];', '#[', 'punctuation.definition.array.dream'],
   ["let c = 'x';", "'x'", 'string.quoted.single.dream'],
   ['let r = try! { 1 } catch e { 2 };', 'try!', 'keyword.control.dream'],
+  ['defer! io.close! handle;', 'defer!', 'keyword.control.dream'],
   ['let v = comp! f;', 'comp!', 'keyword.control.dream'],
   ['let x = comp f;', 'comp', 'keyword.declaration.dream'],
   ['let a = 5 % 2;', '%', 'keyword.operator.arithmetic.dream'],

@@ -844,6 +844,11 @@ NativeResult bi_raise(Process& p, Value, Value* args, uint32_t) {
     return NativeResult::raise(p.heap().make_error(make_atom(well_known(p.runtime()).error), v));
 }
 
+NativeResult bi_defer(Process& p, Value, Value*, uint32_t) {
+    return NativeResult::raise(raise_error(p, well_known(p.runtime()).type_error,
+                                         "defer! must be a block statement"));
+}
+
 /// `error_new kind payload` -- an error as a value, without raising it.
 ///
 /// An error is a kind and a payload, and until these three existed a program
@@ -4553,6 +4558,7 @@ const BuiltinDef BUILTINS[] = {
     // way, since the deep chains it forces are met from interpreted code.
     {"_settled", 1, 0b0, bi_settled},
     {"_forced", 1, 0b1, bi_forced},
+    {"defer!", 1, 0b0, bi_defer},
 };
 
 uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0])); }

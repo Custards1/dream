@@ -251,7 +251,7 @@ void dump_node(const Image& img, uint32_t idx, int depth, std::string& out) {
         case Op::Bind:
             dump_node(img, n.b, depth + 1, out);
             break;
-        case Op::Try:
+        case Op::Try: case Op::Ensure:
             dump_node(img, n.a, depth + 1, out);
             dump_node(img, n.b, depth + 1, out);
             break;

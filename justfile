@@ -152,7 +152,7 @@ clean:
 
 # --- running ----------------------------------------------------------------
 
-# An interactive session: read an entry, compile the session, run it.
+# Deprecated interactive session; use `just run FILE` with a source file.
 repl *ARGS: build
     ./{{dreams}} --repl -L mind -L . {{ARGS}}
 
@@ -337,6 +337,7 @@ test-dreams-compile: build
     python3 dreams/tests/type_codegen.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/contracts.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/core_primitives.py --dream {{dream}} --compiler {{image}}
+    python3 dreams/tests/shorthand.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/modules.py --dream {{dream}} --compiler {{image}}
 
 # The VS Code extension's grammar, tokenized and checked against the scopes it

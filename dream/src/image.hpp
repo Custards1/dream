@@ -81,6 +81,7 @@ enum class Op : uint8_t {
     // copies a record or an array once rather than once per key: what a
     // pipeline of setters (`p |> P.set_a 1 |> P.set_b 2`) is lowered to.
     SetMany = 82,
+    Ensure = 83,  // a = body, b = cleanup; run cleanup on every exit
     Count
 };
 

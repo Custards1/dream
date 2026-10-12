@@ -233,11 +233,21 @@ void Scheduler::worker_loop(unsigned index) {
 }
 
 void Scheduler::run_slice(const std::shared_ptr<Process>& p, unsigned index) {
-    // A kill is honoured here and nowhere else: between slices nothing of the
-    // process is on any C++ stack, so ending it is a matter of not running it.
-    if (p->kill_requested.load(std::memory_order_acquire)) {
-        terminate(p);
-        return;
+    // Start unwinding between slices, then let the machine run cleanup.
+    if (p->kill_requested.load(std::memory_order_acquire) &&
+        !p->kill_unwinding && p->cleanup_depth == 0) {
+        if (p->wait_reason.load(std::memory_order_relaxed) == WaitReason::Io) {
+            int fd = p->wait_fd.load(std::memory_order_relaxed);
+            if (fd >= 0) io_cancel_wait(fd, p->id());
+        }
+        if (p->timer_seq) {
+            cancel_timer(p->timer_seq);
+            p->timer_seq = 0;
+        }
+        p->park_requested = false;
+        p->kill_unwinding = true;
+        p->result = p->kill_error();
+        p->mode = Mode::Raise;
     }
     census_if_due(*p);
     p->status.store(ProcStatus::Running, std::memory_order_relaxed);
@@ -268,7 +278,9 @@ void Scheduler::run_slice(const std::shared_ptr<Process>& p, unsigned index) {
             // wake that beat the park sends it, and answers at the start of
             // that slice. The blocking native it was in looks again and asks
             // to park again.
-            if (!p->wake_pending && !p->census_due.load(std::memory_order_acquire)) {
+            if (!p->wake_pending && !p->census_due.load(std::memory_order_acquire) &&
+                !(p->kill_requested.load(std::memory_order_acquire) &&
+                  !p->kill_unwinding && p->cleanup_depth == 0)) {
                 p->status.store(ProcStatus::Waiting, std::memory_order_release);
                 return;
             }
@@ -387,23 +399,6 @@ void Scheduler::finish(const std::shared_ptr<Process>& p) {
     live_.fetch_sub(1, std::memory_order_acq_rel);
     for (uint64_t id : waiters) wake(id);
     notify_done();
-}
-
-void Scheduler::terminate(const std::shared_ptr<Process>& p) {
-    // Parked on a descriptor, it is still the poller's: take it back, or the
-    // poller would go on counting a wait nobody is making, and the deadlock
-    // check would never again find the program stuck.
-    if (p->wait_reason.load(std::memory_order_relaxed) == WaitReason::Io) {
-        int fd = p->wait_fd.load(std::memory_order_relaxed);
-        if (fd >= 0) io_cancel_wait(fd, p->id());
-    }
-    p->result = p->kill_error();
-    p->failed = true;
-    p->mode = Mode::Halted;
-    p->conts.clear();
-    p->stack.clear();
-    p->pins.clear();
-    finish(p);
 }
 
 std::unique_ptr<Message> Scheduler::down_message(Process& p) {

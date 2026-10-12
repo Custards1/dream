@@ -31,6 +31,8 @@ const char* cont_kind_name(ContKind k) {
         case ContKind::UnaryFinish: return "unary_finish";
         case ContKind::BlockNext: return "block_next";
         case ContKind::Catch: return "catch";
+        case ContKind::Finalize: return "finalize";
+        case ContKind::Finalized: return "finalized";
         case ContKind::FieldOf: return "field_of";
         case ContKind::NativeArg: return "native_arg";
         case ContKind::NativeArgs: return "native_args";

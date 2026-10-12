@@ -120,7 +120,7 @@ let token_continues c t =
 /// Keywords are ordinary identifiers that the parser recognises; the lexer has
 /// no idea they are special.
 let keywords = ["let", "let?", "priv", "rec", "if", "else", "import", "as", "catch", "true", "false",
-                "not", "try!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
+                "not", "try!", "defer!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
                 "match", "macro", "expand", "group", "struct", "mapping", "type", "union"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
@@ -454,6 +454,11 @@ let rec parse_ident c word sp rest =
         "if" => parse_if c sp rest,
         "fn" => parse_lambda c sp rest,
         "try!" => parse_try c sp rest,
+        "defer!" => match parse_expr c rest {
+            [:error, m, s] => err m s,
+            [:ok, body, after] =>
+                ok (ast.apply_e (ast.name_e "defer!" sp) [body] (ast.span_to sp (ast.span body))) after,
+        },
         // Contextual: `receive!` is also a name programs give their own
         // functions, and only a `{` straight after it makes it this.
         "receive!" if at rest :lbrace => parse_receive c sp (list.tail rest),

@@ -81,7 +81,7 @@ Given twice, the second is relative to the first.
 | `mind run [-- args]` | compile, then run with the arguments given |
 | `mind test [NAME..]` | run every test at once: each package's units and its build script's checks |
 | `mind check` | compile without writing an image |
-| `mind repl` | an interactive session with this project's packages on the path |
+| `mind repl` | deprecated interactive session; use source files with `mind run` |
 | `mind add SOURCE` | add a dependency: a directory, a git URL, or a tarball |
 | `mind remove NAME` | take one out again |
 | `mind fetch` | download dependencies without building |

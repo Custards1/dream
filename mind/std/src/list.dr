@@ -199,35 +199,24 @@ let rec filter keep xs =
 ///     console.print! (list.fold (fn total x -> total + x) 0 [1, 2, 3])
 /// };
 /// ```
+/// Each intermediate accumulator is forced to its outer value. Contents and
+/// elements stay lazy, and the first callback receives the seed unforced.
 let fold : (b -> a -> b) -> b -> [a] -> b;
-let rec fold f acc xs =
-    if _list_is_empty xs { acc } else { fold f (f acc (xs.[0])) (_list_tail xs) };
-
-/// A left fold that forces each step before taking the next.
-///
-/// `fold` is lazy in its accumulator, which for a short list is exactly right
-/// and for a long one is a trap: nothing forces `f acc x` until the end, so the
-/// fold answers a chain of n suspended applications, and forcing that chain
-/// walks n frames deep with every intermediate still live. Folding a program's
-/// worth of anything -- the tens of thousands of nodes a compiler emits -- runs
-/// the machine out of memory long before it runs out of list.
-///
-/// The force is a strict parameter (`!acc`): each step's `f acc x` is forced
-/// when the next step is entered, before the one after it is suspended. It
-/// used to be `if type_of next == :nothing`, a condition being the one place
-/// the language had to evaluate something, which read like a type test and
-/// was a force.
-///
-/// The seed is not forced: the first step is taken here, and `step` only ever
-/// sees what `f` answered. So `fold_strict (fn _ x -> x) (1 / 0) [1]` is `1`,
-/// as it always was.
-///
-/// Only the head is forced. What is inside the accumulator stays lazy, which is
-/// where laziness earns its keep: `strict!` would walk the whole accumulator at
-/// every step and turn a linear fold into a quadratic one.
-let fold_strict : (b -> a -> b) -> b -> [a] -> b;
-let fold_strict f acc xs =
+let fold f acc xs =
     if _list_is_empty xs { acc } else { strict_steps f (f acc (xs.[0])) (_list_tail xs) };
+
+/// A left fold with suspended accumulator steps. Use when a later step must
+/// be able to discard an earlier step without evaluating it. Long numeric
+/// folds should use `fold`, which avoids retaining a chain of suspensions.
+let fold_lazy : (b -> a -> b) -> b -> [a] -> b;
+let rec fold_lazy f acc xs =
+    if _list_is_empty xs { acc } else { fold_lazy f (f acc (xs.[0])) (_list_tail xs) };
+
+/// Compatibility spelling for `fold`. Each intermediate accumulator is
+/// forced to its outer value; its contents and list elements stay lazy.
+/// The seed is passed to the first callback unforced.
+let fold_strict : (b -> a -> b) -> b -> [a] -> b;
+let fold_strict f acc xs = fold f acc xs;
 
 /// Accumulate from left to right, forcing each intermediate accumulator.
 priv let strict_steps : (b -> a -> b) -> b -> [a] -> b;

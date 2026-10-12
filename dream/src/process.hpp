@@ -58,6 +58,8 @@ enum class ContKind : uint8_t {
     UnaryFinish, // a = opcode
     BlockNext,   // a = kids offset, b = count, c = next index, v1 = frame
     Catch,       // a = handler node, b = slot, c = value-stack depth, v1 = frame
+    Finalize,    // a = cleanup node, c = value-stack depth, v1 = frame
+    Finalized,   // a = raised, c = value-stack depth, v1 = saved outcome
     FieldOf,     // a = string index of the member name
     NativeArg,   // a = stack base, b = argc, c = index just forced, v1 = callee
     NativeArgs,  // a = the call node, b = stack base, c = index just evaluated,
@@ -387,6 +389,9 @@ public:
     /// again every step would raise it afresh -- including the steps of the
     /// `catch` that caught it, which is what made it uncatchable.
     uint64_t heap_limit_raised_at = UINT64_MAX;
+    // A kill waits while cleanup runs, including across slices and parking.
+    uint32_t cleanup_depth = 0;
+    bool kill_unwinding = false;
 
     Runtime& runtime() { return rt_; }
     Heap& heap() { return heap_; }

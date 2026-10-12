@@ -24,7 +24,7 @@ and are the first thing to read before working on what they describe.
 | [bytecode-format.md](bytecode-format.md) | The `.dream` image, as it actually is: the header, every section, the target bits. |
 | [gc.md](gc.md) | The collector: generational, parallel and concurrent, the rules a native must follow, and what was measured. Read before touching `heap.cpp`. |
 | [dynamic-linking.md](dynamic-linking.md) | The plan for one runtime holding many images, and how far it has got. |
-| [session-mode.md](session-mode.md), [session-work.md](session-work.md) | Incremental compilation for the REPL: the design, and where the work stands. |
+| [session-mode.md](session-mode.md), [session-work.md](session-work.md) | Retained implementation of the deprecated REPL: incremental compilation and design. |
 | [bytecode-format-proposed.md](bytecode-format-proposed.md) | Format changes that have since landed in `bytecode-format.md`; kept for the reasoning. |
 
 ## The notes

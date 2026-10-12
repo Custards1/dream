@@ -104,11 +104,20 @@ mapping Build {
     shared = ()
 }
 
-/// Resolve, lower and link the program, and check it.
-///
-/// Impure because lowering settles `comp` expressions and checking runs the
-/// contracts, both on a VM. Everything the record holds past that is lazy: see
-/// the head of this file.
+/// Resolve names and select standard members from their types. Walk again
+/// with the choices known so the usual fusion and scratch-slot plans apply.
+let resolve! : modules.Loader -> Options -> scope.Resolution;
+let resolve! l o = {
+    let parted = Options.parallel o && Options.optimize o;
+    let initial = if parted { scope.resolve_parts! l (Options.units o) } else { scope.resolve! l };
+    let selected = typecheck.select_overloads l initial;
+    if not (typecheck.has_overloads initial) || diag.error_count (scope.r_diags selected) > 0 { selected }
+    else if parted { scope.resolve_parts_chosen! l (Options.units o) (scope.Resolution.selections selected) }
+    else { scope.resolve_chosen! l (scope.Resolution.selections selected) }
+};
+
+/// Resolve, lower, link and check the program. Lowering settles compile-time
+/// expressions and checking runs contracts on a VM.
 let build! : modules.Loader -> Options -> Build;
 let build! l o = {
     let parallel = Options.parallel o;
@@ -119,7 +128,7 @@ let build! l o = {
     // keeps each part's name uses in the part, and lowering the arena whole
     // (`--no-opt`) asks them all of one resolution.
     let parted = parallel && Options.optimize o;
-    let r = if parted { scope.resolve_parts! l (Options.units o) } else { scope.resolve! l };
+    let r = resolve! l o;
     // A build that will be optimized is lowered in parts, in several processes
     // at once (`lower.link_parallel!`); one that will not keeps the arena
     // exactly as `lower` builds it, which the parts cannot, since each is

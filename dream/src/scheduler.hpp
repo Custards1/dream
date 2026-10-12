@@ -198,8 +198,6 @@ private:
     void run_slice(const std::shared_ptr<Process>& p, unsigned index);
     void requeue(unsigned index, const std::shared_ptr<Process>& p);
     void finish(const std::shared_ptr<Process>& p);
-    /// End a process whose `kill_requested` is set, from the worker running it.
-    void terminate(const std::shared_ptr<Process>& p);
     /// The message a monitor is sent when `p` ends. Called with `p` finished.
     std::unique_ptr<Message> down_message(Process& p);
     /// Put a message in `target`'s mailbox and wake it. False for no such pid.

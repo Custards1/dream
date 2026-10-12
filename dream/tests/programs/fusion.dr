@@ -5,7 +5,7 @@
 // answer below is the answer the combinators give, and the point of writing
 // them out is the cases where the pass must *decline*: a list that is named, a
 // fold whose function reaches the frame around it, one that performs an
-// effect, and a `fold` that was lazy in its accumulator and has to stay lazy.
+// effect, and a `fold_lazy` whose accumulator has to stay lazy.
 //
 // It runs under both tiers, which is the other half of the question. A fused
 // loop is a strict numeric tail loop, so the JIT compiles most of what is here
@@ -68,9 +68,9 @@ let scaled k = list.fold_strict (fn acc x -> acc + k * x) 0 (list.range 1 5);
 // Neither member is `std.list`'s.
 let impostor = fake.fold (fn a b -> a + b) 0 (fake.range 1 5);
 
-// `fold` is lazy in its accumulator, and fusing it must not change that: every
+// `fold_lazy` is lazy in its accumulator, and fusion must preserve that: every
 // step but the last would raise, and none of them is ever forced.
-let stays_lazy = list.fold (fn acc x -> if x == 2 { 7 } else { acc / 0 }) 1 (list.range 1 3);
+let stays_lazy = list.fold_lazy (fn acc x -> if x == 2 { 7 } else { acc / 0 }) 1 (list.range 1 3);
 
 // A fold that performs an effect is not fused, because a fused loop is a
 // global whose name is pure and the machine would stop sequencing it. The

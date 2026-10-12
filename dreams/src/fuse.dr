@@ -27,6 +27,28 @@ import std.str;
 
 import dreams.ast;
 
+// --- Results ---------------------------------------------------------------
+// Saturated prelude calls are branches in the caller's frame. Mapping carries
+// a lazy payload to the next branch; only the final answer builds a variant.
+let result_members : :map;
+let result_members = %{
+    "map" => [:map, 2], "map_error" => [:map_error, 2],
+    "and_then" => [:and_then, 2], "or_else" => [:or_else, 2],
+    "and" => [:and, 2], "or" => [:otherwise, 2],
+    "otherwise" => [:otherwise, 2], "flatten" => [:flatten, 1],
+    "unwrap_or" => [:unwrap_or, 2], "unwrap_or_else" => [:unwrap_or_else, 2],
+};
+
+let result_member : :string -> :string -> :list | :unit;
+let result_member kind name =
+    if kind == "Option" && name == "map_error" { () }
+    else { result_members.[name else ()] };
+
+/// Only maps preserve the branch. A callback that chooses a new variant is
+/// lowered once as the next region's input, keeping the tree linear in stages.
+let result_maps : :atom -> :bool;
+let result_maps tag = tag == :map || tag == :map_error;
+
 // --- the vocabulary ---------------------------------------------------------
 //
 // A pipeline is a *source* that produces elements and a *sink* that consumes
@@ -65,7 +87,8 @@ let roles = %{
     "replicate" => Role.source :replicate 2,
     "map" => Role.step :map 2,
     "filter" => Role.step :filter 2,
-    "fold" => Role.sink :fold 3 false,
+    "fold" => Role.sink :fold 3 true,
+    "fold_lazy" => Role.sink :fold 3 false,
     "fold_strict" => Role.sink :fold 3 true,
     "sum" => Role.sink :add 1 false,
     "product" => Role.sink :mul 1 false,

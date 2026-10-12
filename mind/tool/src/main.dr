@@ -88,7 +88,7 @@ let command_spec = [
     cli.command "run"   "compile, then run it with the arguments given" [],
     cli.command "test"  "run every test at once: units and checks; NAME narrows" [],
     cli.command "check" "compile without writing an image" [],
-    cli.command "repl"  "an interactive session, with this project's packages" [],
+    cli.command "repl"  "deprecated interactive session, with this project's packages" [],
     cli.command "add"   "add a dependency: a directory, a git URL, or a tarball" [],
     cli.command "remove" "remove a dependency by name" [],
     cli.command "fetch" "download dependencies without building" [],
@@ -180,7 +180,8 @@ where nothing changed runs none of it. `-j N` sets how much runs at once.
 
 `mind run -- ARGS` passes ARGS to the program rather than to mind.
 
-`mind repl` starts the compiler's interactive session with this project's
+`mind repl` is deprecated. Use source files with `mind run` instead. It still
+starts the compiler's interactive session with this project's
 packages on the search path. It works outside a project too, with just the
 standard library.
 "

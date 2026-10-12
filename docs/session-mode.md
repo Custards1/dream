@@ -1,5 +1,10 @@
 # Session mode: incremental compilation for the REPL
 
+The interactive REPL is deprecated as of 2026-10-12. `dreams --repl`,
+`dreams -i`, `just repl`, and `mind repl` remain available and warn on startup.
+Use source files with `just run FILE` or `mind run` instead. The design below
+describes the retained session implementation.
+
 The REPL today compiles the whole session from scratch on every entry
 ([dreams/src/repl.dr](dreams/src/repl.dr#L190)): write the accumulated text to a scratch
 file, `modules.load!` from a fresh loader, `scope.resolve!`, `lower.link!`,

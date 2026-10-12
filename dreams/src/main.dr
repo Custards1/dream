@@ -527,7 +527,7 @@ let show_time! o file = {
     // parts there is no `arena` to build.
     let co = compile_options o;
     let parted = compile.Options.optimize co;
-    let resolved = timed! (if parted { scope.resolve_parts! l (compile.Options.units co) } else { scope.resolve! l });
+    let resolved = timed! (compile.resolve! l co);
     let r = value_of resolved;
     // Lowered in parts, a lowering holds a lazy `:image` as well: the parts
     // shared in this process, should the sharing process fail. A build never
@@ -914,11 +914,10 @@ let usage! () = {
         "  --at LINE:COL  say what is at a position, and where it came from",
         "  --stats        count what the program contains",
         "  --time         compile the whole way and say what each stage cost",
-        "  --repl         an interactive session: read, compile, run, repeat",
         "  --print-cfg    print the `when` flags that are defined",
         "  --shebang [LINE]  prefix the image with a `#!` line and make it executable",
         "  --depfile PATH    also write the files the build read, as a make rule",
-        "  -i, --repl     an interactive session: read, compile, run, repeat",
+        "  -i, --repl     deprecated interactive session (use source files)",
         "  --version      print the version",
         "",
         "where to look:",

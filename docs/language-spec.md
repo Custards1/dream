@@ -123,7 +123,7 @@ letter are the runtime's primitives (`_list_cons`), which belong to `std`
 ### Keywords
 
 ```
-let  let?  priv  rec  if  else  import  as  catch  true  false  not  try!
+let  let?  priv  rec  if  else  import  as  catch  true  false  not  try!  defer!
 fn  virtual  derive  comp  comp!  when  mod  match  macro  expand  type  union
 ```
 
@@ -464,6 +464,26 @@ block as an argument.
 A block is a sequence of statements. Its value is the last one, or `()` when
 it is empty. A `let` in a block is in scope for the statements after it.
 
+`defer! expression;` registers an expression to evaluate when that block
+exits. Several defers run in reverse registration order, after the block's
+answer is evaluated to weak head normal form. The answer stays the same; a
+final `defer!` statement answers `()`. Registration happens only when execution
+reaches the statement, and its expression sees the bindings in scope there.
+
+```dream
+let use! handle = {
+    defer! io.close! handle;
+    io.write! handle "hello"
+};
+```
+
+Cleanup runs on normal exit, an early answer from `let?` or `?`, a raised
+error, and a process kill. It may park or use `try!` to handle its own errors.
+If cleanup raises on normal exit, that error becomes the outcome and the
+remaining defers still run. If the body already raised, its original error
+is preserved. A kill waits for cleanup to finish and then ends the process.
+`defer!` is impure and must be a direct block statement with one expression.
+
 ### `match`
 
 ```dream
@@ -787,6 +807,11 @@ An `[:ok, v]` list is not a result, and `let?` passes it on like any other
 value. `let?` binds one value with no parameters, `rec` or signature, and
 must be followed by the statements it guards.
 
+`ok value` and `err reason` construct `Result.ok value` and
+`Result.error reason` without an import. They are typed prelude functions,
+so they can be passed as values (`list.map ok xs`) or shadowed by a module's
+or block's own bindings.
+
 `e?` is the same step written where the value is used: it is `let?` pulled
 out in front of the statement it is in, so the block answers the failure.
 
@@ -812,7 +837,7 @@ the value last so that a chain reads in order through `|>`:
 |---|---|---|
 | `map f`, `map_error f` | `map f` | change what it holds |
 | `and_then f` | `and_then f` | the next step, which may fail |
-| `or_else f`, `otherwise r` | `otherwise o`, `filter p` | recover, or choose |
+| `and r`, `or r`, `or_else f`, `otherwise r` | `and o`, `or o`, `or_else f`, `otherwise o`, `xor o`, `filter p` | combine, recover, or choose |
 | `unwrap_or d`, `unwrap_or_else f` | `unwrap_or d`, `unwrap_or_else f` | the way out |
 | `unwrap!`, `expect! m` | `unwrap!`, `expect! m` | raise when there is none |
 | `flatten`, `both r` | `flatten`, `both o`, `contains v` | |
@@ -823,6 +848,12 @@ the value last so that a chain reads in order through `|>`:
 ```dream
 read path |> Result.and_then parse |> Result.map_error describe
 ```
+
+Saturated calls of `map`, `map_error`, `and`, `or`, `and_then`, `or_else`, `otherwise`,
+`flatten`, `unwrap_or`, and `unwrap_or_else` on the prelude unions are lowered
+in the caller. Adjacent maps carry lazy payloads through one branch without
+building intermediate variants. Partial applications retain ordinary calls,
+and a user-defined union with the same name keeps its own member behavior.
 
 `std.result` spells the same things shorter for a module that imports it --
 `result.ok`, `result.err`, `result.map` -- each a wrapper the compiler
@@ -1293,9 +1324,46 @@ be passed around, but `std` and `std.list` alone cannot.
 
 ### The prelude
 
+The members of `Result` and `Option` are also available unqualified:
+`some 3`, `map f (ok 3)`, `and_then f (some 3)`, and
+`flatten (ok (ok 3))`. Importing `std.list`, `std.array`, or `std.map`
+also makes that module's public functions available as shorthand. The compiler
+selects a unique member from argument types or the expected type. This also
+works for functions passed as arguments and signed function values:
+
+```dream
+import std.list;
+import std.array;
+map (fn x -> x + 1) [1, 2]                     // list.map
+map (fn x -> x + 1) #[1, 2]                    // array.map
+fold (fn acc x -> acc + x) 0 [1, 2]            // list.fold
+let flatten_result : Result (Result a e) e -> Result a e;
+let flatten_result = flatten;                 // Result.flatten
+```
+
+When types do not distinguish the candidates, compilation fails and asks for
+an explicit spelling such as `Result.map` or `array.map`. There is no runtime
+type dispatch. Local definitions, enclosing definitions, and explicit selective
+imports take precedence over shorthand. Qualified calls keep their meaning.
+
+`list.fold`, `array.fold`, and `map.fold` force each accumulator step to its
+outer value by default, keeping accumulator contents lazy and passing the
+initial seed unforced to the first callback. Use `fold_lazy` when later steps
+must be able to discard earlier computations. `list.fold_strict` remains a
+compatible spelling for `list.fold`.
+
+`and other self` continues with `other` when `self` succeeded or is present,
+and keeps the failure or absence otherwise. `or other self` keeps a success or
+present value and uses `other` on failure or absence. Both are lazy in an
+unused `other`. `or_else f self` computes the fallback only when needed:
+`Result.or_else` passes the error reason, while `Option.or_else` passes `()`.
+`Option.xor other self` keeps the value when exactly one option is present.
+These members participate in shorthand selection too.
+
 A few names are in scope in every module without an import: the public
-names of `std.prelude`, which today are the unions `Result` and `Option`
-(§7). Each is bound as `import std.prelude.{Result}` would bind it, and
+names of `std.prelude`, including the unions `Result` and `Option` and
+the constructors `ok` and `err` (§7). Each is bound as an explicit selective
+import would bind it, and
 looked for last -- a
 module's own `Result`, one it imports, and one it is lent by an enclosing
 module all win, and taking the name is shadowing, not a clash. The prelude
@@ -1491,7 +1559,8 @@ function of that name still works as one.
 A kill takes effect at the start of the target's next slice, which is as
 prompt as preemption already is -- and a process inside one long force (a
 `strict!` over something endless) is stopped where its slice would have
-ended. A `try!` cannot catch it. A failure reported to a monitor counts as
+ended. Its registered defers run before it ends; a `try!` in the body cannot
+catch the kill. A failure reported to a monitor counts as
 handled, as one delivered to a joiner does.
 
 The shapes built on these (servers that hold state, supervisors, registries,
@@ -1777,7 +1846,8 @@ binding     ::= 'rec'? name param* ( ':' type )? '=' expr
               | pattern '=' expr
 param       ::= name | '!' name | '(' 'strict' name ')' | '()' | '[' .. ']' | '#[' .. ']' | '%{' .. '}'
               | '(' pattern (',' pattern)* ')'
-statement   ::= binding-let | 'let?' (name | pattern) '=' expr ('else' expr)? | 'type' .. | expr
+statement   ::= binding-let | 'let?' (name | pattern) '=' expr ('else' expr)?
+              | 'defer!' expr | 'type' .. | expr
 expr        ::= expr '|>' expr | expr binop expr | ('-' | 'not') expr
               | ('comp' | 'comp!' | 'expand') application | application
 application ::= postfix postfix* '?'*

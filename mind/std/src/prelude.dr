@@ -8,7 +8,8 @@
 // modules that import nothing, it means "carry on when this is `Result.ok` or
 // `Option.some`", and it is unfolded by the parser before any name is
 // resolved, so the variants it tests have to exist in every module or in
-// none.
+// none. `ok value` and `err reason` are the short constructors for Result;
+// they are ordinary functions and may be shadowed like the union names.
 //
 // The loader loads this module ahead of every other (`modules.load_items!`)
 // and `scope` lends its names to each module that does not bind them itself
@@ -59,6 +60,10 @@ union Result a e {
     /// pipeline, and what `let?` writes out.
     and_then : (a -> Result b e) -> Result a e -> Result b e
     and_then f self = match self { Result.ok(v) => f v, Result.error(why) => error why }
+    /// Continue with `other` on success; keep this error otherwise. `other`
+    /// stays lazy when this result failed.
+    and : Result b e -> Result a e -> Result b e
+    and other self = match self { Result.ok(_) => other, Result.error(why) => error why }
     /// Recover from an error with another step, which may fail in its turn.
     or_else : (e -> Result a f) -> Result a e -> Result a f
     or_else f self = match self { Result.error(why) => f why, Result.ok(v) => ok v }
@@ -66,6 +71,9 @@ union Result a e {
     /// fallback is only computed when it is needed.
     otherwise : Result a e -> Result a e -> Result a e
     otherwise other self = match self { Result.ok(_) => self, Result.error(_) => other }
+    /// Keep this success, or use `other`, whose error type may differ.
+    or : Result a f -> Result a e -> Result a f
+    or other self = match self { Result.ok(v) => ok v, Result.error(_) => other }
 
     /// The value, or `default` for an error. The usual way out.
     unwrap_or : a -> Result a e -> a
@@ -122,6 +130,14 @@ union Result a e {
     }
 }
 
+/// Construct a successful result without qualifying the union name.
+let ok : a -> Result a e;
+let ok value = Result.ok value;
+
+/// Construct a failed result without qualifying the union name.
+let err : e -> Result a e;
+let err reason = Result.error reason;
+
 /// A value that may not be there: `Option.some value`, or `Option.none`.
 /// What a lookup answers when finding nothing is not a failure -- the reason
 /// would always be "it was not there" -- and what `let?` chains as readily as
@@ -152,12 +168,28 @@ union Option a {
     /// The next lookup, which may find nothing in its turn.
     and_then : (a -> Option b) -> Option a -> Option b
     and_then f self = match self { Option.some(v) => f v, Option.none => none }
+    /// Continue with `other` when present, or keep none. `other` stays lazy
+    /// when this option is missing.
+    and : Option b -> Option a -> Option b
+    and other self = match self { Option.some(_) => other, Option.none => none }
     /// The value if `keep` says so, and nothing otherwise.
     filter : (a -> :bool) -> Option a -> Option a
     filter keep self = match self { Option.some(v) => if keep v { self } else { none }, Option.none => none }
     /// This option if it holds a value, otherwise `other`. Lazy in `other`.
     otherwise : Option a -> Option a -> Option a
     otherwise other self = match self { Option.some(_) => self, Option.none => other }
+    /// Keep this value, or use `other` when missing.
+    or : Option a -> Option a -> Option a
+    or other self = otherwise other self
+    /// Compute a fallback only when missing. The callback receives `()`.
+    or_else : (:unit -> Option a) -> Option a -> Option a
+    or_else missing self = match self { Option.some(_) => self, Option.none => missing () }
+    /// Keep the value when exactly one option is present; otherwise none.
+    xor : Option a -> Option a -> Option a
+    xor other self = match self {
+        Option.some(_) => match other { Option.some(_) => none, Option.none => self },
+        Option.none => other,
+    }
 
     /// The value, or `default`.
     unwrap_or : a -> Option a -> a

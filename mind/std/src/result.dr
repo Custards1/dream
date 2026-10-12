@@ -50,6 +50,12 @@ let map_err f r = Result.map_error f r;
 /// `Result.and_then`.
 let and_then : (a -> Result b e) -> Result a e -> Result b e;
 let and_then f r = Result.and_then f r;
+/// `Result.and`.
+let and : Result b e -> Result a e -> Result b e;
+let and other r = Result.and other r;
+/// `Result.or`.
+let or : Result a f -> Result a e -> Result a f;
+let or other r = Result.or other r;
 /// `Result.or_else`.
 let or_else : (e -> Result a f) -> Result a e -> Result a f;
 let or_else f r = Result.or_else f r;

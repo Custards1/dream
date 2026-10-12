@@ -376,6 +376,7 @@ let banner version =
 /// so a REPL started with `-L` can import what a build with the same `-L`
 /// could.
 let start! roots cfg version = {
+    console.error! "dreams: warning: the REPL is deprecated; use source files with `just run FILE` or `mind run` instead."
     console.print! (banner version)
     loop! (io.stdin! ()) empty_session roots cfg (scratch! ".dr") (scratch! ".dream")
 };
