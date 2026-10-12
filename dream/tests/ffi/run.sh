@@ -31,8 +31,8 @@ root=$(cd "$here/../../.." && pwd)
 case "$dream" in /*) ;; *) dream="$root/$dream" ;; esac
 case "$dreams" in /*) ;; *) dreams="$root/$dreams" ;; esac
 mkdir -p "$tmp/pkg"
-cp "$here/mind.toml" "$here/build.dr" "$here/ffi.dr" "$here/sample.c" "$tmp/pkg/"
-timeout 300 "$dream" "$dreams" -L "$root/mind/std" "$root/mind/tool/main.dr" -o "$tmp/mind.dream" >"$tmp/build" 2>&1 \
+cp -r "$here/mind.toml" "$here/build.dr" "$here/src" "$here/sample.c" "$tmp/pkg/"
+timeout 300 "$dream" "$dreams" -L "$root/mind/std" "$root/mind/tool/src/main.dr" -o "$tmp/mind.dream" >"$tmp/build" 2>&1 \
     || { cat "$tmp/build"; exit 1; }
 (cd "$tmp/pkg" && CC="$cc" DREAM="$dream" MIND_STDLIB="$root/mind" MIND_HOME="$tmp/home" \
     timeout 300 "$dream" "$tmp/mind.dream" build --compiler "$dreams" -o "$tmp/ffi.dream") >"$tmp/build" 2>&1 \
@@ -57,7 +57,7 @@ case "$(uname -s)" in
     *) lib="$tmp/lib/libsample.so"; shared=-shared ;;
 esac
 "$cc" $shared -fPIC -O2 -o "$lib" "$here/sample.c" >"$tmp/build" 2>&1 || { cat "$tmp/build"; exit 1; }
-timeout 300 "$dream" "$dreams" -L "$root/mind" "$here/system.dr" -o "$tmp/system.dream" >"$tmp/build" 2>&1 \
+timeout 300 "$dream" "$dreams" -L "$root/mind" "$here/src/system.dr" -o "$tmp/system.dream" >"$tmp/build" 2>&1 \
     || { cat "$tmp/build"; exit 1; }
 found="found libsample.so
 1

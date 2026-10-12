@@ -29,7 +29,7 @@ just bootstrap-check    # the seed, stage 2 and stage 3 are the same bytes
 When you change the compiler, build it, then copy `build/dreams.dream` over
 the seed. A change that adds atoms to the compiler can take two rounds: build
 again with each new image until one compiles the source into itself, and keep
-that one ("`mind/std/all.dr --test` is not byte-stable" in
+that one ("`mind/std/src/all.dr --test` is not byte-stable" in
 [docs/notes/macro-expansion.md](../docs/notes/macro-expansion.md) says why).
 `bootstrap-check` fails on a seed that has fallen behind the source, and says
 which image to copy over it.

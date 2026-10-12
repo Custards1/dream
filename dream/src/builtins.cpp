@@ -760,7 +760,7 @@ std::string describe_untraced(Process& p, Value err) {
     auto* e = static_cast<ErrorObj*>(as_obj(v));
     if (resolve(e->kind) != make_atom(p.runtime().intern_atom("match_error"))) return text;
     // `[value, path, line, col]`, as the lowering of a failed match builds it
-    // (see "a failed match" in dreams/lower.dr). Anything else -- one raised
+    // (see "a failed match" in dreams/src/lower.dr). Anything else -- one raised
     // by hand, or by an older compiler -- is shown as it is.
     Value items[4];
     Value cell = resolve(e->payload);
@@ -3332,7 +3332,7 @@ NativeResult core_parse_int(Process& p, Value, Value* args, uint32_t) {
     // Space either side, a sign, and digits -- the whole of the rest, or
     // "12abc" would parse as 12. However many digits: past eighteen the answer
     // is a bignum, which is also how a literal too big for a fixnum is built
-    // (`const_int` in dreams/lower.dr).
+    // (`const_int` in dreams/src/lower.dr).
     const char* d = s->data();
     size_t lo = 0, hi = s->len;
     while (lo < hi && std::isspace(uint8_t(d[lo]))) ++lo;

@@ -3,7 +3,7 @@
 # next to it in `<name>.expected`.
 #
 # Single-file examples are `examples/NN_name.dr`. A package is any directory
-# with a `mind.toml`; its entry point is `main.dr` and its expected output is
+# with a `mind.toml`; its entry point is `src/main.dr` and its expected output is
 # `<dir>.expected` beside the directory.
 #
 #   examples/run.sh            check every example
@@ -118,17 +118,17 @@ for src in "$HERE"/*.dr; do
   check "$name" "$src" "$HERE/$name.expected"
 done
 
-# Packages: any directory with a manifest, entered through main.dr.
+# Packages: any directory with a manifest, entered through src/main.dr.
 for manifest in "$HERE"/*/mind.toml; do
   [[ -e "$manifest" ]] || continue
   dir="$(dirname "$manifest")"
   name="$(basename "$dir")"
   [[ -z "$filter" || "$name" == *"$filter"* ]] || continue
-  if [[ ! -f "$dir/main.dr" ]]; then
-    echo "skip $name (no main.dr)"
+  if [[ ! -f "$dir/src/main.dr" ]]; then
+    echo "skip $name (no src/main.dr)"
     continue
   fi
-  check "$name" "$dir/main.dr" "$HERE/$name.expected"
+  check "$name" "$dir/src/main.dr" "$HERE/$name.expected"
 done
 
 echo

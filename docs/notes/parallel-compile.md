@@ -20,14 +20,14 @@ what is left and why none of it is an edit. In the order the wins were found:
   `--profile` and to `-j 1`, which is where it hid.
 - **A `comp` ran against an image of the whole unshared arena.** Six one-line
   compile-time expressions paid for serializing 142,000 nodes. `comp_image` in
-  [dreams/lower.dr](../../dreams/lower.dr) gives every function the expressions
+  [dreams/src/lower.dr](../../dreams/src/lower.dr) gives every function the expressions
   cannot reach one shared raising body and runs the optimizer, which copies only
   what a body reaches: **~0.9 s -> 0.17 s**. Incomplete reachability is loud,
   not wrong, for the reason the macro stub is.
 - **Parsing is spread across processes.** Before a file is parsed its
   top-level `import` lines are read off the text, and every file they lead to is
   read and handed to a process of its own (`prefetch!` in
-  [dreams/modules.dr](../../dreams/modules.dr)); the depth-first walk is unchanged
+  [dreams/src/modules.dr](../../dreams/src/modules.dr)); the depth-first walk is unchanged
   and joins each parse when it reaches the file. Loading went 2.2 s -> 0.75 s.
   Two things had to be fixed first, and both are general:
   - `Heap::copy_between` searched a vector for every object it had already
@@ -41,7 +41,7 @@ what is left and why none of it is an edit. In the order the wins were found:
     compiler.
 - **The arena is shared in a child while the checker runs.** They need
   nothing from each other; `share_elsewhere!` in
-  [dreams/compile.dr](../../dreams/compile.dr) hands the program's *tables* over
+  [dreams/src/compile.dr](../../dreams/src/compile.dr) hands the program's *tables* over
   (the child flattens them, `opt.optimize_program`), and the checker's half
   second comes off the critical path. Splitting the share itself in two and
   walking the second half's arena into the first's table was built and gives
@@ -49,7 +49,7 @@ what is left and why none of it is an edit. In the order the wins were found:
   the half it saves, so it is not kept.
 - **A rename is a wrapper.** `let node_op = Node.op;` was a global read and a
   closure application at every call; `rename_wrapper` in
-  [dreams/scope.dr](../../dreams/scope.dr) records it as the wrapper it amounts to,
+  [dreams/src/scope.dr](../../dreams/src/scope.dr) records it as the wrapper it amounts to,
   and an empty `[]` or `%{}` now counts as a literal, which makes every
   `p.[:nodes else (%{})]` accessor a wrapper too. 4%.
 - **Forcing a small tree is `to_string`.** `ir.settled` and `scope.forced`
@@ -97,7 +97,7 @@ machine (the commit before measured 5.75 s here). Lowering was 2.4 s of the
 critical path and every body's lowering depends on the resolution and on
 nothing else, so it runs in four processes (`lower.link_parallel!`, used by
 `compile.build!` whenever the build is optimized). "Lowering in parts" in
-[dreams/lower.dr](../../dreams/lower.dr) is the design; what is worth carrying away:
+[dreams/src/lower.dr](../../dreams/src/lower.dr) is the design; what is worth carrying away:
 
 - **The split was worth nothing until copying stopped.** Four processes lower
   in 0.62 s against 2.5 s for one, but handing each of them the resolution by
@@ -142,7 +142,7 @@ nothing else, so it runs in four processes (`lower.link_parallel!`, used by
 - **The bootstrap needs two stages to settle.** The parts intern atoms in a
   different order than the whole-program walk, and a `comp` that builds an
   atom-keyed map quotes it in the compiling VM's atom order (the same effect as
-  "`mind/std/all.dr --test` is not byte-stable" below). So the stage the old
+  "`mind/std/src/all.dr --test` is not byte-stable" below). So the stage the old
   seed builds and the stage after it differ in 434 bytes, and the stage after
   that is the fixpoint. It is deterministic run to run.
 
@@ -231,7 +231,7 @@ nothing else, so it runs in four processes (`lower.link_parallel!`, used by
   kept, because it is simpler and the output is byte-identical.
 
 `Options.parallel` is what turns all of this on, and only the command line
-sets it; see the `Options` doc in [dreams/compile.dr](../../dreams/compile.dr).
+sets it; see the `Options` doc in [dreams/src/compile.dr](../../dreams/src/compile.dr).
 
 Where the time is now, wall clock from the start of a self-compile: loaded
 1.0 s (parsing 0.7, spread over processes and bound by 1.8 s of parse CPU;

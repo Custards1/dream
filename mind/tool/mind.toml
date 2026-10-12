@@ -1,8 +1,6 @@
+# `mind`, the build tool. build.dr beside this declares the checks against
+# packages on disk that `mind test mind` runs after the units.
 [package]
 name = "mind"
 version = "0.1.0"
-src = "."
-
-[build]
-# `build.dr` here is `mind`'s own module; the build script is this one.
-script = "tests/build.dr"
+description = "The Dream build tool"

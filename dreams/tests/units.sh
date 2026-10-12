@@ -140,9 +140,9 @@ else
 fi
 
 # The compiler itself, which is the program with the most parts there is.
-( "$dream" "$image" -L "$root/mind" -L "$root" --units "$tmp/self" -o "$tmp/self1.dream" "$root/dreams/main.dr" >/dev/null 2>&1 &&
-  "$dream" "$image" -L "$root/mind" -L "$root" --units "$tmp/self" -o "$tmp/self2.dream" "$root/dreams/main.dr" >/dev/null 2>&1 &&
-  "$dream" "$image" -L "$root/mind" -L "$root" -o "$tmp/self3.dream" "$root/dreams/main.dr" >/dev/null 2>&1 )
+( "$dream" "$image" -L "$root/mind" -L "$root" --units "$tmp/self" -o "$tmp/self1.dream" "$root/dreams/src/main.dr" >/dev/null 2>&1 &&
+  "$dream" "$image" -L "$root/mind" -L "$root" --units "$tmp/self" -o "$tmp/self2.dream" "$root/dreams/src/main.dr" >/dev/null 2>&1 &&
+  "$dream" "$image" -L "$root/mind" -L "$root" -o "$tmp/self3.dream" "$root/dreams/src/main.dr" >/dev/null 2>&1 )
 if cmp -s "$tmp/self1.dream" "$tmp/self2.dream" && cmp -s "$tmp/self1.dream" "$tmp/self3.dream"; then
     echo "ok   the compiler, cold, warm and without units"; pass=$((pass + 1))
 else

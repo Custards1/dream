@@ -2,7 +2,7 @@
 
 The design lives in [session-mode.md](session-mode.md). This file says where the
 implementation actually is, so the work can be picked up from here without
-re-deriving it. Today: **`dreams/session.dr` is written and wired into `repl.dr`,
+re-deriving it. Today: **`dreams/src/session.dr` is written and wired into `repl.dr`,
 the live session works end to end, and `just test` is green. The two issues the
 last session left are fixed — the first-entry crash and the `compile!` shape
 mismatch (below). The seed has not been re-bootstrapped yet; see "Ground
@@ -10,13 +10,13 @@ rules".**
 
 ## Ground rules
 
-- Build with `./build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/main.dr`, then `just test-dreams`.
+- Build with `./build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/src/main.dr`, then `just test-dreams`.
 - After changing the compiler: `just bootstrap` and copy `build/dreams.dream` over `dreams/bootstrap/dreams.dream`.
 - Byte-identity with a fresh build is *not* a goal (session-mode.md#L276). Correctness is "indices never change meaning".
 
 ## Done, verified
 
-### `modules.reload_root!` (dreams/modules.dr:614)
+### `modules.reload_root!` (dreams/src/modules.dr:614)
 Unmounts the root from `:modules`, `:by_name`, `:by_path`, `:visited`, then
 re-runs `load_file!` at the same index. Dependencies' parses, maps and positions
 survive. `modules.load!` is untouched.
@@ -51,7 +51,7 @@ survive. `modules.load!` is untouched.
 All of it builds warning-free from the seed and `just test-dreams` is fully
 green (10 `when test` cases in session.dr, 11 in repl.dr).
 
-## The module as it is (dreams/session.dr)
+## The module as it is (dreams/src/session.dr)
 
 `session.dr` imports std.io, std.list, std.str; then dreams.diag,
 dreams.emit, dreams.ir, dreams.lower, dreams.modules, dreams.parser,
@@ -185,18 +185,18 @@ is its presentable form. `just test-dreams` and the full `just test` are green.
 ## Breadcrumbs
 
 - `list.all`, `list.take`, `list.drop`, `list.fold_strict`, `list.last` all
-  exist in mind/std/list.dr; `str.starts_with` in mind/std/str.dr (verified).
+  exist in mind/std/src/list.dr; `str.starts_with` in mind/std/src/str.dr (verified).
 - `parser.parse_module` → `[:ok, items]` / `[:error, m, offset]` (parser.dr:1082).
 - `ir.program` (ir.dr:197), `ir.finish` (ir.dr:295), `ir.no_node` (ir.dr:138);
   `lower.strk` (lower.dr:823) for interning names.
 - `lower.link_imports` (lower.dr:898), `lower.link_modules` (lower.dr:907) —
   rec shapes there; the root rec is built by hand in `finalize!` to mirror them.
-- Caller that must keep working: `lucid/analysis.dr:65` uses `scope.resolve!`.
+- Caller that must keep working: `lucid/src/analysis.dr:65` uses `scope.resolve!`.
 - `just test-dreams` collects `when test` in repl.dr (11 cases) and session.dr
   (10 cases).
 - The compiler a `dream` run uses must come from a rebuild after `session.dr`
   edits: `./build-dream/bin/dream dreams/bootstrap/dreams.dream -o
-  build/dreams.dream -L mind -L . dreams/main.dr` (writing to `build/dreams.dream`
+  build/dreams.dream -L mind -L . dreams/src/main.dr` (writing to `build/dreams.dream`
   and reading from it in one command truncates the input; write to a temp path
   and copy).
 - Live session check-cases that work now: `let a = 1;` then `let b = a + 1;`

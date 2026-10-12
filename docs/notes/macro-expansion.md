@@ -10,7 +10,7 @@ whole program, compiles it, appends the call as a temporary entry, emits an
 image and hands it to `vm.eval_image!`, exactly as `comp!` does. That is a
 compile of the program per call, and the compiler had been doing precisely
 that: a 10-declaration file cost 1.13 s against 0.30 s for the same file with
-the macros written out, and `mind/std/all.dr --test` — whose `std.macros` test
+the macros written out, and `mind/std/src/all.dr --test` — whose `std.macros` test
 block is forty `expand`s in one declaration — cost **38.2 s**.
 
 Two changes, each removing one of the two O(program) costs:
@@ -39,7 +39,7 @@ a 13 s compile. Beware a benchmark that holds constant the thing the cost is
 proportional to. The row below is the fix.
 
 - **One image per round, not per call** (`evaluate!` in
-  [dreams/expand.dr](../../dreams/expand.dr)). Every call of one declaration is
+  [dreams/src/expand.dr](../../dreams/src/expand.dr)). Every call of one declaration is
   compiled against the same snapshot, so the wrapper's body is a *list* of them
   and the arena is serialized once. `emit.to_binary` was 36% of the compile at
   that point and is the part whose cost is the whole program rather than the
@@ -68,12 +68,12 @@ result, so a raise anywhere in it is one failure for the whole image and says
 nothing about which call raised. The alternative — generate a `try` around each
 call — means naming `strict!` and `to_string` in the wrapper, and a module is
 free to declare a global of either, which would win (a builtin loses to a
-global; see [dreams/builtins.dr](../../dreams/builtins.dr)). So a batch that fails is
+global; see [dreams/src/builtins.dr](../../dreams/src/builtins.dr)). So a batch that fails is
 thrown away and its calls are run one at a time, where the wrapper *is* the
 call and every diagnostic is the one it gave before batching existed.
 
 **What did not change**, and is worth checking after any change here: the image
-a macro-using program compiles to. `mind/std/all.dr --test` and the benchmark
+a macro-using program compiles to. `mind/std/src/all.dr --test` and the benchmark
 above both come out byte-identical to what the pre-change compiler emitted,
 except for the `SPAN` entries of generated functions — expansion hands out
 offsets from a reserved part of the 32-bit space and the order it hands them
@@ -187,7 +187,7 @@ what. It is `1 / 0`: the same placeholder an unexpanded `expand` is staged as,
 for the same reason. A macro is pure, so it cannot catch it. So an incomplete
 reachability answer cannot be silently wrong -- it raises, the batch is thrown
 away, and the round is run again with every declaration a root, which is the
-whole program (`:whole` in [dreams/expand.dr](../../dreams/expand.dr), and every
+whole program (`:whole` in [dreams/src/expand.dr](../../dreams/src/expand.dr), and every
 fallback path sets it: `one_by_one!` and `sequential!` both).
 
 **That was measured rather than argued.** A compiler built with the dependency
@@ -199,7 +199,7 @@ is slower and it is not wrong. What it produces differs from the batch path in
 already says the two paths disagree about.
 
 **What to expect of the images.** Byte-identical, everywhere: the bootstrap
-reaches a fixpoint in one stage, and `mind/std/all.dr --test` comes out the same
+reaches a fixpoint in one stage, and `mind/std/src/all.dr --test` comes out the same
 file it came out before. That is the test worth running after any change here,
 because expansion deciding differently is exactly the failure this pass could
 have.
@@ -287,7 +287,7 @@ for the reason `main.dr`'s `timed!` gives: forcing a phase walks everything the
 phases before it built, and the walk is not this phase's work.
 
 Off, it costs nothing measurable: the same compiler with the meter in it and
-the commit before it, alternating on `mind/std/all.dr --test`, came back
+the commit before it, alternating on `mind/std/src/all.dr --test`, came back
 2534/2597/2593 ms against 2519/2568/2589 -- the metered build nominally faster
 in all three, which is how a difference inside the noise floor looks. Every
 image in this repository is byte-identical either way.
@@ -306,7 +306,7 @@ Nothing says two globals may not name the same function. A `GLOB` is a name, a
 kind and a `FUNC` index, and the VM checks only that the index is in range. So
 the stub is declared once and every unreached global points at it
 (`shared_stub` and the rewrite at the end of `resolve_reachable!` in
-[dreams/scope.dr](../../dreams/scope.dr)), which takes the per-declaration work out of
+[dreams/src/scope.dr](../../dreams/src/scope.dr)), which takes the per-declaration work out of
 three phases at once: `check_body` does not run, no function record is built,
 and no nodes are lowered or serialized.
 
@@ -345,7 +345,7 @@ thrown away and the round runs again with every declaration a root. What the
 sharing changes is only how many function records say so.
 
 **What did not change: the image.** Every image in this repository is
-byte-identical -- `dreams`, `lucid`, `mind`, and `mind/std/all.dr --test`,
+byte-identical -- `dreams`, `lucid`, `mind`, and `mind/std/src/all.dr --test`,
 which is the macro-heavy one -- and so is the 3,200-declaration program's
 (877,144 bytes, 26,109 nodes either way). That is the test this change is held
 to, and the reason is that nothing *reachable* changes: the stub is only ever
@@ -431,7 +431,7 @@ than the program.
 declares a *slice* of one module and the module's stored answer is about all of
 it. One statement is not a walk worth saving.
 
-Every image in the repository is byte-identical, `mind/std/all.dr --test`
+Every image in the repository is byte-identical, `mind/std/src/all.dr --test`
 excepted for a reason that is not this change -- the section below -- and the
 bootstrap reaches a fixpoint in one stage.
 
@@ -475,7 +475,7 @@ and what the resolver answers "which macro is this?" about -- nothing here
 re-implements name lookup, which is the mistake that would make it subtly wrong
 in the cases nobody writes a test for. Its body is just the names.
 
-`dreams --time` on `mind/std/all.dr --test`, which is the macro-heavy build --
+`dreams --time` on `mind/std/src/all.dr --test`, which is the macro-heavy build --
 55 calls in two rounds:
 
 | | declare | resolve | lower | emit | run | tax | image |
@@ -521,11 +521,11 @@ and it is fatal when a member is found by the name of its module and its own:
 the image loads, runs, and has no member of any name. `MODS` is the only
 statement in the container of which globals are whose, and a global's name is
 not unique in one -- two modules may each declare `helper`. See
-`invocation_image` in [dreams/expand.dr](../../dreams/expand.dr).
+`invocation_image` in [dreams/src/expand.dr](../../dreams/src/expand.dr).
 
 **What the images did.** `dreams` changes, because its own source did. `lucid`,
 `mind` and a generated 3,200-declaration program are byte-identical, and the
-bootstrap reaches a fixpoint in one stage. `mind/std/all.dr --test` moves by
+bootstrap reaches a fixpoint in one stage. `mind/std/src/all.dr --test` moves by
 **12 bytes**, and they are not the 6 the section below is about: three
 `<lambda>` function records' `span_start` and `span_end`, all of them above
 2^31, which is the reserved part of the offset space expansion hands generated
@@ -604,7 +604,7 @@ source now, which is the question the offsets actually pose.
 | + accounting per file | **14 ms, 0.6 M** | **116 ms** |
 
 `lucid`, which imports this compiler, moves the same way: 51 ms -> **14**, and
-its macro tax 167 -> **133**. `mind/std/all.dr --test` does not move at all
+its macro tax 167 -> **133**. `mind/std/src/all.dr --test` does not move at all
 (3-4 ms either way), and the reason is worth keeping: in `--test` mode
 `std.macros`'s `when test` blocks survive, so its 55 offsets land in
 declarations and it never fell back. The whole self-compile does not move
@@ -620,7 +620,7 @@ logic is broken" would need the loader to carry the spans it dropped, and 3 ms
 does not buy that.
 
 **What the images did.** Every one of them changed, in one field. `mind`,
-`lucid` and `mind/std/all.dr --test` come out the same size with the same node
+`lucid` and `mind/std/src/all.dr --test` come out the same size with the same node
 and function counts, differing in 63, 496 and 142 bytes -- and every one of
 those bytes is offset 24 of a `FUNC` record, which is `span_end`. 39 of `mind`'s
 505 functions, 284 of `lucid`'s 2,630 and 97 of the std build's 2,010 had a span
@@ -637,7 +637,7 @@ printing what the pass decided: eleven modules with offsets, of which eight
 could not account for their own. A pass with a fallback should be asked how
 often it takes it, and `work_of` had been taking it for a year.
 
-**One thing this deletes elsewhere.** `lucid/analysis.dr` had a `reach` walk --
+**One thing this deletes elsewhere.** `lucid/src/analysis.dr` had a `reach` walk --
 follow the last part of a lambda, an `if`, an application, a `let`, a `match`'s
 arms, and take the largest end -- built because "a cursor in a match arm looks
 as though it is in no `match` at all", at a cost its comment records as eight
@@ -667,7 +667,7 @@ nothing is lowered for it. It is still the thing the resolver answers "which
 macro is this?" about, which is the one question expansion must not answer for
 itself.
 
-`dreams --time` on `mind/std/all.dr --test`, which is the macro-heavy build --
+`dreams --time` on `mind/std/src/all.dr --test`, which is the macro-heavy build --
 55 calls in two rounds -- and on a self-compile, which is 14 calls in one:
 
 | | sites | resolve | lower | emit | tax | image |
@@ -725,7 +725,7 @@ charged for because the wrappers were resolved with everything else. The pair is
 26 ms where it was 38.
 
 **What did not change.** The images: `dreams`, `lucid`, `mind` and
-`mind/std/all.dr --test` are all four byte-identical to what the previous
+`mind/std/src/all.dr --test` are all four byte-identical to what the previous
 compiler emitted -- including the std build, which the section above had to
 excuse for twelve generated-span bytes and this one does not -- and the
 bootstrap reaches a fixpoint in one stage. And the diagnostics, which is the
@@ -737,13 +737,13 @@ the name), one that *is* called and names it (reported twice, as it always was
 -- once against the `expand` and once at the name), and one that raises when it
 runs.
 
-## `mind/std/all.dr --test` is not byte-stable across compiler changes
+## `mind/std/src/all.dr --test` is not byte-stable across compiler changes
 
 Worth knowing before the next person spends an hour on it, because several
 sections above tell you to check byte equality after a compiler change and this
 is the one image that can move without anything being wrong.
 
-`mind/std/all.dr` contains `let compiled_options = comp cli.parse_as
+`mind/std/src/all.dr` contains `let compiled_options = comp cli.parse_as
 option_schema options_for_types [..]`, and the value of that is a *map* --
 `%{ :values => .., :rest => .. }`, from `cli.parsed`. A compile-time expression
 is evaluated by running it on a VM and quoting the answer back into the image,
@@ -760,7 +760,7 @@ again:
 - it is stable across runs, across `-j`, across `DREAM_GC_THREADS`,
   `DREAM_GC_CONCURRENT` and `DREAM_MAX_HEAP` -- this is not a race;
 - it is decided by the compiler image. A one-line `let x = :zzz;` added to
-  `dreams/config.dr` and nothing else flips it, and so does a one-line
+  `dreams/src/config.dr` and nothing else flips it, and so does a one-line
   `let x = "zzz";`, and so did the change in the section above -- **and all
   three produce the same image as each other**, which is the check to apply.
 
@@ -772,7 +772,7 @@ rather than against the seed.
 
 **Later, 2026-09-30: `dreams` has one too.** The compiler's own image carries a
 compile-time map of atoms to opcode numbers, and it moved the same way when
-`dreams/package.dr` gained a record field (`Package.overlays`, a new atom):
+`dreams/src/package.dr` gained a record field (`Package.overlays`, a new atom):
 the seed compiling the new source gave one image, and that image compiling the
 source gave another, 387 bytes apart, all in that constant's `NODE` records.
 Both are deterministic, and the second is a fixpoint -- it compiles the source

@@ -4,7 +4,7 @@
 # resolved whole: the same diagnostics, in the same order, and code that does
 # the same thing. `--check` never builds, so it is always the whole walk, and
 # `--no-opt` lowers the arena whole -- which is exactly the pair to hold the
-# parts to. See "resolving in parts" in dreams/scope.dr.
+# parts to. See "resolving in parts" in dreams/src/scope.dr.
 set -u
 
 dream=${dream:-build-dream/bin/dream}

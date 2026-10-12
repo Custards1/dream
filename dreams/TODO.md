@@ -31,7 +31,7 @@ walk was taken out of `scope.declare!`:
 | 6,400 declarations, one call | 431 -> **93 ms** | 518 -> **184 ms** | 8132 -> **7315 ms** |
 
 Every image is byte-identical to what the previous compiler emitted -- with the
-one standing exception `mind/std/all.dr --test` is, for reasons that are not
+one standing exception `mind/std/src/all.dr --test` is, for reasons that are not
 about any of this work and are written up in `docs/notes/macro-expansion.md` -- and the bootstrap
 reaches a fixpoint in one stage.
 
@@ -115,7 +115,7 @@ is 51 ms of a 99 ms tax on a 3.7 s compile.
   `emit` and `run`. What it actually removed was the *arguments from the
   image*, which is `emit` (32 ms -> 10 on the std build) plus the `lower` and
   `resolve` and `declare` of code that no longer exists: 202 ms -> 133 on
-  `mind/std/all.dr --test`, 194 -> 147 on a self-compile. The lesson is the
+  `mind/std/src/all.dr --test`, 194 -> 147 on a self-compile. The lesson is the
   one this file keeps relearning from the other side -- a phase meter says
   where the time is, not what a change will reach.
 
@@ -292,7 +292,7 @@ it is no longer the only thing that moves the wall.
     a set of `root_key`s rather than an index, and the wrapper got out of the
     image altogether (`scope.resolve_names!` resolves it on its own and the
     caller keeps `refs` and throws the rest away). One image per *compile*
-    rather than per round: `mind/std/all.dr --test` 134 ms -> **107** with its
+    rather than per round: `mind/std/src/all.dr --test` 134 ms -> **107** with its
     two rounds sharing one 51 KB image where they built two totalling 88 KB.
   - keep it across rounds ~~and then across builds~~. Across rounds is what the
     above is. **Across builds is priced and is not worth building yet** -- see
@@ -414,7 +414,7 @@ the work.
    history of, 1.5 in a self-compile. The arena was most of that and is fixed
    (`ir.settled`); what is left has the same shape and the same cause -- a
    value stored into a persistent map before anything forces it, pinning the
-   version it was stored in. [dreams/opt.dr](dreams/opt.dr)'s five tables are
+   version it was stored in. [dreams/src/opt.dr](dreams/src/opt.dr)'s five tables are
    the named suspect: `keep` forces a node only when it happens to be
    shareable, because `to_string` is how it makes the sharing key, so every
    node that is not shareable goes in as a thunk. Measure the ratio before and
@@ -431,7 +431,7 @@ the work.
    ceiling the meter predicted for it, and the reason is worth carrying: the
    meter costed "stop rebuilding the image", and what the change actually did
    was stop *putting the calls in it*. The macro tax is 202 ms -> 133 on
-   `mind/std/all.dr --test` and 194 -> 147 on a self-compile, with every image
+   `mind/std/src/all.dr --test` and 194 -> 147 on a self-compile, with every image
    in the repository byte-identical bar the 12 generated-span bytes of
    `std --test`, and the bootstrap a fixpoint in one stage. See "The image was
    the calls, and now it is the transformers" in `docs/notes/macro-expansion.md`.
@@ -462,7 +462,7 @@ the work.
 
    `discover` 49 ms -> **14**, 2.5 M reductions -> **0.6 M**, the self-compile's
    macro tax 152 -> **116**, and `lucid` the same (51 -> 14, tax 167 -> 133).
-   `mind/std/all.dr --test` does not move, because in `--test` mode
+   `mind/std/src/all.dr --test` does not move, because in `--test` mode
    `std.macros`'s sites are inside declarations that survive. Every image in the
    repository changed in exactly one field -- `span_end` of a `FUNC` record --
    and the bootstrap reaches a fixpoint in one stage. See "Discovery was a walk

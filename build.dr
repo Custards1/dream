@@ -49,7 +49,7 @@ let suite ctx name program = command.check_in (build.Context.root ctx) name (too
 let std_build : :string;
 let std_build = "t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
     + " && for p in toolchains incremental dependencies; do"
-    + " \"$dream\" \"$dreams\" -L mind mind/std/build/tests/$p.dr -o \"$t/$p.dream\" >/dev/null"
+    + " \"$dream\" \"$dreams\" -L mind mind/std/src/build/tests/$p.dr -o \"$t/$p.dream\" >/dev/null"
     + " && \"$dream\" \"$t/$p.dream\" || exit 1; done"
     + " && python3 dream/tests/static_link.py";
 
@@ -72,9 +72,9 @@ let checks ctx =
     |> build.check "ffi" (suite ctx "ffi" "dream/tests/ffi/run.sh")
     |> build.check "image" (suite ctx "image" "dream/tests/image/run.sh")
     |> build.check "tls" (suite ctx "tls" "dream/tests/tls/run.sh")
-    |> build.check "sql_pg_contracts" (suite ctx "sql_pg_contracts" "mind/std/sql/pg/tests/contracts.sh")
-    |> build.check "sql_pg_live" (suite ctx "sql_pg_live" "mind/std/sql/pg/tests/live.sh")
-    |> build.check "pack_formats" (suite ctx "pack_formats" "mind/tool/pack/tests/formats.sh");
+    |> build.check "sql_pg_contracts" (suite ctx "sql_pg_contracts" "mind/std/src/sql/pg/tests/contracts.sh")
+    |> build.check "sql_pg_live" (suite ctx "sql_pg_live" "mind/std/src/sql/pg/tests/live.sh")
+    |> build.check "pack_formats" (suite ctx "pack_formats" "mind/tool/tests/pack/formats.sh");
 
 // --- the VM -------------------------------------------------------------------------
 
@@ -201,7 +201,7 @@ let native ctx name source lib =
 
 /// The compiler, compiled by `compiler` and run on `vm`.
 let dreams_by : :any -> :any -> :any;
-let dreams_by vm compiler = dream.program "dreams" "dreams/main.dr" compiler vm |> dream.paths ["mind", "."];
+let dreams_by vm compiler = dream.program "dreams" "dreams/src/main.dr" compiler vm |> dream.paths ["mind", "."];
 
 let goals : :map -> cc.Toolchain -> :any -> [:string] -> [:string] -> :map;
 let goals ctx tc llvm libffi openssl = {
@@ -220,10 +220,10 @@ let goals ctx tc llvm libffi openssl = {
     |> build.note "dreams" "the compiler, built by the seed"
     |> build.goal "seed" (build.place "dreams/bootstrap/dreams.dream" stage3)
     |> build.note "seed" "the compiler built by itself, over the checked-in seed"
-    |> build.goal "mind" (build.place "build/mind" (dream.artifact (dream.program "mind" "mind/tool/main.dr" dreams vm
+    |> build.goal "mind" (build.place "build/mind" (dream.artifact (dream.program "mind" "mind/tool/src/main.dr" dreams vm
                                                                      |> dream.paths ["mind/std"] |> dream.flags ["--shebang"])))
     |> build.goal "lucid" (build.place "build/lucid.dream"
-                                       (dream.artifact (dream.program "lucid" "lucid/main.dr" dreams vm |> dream.paths ["mind", "."])))
+                                       (dream.artifact (dream.program "lucid" "lucid/src/main.dr" dreams vm |> dream.paths ["mind", "."])))
     |> build.goal "default" (build.each ["vm", "dreams", "mind", "lucid"])
 };
 

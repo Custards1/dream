@@ -18,7 +18,7 @@ trap 'rm -rf "$tmp"' EXIT
 fail=0
 say_fail() { echo "FAIL: $*"; fail=1; }
 
-"$dream" "$dreams" lucid/main.dr -L mind -L . -o "$image" >/dev/null 2>&1 || exit 1
+"$dream" "$dreams" lucid/src/main.dr -L mind -L . -o "$image" >/dev/null 2>&1 || exit 1
 
 python3 lucid/tests/editor.py "$dream" "$image" || exit 1
 python3 lucid/tests/responsive.py "$dream" "$image" || exit 1

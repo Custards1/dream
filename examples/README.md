@@ -53,23 +53,27 @@ A package is any directory here with a `mind.toml`; its entry is `main.dr` and
 its expected output is `<dir>.expected`.
 
 **[`example/`](example)** is the smallest package there is, a manifest and a
-`main!` -- what `mind new` makes.
+`src/main.dr` -- what `mind new` makes.
 
 **[`textstats/`](textstats)** is a word-frequency tool, split across files the
 way a real one would be:
 
 ```
 textstats/
-  mind.toml          the manifest: this directory is a package named `textstats`
-  tokenize.dr        text -> words
-  counter.dr         words -> a tally, over a map
-  report.dr          a GENERIC report: declares `virtual let row`, and writes
-                     `render`, `body`, `width` and `pad` in terms of it
-  report_plain.dr    `derive textstats.report` -- fills the holes one way
-  report_bars.dr     `derive textstats.report` -- fills them another
-  stats/mod.dr       a module that grew into a directory; importers do not care
-  main.dr            wires them together
+  mind.toml            the manifest: this directory is a package named `textstats`
+  src/
+    tokenize.dr        text -> words
+    counter.dr         words -> a tally, over a map
+    report.dr          a GENERIC report: declares `virtual let row`, and writes
+                       `render`, `body`, `width` and `pad` in terms of it
+    report_plain.dr    `derive textstats.report` -- fills the holes one way
+    report_bars.dr     `derive textstats.report` -- fills them another
+    stats/mod.dr       a module that grew into a directory; importers do not care
+    main.dr            wires them together
 ```
+
+The modules are in `src/` and the manifest beside it, which is where `mind`
+and the compiler both look when the manifest does not say otherwise.
 
 `report_plain` and `report_bars` share every line of their rendering logic and
 print completely different output, because `derive` specializes the base
@@ -79,7 +83,7 @@ module against each one at compile time.
 
 ```toml
 [dependencies]
-textstats = { path = "../textstats" }
+textstats = "../textstats"
 ```
 
 It shows two things a single package cannot: that a dependency is reached by

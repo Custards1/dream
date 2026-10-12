@@ -24,14 +24,14 @@ not looking at.
 Two things to know before changing it. A member access is recorded at the head
 of its chain — `helper.double` is keyed where `helper` begins — so a cursor on
 the field walks back over the dot. And the compiler counts **bytes** while LSP
-counts **UTF-16 code units**; `lucid/pos.dr` is the only place that conversion
+counts **UTF-16 code units**; `lucid/src/pos.dr` is the only place that conversion
 happens, and it should stay that way.
 
 ## Completion is asked of something that is not a program
 
 Every other request is asked of a program. Completion is asked of a buffer
 mid-keystroke, and that difference decides the design — it is the thing to
-understand before touching [lucid/complete.dr](../../lucid/complete.dr).
+understand before touching [lucid/src/complete.dr](../../lucid/src/complete.dr).
 
 At the moment a completion is wanted the buffer usually says `console.`, and
 **that does not parse**. Measured rather than assumed: the loader reports zero
@@ -44,7 +44,7 @@ would write is inserted at the cursor and the repaired text is analysed instead.
 The two fail in *different* places, which is why both are kept. A bare name is a
 statement but it is not a declaration, so a cursor on a blank line between two
 top-level `let`s is exactly where the repair breaks a file that was fine — found
-by asking `dreams/lower.dr` for completions at line 300 and getting nineteen
+by asking `dreams/src/lower.dr` for completions at line 300 and getting nineteen
 keywords. Everything read here is before the cursor, so both candidates agree
 about every offset that matters.
 
@@ -79,7 +79,7 @@ was typed. Hovering a name at its own *definition* still answers nothing, which
 is not new: `refs` records uses, and a binder is not one.
 
 One cost worth knowing: a completion is a whole-program analysis, as hover and
-go-to-definition already are. On `dreams/lower.dr`, which pulls in the whole
+go-to-definition already are. On `dreams/src/lower.dr`, which pulls in the whole
 compiler, that is roughly a second per request.
 
 ## Two trees, and which question goes to which
@@ -122,7 +122,7 @@ parse.
 
 `group Point { x, y }`, `struct`, and `mapping` are rewritten by the *loader*
 into a module of generated functions — a constructor, an accessor and a setter
-per field ([syntax.record](../../dreams/syntax.dr)). That happens before anything
+per field ([syntax.record](../../dreams/src/syntax.dr)). That happens before anything
 resolves, which is what makes records cost the rest of the compiler nothing;
 and it is why a language server had nothing true to say about one.
 
@@ -149,7 +149,7 @@ it** — it is there for `lucid`, the same way `modules.expansions` is, and for 
 same reason: the pass that rewrites something is the only one that ever sees what
 was written.
 
-What it buys, all in [lucid/analysis.dr](../../lucid/analysis.dr)'s "records" section:
+What it buys, all in [lucid/src/analysis.dr](../../lucid/src/analysis.dr)'s "records" section:
 the outline lists each record with its fields and members underneath it, in
 source order; hover says `` `x record` -- reads `x` of the group `Point` ``,
 `` `set_y value record` -- replaces `y` in the struct `Vector` `` and
@@ -245,7 +245,7 @@ loader's filesystem paths.
 Outline ranges use the existing indexed UTF-16 conversion in `pos`: walking
 from byte zero for each symbol was the larger bottleneck. Three interleaved
 runs against the preceding Lucid sources, with the same VM and dependencies,
-measured repeated requests on `mind/std/str.dr`: median outline latency fell
+measured repeated requests on `mind/std/src/str.dr`: median outline latency fell
 from 3296 ms to 19 ms, and unchanged hover from 76 ms to 3.6 ms. Completion at
 an appended unfinished `import std.` fell from 40 ms to 19 ms and now returns
 module candidates. These are request latencies after the document's diagnostic
@@ -311,9 +311,9 @@ implementations containing unexpanded macros can contribute unknown types;
 the full diagnostic worker retains whole-program expansion and checking.
 
 Without a simultaneous Nix/C++ build, the RPC latency regression measured cold
-hints at 506 ms for 25 lines of `lucid/main.dr`, 731 ms for the whole file plus
+hints at 506 ms for 25 lines of `lucid/src/main.dr`, 731 ms for the whole file plus
 a signed `std.num.parse_int` probe, 641 ms for the hint implementation in
-`lucid/analysis.dr`, and 870 ms for `dreams/typecheck.dr`. Repeated requests took
+`lucid/src/analysis.dr`, and 870 ms for `dreams/src/typecheck.dr`. Repeated requests took
 138, 288, 173 and 356 ms. `tests/hints.py` requires nonempty results within
 one second, verifies line ranges and the stdlib probe's actual inferred type.
 These measurements include a concurrently running diagnostic worker, but do

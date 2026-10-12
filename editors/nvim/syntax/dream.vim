@@ -29,7 +29,7 @@ syn keyword dreamBuiltin type_of to_string len
 
 " --- keywords -------------------------------------------------------------------
 
-" The parser's list (`keywords` in dreams/parser.dr), split by what each does.
+" The parser's list (`keywords` in dreams/src/parser.dr), split by what each does.
 syn keyword dreamConditional if else match
 syn keyword dreamException catch
 syn keyword dreamKeyword when not expand

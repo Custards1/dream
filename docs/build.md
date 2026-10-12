@@ -84,8 +84,8 @@ machine").
 
 ## The vocabulary
 
-`std.build` is `mind/std/build/mod.dr`, and the tools that ship with Dream
-are the other files in `mind/std/build/`.
+`std.build` is `mind/std/src/build/mod.dr`, and the tools that ship with Dream
+are the other files in `mind/std/src/build/`.
 
 ### Context
 
@@ -214,7 +214,7 @@ again under the same key, and the program linked from it must see a different
 input or it would not be relinked. It is also why keys are worked out as steps
 become ready rather than all at once beforehand. The tests that pin this are
 `std.build.run`'s own, with a step that copies its source and names a header,
-and `mind/std/build/tests/incremental.dr`, which builds a library and a
+and `mind/std/src/build/tests/incremental.dr`, which builds a library and a
 program with the machine's compiler and changes a header only the program
 includes.
 
@@ -345,7 +345,7 @@ holes to fill and gives back the step construction every tool would
 otherwise write for itself:
 
 ```dream
-// mind/std/build/tool.dr
+// mind/std/src/build/tool.dr
 virtual let name cfg;                   // "cc"
 virtual let inputs cfg;                 // [Input]
 virtual let outputs ctx cfg;            // [:string]; may depend on the target
@@ -448,7 +448,7 @@ which writes a `CMakeLists.txt` for the same targets (`cmake.export`). What
 is about one compiler says which -- `cc.flags_for :gcc [..]`, `:clang`,
 `:gnu` for both, `:msvc` -- and a toolchain of another family leaves it out.
 None of the translation runs anything, so all of it is tested on any machine,
-and `mind/std/build/tests/toolchains.dr` builds one library and program with
+and `mind/std/src/build/tests/toolchains.dr` builds one library and program with
 GCC, with Clang and through CMake and runs each.
 
 What differs between compilers is `cc`'s problem, not the script's:
@@ -486,8 +486,8 @@ mean what they say there, and writes into the step's.
 ## Dream programs: `std.build.dream`
 
 ```dream
-let stage2 = dream.program "dreams" "dreams/main.dr" seed vm |> dream.paths ["mind", "."];
-let stage3 = dream.program "dreams" "dreams/main.dr" (dream.artifact stage2) vm |> dream.paths ["mind", "."];
+let stage2 = dream.program "dreams" "dreams/src/main.dr" seed vm |> dream.paths ["mind", "."];
+let stage3 = dream.program "dreams" "dreams/src/main.dr" (dream.artifact stage2) vm |> dream.paths ["mind", "."];
 ```
 
 The compiler is an **input**, so it may be an artifact, and compiling the
@@ -680,7 +680,7 @@ and across packages are unaffected, because this is about manifests.
 The walk tells the two apart by where the key is. A key on the path the
 walk is still descending is a cycle, and a key finished earlier is a diamond.
 The path is kept by directory rather than by key, because it runs through
-every namespace (`mind/tool/build.dr`).
+every namespace (`mind/tool/src/build.dr`).
 
 ### Versions
 
@@ -943,7 +943,7 @@ they are built says is not optional.
    context's digest and the stamps of the script's sources and of everything
    it read), folding outcomes into the compile, `--target` and `-j`, and
    `mind/tool/tests/scripts.sh`. The overlay is `-L KEY+=DIR` in
-   `dreams/package.dr`. A driver is written into a directory with a manifest
+   `dreams/src/package.dr`. A driver is written into a directory with a manifest
    of its own, so that `import build` finds the script it is for and not the
    enclosing project's; and the outcome is a record in `std.build`
    (`Outcome`), because it crosses to `mind` as `std.wire` and a reader has to

@@ -60,7 +60,7 @@ records both systems and both architectures, and so also admits Linux on
 ARM64. The header cannot say more, and a library for the wrong machine fails
 where it always did.
 
-The compiler decides the sets (`dreams/target.dr`). `--target` states them,
+The compiler decides the sets (`dreams/src/target.dr`). `--target` states them,
 and `--target any` leaves them empty. Otherwise they come from what the
 program is made of: a payload that is an ELF, Mach-O or PE binary contributes
 its system and machine, and a `when` condition that read `os`, `family` or

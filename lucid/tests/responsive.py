@@ -10,12 +10,12 @@ import time
 
 def run(vm, image):
     root = Path(__file__).resolve().parents[2]
-    source = root / 'lucid' / 'main.dr'
+    source = root / 'lucid' / 'src' / 'main.dr'
     text = source.read_text() + '\nlet navigation_probe a = analysis.inlay_hints a 0 5;\n'
     line = len(text.splitlines()) - 1
     character = text.splitlines()[line].index('inlay_hints') + 4
     uri = source.as_uri()
-    target = root / 'lucid' / 'analysis.dr'
+    target = root / 'lucid' / 'src' / 'analysis.dr'
     target_line = next(i for i, s in enumerate(target.read_text().splitlines())
                        if s.startswith('let inlay_hints a'))
     process = subprocess.Popen([vm, image, '-L', str(root / 'mind')],

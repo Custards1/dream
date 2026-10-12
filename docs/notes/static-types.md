@@ -3,7 +3,7 @@
 The checker, compile-time contracts, and what a signature buys the JIT. Moved out of `CLAUDE.md` on 2026-09-25; the prose is as it was, so a date or number in it is as of when it was written.
 
 `let add : :integer -> :integer -> :integer` is checked at compile time, by
-[dreams/typecheck.dr](../../dreams/typecheck.dr), which runs after resolution, lowering and compile-time evaluation. Its analysis
+[dreams/src/typecheck.dr](../../dreams/src/typecheck.dr), which runs after resolution, lowering and compile-time evaluation. Its analysis
 contains diagnostics, contracts to run, and parameter hints for the JIT; it
 does not rewrite the IR. Its header is the design; what is here is what to know
 before changing it.
@@ -48,7 +48,7 @@ not, each found by running the checker over this repository:
   `x` may be a global (keyed by its index, so a local of the same spelling
   under the test is not it) but not an impure name, and `:any` is never
   narrowed, so rule 1 still holds of unannotated code -- "narrowing" in
-  [dreams/typecheck.dr](../../dreams/typecheck.dr). It only ever removes members it
+  [dreams/src/typecheck.dr](../../dreams/src/typecheck.dr). It only ever removes members it
   can see a value cannot be, so an incomplete answer narrows less and never
   reports more. Before it, `if r == () { 0 } else { r + 1 }` was a report.
   And a *default* is not a maybe: `map.get () k ages` solving `v` as
@@ -62,7 +62,7 @@ not, each found by running the checker over this repository:
   sequence and a tuple's element type is the union of its fields; and a
   decoded message, because the reader knows its shape and the format's
   `Value` would only say it might be a list. The head of
-  [mind/std/list.dr](../../mind/std/list.dr) says the same.
+  [mind/std/src/list.dr](../../mind/std/src/list.dr) says the same.
 
 The check to run after any change here: every `.dr` in the repository must
 check clean -- `std --test`, `dreams --test`, `lucid`, `mind`, the examples,
@@ -177,7 +177,7 @@ compiler meets it:
   `[2, 2]` of global `Port`, and the path is read off the declaration's syntax,
   which has the value's shape. So nothing is re-resolved or recompiled: the
   answer is the closure `types.check` would apply at run time.
-- **[dreams/contract.dr](../../dreams/contract.dr) runs them all at once**: one
+- **[dreams/src/contract.dr](../../dreams/src/contract.dr) runs them all at once**: one
   function appended to a *copy* of the linked arena answers a list, one
   element per contract, each inside its own `try`, so a raising predicate is
   its own call's failure. One image and one VM start per program, and none for
@@ -390,7 +390,7 @@ Records are 36% of what that loop allocates; frames are most of the rest.
 **What a type is worth at run time.** A `match` over a union used to ask
 `_record_is` of each arm in turn. A constructor arm now has a key, its
 record's id, and `switch_atom` keys a record by that id (`arm_key` in
-dreams/lower.dr; `take_switch`, `Emitter::switch_node`), so the match jumps
+dreams/src/lower.dr; `take_switch`, `Emitter::switch_node`), so the match jumps
 to the variant's arm -- the id is in the header, so reading it forces
 nothing. Wiring that up found that the JIT had never compiled a function
 whose `match` had a switch, of any kind: a switch's targets are suffixes of

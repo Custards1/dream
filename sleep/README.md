@@ -13,7 +13,7 @@ nix-shell sleep/shell.nix     # SQLite, and the OpenCL loader for a GPU
 
 ## Where it stands
 
-Written and tested (`mind test sleep`, or `dreams sleep/main.dr --test -L mind`):
+Written and tested (`mind test sleep`, or `dreams sleep/src/main.dr --test -L mind`):
 
 | module | what | std |
 |---|---|---|

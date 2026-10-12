@@ -157,13 +157,13 @@ SEED="dreams/bootstrap/dreams.dream"
 DREAMS="$BUILD_DIR/bin/dreams.dream"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-"$dream" "$SEED" -L mind -L . -o "$DREAMS" dreams/main.dr >/dev/null 2>&1 || \
+"$dream" "$SEED" -L mind -L . -o "$DREAMS" dreams/src/main.dr >/dev/null 2>&1 || \
   die "the bootstrap image could not compile dreams"
 if [[ $RUN_TESTS -eq 1 ]]; then
   # A compiler that does not rebuild itself into the same bytes is not the
   # compiler in this tree, whatever it claims. Nothing else here proves the
   # source and the seed agree.
-  "$dream" "$DREAMS" -L mind -L . -o "$TMP/stage3.dream" dreams/main.dr >/dev/null 2>&1 || \
+  "$dream" "$DREAMS" -L mind -L . -o "$TMP/stage3.dream" dreams/src/main.dr >/dev/null 2>&1 || \
     die "dreams could not compile itself"
   cmp -s "$DREAMS" "$TMP/stage3.dream" || \
     die "dreams does not reproduce itself: the seed and the source disagree"
@@ -178,7 +178,7 @@ step "Building the standard library and build tool (mind)"
 # `--shebang` writes the `#!` line and sets the execute bit, so `mind` is a
 # program you can run rather than an image you have to hand to the VM.
 MIND="$BUILD_DIR/bin/mind"
-"$dream" "$DREAMS" -L mind/std mind/tool/main.dr --shebang -o "$MIND" >/dev/null 2>&1 || \
+"$dream" "$DREAMS" -L mind/std mind/tool/src/main.dr --shebang -o "$MIND" >/dev/null 2>&1 || \
   die "dreams could not compile mind"
 [[ -x "$MIND" ]] || die "the compiler finished but $MIND is missing"
 ok "$MIND"
@@ -190,7 +190,7 @@ ok "$MIND"
 
 step "Building the language server (lucid)"
 LUCID="$BUILD_DIR/bin/lucid.dream"
-"$dream" "$DREAMS" -L mind -L . -o "$LUCID" lucid/main.dr >/dev/null 2>&1 || \
+"$dream" "$DREAMS" -L mind -L . -o "$LUCID" lucid/src/main.dr >/dev/null 2>&1 || \
   die "dreams could not compile lucid"
 ok "$LUCID (compiled by dreams)"
 

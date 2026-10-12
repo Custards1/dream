@@ -20,7 +20,7 @@ separate until the format work lands.
 
 ## Why
 
-`MODS` exists in the format already — it is emitted (`dreams/emit.dr:213`),
+`MODS` exists in the format already — it is emitted (`dreams/src/emit.dr:213`),
 validated (`dream/src/image.cpp:284`), and read by the VM
 (`dream/src/image.cpp:296-304`) — but it is missing from the section table in
 `docs/bytecode-format.md`. Merging images (see `docs/dynamic-linking.md`) makes
@@ -63,7 +63,7 @@ globals_count`; the range is what lets a reader say which module a global
 belongs to without the `GLBL` records carrying a module id of their own.
 
 The record matches `ModuleRec` in `dream/src/image.hpp` and `module_bytes` in
-`dreams/emit.dr`. The `MODS` section is validated like any other record array at
+`dreams/src/emit.dr`. The `MODS` section is validated like any other record array at
 load; unknown sections are skipped, so a reader predating this documentation is
 unaffected.
 

@@ -1,5 +1,5 @@
 // Fixed-arity runtime primitives. X(enum name, opcode, builtin ID, arity).
-// Keep IDs in sync with BUILTINS and dreams/builtins.dr.
+// Keep IDs in sync with BUILTINS and dreams/src/builtins.dr.
 #pragma once
 
 #define DREAM_PRIMITIVES(X) \

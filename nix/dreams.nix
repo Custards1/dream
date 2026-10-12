@@ -18,9 +18,9 @@ stdenvNoCC.mkDerivation {
     src = ../.;
     # The build output directories change constantly and none of them affect
     # this build, so they are dropped by name -- but only *directories*: a
-    # source file whose name begins with `build` (build.sh, mind/tool/build.dr)
+    # source file whose name begins with `build` (build.sh, mind/tool/src/build.dr)
     # is part of the tree and must stay. And only at the root, which is where
-    # `build`, `build-dream` and `build-pgo` are: `mind/std/build` is the
+    # `build`, `build-dream` and `build-pgo` are: `mind/std/src/build` is the
     # `std.build` package, and dropping every `build*` directory wherever it
     # was dropped that too, so nothing that imports it would compile.
     filter = path: type:
@@ -48,14 +48,14 @@ stdenvNoCC.mkDerivation {
     runHook preBuild
     mkdir -p $out/lib/dream
     dream $src/dreams/bootstrap/dreams.dream -L $src/mind -L $src \
-      -o $out/lib/dream/dreams.dream $src/dreams/main.dr
+      -o $out/lib/dream/dreams.dream $src/dreams/src/main.dr
     runHook postBuild
   '';
 
   checkPhase = ''
     runHook preCheck
     dream $out/lib/dream/dreams.dream -L $src/mind -L $src \
-      -o $TMPDIR/stage3.dream $src/dreams/main.dr
+      -o $TMPDIR/stage3.dream $src/dreams/src/main.dr
     cmp $out/lib/dream/dreams.dream $TMPDIR/stage3.dream
     runHook postCheck
   '';

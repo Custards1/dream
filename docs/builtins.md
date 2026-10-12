@@ -1574,7 +1574,7 @@ JSON, and atoms as their names; each dialect validates parameter kinds.
 `std.sql.pg.db` connection. It preserves SQLSTATE as `:state` and the original error as
 `:cause`, returns `bytea` as blobs, streams through portals, and prepares each
 run of equal SQL once for `exec_many!`. Use `RETURNING` for generated keys;
-PostgreSQL outcomes have `:last_id` set to `()`. See [pg](../mind/std/sql/pg/README.md).
+PostgreSQL outcomes have `:last_id` set to `()`. See [pg](../mind/std/src/sql/pg/README.md).
 
 `std.sql.sqlite` is the SQLite driver. It binds the system's
 libsqlite3 through `std.foreign` as `from system "sqlite3" "0"`, which searches
@@ -1594,7 +1594,7 @@ import std.all;
 
 Every module in the standard library, imported in one place. Two things use it.
 
-`dreams mind/std/all.dr --test` builds a runner from the `tests` each of those
+`dreams mind/std/src/all.dr --test` builds a runner from the `tests` each of those
 modules exports, so **adding a module here is all it takes for its tests to
 run**. Importing them is also a check in itself: a module that no longer
 compiles fails the build rather than being quietly skipped.

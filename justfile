@@ -68,8 +68,8 @@ vm-pgo:
     # training runs: a run ends in `os.exit!` whether or not that thread is
     # mid-compile, and counters flushed from under it are not flow-consistent,
     # which `-fprofile-use` rejects outright for `jit.cpp`.
-    DREAM_JIT_SYNC=1 build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/main.dr
-    DREAM_JIT_SYNC=1 build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/main.dr
+    DREAM_JIT_SYNC=1 build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/src/main.dr
+    DREAM_JIT_SYNC=1 build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/src/main.dr
     cmp build-pgo/train/stage2.dream build-pgo/train/stage3.dream
     cmake -S . -B build-pgo -DDREAM_PGO=USE
     cmake --build build-pgo -j
@@ -89,12 +89,12 @@ bench-self-compile vm=dream target="1.25":
 # into `build/dreams.dream`, which is what every other recipe here runs.
 dreams: vm
     mkdir -p build
-    ./{{dream}} {{seed}} -L mind -L . -o {{image}} dreams/main.dr
+    ./{{dream}} {{seed}} -L mind -L . -o {{image}} dreams/src/main.dr
 
 # The build tool, itself a Dream program.
 mind: dreams
     mkdir -p build
-    ./{{dreams}} -L mind/std mind/tool/main.dr --shebang -o build/mind
+    ./{{dreams}} -L mind/std mind/tool/src/main.dr --shebang -o build/mind
 
 # Dream itself, packaged every way `mind pack` supports, into dist/: the `[ship]`
 # sections of mind.toml say what goes in. The VM is staged by `cmake --install`
@@ -112,7 +112,7 @@ package: vm dreams mind lucid
 # program here that is both built by the compiler and made of it.
 lucid: dreams
     mkdir -p build
-    ./{{dreams}} lucid/main.dr -L mind -L . -o build/lucid.dream
+    ./{{dreams}} lucid/src/main.dr -L mind -L . -o build/lucid.dream
     @echo "built build/lucid.dream -- run it as: {{dream}} build/lucid.dream"
 
 # Build `dreams` from the checked-in image.
@@ -122,23 +122,23 @@ lucid: dreams
 # compiler, run this and keep `build/dreams.dream`.
 bootstrap: vm
     mkdir -p build
-    ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/main.dr
+    ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/src/main.dr
 
 # The seed must still reproduce itself from this source: what it builds must
 # be the seed again, and build an identical third image. That equality is the whole guarantee -- it
 # says the compiler in the tree and the compiler in the image agree.
 bootstrap-check: vm
-    ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/main.dr
-    ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/main.dr
+    ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/src/main.dr
+    ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/src/main.dr
     cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
     @cmp -s {{seed}} /tmp/dreams-stage2.dream || { echo "the seed is stale: it builds a different compiler from this source -- copy /tmp/dreams-stage2.dream over {{seed}}"; exit 1; }
     @echo "the bootstrap image reproduces itself"
 
 # `mind`'s own tests: path handling, manifest reading, dependency specs.
 test-mind: build
-    ./{{dreams}} -L mind/std mind/tool/main.dr --test -o /tmp/dream-mind-tests.dream
+    ./{{dreams}} -L mind/std mind/tool/src/main.dr --test -o /tmp/dream-mind-tests.dream
     ./{{dream}} /tmp/dream-mind-tests.dream
-    ./{{dreams}} -L mind/std mind/tool/main.dr -o /tmp/dream-mind-graph.dream
+    ./{{dreams}} -L mind/std mind/tool/src/main.dr -o /tmp/dream-mind-graph.dream
     dream={{dream}} mind=/tmp/dream-mind-graph.dream mind/tool/tests/graph.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/options.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/scripts.sh
@@ -169,7 +169,7 @@ compile FILE *ARGS: dreams
 check FILE: dreams
     ./{{dreams}} {{FILE}} --no-emit
 
-# Lay files out in the house style, in place (dreams/fmt.dr says what that is).
+# Lay files out in the house style, in place (dreams/src/fmt.dr says what that is).
 fmt +FILES: dreams
     ./{{dreams}} --fmt {{FILES}}
 
@@ -255,11 +255,11 @@ test-vm: vm
 # kind of build through `std.build`'s runner, changed a piece at a time, to
 # check that each change reruns what depends on it and nothing else.
 test-build: build
-    ./{{dreams}} -L mind mind/std/build/tests/toolchains.dr -o /tmp/dream-toolchains.dream
+    ./{{dreams}} -L mind mind/std/src/build/tests/toolchains.dr -o /tmp/dream-toolchains.dream
     ./{{dream}} /tmp/dream-toolchains.dream
-    ./{{dreams}} -L mind mind/std/build/tests/incremental.dr -o /tmp/dream-incremental.dream
+    ./{{dreams}} -L mind mind/std/src/build/tests/incremental.dr -o /tmp/dream-incremental.dream
     ./{{dream}} /tmp/dream-incremental.dream
-    ./{{dreams}} -L mind mind/std/build/tests/dependencies.dr -o /tmp/dream-dependencies.dream
+    ./{{dreams}} -L mind mind/std/src/build/tests/dependencies.dr -o /tmp/dream-dependencies.dream
     ./{{dream}} /tmp/dream-dependencies.dream
     python3 dream/tests/static_link.py
 
@@ -293,13 +293,13 @@ examples-bless: build
 # The example package's own tests, which also exercise `virtual`/`derive`
 # across files and a path dependency between two packages.
 test-examples-std: build
-    ./{{dreams}} examples/textstats/main.dr --test -L mind -L examples -o /tmp/dream-ex-tests.dream
+    ./{{dreams}} examples/textstats/src/main.dr --test -L mind -L examples -o /tmp/dream-ex-tests.dream
     ./{{dream}} /tmp/dream-ex-tests.dream
 
 # `dreams`, the self-hosted compiler: the parts of it that exist so far.
 # Built from `main.dr` so that every module it reaches has its tests collected.
 test-dreams: build
-    ./{{dreams}} dreams/main.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
+    ./{{dreams}} dreams/src/main.dr --test -L mind -L . -o /tmp/dream-dreams-tests.dream
     ./{{dream}} /tmp/dream-dreams-tests.dream
 
 # Every Dream file in the repository must parse. The corpus is the real test of
@@ -310,14 +310,14 @@ test-dreams: build
 # file is well formed on its own -- a module in the middle of a package is not a
 # program, and following its imports would be asking something else.
 test-dreams-corpus: build
-    @for f in mind/std/*.dr mind/std/build/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr \
-              dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr mind/tool/pack/*.dr; do \
+    @for f in mind/std/src/*.dr mind/std/src/build/*.dr mind/tool/src/*.dr examples/*.dr examples/*/src/*.dr \
+              dream/tests/programs/*.dr dreams/src/*.dr benchmark/*/src/*.dr mind/tool/src/pack/*.dr; do \
         ./{{dreams}} --parse "$f" || exit 1; \
     done
     @echo "every file in the corpus parses"
-    ./{{dreams}} dreams/ast.dr --test -L mind -L . -o /tmp/dream-ast-tests.dream
+    ./{{dreams}} dreams/src/ast.dr --test -L mind -L . -o /tmp/dream-ast-tests.dream
     ./{{dream}} /tmp/dream-ast-tests.dream
-    ./{{dreams}} dreams/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
+    ./{{dreams}} dreams/src/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
     ./{{dream}} /tmp/dream-parser-tests.dream
 
 # The end of the pipeline: programs `dreams` compiled, run by the VM, checked
@@ -352,7 +352,7 @@ test-nvim: lucid
 
 # `lucid`'s own tests: positions, framing, and the URI/path boundary.
 test-lucid: build
-    ./{{dreams}} lucid/main.dr --test -L mind -L . -o /tmp/lucid-tests.dream
+    ./{{dreams}} lucid/src/main.dr --test -L mind -L . -o /tmp/lucid-tests.dream
     ./{{dream}} /tmp/lucid-tests.dream
 
 # And one whole conversation with it, which is the only place the server is
@@ -365,14 +365,14 @@ test-bootstrap: bootstrap-check
 
 # The standard library's own tests, compiled with `--test`.
 test-std: build
-    ./{{dreams}} mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
+    ./{{dreams}} mind/std/src/all.dr --test -L mind -o /tmp/dream-std-tests.dream
     ./{{dream}} /tmp/dream-std-tests.dream
     python3 dreams/tests/binary.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/paths.py --dream {{dream}} --compiler {{image}}
 
 # Binary layouts against reference integers and every finite IEEE binary16 value.
 test-binary: build
-    ./{{dreams}} mind/std/binary/tests.dr --test -L mind -o /tmp/dream-binary-tests.dream
+    ./{{dreams}} mind/std/src/binary/tests.dr --test -L mind -o /tmp/dream-binary-tests.dream
     ./{{dream}} /tmp/dream-binary-tests.dream
     python3 dreams/tests/binary.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/paths.py --dream {{dream}} --compiler {{image}}
@@ -386,20 +386,20 @@ test-tls: build
 # whole library against a throwaway cluster -- which skips itself where there
 # is no PostgreSQL to make one with.
 test-pg: build
-    ./{{dreams}} mind/std/sql/pg/all.dr --test -L mind -L . -o /tmp/dream-pg-tests.dream
+    ./{{dreams}} mind/std/src/sql/pg/all.dr --test -L mind -L . -o /tmp/dream-pg-tests.dream
     ./{{dream}} /tmp/dream-pg-tests.dream
-    dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/contracts.sh
-    dream={{dream}} dreams={{image}} mind/std/sql/pg/tests/live.sh
+    dream={{dream}} dreams={{image}} mind/std/src/sql/pg/tests/contracts.sh
+    dream={{dream}} dreams={{image}} mind/std/src/sql/pg/tests/live.sh
 
-# Packaging: its units, then every package it makes from mind/tool/pack/tests/fixture
+# Packaging: its units, then every package it makes from mind/tool/tests/pack/fixture
 # handed to the program that installs it -- dpkg, rpm, pacman, makepkg, ruby,
 # shellcheck -- each skipped, saying so, where this machine has not got it.
 # `nix-shell -p dpkg rpm pacman fakeroot ruby shellcheck --run 'just test-pack'`
 # has them all.
 test-pack: build
-    ./{{dreams}} mind/tool/main.dr --test -L mind -o /tmp/dream-pack-tests.dream
+    ./{{dreams}} mind/tool/src/main.dr --test -L mind -o /tmp/dream-pack-tests.dream
     ./{{dream}} /tmp/dream-pack-tests.dream
-    dream={{dream}} dreams={{image}} mind/tool/pack/tests/formats.sh
+    dream={{dream}} dreams={{image}} mind/tool/tests/pack/formats.sh
 
 # Malformed images must be rejected, never crashed on.
 fuzz ITERATIONS="400": build

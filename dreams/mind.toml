@@ -1,9 +1,9 @@
+# The compiler. Its modules are in src/, and `dreams.main` is the program;
+# build.dr beside this declares the checks `mind test dreams` runs.
 [package]
 name = "dreams"
 version = "0.1.0"
-src = "."
-
-[dependencies]
+description = "The Dream compiler: .dr source to .dream bytecode"
 
 [vm]
 # A compile keeps a lot alive for a pass at a time. Measured at 64 MB against

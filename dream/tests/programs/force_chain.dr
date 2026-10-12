@@ -3,7 +3,7 @@
 // `acc` here is lazy and nothing ever forces it until the end, so the loop
 // builds a chain of suspended applications rather than adding anything -- the
 // trap `list.fold_strict` exists to avoid, and its note in
-// [mind/std/list.dr](mind/std/list.dr) explains it. The point of the file is
+// [mind/std/src/list.dr](mind/std/src/list.dr) explains it. The point of the file is
 // what happens when that chain is finally forced.
 //
 // The interpreter forces a slot by pushing a *continuation*, so its recursion

@@ -18,8 +18,8 @@ just install                    # and into ~/.mindv2/bin, with everything it nee
 ## A project
 
 ```
-mind new hello                  # hello/mind.toml and hello/main.dr
-cd hello
+mind new hello                  # hello/mind.toml and hello/src/main.dr
+cd hello                        # or, in a directory that exists: mind init
 mind run                        # build target/debug/hello.dream and run it
 mind add ../util                # depend on a directory
 mind test                       # every test, at once
@@ -63,15 +63,19 @@ as is a name with `/` or `=` in it. It is the compiler's `--payload NAME=FILE`
 written down once, and a build script's `build.payload` is the same for a file
 that has to be made first.
 
-Every command but `new` looks for `mind.toml` here or above, so they work from
-anywhere inside a project, the way `git` finds its root. `-C DIR` names
-another.
+Every command but `new` and `init` looks for `mind.toml` here or above, so
+they work from anywhere inside a project, the way `git` finds its root.
+`-C DIR` runs `mind` as if it had been started in DIR, as `git -C` and
+`make -C` do: the project is found from there, and every relative path on the
+line (`-o`, `-L`, what `mind add` is given) means what it would typed there.
+Given twice, the second is relative to the first.
 
 ## Commands
 
 | | |
 |---|---|
 | `mind new NAME` | create a project in `./NAME` |
+| `mind init [NAME]` | make this directory a project, named after it unless NAME is given; a `main.dr` or `src/` already there is kept |
 | `mind build` | compile to `target/<profile>/<name>.dream` |
 | `mind build GOAL..` | make what the build script names instead ([Goals](#goals)) |
 | `mind run [-- args]` | compile, then run with the arguments given |
@@ -342,12 +346,15 @@ on.
 
 ## Layout
 
+The modules are in `src/`; `build.dr` beside the manifest is the build script
+whose checks `mind test mind` runs after the units.
+
 | | |
 |---|---|
 | `main.dr` | the commands and their arguments |
 | `manifest.dr` | reading `mind.toml`, and the line edits `add` and `remove` make |
 | `fetch.dr` | a dependency to a directory, fetching when needed |
-| `build.dr` | the dependency graph, options, and calling the compiler |
+| `build.dr` | the dependency graph, options, and calling the compiler (the module, not the script) |
 | `script.dr` | running build scripts and folding what they make into the compile |
 | `lock.dr` | `mind.lock`, and what counts as drift |
 | `config.dr`, `util.dr` | settings, paths and files |

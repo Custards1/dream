@@ -27,13 +27,13 @@ and hand the JIT something it can already take" -- 4.6 ns an element instead of
 compiled`; that pair is the check that it worked, and it is worth making, because
 fusing without reaching the JIT is only a 2x.
 
-**Where it lives.** Three files. [dreams/fuse.dr](../../dreams/fuse.dr) is the
+**Where it lives.** Three files. [dreams/src/fuse.dr](../../dreams/src/fuse.dr) is the
 vocabulary -- which member plays which role, the shape of the plan, and the
-syntactic rules. [dreams/scope.dr](../../dreams/scope.dr) decides *whether*, because
+syntactic rules. [dreams/src/scope.dr](../../dreams/src/scope.dr) decides *whether*, because
 only a resolved name can say that the `range` in front of you really is
 `std.list`'s and not a parameter, a shadow or another module's; the question
 becomes "is this the global index `std.list` gave `range`?", which has one
-answer. [dreams/lower.dr](../../dreams/lower.dr) builds the loop, beside the wrapper
+answer. [dreams/src/lower.dr](../../dreams/src/lower.dr) builds the loop, beside the wrapper
 rewriting it resembles.
 
 **What it covers.** Sources `range` and `replicate`; steps `map` and `filter`;
@@ -46,7 +46,7 @@ hand in `lower`, which is the price of not having a `build`/`foldr` mechanism.
 Shortcut fusion (`foldr`/`build`, as Haskell does it) remains the general
 answer if this ever needs to fuse arbitrary producers with arbitrary consumers.
 It was not taken: it costs a rewrite-rule mechanism plus a rewrite of
-[mind/std/list.dr](../../mind/std/list.dr) into a shape nobody reading it would
+[mind/std/src/list.dr](../../mind/std/src/list.dr) into a shape nobody reading it would
 recognise, and it is poor at exactly what this codebase does most -- left folds
 and `zip`.
 
@@ -59,7 +59,7 @@ and `zip`.
   `let squares = ..; let odds = ..; fold .. odds`. The reason behind the rule is
   sharing, and sharing needs *two* reads. A binding read once is nobody else's
   list, so its body is written where it is read and the pipeline fuses. See "a
-  stage that was given a name" in [dreams/fuse.dr](../../dreams/fuse.dr). Moving one
+  stage that was given a name" in [dreams/src/fuse.dr](../../dreams/src/fuse.dr). Moving one
   is only sound with all four of: read once in the whole block, that read below
   the binding, that read in the same frame, and nothing the body names rebound
   in between. Three of those four were found by a test failing, and they are in

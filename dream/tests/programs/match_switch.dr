@@ -2,7 +2,7 @@
 //
 // When enough arms name a tag -- `[:name, ..]` or `:empty` -- the compiler puts
 // a switch in front of the chain of arm tests and jumps into it at the first
-// arm that could match (`dispatch` in dreams/lower.dr). Every target is a
+// arm that could match (`dispatch` in dreams/src/lower.dr). Every target is a
 // suffix of the ordinary chain, so the answer must be exactly what the chain
 // alone gives. These are the cases where a jump could get that wrong:
 //

@@ -38,9 +38,9 @@ jobs:
       - name: the compiler, the tools and the packager
         run: |
           mkdir -p build
-          build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/main.dr
-          build-dream/bin/dream build/dreams.dream -L mind/std mind/tool/main.dr --shebang -o build/mind
-          build-dream/bin/dream build/dreams.dream lucid/main.dr -L mind -L . -o build/lucid.dream
+          build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/src/main.dr
+          build-dream/bin/dream build/dreams.dream -L mind/std mind/tool/src/main.dr --shebang -o build/mind
+          build-dream/bin/dream build/dreams.dream lucid/src/main.dr -L mind -L . -o build/lucid.dream
       - run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) build-dream/bin/dream build/mind pack tarball --package-version "${VERSION#v}"
       - uses: actions/upload-artifact@v4
         with:
@@ -59,9 +59,9 @@ jobs:
       - name: the compiler, the tools and the packager
         run: |
           mkdir -p build
-          build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/main.dr
-          build-dream/bin/dream build/dreams.dream -L mind/std mind/tool/main.dr --shebang -o build/mind
-          build-dream/bin/dream build/dreams.dream lucid/main.dr -L mind -L . -o build/lucid.dream
+          build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o build/dreams.dream dreams/src/main.dr
+          build-dream/bin/dream build/dreams.dream -L mind/std mind/tool/src/main.dr --shebang -o build/mind
+          build-dream/bin/dream build/dreams.dream lucid/src/main.dr -L mind -L . -o build/lucid.dream
       - uses: actions/download-artifact@v4
         with:
           name: macos

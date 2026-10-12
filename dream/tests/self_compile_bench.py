@@ -53,7 +53,7 @@ def main():
             dest.unlink(missing_ok=True)
             start = time.perf_counter()
             run = subprocess.run(command + [str(image), '-L', 'mind', '-L', '.',
-                                 '-o', str(dest), 'dreams/main.dr'], cwd=root,
+                                 '-o', str(dest), 'dreams/src/main.dr'], cwd=root,
                                  capture_output=True, text=True, timeout=args.timeout)
             elapsed = time.perf_counter() - start
             if run.returncode:

@@ -587,7 +587,7 @@ bool cheap_lazy(const Image& img, const std::vector<uint32_t>& binds, uint32_t a
 // avoids one: compiled code orders nothing, and a call it makes may be run
 // again from the top. So a node marked impure is refused as before, and the
 // lowerer marks a node impure when anything under it is (`inherit` in
-// dreams/lower.dr), so the mark on the node is the answer for all of it.
+// dreams/src/lower.dr), so the mark on the node is the answer for all of it.
 //
 // What the interpreter evaluates is invisible to the analysis: none of it is a
 // self call site, none of it counts as forcing a parameter, and none of it has
@@ -3093,7 +3093,7 @@ llvm::Value* Emitter::snapshot() {
 // value to put there. Whatever reads that slot afterwards forces the thunk and
 // runs the binding a second time. Pure, so no answer changes; but in a function
 // that recursion re-enters through that binding, the work doubles at every
-// level. dreams/opt.dr's `rebuild_node` is that function, and compiled, a
+// level. dreams/src/opt.dr's `rebuild_node` is that function, and compiled, a
 // four-second compile of a hello-world ran out of memory instead. So the value,
 // once computed, settles that thunk in place (`dream_rt_settle`), as forcing it
 // would have.
@@ -4099,7 +4099,7 @@ static uint32_t written_size(const Image& img, uint32_t node, uint32_t limit, in
 
 /// The first arm of the chain a switch jumps into, or `NO_NODE`.
 ///
-/// Every target is a suffix of that chain (`dispatch` in dreams/lower.dr): an
+/// Every target is a suffix of that chain (`dispatch` in dreams/src/lower.dr): an
 /// arm is an `if` whose `else` is the arm below it. So the head is the one
 /// target no other target reaches down its `else`s. A target that is itself a
 /// switch -- the atom switch under a head switch -- is looked through.

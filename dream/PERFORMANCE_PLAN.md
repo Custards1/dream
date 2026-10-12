@@ -149,8 +149,8 @@ The target is not met. The GC fix, indexed heap verification, decoded array
 accessors, benchmark gate, and optional GCC profile-guided build are implemented
 in `dream/`. Compiler and standard library sources remain unchanged by this
 work. Measurements are from this checkout on
-2026-09-18, including the existing user edits in `dreams/ir.dr` and
-`mind/std/dynamic.dr`. Those edits were preserved.
+2026-09-18, including the existing user edits in `dreams/src/ir.dr` and
+`mind/std/src/dynamic.dr`. Those edits were preserved.
 
 ## Implementation results
 
@@ -215,8 +215,8 @@ LLVM setting must remain unchanged between training and use:
 cmake -S dream -B /tmp/dream-trained-build -DCMAKE_BUILD_TYPE=Release -DDREAM_PGO=GENERATE
 cmake --build /tmp/dream-trained-build -j 4
 /tmp/dream-trained-build/bin/dream_tests
-/tmp/dream-trained-build/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o /tmp/dream-trained-stage2.dream dreams/main.dr
-/tmp/dream-trained-build/bin/dream --no-jit -j 1 /tmp/dream-trained-stage2.dream -L mind -L . -o /tmp/dream-trained-stage3.dream dreams/main.dr
+/tmp/dream-trained-build/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o /tmp/dream-trained-stage2.dream dreams/src/main.dr
+/tmp/dream-trained-build/bin/dream --no-jit -j 1 /tmp/dream-trained-stage2.dream -L mind -L . -o /tmp/dream-trained-stage3.dream dreams/src/main.dr
 cmp /tmp/dream-trained-stage2.dream /tmp/dream-trained-stage3.dream
 cmake -S dream -B /tmp/dream-trained-build -DDREAM_PGO=USE
 cmake --build /tmp/dream-trained-build -j 4
@@ -247,8 +247,8 @@ The existing RelWithDebInfo build was confirmed current with
 Run from the repository root (VM options must precede the image):
 
 ```sh
-time ./build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o /tmp/dream-perf-stage2.dream dreams/main.dr
-time ./build-dream/bin/dream --stats /tmp/dream-perf-stage2.dream -L mind -L . -o /tmp/dream-perf-stage3.dream dreams/main.dr
+time ./build-dream/bin/dream dreams/bootstrap/dreams.dream -L mind -L . -o /tmp/dream-perf-stage2.dream dreams/src/main.dr
+time ./build-dream/bin/dream --stats /tmp/dream-perf-stage2.dream -L mind -L . -o /tmp/dream-perf-stage3.dream dreams/src/main.dr
 cmp /tmp/dream-perf-stage2.dream /tmp/dream-perf-stage3.dream
 ```
 
@@ -277,7 +277,7 @@ deliver the target.
 Before the fix, the newly generated compiler repeatedly failed with:
 
 ```sh
-./build-dream/bin/dream --no-jit -j 1 /tmp/dream-perf-stage2.dream -L mind -L . -o /tmp/dream-perf-interp.dream dreams/main.dr
+./build-dream/bin/dream --no-jit -j 1 /tmp/dream-perf-stage2.dream -L mind -L . -o /tmp/dream-perf-interp.dream dreams/src/main.dr
 ```
 
 Observed error: `not` needs a bool, got a list. With JIT enabled and `-j 1`,

@@ -98,7 +98,7 @@ ctest --test-dir "$build_dir" -R '^dream_tests$' --output-on-failure
 vm="$build_dir/bin/dream"
 compiler="$build_dir/dreams.dream"
 "$vm" "$source_dir/dreams/bootstrap/dreams.dream" \
-    -L "$source_dir/mind" -L "$source_dir" "$source_dir/dreams/main.dr" -o "$compiler"
+    -L "$source_dir/mind" -L "$source_dir" "$source_dir/dreams/src/main.dr" -o "$compiler"
 "$vm" "$compiler" -L "$source_dir/mind" "$source_dir/dream/android/smoke.dr" \
     -o "$build_dir/android-smoke.dream"
 [[ $("$vm" "$build_dir/android-smoke.dream") == $'true\ntrue\ntrue' ]] ||

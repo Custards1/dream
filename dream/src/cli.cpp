@@ -68,7 +68,7 @@ const char* USAGE =
 // --- the image's target ---------------------------------------------------------
 //
 // An image records the systems and architectures it may run on, as two sets of
-// bits in its header (dreams/target.dr decides them). One built for another
+// bits in its header (dreams/src/target.dr decides them). One built for another
 // machine is refused here, before anything runs, because the alternative is a
 // program that fails at its first `dlopen` with an error about a library it
 // never mentioned. The check is the command's and not the loader's: the

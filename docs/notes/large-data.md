@@ -33,6 +33,6 @@ Two consequences worth knowing before changing any of it. The compiler never
 holds a payload — a Dream string is capped at the same 4 GiB — so `build!`
 measures each file with `io.size!`, lays the table out from the sizes, writes
 the ordinary image, and only then streams the files through a bounded buffer
-(`copy_payload!` in [dreams/main.dr](../../dreams/main.dr)). And a build with no
+(`copy_payload!` in [dreams/src/main.dr](../../dreams/src/main.dr)). And a build with no
 `--payload` emits neither section, so it writes the bytes it wrote before any of
 this existed — which is what the bootstrap compares.

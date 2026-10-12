@@ -41,7 +41,7 @@ primitives = [
     ('map_pairs', 1), ('data_count', 1), ('data_at', 1), ('compare', 2),
 ]
 # A primitive is spelled with a leading `_`; `compare` is one of the
-# language's own builtins and keeps its name (see dreams/builtins.dr).
+# language's own builtins and keeps its name (see dreams/src/builtins.dr).
 def spelled(name):
     return name if name == 'compare' else '_' + name
 

@@ -1,4 +1,4 @@
 [package]
 name = "textstats"
 version = "0.1.0"
-src = "."
+description = "Word statistics, split across modules"

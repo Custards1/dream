@@ -72,7 +72,7 @@ if args.mode == "compile":
     # OpenSSL on Linux and macOS, SChannel on Windows. One image, one output.
     run([vm, compiler, "-L", ROOT / "mind", ROOT / "dream/tests/tls/tls.dr", "-o", images / "tls.dream"])
     cases.append(dict(name="tls", sha256=digest(images / "tls.dream")))
-    run([vm, compiler, "-L", ROOT / "mind", "-L", ROOT, ROOT / "dreams/main.dr",
+    run([vm, compiler, "-L", ROOT / "mind", "-L", ROOT, ROOT / "dreams/src/main.dr",
          "-o", images / "dreams.dream"])
     cases.append(dict(name="dreams", sha256=digest(images / "dreams.dream")))
     (images / "manifest.json").write_text(json.dumps(cases, indent=2), encoding="utf-8")

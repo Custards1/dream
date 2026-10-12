@@ -1,7 +1,7 @@
 -- Indentation by brackets, as the VS Code extension's language configuration
 -- does it: a line after one that left a bracket open goes in a level, and a
 -- line that starts by closing one comes back out. The house style is the
--- formatter's (dreams/fmt.dr), which the server runs for `vim.lsp.buf.format()`;
+-- formatter's (dreams/src/fmt.dr), which the server runs for `vim.lsp.buf.format()`;
 -- this is only for the line being typed.
 
 if vim.b.did_indent then return end

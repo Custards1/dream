@@ -80,7 +80,7 @@ ok   session
 77 passed, 0 failed
 python3 dream/tests/console.py --dream build-dream/bin/dream --compiler build/dreams.dream
 console: output, formatting, prompts, EOF, limits, colors, logging and short writes passed
-./build-dream/bin/dream build/dreams.dream mind/std/all.dr --test -L mind -o /tmp/dream-std-tests.dream
+./build-dream/bin/dream build/dreams.dream mind/std/src/all.dr --test -L mind -o /tmp/dream-std-tests.dream
 compiled -> /tmp/dream-std-tests.dream (2127664 bytes, 191 modules, 75592 nodes, 8966 functions)
 ./build-dream/bin/dream /tmp/dream-std-tests.dream
 

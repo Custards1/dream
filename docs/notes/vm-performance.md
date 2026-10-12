@@ -451,7 +451,7 @@ What has already been learnt from them, so it is not learnt twice:
   A twenty-arm match reaching its last arm went 1645 ms -> 350 ms, and the
   self-compile 176.0M -> 156.0M reductions (-11.4%), 5733 -> 5394 ms on three
   interleaved rounds (-5.9%). It is `dispatch` in
-  [dreams/lower.dr](../../dreams/lower.dr), and two properties make it safe. Every
+  [dreams/src/lower.dr](../../dreams/src/lower.dr), and two properties make it safe. Every
   target is a suffix of the chain, so each arm is lowered once and a tag arm
   that does not match after all falls through as before. And `switch_head` is
   only emitted where the chain would have forced the cell's head first anyway.
@@ -615,7 +615,7 @@ let main! = { console.print! (loop_f (fn a b -> a + b) 1 10000000 0) };
 
 `acc` is lazy, so this builds ten million suspended applications rather than
 adding anything -- the trap `list.fold_strict` exists to avoid, and its note in
-[mind/std/list.dr](../../mind/std/list.dr) explains it. Forcing that chain is supposed
+[mind/std/src/list.dr](../../mind/std/src/list.dr) explains it. Forcing that chain is supposed
 to raise at `DREAM_MAX_DEPTH`, and with `--no-jit` it always did, exactly:
 
 ```
@@ -1552,7 +1552,7 @@ nobody had measured it.
 
 **How.** `-D strict_everything` makes the compiler rewrite every named
 parameter of every `let` and `fn` in the program as though it were `!x`
-(`strict_everything` in dreams/modules.dr). It is call-by-value in arguments
+(`strict_everything` in dreams/src/modules.dr). It is call-by-value in arguments
 and nothing else: list cells, map values and a block's `let` stay lazy. Two
 exceptions, both to model what a strict-by-default compiler would actually do
 rather than to flatter the result: a pattern parameter, and a `let` whose body
@@ -1585,7 +1585,7 @@ the slots it reads would release the rest. That is the next thing to measure.
 
 **The time is real work laziness was skipping**, not overhead. The largest
 single item: the lexer's `char_len` walks a `//` comment to advance the column
-(dreams/lexer.dr, `skip_trivia`), and the column is never read, because the
+(dreams/src/lexer.dr, `skip_trivia`), and the column is never read, because the
 newline after the comment resets it. Lazily that walk never happens; strictly
 it is 16.6 M reductions. The rest is spread thin over the folds, the checker
 and the parser -- the same shape many times: an argument computed for a

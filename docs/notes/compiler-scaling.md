@@ -60,7 +60,7 @@ accumulator built this way is therefore **invisible in a reduction profile and
 quadratic in bytes**. `record_global`, `add_pending` and `check_body`'s queue of
 bodies were 282 MB, 281 MB and 295 MB of a 3,200-declaration compile against
 80 MB, 80 MB and 87 MB at half the size; the three `link_*` folds in
-[dreams/lower.dr](../../dreams/lower.dr) were another 39% of everything allocated.
+[dreams/src/lower.dr](../../dreams/src/lower.dr) were another 39% of everything allocated.
 All are `core.cons` onto a reversed list now, with one `list.reverse` in the
 accessor. Where a caller only wanted the length, it asks for a count and the
 ordered list is never built (`scope.pending_count`, `bodies_count`,
@@ -252,7 +252,7 @@ asks whether it has emitted that node before. It has, constantly: `local 3` is
 one 16-byte record and a self-compile writes ten thousand of them, `core.head`
 as a callee is a `builtin` beside an `apply` and there are seven thousand of
 those, and a condition written the same way in two modules is two identical
-subtrees. [dreams/opt.dr](../../dreams/opt.dr) rebuilds the finished arena once,
+subtrees. [dreams/src/opt.dr](../../dreams/src/opt.dr) rebuilds the finished arena once,
 bottom up, into a fresh one that keeps a table of every record it has already
 written. On the three programs in this repository:
 
@@ -456,7 +456,7 @@ Allocation falls 3% and promotion 14%, which is the mechanism showing up from
 the other side: a version chain is not merely churn, it is churn the nursery
 hands to the old generation.
 
-**What did not change.** `mind` and `mind/std/all.dr --test` are byte-identical,
+**What did not change.** `mind` and `mind/std/src/all.dr --test` are byte-identical,
 and so is the 6,400-declaration program's image. `dreams` and `lucid` differ,
 for a reason that is not a behaviour change and is worth knowing before anyone
 checks: both *contain* the compiler, so editing `ir.dr` edits their source --
@@ -468,7 +468,7 @@ the 0.35 a settled map has, so roughly a hundred megabytes of a self-compile's
 peak is *still* versions nobody can reach but a value nobody has forced. The
 tool says so in one number now, which is the useful part: divide the map
 branch count by the entry count, and anything much above a third means this.
-[dreams/opt.dr](../../dreams/opt.dr) is the obvious next place -- its five tables are
+[dreams/src/opt.dr](../../dreams/src/opt.dr) is the obvious next place -- its five tables are
 the same shape as the arena's, and `keep` only forces a node when it happens to
 be shareable, because `to_string` is how it makes the sharing key.
 
@@ -504,7 +504,7 @@ Read `promoted` down that column rather than `peak live`: a version chain is
 churn the nursery hands to the old generation, so promotion is what falls
 monotonically, where a peak is only ever sampled where a collection happens and
 moves by a third between runs of the *same* binary for the reason "Two things
-that will lie to you" gives. `mind` and `mind/std/all.dr --test` are
+that will lie to you" gives. `mind` and `mind/std/src/all.dr --test` are
 byte-identical to what the previous compiler emitted, and the bootstrap reaches
 a fixpoint in one stage. `lucid` differs in **3 bytes**, all of them `span_start`
 and `span_end` of one `FUNC` record, because `lucid` imports `dreams` and so

@@ -17,7 +17,7 @@
 
 namespace dream {
 
-// Must match the compiler's `ir::Op` in dreams/ir.dr.
+// Must match the compiler's `ir::Op` in dreams/src/ir.dr.
 // See docs/bytecode-format.md for the container.
 enum class Op : uint8_t {
     Nop = 0,
@@ -56,7 +56,7 @@ enum class Op : uint8_t {
     // constant node and a target, then the default target. Every target is a
     // suffix of the ordinary chain of arm tests, so the tests still run -- the
     // switch only skips the arms that cannot match. See `lower_match` in
-    // dreams/lower.dr.
+    // dreams/src/lower.dr.
     SwitchHead = 41, SwitchAtom = 42,
     // Force a, test its surface type b (DREAM_TYPE_INTEGER..DREAM_TYPE_MAP).
     // c is 0 for equality, 1 for inequality. No atom or native call is needed.
@@ -216,7 +216,7 @@ struct VmOptionRec {
 };
 static_assert(sizeof(VmOptionRec) == 16, "VM option records are 16 bytes on disk");
 
-/// `VMOP` keys. See `emit.vm_nursery_max` in dreams/emit.dr.
+/// `VMOP` keys. See `emit.vm_nursery_max` in dreams/src/emit.dr.
 inline constexpr uint32_t VMOP_NURSERY_MAX = 1;
 
 /// One module of a whole-program image. Compilation is whole-program, so an

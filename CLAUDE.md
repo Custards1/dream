@@ -17,8 +17,8 @@ Dont forget about strict parameters, use them when needed
 | `mind/std/` | The standard library. | Dream |
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. | Dream |
-| `mind/std/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/sql/pg/README.md](mind/std/sql/pg/README.md). | Dream |
-| `mind/tool/pack/` | `mind pack`, the packager: .deb, .rpm, Arch packages, tarballs, Homebrew formulas, PKGBUILDs and install scripts, every byte written in Dream. [mind/tool/PACKAGING.md](mind/tool/PACKAGING.md). | Dream |
+| `mind/std/src/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/src/sql/pg/README.md](mind/std/src/sql/pg/README.md). | Dream |
+| `mind/tool/src/pack/` | `mind pack`, the packager: .deb, .rpm, Arch packages, tarballs, Homebrew formulas, PKGBUILDs and install scripts, every byte written in Dream. [mind/tool/PACKAGING.md](mind/tool/PACKAGING.md). | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
 | `editors/nvim/` | The Neovim plugin: starts `lucid`, plus syntax, indent and a filetype. | Lua, Vim |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
@@ -34,7 +34,7 @@ describes: that is where the traps are written down, and where a comment's
 
 There is no `std.core` any more. The primitives (`_list_cons`, `_str_slice`,
 `_data_at`, ...) are plain builtins spelled with a leading `_`, declared in
-[dreams/builtins.dr](dreams/builtins.dr) and implemented in
+[dreams/src/builtins.dr](dreams/src/builtins.dr) and implemented in
 [dream/src/builtins.cpp](dream/src/builtins.cpp). They are `std`'s to call:
 everything else calls the `std` function that wraps each one (`list.cons`,
 `str.slice`, `payload.at`), which compiles to the same opcode, and naming a
@@ -61,7 +61,7 @@ identical image, and so does the stage after that. When you change the compiler,
 run `just bootstrap` and copy `build/dreams.dream` over the seed -- or, when the
 change adds atoms to the compiler, build again with each new image until one
 compiles the source into itself, and copy that one: it can take two rounds
-(see "`mind/std/all.dr --test` is not byte-stable" in
+(see "`mind/std/src/all.dr --test` is not byte-stable" in
 docs/notes/macro-expansion.md).
 
 A parallel build resolves and lowers in **parts, one per module**, each in a
@@ -72,11 +72,11 @@ module and reads the rest back (its type check too, keyed as well on the
 program's signatures, and every file's parse, keyed on its text), and the
 image is byte for byte the one an
 uncached build writes (`dreams/tests/units.sh`). `mind` passes it on every
-build. [dreams/unit.dr](dreams/unit.dr) and "Compile units" in
+build. [dreams/src/unit.dr](dreams/src/unit.dr) and "Compile units" in
 docs/notes/parallel-compile.md are the design.
 
 The pipeline a build runs -- resolve, lower and link, types, contracts, share,
-emit -- is written once, in [dreams/compile.dr](dreams/compile.dr):
+emit -- is written once, in [dreams/src/compile.dr](dreams/src/compile.dr):
 `compile.build!` answers a `Build` whose image and bytes are lazy, and
 `compile.check!`/`checked` are what `--check` and `lucid` ask. The command
 line, the REPL's session and the language server all call it rather than
@@ -84,7 +84,7 @@ spelling the stages out, so a new stage is added in one place.
 
 `mind` finds its compiler through `--compiler`, then `[build] compiler`, then
 `$DREAMS`, then `dreams.dream` from the installation
-([mind/tool/build.dr](mind/tool/build.dr#L139)). A name ending in `.dream`
+([mind/tool/src/build.dr](mind/tool/src/build.dr#L139)). A name ending in `.dream`
 is an image and is run by the VM; anything else is executed directly.
 
 A dependency is used by listing it in `[dependencies]` and nothing else: the
@@ -94,7 +94,7 @@ directory with no `mind.toml` is still a package. `mind` walks the graph
 a conflict, and hands each package to the compiler as `-L DIR`, or `-L KEY=DIR`
 when the key is not the package's own name. The compiler half of that -- a key
 as a second name for a package, and a manifest-less package -- is `alias!` and
-`add_named!` in [dreams/package.dr](dreams/package.dr), so `dreams` follows a
+`add_named!` in [dreams/src/package.dr](dreams/src/package.dr), so `dreams` follows a
 path dependency the same way without `mind`. `mind add`/`remove` edit the
 manifest a line at a time and leave the rest of the file as written.
 [mind/tool/README.md](mind/tool/README.md) is the user-facing half.
@@ -186,7 +186,7 @@ The groups, and what each one is actually asking:
 | `test-image` | `std.image`: one image calling another, found by path, installed and carried |
 | `test-tls` | `std.tls`: a server and clients in one VM, and against OpenSSL's `s_server`/`s_client` |
 | `test-mind` | `mind`'s path handling, manifests, dependency specs |
-| `test-dreams` | Every `when test` block `dreams/main.dr` reaches |
+| `test-dreams` | Every `when test` block `dreams/src/main.dr` reaches |
 | `test-dreams-corpus` | Every `.dr` file in the repository parses |
 | `test-dreams-compile` | Programs `dreams` compiled, run, output compared |
 | `test-bootstrap` | The seed still reproduces itself byte for byte |
@@ -221,7 +221,7 @@ times in a row afterwards, which is the shape of a race and not of a bug.
 just repl              # an interactive session
 just run FILE [args]   # compile and run
 just check FILE        # scope- and purity-check, no image
-just fmt FILE..        # lay files out in the house style (dreams/fmt.dr)
+just fmt FILE..        # lay files out in the house style (dreams/src/fmt.dr)
 just dump FILE         # the execution trees it compiles to
 just modules FILE      # what it pulls in
 ```
@@ -231,7 +231,7 @@ There is no environment to extend one binding at a time — a Dream program is
 compiled whole — so the session is the *text* of what has been defined, and
 every entry recompiles all of it. A definition survives because its text does;
 a runtime value does not, because the result is run as a child VM (`$DREAM`).
-[dreams/repl.dr](dreams/repl.dr) says the rest.
+[dreams/src/repl.dr](dreams/src/repl.dr) says the rest.
 
 `mind repl` is the same session with a project's packages already on the search
 path — the flags a session wants are the flags a build wants. It hands the
@@ -333,19 +333,19 @@ The lessons that keep coming back:
 - `let? x = e;` in a block is one step of an errors-as-values chain: on
   `[:ok, v]` it binds `v` and goes on, and anything else is the block's
   answer. The parser unfolds it to a `match` (`unfold_let_try`). The compiler
-  also warns about an accumulator nothing forces (`dreams/lint.dr`).
+  also warns about an accumulator nothing forces (`dreams/src/lint.dr`).
 - `virtual dyn let f self` and a record's `derive dyn base` opt in to run-time
   dispatch: the record's values carry a table in slot 0, and `base.f x`
   called through the declaring module dispatches on its last argument.
   Everything else about `derive` is still compile-time specialization;
-  "Dispatch" in docs/language-spec.md and `dispatching` in dreams/scope.dr.
+  "Dispatch" in docs/language-spec.md and `dispatching` in dreams/src/scope.dr.
 - `when test { .. }` holds a module's tests, collected by compiling with
   `--test`. Tests are `test.case "name" $( test.eq! expected actual )`.
 - `macro name params = ..` declares a syntax transformer and `expand name args`
   calls one. A macro receives its arguments as **syntax** — ordinary Dream
   lists, with a span last — and returns syntax, which is checked and then
   substituted. It runs on the same embedded VM `comp!` does, before name
-  resolution; [dreams/expand.dr](dreams/expand.dr) and [docs/notes/macro-expansion.md](docs/notes/macro-expansion.md) says what
+  resolution; [dreams/src/expand.dr](dreams/src/expand.dr) and [docs/notes/macro-expansion.md](docs/notes/macro-expansion.md) says what
   that costs.
 - `group P { x, y }`, `struct P { x, y }` and `mapping P { x, y }` declare a
   record: a module of generated functions — `P.make`, `P.new`, `P.x`, `P.set_x`.
@@ -380,7 +380,7 @@ The lessons that keep coming back:
   "The type grammar" in [docs/language-spec.md](docs/language-spec.md)
   is the grammar.
 - `let name : type` is a **signature**, checked at compile time
-  ([dreams/typecheck.dr](dreams/typecheck.dr)); `let x : t = e` and
+  ([dreams/src/typecheck.dr](dreams/src/typecheck.dr)); `let x : t = e` and
   `let f x : answer = e` are the inline forms. A free lowercase name in one is
   a type variable. A signature changes no node -- the one thing it adds to an
   image is a hint for the JIT -- code no signature touches is
@@ -508,7 +508,7 @@ default for every field" in [mind/std/README.md](mind/std/README.md) says why.
 Comments in this codebase explain *why a thing is the way it is*, usually in
 full sentences, often several lines at the head of a section. Match that. The
 existing prose is the style guide — read the top of
-[dreams/emit.dr](dreams/emit.dr) or [dreams/scope.dr](dreams/scope.dr) before
+[dreams/src/emit.dr](dreams/src/emit.dr) or [dreams/src/scope.dr](dreams/src/scope.dr) before
 adding to either.
 
 Keep the build warning-free. A stray warning in the output reads as a failure.

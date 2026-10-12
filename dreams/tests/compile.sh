@@ -22,7 +22,7 @@ trap 'rm -rf "$tmp"' EXIT
 fail=0
 pass=0
 
-"$dream" "$seed" dreams/main.dr -L mind -L . -o "$image" >/dev/null 2>&1 || exit 1
+"$dream" "$seed" dreams/src/main.dr -L mind -L . -o "$image" >/dev/null 2>&1 || exit 1
 
 for src in examples/*.dr; do
     [ -f "$src" ] || continue

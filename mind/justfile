@@ -1,5 +1,5 @@
 std:="./std"
-src := "tool/main.dr"
+src := "tool/src/main.dr"
 output := "mind.dream"
 dream := "../build-dream/bin/dream"
 compiler := "../build/dreams.dream"

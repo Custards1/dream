@@ -1,7 +1,7 @@
 # Session mode: incremental compilation for the REPL
 
 The REPL today compiles the whole session from scratch on every entry
-([dreams/repl.dr](dreams/repl.dr#L190)): write the accumulated text to a scratch
+([dreams/src/repl.dr](dreams/src/repl.dr#L190)): write the accumulated text to a scratch
 file, `modules.load!` from a fresh loader, `scope.resolve!`, `lower.link!`,
 write the image, optionally run it. Every entry re-parses every reachable module
 — including `std.console` — and renumbers every node from zero.
@@ -28,7 +28,7 @@ source every time. Carrying it forward is the real work.
 ### Global indices — stable by construction
 
 The one counter and the reason it is safe
-([dreams/scope.dr](dreams/scope.dr#L110)):
+([dreams/src/scope.dr](dreams/src/scope.dr#L110)):
 
 ```
 let state = %{ :envs => [], :pending => [], :diags => [], :next_global => 0, ... };
@@ -36,14 +36,14 @@ let take_global s = [map_put s :next_global (next_global s + 1), next_global s];
 ```
 
 `declare_module` captures its offset before doing anything else
-([dreams/scope.dr](dreams/scope.dr#L527)):
+([dreams/src/scope.dr](dreams/src/scope.dr#L527)):
 
 ```
 let globals_from = next_global s0;
 ```
 
 ...hands out a fresh index per declaration in order, and records the module as a
-*range* ([dreams/scope.dr](dreams/scope.dr#L590)):
+*range* ([dreams/src/scope.dr](dreams/src/scope.dr#L590)):
 
 ```
 map_put checked :module_recs
@@ -56,13 +56,13 @@ as `globals_start`/`globals_count`
 ([dream/src/image.hpp](dream/src/image.hpp#L120)), and the `Global` opcode's `a`
 operand is that flat index ([dream/src/interp.cpp](dream/src/interp.cpp#L808)).
 Cross-module references already carry the flat program-wide index by the time
-scope finishes ([dreams/scope.dr](dreams/scope.dr#L1061),
-[dreams/scope.dr](dreams/scope.dr#L966)).
+scope finishes ([dreams/src/scope.dr](dreams/src/scope.dr#L1061),
+[dreams/src/scope.dr](dreams/src/scope.dr#L966)).
 
 Modules are appended only after their dependencies
-([dreams/modules.dr](dreams/modules.dr#L68)), so the order is *dependencies
+([dreams/src/modules.dr](dreams/src/modules.dr#L68)), so the order is *dependencies
 first, root last*, and the root is the last module loaded
-([dreams/lower.dr](dreams/lower.dr#L878)). The consequence for a session:
+([dreams/src/lower.dr](dreams/src/lower.dr#L878)). The consequence for a session:
 
 - a new `let` in the root module takes the next sequential index — which is
   inside the root's range, **after** everything before it;
@@ -72,15 +72,15 @@ first, root last*, and the root is the last module loaded
   touching when the root grows.
 
 The same append-only reasoning holds for the import records (`take_import`,
-[dreams/scope.dr](dreams/scope.dr#L128)) and for the per-module `core` global
+[dreams/src/scope.dr](dreams/src/scope.dr#L128)) and for the per-module `core` global
 `declare_core` takes only when a module mentions `core`
-([dreams/scope.dr](dreams/scope.dr#L396)) — all of them are declared inside the
+([dreams/src/scope.dr](dreams/src/scope.dr#L396)) — all of them are declared inside the
 module that needs them, and the root is last.
 
 ### Function indices — stable by construction
 
 `begin_func` hands out indices from an append-only counter
-([dreams/scope.dr](dreams/scope.dr#L759)):
+([dreams/src/scope.dr](dreams/src/scope.dr#L759)):
 
 ```
 let fi = func_count r;
@@ -93,13 +93,13 @@ let with_func =
 The comment says it outright: *"The index is stable: functions are only ever
 appended."* Functions are reserved during the check phase, which walks
 `pending` in declaration order — dependencies first, root last
-([dreams/scope.dr](dreams/scope.dr#L1343)). New root bodies walk last, so they
+([dreams/src/scope.dr](dreams/src/scope.dr#L1343)). New root bodies walk last, so they
 get the highest function indices and nothing earlier shifts.
 
 ### Constant pools — stable if carried over
 
 The integer, float, string and atom pools are `intern` maps: a value keeps its
-first-seen index ([dreams/ir.dr](dreams/ir.dr#L259)). Carrying the pools forward
+first-seen index ([dreams/src/ir.dr](dreams/src/ir.dr#L259)). Carrying the pools forward
 means appending new constants does not disturb the indices of existing ones.
 
 ---
@@ -108,18 +108,18 @@ means appending new constants does not disturb the indices of existing ones.
 
 ### The node arena
 
-`ir.program` starts empty ([dreams/ir.dr](dreams/ir.dr#L197)) and `lower_program`
+`ir.program` starts empty ([dreams/src/ir.dr](dreams/src/ir.dr#L197)) and `lower_program`
 walks every body in order, appending to one shared arena
-([dreams/lower.dr](dreams/lower.dr#L906)). Node indices are assigned by
-`push_node` from `node_count` ([dreams/ir.dr](dreams/ir.dr#L242)), so they are a
+([dreams/src/lower.dr](dreams/src/lower.dr#L906)). Node indices are assigned by
+`push_node` from `node_count` ([dreams/src/ir.dr](dreams/src/ir.dr#L242)), so they are a
 position in the whole program. A fresh build renumbers everything. To make nodes
 stable, the arena itself must be carried forward and only appended to.
 
 The good news inside that: nodes are *referenced*, not position-relative. A
 parent holds a child index, a call holds a target function index, a flag is
-`set_node_flag` *in place* ([dreams/ir.dr](dreams/ir.dr#L276)), a compile-time
+`set_node_flag` *in place* ([dreams/src/ir.dr](dreams/src/ir.dr#L276)), a compile-time
 placeholder is replaced *in place* by `set_node` at the same index
-([dreams/lower.dr](dreams/lower.dr#L1025)). Appending nodes never moves an
+([dreams/src/lower.dr](dreams/src/lower.dr#L1025)). Appending nodes never moves an
 existing one. So an arena that is only ever appended to is safe by this design;
 the entire reset happens because `lower_program` builds a *fresh* `ir.program`.
 
@@ -127,15 +127,15 @@ the entire reset happens because `lower_program` builds a *fresh* `ir.program`.
 
 `link_funcs` walks `scope.funcs r` in index order and builds a `FuncRec` per
 function; `link_globals` walks `scope.r_global_recs r` in declaration order
-([dreams/lower.dr](dreams/lower.dr#L812),
-[dreams/lower.dr](dreams/lower.dr#L838)). Both produce lists. As long as the
+([dreams/src/lower.dr](dreams/src/lower.dr#L812),
+[dreams/src/lower.dr](dreams/src/lower.dr#L838)). Both produce lists. As long as the
 *lists are carried forward and appended to* — not rebuilt from the resolver each
 time — the records for earlier modules keep their positions. `place_captures`
 appends capture runs to the shared kids pool
-([dreams/lower.dr](dreams/lower.dr#L799)), same rule.
+([dreams/src/lower.dr](dreams/src/lower.dr#L799)), same rule.
 
 One asymmetry to respect: `scope.funcs r` regenerates the whole list on demand
-([dreams/scope.dr](dreams/scope.dr#L670)). `link_funcs` must be fed the carried
+([dreams/src/scope.dr](dreams/src/scope.dr#L670)). `link_funcs` must be fed the carried
 `funcs` list, not a freshly materialised view, or re-linking would re-derive
 (identical but rebuilt) records. The records for a session are append-only
 just like the globals.
@@ -143,12 +143,12 @@ just like the globals.
 ### The loader and parser
 
 `modules.load!` builds a fresh loader from scratch every call
-([dreams/modules.dr](dreams/modules.dr#L643)), so the parse cache does not
+([dreams/src/modules.dr](dreams/src/modules.dr#L643)), so the parse cache does not
 survive. The loader already *has* the machinery session mode needs — modules are
 deduplicated by `:by_name`/`:by_path`, and a persisted loader's `:parsed` map
 means a dependency whose text is unchanged is not lexed or parsed again
-([dreams/modules.dr](dreams/modules.dr#L78)). `load_overlaid_cached!`
-([dreams/modules.dr](dreams/modules.dr#L662)) is exactly the shape to build on:
+([dreams/src/modules.dr](dreams/src/modules.dr#L78)). `load_overlaid_cached!`
+([dreams/src/modules.dr](dreams/src/modules.dr#L662)) is exactly the shape to build on:
 it threads a previous loader's parse cache in and hands a loader back out. A
 session does the same, but with the whole loader — modules, by-name, by-path,
 host modules, and parsed map — reused rather than just the parse cache.
@@ -158,7 +158,7 @@ host modules, and parsed map — reused rather than just the parse cache.
 ## The session state
 
 Extend the session record
-([dreams/repl.dr](dreams/repl.dr#L51)) with what a compile leaves behind:
+([dreams/src/repl.dr](dreams/src/repl.dr#L51)) with what a compile leaves behind:
 
 ```
 let session imports defs =
@@ -208,7 +208,7 @@ moves. Concretely:
 3. **Resolve.** Re-run the check phase for just the new pending bodies. The
    resolver is carried, so `func_count` continues and the new functions take the
    next indices. `refs` are keyed per occurrence
-   ([dreams/scope.dr](dreams/scope.dr#L700)) and newly recorded keys are new;
+   ([dreams/src/scope.dr](dreams/src/scope.dr#L700)) and newly recorded keys are new;
    nothing earlier is overwritten.
 4. **Lower.** Re-run `lower_expr`/`mark_tail` for just the new bodies into the
    carried arena. `push_node`/`push_kids` continue from the watermark. Update
@@ -221,8 +221,8 @@ moves. Concretely:
    settled — their placeholder was replaced in place and the resulting nodes are
    in the arena, so they are not re-run.
 7. **Finish and run.** `ir.finish` reads the accumulated arena
-   ([dreams/ir.dr](dreams/ir.dr#L295)) and produces the image. Recompute `entry`
-   (`find_entry`, [dreams/lower.dr](dreams/lower.dr#L878)),
+   ([dreams/src/ir.dr](dreams/src/ir.dr#L295)) and produces the image. Recompute `entry`
+   (`find_entry`, [dreams/src/lower.dr](dreams/src/lower.dr#L878)),
    `module_name`/`source_name` from the root module.
 
 Steps 2–5 each cost only the new content, and their union is: **one production
@@ -254,7 +254,7 @@ module index and its `globals_start`. The design rule for this case is narrow:
   surviving values stable.
 
 This is why the session keeps `imports` separate from `defs`
-([dreams/repl.dr](dreams/repl.dr#L45)): the header is a small, explicitly
+([dreams/src/repl.dr](dreams/src/repl.dr#L45)): the header is a small, explicitly
 tracked thing, and a new import is the one edit that costs a re-resolve of the
 root. Everything else reuses outright.
 
@@ -266,7 +266,7 @@ a wiped root.
 ## Image writing
 
 The image sections are rendered independently in `emit.dr`
-([dreams/emit.dr](dreams/emit.dr#L198)): ints, floats, strings blob+table,
+([dreams/src/emit.dr](dreams/src/emit.dr#L198)): ints, floats, strings blob+table,
 atoms, nodes, kids, funcs, globals, imports, modules. With the pools carried,
 the first sections are byte-identical between compiles and only
 nodes/kids/funcs/globals/imports/modules change. Two options:
@@ -279,7 +279,7 @@ nodes/kids/funcs/globals/imports/modules change. Two options:
   cached prefix with fresh tail sections is all the writer would do.
 
 The run step (`os.exec!` on the image,
-[dreams/repl.dr](dreams/repl.dr#L211)) is unchanged — the image is still a file
+[dreams/src/repl.dr](dreams/src/repl.dr#L211)) is unchanged — the image is still a file
 and a child VM still runs it. Byte equality with a fresh build of the same text
 is *not* a goal of session mode (comp value nodes land after the new bodies'
 nodes instead of interleaved), and it does not need to be: correctness is
@@ -291,24 +291,24 @@ nodes instead of interleaved), and it does not need to be: correctness is
 
 - **The entry point is always a fresh `let main!`.** Every entry compiles the
   session with a new `echo`/`quiet_main` body —
-  [dreams/repl.dr](dreams/repl.dr#L74). The root module grows by one statement
+  [dreams/src/repl.dr](dreams/src/repl.dr#L74). The root module grows by one statement
   per entry, and `main!` is not accumulated in `defs`, so nothing gets
   redefined. In session mode the new `main!` is just another appended let: case
   A.
-- **`with_import` dedupes** ([dreams/repl.dr](dreams/repl.dr#L60)) so the header
+- **`with_import` dedupes** ([dreams/src/repl.dr](dreams/src/repl.dr#L60)) so the header
   only grows, which is the only direction case B handles cheaply. A session that
   wants to drop an import is a `:reset`.
 - **`:reset`** wipes the session; it also resets loader/scope/resolver/arena to
   empty and reloads `std.console`. It is the one place that returns to a fresh
   build from nothing — the current code path, kept.
 - **`:load`** enters a file's declarations through `define!`
-  ([dreams/repl.dr](dreams/repl.dr#L289)); each line is an appended statement,
+  ([dreams/src/repl.dr](dreams/src/repl.dr#L289)); each line is an appended statement,
   so it is N applications of case A.
 - **Errors keep being whole-session errors.** Session mode still reports a
   diagnostic against the *whole* session text (`as_session`, and the scratch
-  file path is rendered per [dreams/repl.dr](dreams/repl.dr#L186)), unchanged
+  file path is rendered per [dreams/src/repl.dr](dreams/src/repl.dr#L186)), unchanged
   from today. The failed entry is not kept
-  ([dreams/repl.dr](dreams/repl.dr#L269)).
+  ([dreams/src/repl.dr](dreams/src/repl.dr#L269)).
 - **Diagnostics.** Loader and resolver diagnostics for earlier modules are kept
   and replayed (`modules.diags`, `scope.r_diags`); only the new statements add
   to them.
@@ -329,19 +329,19 @@ nodes instead of interleaved), and it does not need to be: correctness is
   module the session text itself declares onward*, not literally the single
   last record.
 - **`derive`.** A derived body is re-walked once per derived module
-  ([dreams/scope.dr](dreams/scope.dr#L695)); if the session derives something,
+  ([dreams/src/scope.dr](dreams/src/scope.dr#L695)); if the session derives something,
   its effective items change when the session changes and the derived module's
   segment must follow the root-segment rule. First version: treat any session
   containing `derive` as case B for the deriving module.
 - **Wrapper globals.** Lowering rewrites calls to wrapper globals into what they
-  stand for ([dreams/lower.dr](dreams/lower.dr#L209)). The wrappers map is keyed
+  stand for ([dreams/src/lower.dr](dreams/src/lower.dr#L209)). The wrappers map is keyed
   by global index and lives in the resolver; carried forward it stays correct,
   and a *new* wrapper in the root only affects the root's own newly lowered
   nodes. But a wrapper's `target` is a function index, so `link_globals` for a
   newly declared wrapper must be re-run for that record only — already covered
   by step 5.
 - **`virtual` / `unimplemented`** in the root fills a virtual at declare time
-  ([dreams/scope.dr](dreams/scope.dr#L557)) and is handled by case A/B exactly
+  ([dreams/src/scope.dr](dreams/src/scope.dr#L557)) and is handled by case A/B exactly
   like any other let.
 - **Timers and divergence.** Session mode does not change the rule in
   [CLAUDE.md](../CLAUDE.md): every VM run still needs a timeout, because

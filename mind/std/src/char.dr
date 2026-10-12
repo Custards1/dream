@@ -1,0 +1,111 @@
+// Characters: a character and its code point.
+//
+// A character is a value of its own, not a one-byte string and not an
+// integer, so the two conversions between it and its Unicode scalar value are
+// where this module starts. Each is the runtime's primitive under a name a
+// program is meant to write; a call of one compiles to the primitive itself
+// (see "wrappers" in dreams/src/scope.dr), so there is nothing to save by reaching
+// past it. The ASCII classes after them are what every lexer wrote for itself.
+
+/// The code point: `code 'A'` is 65.
+///
+/// ```dream
+/// import std.char;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (char.code 'λ')
+/// };
+/// ```
+let code : :char -> :integer;
+let code c = _char_code c;
+
+/// The character with this code point. Raises on a surrogate (U+D800 to
+/// U+DFFF) or on anything past U+10FFFF, neither of which is a character.
+///
+/// ```dream
+/// import std.char;
+/// import std.console;
+///
+/// let main! = {
+///     console.print! (char.of_code 65)
+/// };
+/// ```
+let of_code : :integer -> :char;
+let of_code n = _char_of_code n;
+
+/// Is this an ASCII digit?
+let is_digit : :char -> :bool;
+let is_digit c = c >= '0' && c <= '9';
+
+// --- classes, for ASCII -----------------------------------------------------
+//
+// What a lexer, a parser of a config format or a validator of an identifier
+// asks, written once rather than in each of them. Only the ASCII range, for
+// the reason `std.str` gives for its case functions: Unicode's classes are
+// tables this library does not carry, and a test that answered for some of
+// them would be worse than one that says it answers for none.
+
+/// Is this an ASCII letter?
+let is_alpha : :char -> :bool;
+let is_alpha c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+
+/// Is this an ASCII letter or digit?
+let is_alnum : :char -> :bool;
+let is_alnum c = is_alpha c || is_digit c;
+
+/// Is this an ASCII uppercase letter?
+let is_upper : :char -> :bool;
+let is_upper c = c >= 'A' && c <= 'Z';
+
+/// Is this an ASCII lowercase letter?
+let is_lower : :char -> :bool;
+let is_lower c = c >= 'a' && c <= 'z';
+
+/// A space, tab, newline or carriage return.
+let is_space : :char -> :bool;
+let is_space c = c == ' ' || c == '\t' || c == '\n' || c == '\r';
+
+/// A digit in base 16, either case.
+let is_hex_digit : :char -> :bool;
+let is_hex_digit c = is_digit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+
+/// The uppercase letter for an ASCII lowercase one; anything else as it is.
+let upper : :char -> :char;
+let upper c = if c >= 'a' && c <= 'z' { _char_of_code (_char_code c - 32) } else { c };
+
+/// The lowercase letter for an ASCII uppercase one; anything else as it is.
+let lower : :char -> :char;
+let lower c = if c >= 'A' && c <= 'Z' { _char_of_code (_char_code c + 32) } else { c };
+
+/// What the character is worth as a digit in any base up to 36 -- `'7'` is 7,
+/// `'f'` and `'F'` are 15, `'z'` is 35 -- or `()` for one that is no digit.
+/// Whether it is a digit *of a particular base* is the caller's comparison.
+let digit_value : :char -> (:integer | :unit);
+let digit_value c = {
+    let n = _char_code c;
+    if n >= 48 && n <= 57 { n - 48 }
+    else if n >= 97 && n <= 122 { n - 87 }
+    else if n >= 65 && n <= 90 { n - 55 }
+    else { () }
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "a character's code"   $( test.eq! [65, 955] [code 'A', code 'λ'] ),
+        test.case "and back"             $( test.eq! ['A', 'λ'] [of_code 65, of_code 955] ),
+        test.case "a surrogate is not a character"
+            $( test.raises! $( strict! (of_code 55296) ) ),
+        test.case "digits"               $( test.eq! [true, false] [is_digit '7', is_digit 'x'] ),
+        test.case "letters"              $( test.eq! [true, true, false, false] [is_alpha 'q', is_alpha 'Q', is_alpha '1', is_alpha 'λ'] ),
+        test.case "letters and digits"   $( test.eq! [true, true, false] [is_alnum 'a', is_alnum '9', is_alnum '_'] ),
+        test.case "case tests"           $( test.eq! [true, false, true, false] [is_upper 'A', is_upper 'a', is_lower 'a', is_lower '1'] ),
+        test.case "space"                $( test.eq! [true, true, false] [is_space ' ', is_space '\n', is_space 'x'] ),
+        test.case "hex digits"           $( test.eq! [true, true, false] [is_hex_digit 'F', is_hex_digit '0', is_hex_digit 'g'] ),
+        test.case "upper and lower"      $( test.eq! ['A', '1', 'a', 'λ'] [upper 'a', upper '1', lower 'A', lower 'λ'] ),
+        test.case "digit_value"          $( test.eq! [7, 15, 15, 35, ()] [digit_value '7', digit_value 'f', digit_value 'F',
+                                                                        digit_value 'z', digit_value '-'] ),
+    ];
+}

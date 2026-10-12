@@ -86,9 +86,9 @@ def check(vm, image, relative, marker, size):
 if __name__ == '__main__':
     vm, image = sys.argv[1:]
     for relative, marker, size in [
-        ('lucid/main.dr', 'let handle!', 25),
-        ('lucid/main.dr', 'full', None),
-        ('lucid/analysis.dr', 'let inlay_hints a', 25),
-        ('dreams/typecheck.dr', 'let hints l r', 25),
+        ('lucid/src/main.dr', 'let handle!', 25),
+        ('lucid/src/main.dr', 'full', None),
+        ('lucid/src/analysis.dr', 'let inlay_hints a', 25),
+        ('dreams/src/typecheck.dr', 'let hints l r', 25),
     ]:
         check(vm, image, relative, marker, size)

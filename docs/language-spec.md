@@ -350,7 +350,7 @@ same name shadows them.
 
 Everything else the machine provides is a **primitive**, spelled with a
 leading underscore (`_list_cons`, `_str_slice`) and declared in
-[`dreams/builtins.dr`](../dreams/builtins.dr). Primitives are `std`'s to
+[`dreams/src/builtins.dr`](../dreams/src/builtins.dr). Primitives are `std`'s to
 call: every one has a `std` function that wraps it (`list.cons`,
 `str.slice`) and compiles to the same operation. Naming a primitive outside
 `std` compiles, with a warning:
@@ -568,7 +568,7 @@ something already forced costs nothing. It takes a block too:
 a list whose second element is a thunk of the force. To force `x` first, make
 it a statement: `strict! x` on its own line, then `[:ok, x]`. The compiler
 warns about a `strict!` written as an element of a list, array or map
-literal (`dreams/lint.dr`).
+literal (`dreams/src/lint.dr`).
 
 ### Strict parameters
 
@@ -1229,23 +1229,23 @@ be passed around, but `std` and `std.list` alone cannot.
 ### Packages
 
 **A package is a directory of modules with a name**, given by a `mind.toml`
-at its root:
+at its root, with the modules in `src/` beside it:
 
 ```toml
 [package]
 name = "textstats"
 version = "0.1.0"
-src = "."
 
 [dependencies]
 util = "../util"
 ```
 
 `import textstats.report` means the module `report` in the package called
-`textstats`, wherever that package is. A package's own modules are also
-reachable from inside it unqualified (`import report`). `src` defaults to a
-`src` directory when there is one. A directory with no manifest can still be
-a package, named by the key that lists it.
+`textstats` -- `src/report.dr` -- wherever that package is. A package's own
+modules are also reachable from inside it unqualified (`import report`).
+`[package] src` names another directory; without it the modules are in `src`
+when there is one and beside the manifest when there is not. A directory with
+no manifest can still be a package, named by the key that lists it.
 
 The compiler is told where packages are with `-L DIR` (a package, or a
 directory of packages) and `-L NAME=DIR` (the package at `DIR`, imported as
@@ -1491,7 +1491,7 @@ expand swap [1, 2]                       // [2, 1]
 `expand name args` calls the macro with its arguments **unevaluated**, as
 syntax, and replaces the call with the syntax it answers. Syntax is ordinary
 Dream data: tagged lists whose last element is a source span, in the forms
-[`dreams/ast.dr`](../dreams/ast.dr) defines. `x + 1` arrives as
+[`dreams/src/ast.dr`](../dreams/src/ast.dr) defines. `x + 1` arrives as
 `[:binary, :add, [:name, "x", span], [:int, 1, span], span]`. A transformer
 uses ordinary functions, imports and `match` to read and build it.
 
@@ -1679,7 +1679,7 @@ dream --stats IMG            # reductions, collections, allocation, the JIT
 
 ## 19. Grammar summary
 
-Informal; [`dreams/parser.dr`](../dreams/parser.dr) is the definition.
+Informal; [`dreams/src/parser.dr`](../dreams/src/parser.dr) is the definition.
 
 ```
 file        ::= item*

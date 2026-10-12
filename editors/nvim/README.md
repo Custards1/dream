@@ -15,7 +15,7 @@ Through Neovim's own LSP client, with nothing else installed:
 - **Completion** (`<C-x><C-o>`, or any completion plugin): a module's members
   after a `.`, and everything in scope elsewhere.
 - **Rename** (`grn`), **format** (`vim.lsp.buf.format()`, the house style of
-  `dreams/fmt.dr`) and **inlay hints** (`vim.lsp.inlay_hint.enable()`).
+  `dreams/src/fmt.dr`) and **inlay hints** (`vim.lsp.inlay_hint.enable()`).
 
 The server reads the buffer rather than the file on disk, so all of this works
 on code you have not saved.

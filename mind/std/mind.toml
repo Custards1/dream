@@ -1,7 +1,7 @@
 [package]
 name = "std"
 version = "0.1.0"
-src = "."
+description = "The Dream standard library"
 
 [test]
 # A library has no program; its tests are gathered by all.dr, which imports

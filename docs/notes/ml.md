@@ -2,7 +2,7 @@
 
 The design behind `std.ml` -- autodiff, layers, losses, optimizers, datasets
 and the training loop -- what it had to add underneath it, and what was
-measured. The code is [mind/std/ml/](../../mind/std/ml/), one module per
+measured. The code is [mind/std/src/ml/](../../mind/std/src/ml/), one module per
 piece, each with its design at the head of the file; this note is the why
 across them. Numbers are from a 12-core Ryzen 5900X and an RTX 3070, as of
 2026-10-04.

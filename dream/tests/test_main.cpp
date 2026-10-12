@@ -940,7 +940,7 @@ static void test_image_rejects_bad_input() {
 //
 // Building an image by hand, because that is the only way to write the ones a
 // loader must *reject* -- the compiler cannot be asked for a malformed file.
-// The shape is what `dreams/emit.dr` writes: a 32-byte header, a table of
+// The shape is what `dreams/src/emit.dr` writes: a 32-byte header, a table of
 // 16-byte entries, then each section on an 8-byte boundary.
 // ---------------------------------------------------------------------------
 

@@ -100,7 +100,7 @@ per program, and the phase meter that guided them.
 - The image was the calls, and now it is the transformers
 - Discovery was a walk of two whole modules, because a `match` lied about where it ended
 - One image for the whole expansion, and what it cost to buy that
-- `mind/std/all.dr --test` is not byte-stable across compiler changes
+- `mind/std/src/all.dr --test` is not byte-stable across compiler changes
 - A program that does not resolve ran the machine out of memory
 
 ## [Deforestation](deforestation.md)

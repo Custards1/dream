@@ -32,9 +32,9 @@ stdenv.mkDerivation {
     src = ../.;
     # The build output directories change constantly and none of them affect
     # this build, so they are dropped by name -- but only *directories*: a
-    # source file whose name begins with `build` (build.sh, mind/tool/build.dr)
+    # source file whose name begins with `build` (build.sh, mind/tool/src/build.dr)
     # is part of the tree and must stay. And only at the root, which is where
-    # `build`, `build-dream` and `build-pgo` are: `mind/std/build` is the
+    # `build`, `build-dream` and `build-pgo` are: `mind/std/src/build` is the
     # `std.build` package, and dropping every `build*` directory wherever it
     # was dropped that too, so nothing that imports it would compile.
     filter = path: type:

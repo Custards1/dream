@@ -1,4 +1,4 @@
 [package]
 name = "example"
 version = "0.1.0"
-src = "."
+description = "The smallest package there is"

@@ -42,19 +42,19 @@ let python ctx name =
 /// that reproduces itself -- just not one that is the seed.
 let bootstrap : :string;
 let bootstrap = "t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
-    + " && \"$dream\" \"$seed\" -L mind -L . -o \"$t/stage2.dream\" dreams/main.dr >/dev/null"
-    + " && \"$dream\" \"$t/stage2.dream\" -L mind -L . -o \"$t/stage3.dream\" dreams/main.dr >/dev/null"
+    + " && \"$dream\" \"$seed\" -L mind -L . -o \"$t/stage2.dream\" dreams/src/main.dr >/dev/null"
+    + " && \"$dream\" \"$t/stage2.dream\" -L mind -L . -o \"$t/stage3.dream\" dreams/src/main.dr >/dev/null"
     + " && cmp \"$t/stage2.dream\" \"$t/stage3.dream\""
     + " && { cmp -s \"$seed\" \"$t/stage2.dream\" || { echo 'the seed is stale: it builds a different compiler from this source' >&2; exit 1; }; }";
 
 /// Every Dream file in the repository parses, and the parser's own tests pass.
 let corpus : :string;
-let corpus = "for f in mind/std/*.dr mind/std/build/*.dr mind/tool/*.dr examples/*.dr examples/*/*.dr"
-    + " dream/tests/programs/*.dr dreams/*.dr benchmark/*/*.dr; do"
+let corpus = "for f in mind/std/src/*.dr mind/std/src/build/*.dr mind/tool/src/*.dr examples/*.dr examples/*/src/*.dr"
+    + " dream/tests/programs/*.dr dreams/src/*.dr benchmark/*/src/*.dr mind/tool/src/pack/*.dr; do"
     + " \"$dream\" \"$image\" --parse \"$f\" >/dev/null || { echo \"$f does not parse\"; exit 1; }; done"
     + " && t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
-    + " && \"$dream\" \"$image\" dreams/ast.dr --test -L mind -L . -o \"$t/ast.dream\" >/dev/null && \"$dream\" \"$t/ast.dream\""
-    + " && \"$dream\" \"$image\" dreams/parser.dr --test -L mind -L . -o \"$t/parser.dream\" >/dev/null && \"$dream\" \"$t/parser.dream\"";
+    + " && \"$dream\" \"$image\" dreams/src/ast.dr --test -L mind -L . -o \"$t/ast.dream\" >/dev/null && \"$dream\" \"$t/ast.dream\""
+    + " && \"$dream\" \"$image\" dreams/src/parser.dr --test -L mind -L . -o \"$t/parser.dream\" >/dev/null && \"$dream\" \"$t/parser.dream\"";
 
 let plan : :map -> :map;
 let plan ctx =

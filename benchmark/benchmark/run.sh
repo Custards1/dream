@@ -48,7 +48,7 @@ for f in "$dream" "$dreams"; do
 done
 
 mkdir -p "$(dirname "$image")"
-"$dream" "$dreams" "$here/main.dr" -L "$root/mind" -o "$image" >/dev/null || exit 1
+"$dream" "$dreams" "$here/src/main.dr" -L "$root/mind" -o "$image" >/dev/null || exit 1
 
 # The best of `repeat` runs, in milliseconds, for one workload in one runtime.
 # The timing lines are on stderr; stdout is kept for the agreement check.

@@ -62,7 +62,7 @@ counts **UTF-16 code units**; `pos.dr` is the only conversion and it should
 stay the only one. And completion has to offer the *locals* in scope, which is
 the one thing the compiler does not record, so `analysis.dr` reads the binders
 back off the syntax tree -- those scoping rules are written twice, and the
-section that does it says which parts of `dreams/scope.dr` it transcribes.
+section that does it says which parts of `dreams/src/scope.dr` it transcribes.
 
 Parses are kept between requests. The latest resolved analysis is also reused
 for an unchanged document, after checking the loaded source texts and package

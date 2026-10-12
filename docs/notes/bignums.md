@@ -84,7 +84,7 @@ tensors".
 ### Literals
 
 A literal past the fixnum range lowers to `_parse_int "<digits>"`
-(`const_int` in dreams/lower.dr), so the image format's `KINT` stays an
+(`const_int` in dreams/src/lower.dr), so the image format's `KINT` stays an
 `i64`. The seed was regenerated with that lowering in it, so a big literal is
 fine anywhere, the compiler's own source included; a seed older than it dies
 on one with `str_le needs an integer`.

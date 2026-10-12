@@ -139,7 +139,7 @@ Two rules keep these predictable:
   with `new`. A function that has defaults of its own takes a *configure
   function* instead, `X -> X`, and hands it those defaults: a setter is
   already one (`model.train! nights (ml.Fit.set_epochs 30)`), and
-  `fn o -> o |> .. |> ..` chains several. `sleep/model.dr`'s `train!` is
+  `fn o -> o |> .. |> ..` chains several. `sleep/src/model.dr`'s `train!` is
   the example.
 - **A setting that may be left unsaid is `()`, not `false`.** In
   `sql.Transaction`, `read_only = ()` says nothing and lets the database
