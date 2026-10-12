@@ -61,7 +61,12 @@ then runs it in its own temporary directory. Code and actual captured output
 appear together in the documentation, including the phase and exit status.
 Standard output and standard error are both retained. Examples that fail to
 compile, raise an error, exit unsuccessfully or time out **do not fail the
-documentation build**. This lets comments demonstrate incorrect usage too.
+documentation build**. This lets comments demonstrate incorrect usage too:
+fence such an example as ```` ```dream fails ````. An example whose outcome is
+not the one its fence promises -- a plain `dream` example that fails, or one
+marked `fails` that runs cleanly -- is listed with its page when the build
+ends, and with `--strict-examples` (or `strict-examples = true` under
+`[docs]`) the build fails instead.
 A successful example that prints nothing is labeled “(no output)”.
 
 Use a `text` fence for a fragment that should only be displayed. Each example

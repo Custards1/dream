@@ -24,6 +24,7 @@ let opts = [
     cli.value "" "compiler" "PATH" "compiler for documentation examples",
     cli.value "" "example-timeout" "MS" "compile and run deadline per example (default: 5000 ms)",
     cli.flag "" "no-api" "compile only Markdown guides",
+    cli.flag "" "strict-examples" "fail when an example's outcome is not the one its fence promises",
     cli.flag "h" "help" "show documentation options",
 ];
 let usage = "mind docs -- compile guides and source API documentation\n\nusage: mind docs [options]\n\n"
@@ -42,11 +43,11 @@ let ignored path = list.any (fn p -> list.contains p ["target", "build", ".git",
 let files! dir = if io.is_dir! dir { list.sort (list.filter (fn p -> not (ignored p)) (io.walk! dir)) } else { [] };
 let guide! ctx dir rel = {
     let text = read! (path.join dir rel);
-    page ("guides/" + html_path rel) (markdown.title rel text) (examples.render! ctx text) text
+    let url = "guides/" + html_path rel;
+    page url (markdown.title rel text) (examples.render! ctx.[:page => url] text) text
 };
 let module_pages! ctx label dir rel = {
     let text = read! (path.join dir rel);
-    console.error! ("documenting " + label + "/" + rel)
     let entries = api.extract text;
     let url = "api/" + label + "/" + html_path rel;
     let source = "source/" + label + "/" + html_path rel;
@@ -54,7 +55,7 @@ let module_pages! ctx label dir rel = {
     let stem = if module == "mod" { "" } else if str.ends_with "/mod" module { str.slice 0 (len module - 4) module } else { module };
     let name = label + (if stem == "" { "" } else { "." + str.replace "/" "." stem });
     if list.is_empty entries { [] } else {
-        [page url name ("<h1>" + markdown.escape name + "</h1>" + api.render! ctx (relative_root url + source) entries)
+        [page url name ("<h1>" + markdown.escape name + "</h1>" + api.render! ctx.[:page => url] (relative_root url + source) entries)
              (str.join_str "\n" (list.map (fn e -> e.[:name] + " " + e.[:signature] + " " + e.[:doc]) entries)),
          page source (name + " source") ("<h1>" + markdown.escape name + " source</h1>" + api.source_html text) ""]
     }
@@ -141,8 +142,17 @@ let build! c m = {
     let search = list.map (fn p -> %{ "title" => p.[:title], "url" => p.[:url], "text" => p.[:text] }) listed;
     write! out "assets/search.js" ("window.mindDocs=" + json.write search + ";\n")
     write! out "search-index.json" (json.write search)
+    // Read before the scratch directory goes: see the head of examples.dr.
+    let unexpected = examples.unexpected_in! scratch;
     file.remove_all! scratch
     console.print! ("made " + path.join out "index.html" + " (" + to_string (list.length guides) + " guides, " + to_string (list.length listed - list.length guides) + " API modules)")
+    if not (list.is_empty unexpected) {
+        let strict = cli.flag_set c "strict-examples" || toml.get false cfg "docs" "strict-examples" == true;
+        console.error! ((if strict { "mind docs: " } else { "mind docs: warning: " }) + to_string (list.length unexpected)
+            + " example(s) did not do what their fence says (mark one written to fail with ```dream fails):")
+        list.each! (fn u -> console.error! ("  " + u)) unexpected
+        if strict { os.exit! 1 }
+    }
 };
 let run! args = match cli.parse opts args {
     [:error, why] => fail! (why + "\n" + usage),

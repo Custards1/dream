@@ -713,6 +713,38 @@ bool peer_admits(PeerSet& peers, uint32_t gi, int depth);
 /// be floats. Also a free function, for the same reason.
 Ty peer_call_ty(const PeerSet& peers, uint32_t gi, SlotSet float_args);
 
+/// `DREAM_JIT_DENY=name,#index,..` keeps the named functions out of the tier,
+/// as roots and as peers alike: a name as `--profile` and `DREAM_JIT_TRACE`
+/// print it, which may match several functions, or `#` and the index the
+/// trace gives, which matches one. It is how a fault the interpreter does not
+/// have is narrowed to the function whose compiled form has it -- halve the
+/// trace's list until the fault goes -- without a rebuild per guess.
+bool denied_by_env(const Image& img, uint32_t func_index) {
+    static const std::vector<std::string> deny = [] {
+        std::vector<std::string> out;
+        const char* env = std::getenv("DREAM_JIT_DENY");
+        if (!env) return out;
+        std::string all(env);
+        size_t start = 0;
+        while (start <= all.size()) {
+            size_t comma = all.find(',', start);
+            if (comma == std::string::npos) comma = all.size();
+            if (comma > start) out.push_back(all.substr(start, comma - start));
+            start = comma + 1;
+        }
+        return out;
+    }();
+    if (deny.empty()) return false;
+    StringRef name = img.str(img.func(func_index).name);
+    const std::string index = "#" + std::to_string(func_index);
+    for (const std::string& d : deny) {
+        if (d == index || (d.size() == name.len && std::memcmp(d.data(), name.data, name.len) == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 class Analyzer {
 public:
     Analyzer(Runtime& rt, const Image& img, uint32_t func_index, PeerSet* peers = nullptr,
@@ -723,6 +755,7 @@ public:
     Analysis run() {
         Analysis a;
         if (f_.slots > 64 || f_.arity == 0) return a;
+        if (denied_by_env(img_, fi_)) return a;
         binds_.assign(f_.slots, NO_NODE);
         reads_.assign(f_.slots, 0);
         bind_state_.assign(f_.slots, 0);

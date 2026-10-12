@@ -1,4 +1,12 @@
 // Execute fenced Dream examples and retain both successful and failing runs.
+//
+// An example either works or is written to fail -- a compile error or a raise
+// is documentation too -- and the fence says which: ```dream for one that
+// should run cleanly, ```dream fails for one that should not. An example whose
+// outcome is not the one its fence promises is recorded as it runs, under
+// `unexpected/` in the scratch directory, because the pages are rendered
+// lazily and there is no other point where every result is in one place;
+// `docs.dr` reads the records back before it removes the directory.
 import std.file;
 import std.io;
 import std.list;
@@ -10,7 +18,8 @@ import build;
 import manifest;
 import documentation.markdown;
 
-let context m compiler timeout scratch = %{ :manifest => m, :compiler => compiler, :timeout => timeout, :scratch => scratch };
+let context m compiler timeout scratch = %{ :manifest => m, :compiler => compiler, :timeout => timeout,
+                                            :scratch => scratch, :page => "" };
 let output r = r.[:out else ""] + r.[:err else ""];
 let report phase r = {
     let label = if r.[:timed_out else false] { phase + " timed out" }
@@ -19,6 +28,46 @@ let report phase r = {
     let shown = if len text > 32768 { str.slice 0 32768 text + "\n[output truncated]" } else if text == "" { "(no output)" } else { text };
     "<div class=\"example-result\"><p><strong>" + markdown.escape label + "</strong></p><pre><code>" + markdown.escape shown + "</code></pre></div>"
 };
+
+/// Whether a phase's result is a clean finish: exit 0, in time.
+let clean : :map -> :bool;
+let clean r = r.[:code else 1] == 0 && not r.[:timed_out else false];
+
+/// A fence's info string as `[language, expected to fail]`: `dream fails` is
+/// `["dream", true]`.
+let fence_info : :string -> [:string, :bool];
+let fence_info info = {
+    let ws = str.words info;
+    [list.first_or "" ws, list.contains "fails" (list.drop 1 ws)]
+};
+
+/// Whether a fence's language is one whose examples are run.
+let runs : :string -> :bool;
+let runs language = language == "dream" || language == "dr";
+
+/// The example's page and its first line of substance, to find it by.
+let describe : :map -> :string -> :string;
+let describe ctx code = {
+    let line = list.first_or "" (list.filter (fn l -> not (str.is_blank l) && not (str.starts_with "import " (str.trim l))) (str.lines code));
+    ctx.[:page] + ": " + str.truncate 70 (str.trim line)
+};
+
+/// Note an example whose outcome is not the one its fence promised.
+let unexpected! : :map -> :string -> :string -> :unit;
+let unexpected! ctx code why = {
+    let dir = path.join ctx.[:scratch] "unexpected";
+    file.mkdir_all! dir
+    file.write! (path.join dir (io.digest (ctx.[:page] + code))) (describe ctx code + " (" + why + ")")
+};
+
+/// The records `unexpected!` left, sorted: one line each.
+let unexpected_in! : :string -> [:string];
+let unexpected_in! scratch = {
+    let dir = path.join scratch "unexpected";
+    list.sort (list.map (fn rel -> match file.read! (path.join dir rel) { () => rel, text => text }) (file.walk! dir))
+};
+
+/// Compile and run one example: `[html, whether both phases finished cleanly]`.
 let run! ctx code = try! {
     let dir = path.join ctx.[:scratch] (io.digest code);
     file.mkdir_all! dir
@@ -28,25 +77,25 @@ let run! ctx code = try! {
     let m = ctx.[:manifest];
     let opts = map.merge build.options (%{ :entry => entry, :output => image, :compiler => ctx.[:compiler] });
     match build.compile_args! m opts {
-        [:error, why] => report "Build setup" (%{ :code => 1, :err => why }),
+        [:error, why] => [report "Build setup" (%{ :code => 1, :err => why }), false],
         [:ok, args] => {
             let cmd = build.compiler_command! (build.choose_compiler! m ctx.[:compiler]);
             // The example's deadline bounds its compile as well as its run:
             // an example that cannot build in that time is as broken as one
             // that cannot finish, and the page says so either way.
             let compiled = os.exec_for! (list.head cmd) (list.append (list.nth 1 cmd) args) ctx.[:timeout];
-            if compiled.[:code else 1] != 0 || compiled.[:timed_out else false] { report "Compile" compiled }
+            if not (clean compiled) { [report "Compile" compiled, false] }
             else {
                 let vm = build.vm_command! ();
                 let program = if str.contains_str "/" vm { path.absolute! vm } else { vm };
                 let ran = os.exec_in! dir program [image] ctx.[:timeout];
                 // Successful compiler chatter only repeats temporary paths.
                 // Warnings are kept when present; execution always has a result.
-                (if compiled.[:err else ""] == "" { "" } else { report "Compile" compiled }) + report "Run" ran
+                [(if compiled.[:err else ""] == "" { "" } else { report "Compile" compiled }) + report "Run" ran, clean ran]
             }
         },
     }
-} catch e { report "Example" (%{ :code => 1, :err => to_string e }) };
+} catch e { [report "Example" (%{ :code => 1, :err => to_string e }), false] };
 let rec collect! ctx lines results = match lines {
     [] => results,
     [line, ..rest] => {
@@ -54,10 +103,15 @@ let rec collect! ctx lines results = match lines {
         if str.starts_with "```" s || str.starts_with "~~~" s {
             match markdown.fenced (str.slice 0 3 s) rest [] {
                 [code, more] => {
-                    let language = str.trim (markdown.tail 3 s);
-                    if language == "dream" || language == "dr" {
-                        let result = run! ctx code;
-                        collect! ctx more (map.put code result results)
+                    let [language, fails] = fence_info (markdown.tail 3 s);
+                    if runs language {
+                        let [html, ok] = run! ctx code;
+                        match [ok, fails] {
+                            [false, false] => unexpected! ctx code "failed",
+                            [true, true] => unexpected! ctx code "marked `fails` but ran cleanly",
+                            _ => (),
+                        }
+                        collect! ctx more (map.put code html results)
                     } else { collect! ctx more results }
                 },
             }
@@ -66,6 +120,8 @@ let rec collect! ctx lines results = match lines {
 };
 let render! ctx text = {
     let results = collect! ctx (str.split "\n" text) (%{});
-    markdown.render_with (fn language code -> markdown.code_html language code
-        + (if language == "dream" || language == "dr" { map.get "" code results } else { "" })) text
+    markdown.render_with (fn info code -> {
+        let language = list.head (fence_info info);
+        markdown.code_html language code + (if runs language { map.get "" code results } else { "" })
+    }) text
 };

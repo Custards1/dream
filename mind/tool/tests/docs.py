@@ -35,20 +35,20 @@ let hello : :string -> :string;
 let hello name = "hello " + name;
 
 /// A compile error is useful documentation too.
-/// ```dream
+/// ```dream fails
 /// let main! = unknown_name;
 /// ```
 let broken = 1;
 
 /// Runtime failures are captured.
-/// ```dream
+/// ```dream fails
 /// import std.console;
 /// let main! = { console.error! "before failure"; raise! "intentional" };
 /// ```
 let failure = 2;
 
 /// Deadlines do not stop the build.
-/// ```dream
+/// ```dream fails
 /// let rec forever! () = forever! ();
 /// let main! = forever! ();
 /// ```
@@ -91,7 +91,8 @@ let main! = console.print! "guide output";
     # Discovery from a subdirectory and a global compiler option must work.
     # The deadline bounds each example's compile as well as its run, so it
     # has to leave room for a compile; the endless example still runs out.
-    out = invoke('--compiler', COMPILER, 'docs', '--example-timeout', '2000', cwd=project / 'src')
+    out = invoke('--compiler', COMPILER, 'docs', '--example-timeout', '2000', '--strict-examples', cwd=project / 'src')
+    assert 'did not do what' not in out, out
     target = project / 'target/docs'
     assert (target / 'index.html').exists(), out
     api = (target / 'api/demo/lib.html').read_text()
@@ -115,9 +116,24 @@ let main! = console.print! "guide output";
     assert any('hello' in p['text'] for p in entries)
     for asset in ['docs.css', 'docs.js', 'search.js']:
         assert (target / 'assets' / asset).stat().st_size > 0
+    # An example that fails without saying so is reported, and refused under
+    # --strict-examples; so is one marked `fails` that works.
+    lib = project / 'src/lib.dr'
+    lib.write_text(lib.read_text().replace('/// ```dream fails\n/// let main! = unknown_name;', '/// ```dream\n/// let main! = unknown_name;')
+                   .replace('/// ```dream\n/// import demo.lib;', '/// ```dream fails\n/// import demo.lib;'))
+    out = invoke('--compiler', COMPILER, 'docs', '-C', str(project), '--example-timeout', '2000')
+    assert '2 example(s) did not do what' in out and 'warning' in out, out
+    assert 'api/demo/lib.html: let main! = unknown_name; (failed)' in out, out
+    assert 'marked `fails` but ran cleanly' in out, out
+    out = invoke('--compiler', COMPILER, 'docs', '-C', str(project), '--example-timeout', '2000', '--strict-examples', ok=False)
+    assert 'did not do what' in out, out
     invoke('docs', '-C', str(project), '-o', str(project), ok=False)
     invoke('docs', '-C', str(project), '--example-timeout', '0', ok=False)
     invoke('pack', '-C', str(project), 'init')
     assert '[ship]' in (project / 'mind.toml').read_text()
     invoke('pack', 'files', 'unexpected', ok=False)
-    print('Documentation: comments, examples, failures, timeouts, Markdown and offline assets passed')
+    # Every example in the standard library does what its fence says.
+    out = invoke('--compiler', COMPILER, 'docs', '-C', str(ROOT / 'mind/std'), '-o', str(project / 'std-docs'),
+                 '--strict-examples')
+    assert 'did not do what' not in out, out
+    print('Documentation: comments, examples, failures, timeouts, Markdown, offline assets and std examples passed')

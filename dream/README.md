@@ -82,6 +82,7 @@ VM options go **before** the image; everything after it belongs to the program.
 | `DREAM_STUCK_SECONDS` | report what every process is doing if nothing has progressed for this long |
 | `DREAM_JIT_SYNC` | compile on the calling thread rather than in the background |
 | `DREAM_JIT_TRACE` | print every compile, whether it was taken, and what it cost |
+| `DREAM_JIT_DENY` | keep these functions out of the JIT: names, or `#` and an index from the trace, comma-separated -- bisect a fault the interpreter does not have |
 | `DREAM_TENSOR_THREADS`, `DREAM_OPENCL_LIB` | tensor parallelism, and which OpenCL to `dlopen` |
 
 ## Why the interpreter is a state machine

@@ -273,7 +273,7 @@ let shape_field kind field value = match field {
 /// partial operation in pure code: it happens when the result is demanded,
 /// and not at all if it never is.
 ///
-/// ```dream
+/// ```dream fails
 /// import std.types;
 /// import std.console;
 ///
