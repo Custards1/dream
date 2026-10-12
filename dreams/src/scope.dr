@@ -1986,6 +1986,14 @@ let rec check_expr c e r =
             set_staged saved (pop_scope (check_block c stmts (push_scope entered)))
         },
 
+        // A `?` the parser could not pull in front of a statement: it is under
+        // something that may not run -- the right of `&&` or `||`, a branch, a
+        // fallback -- so there is no step that would always run it. See "`?`"
+        // in the parser.
+        [:question, x, span] =>
+            report c span ("`?` answers a failure from the statement it is in, and this one is "
+                           + "where it may not run: bind it with `let?` first, or give it a block")
+                   (check_expr c x r),
         // `$( .. )` is a value: building it is always allowed, and running it is
         // what needs an impure context. So the thunk's own frame permits
         // effects however pure the function around it is.

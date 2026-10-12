@@ -406,9 +406,8 @@ let ident_run s i = str.span ident_bytes i s;
 /// of the name and is what marks the binding impure. It is taken greedily, so
 /// `a!= b` is the name `a!` and then `=`, exactly as the Rust lexer reads it.
 ///
-/// `let?` is the one word that ends in `?`, and only that word: `?` is no
-/// operator, so nothing else could be meant by it, and keeping it to one
-/// spelling leaves `?` free for anything the language wants later.
+/// `let?` is the one word that ends in `?`, and only that word: `x?` is the
+/// name `x` and then the postfix `?` (see "`?`" in the parser).
 let identifier s i = {
     let j = ident_run s i;
     match str.byte j s {
@@ -436,6 +435,7 @@ let operators = [
     ["@", :at], ["&", :amp], ["^", :caret], ["~", :tilde],
     ["::", :colon_colon],
     [".", :dot], [",", :comma], [";", :semi], [":", :colon], ["|", :bar],
+    ["?", :question],
 ];
 
 /// The operator at `i`, as `[kind, width]`, or `()`.
@@ -484,6 +484,7 @@ let operator_at s i = {
     else if a == 38 { if b == 38 { [:and_and, 2] } else { [:amp, 1] } }
     else if a == 94 { [:caret, 1] }
     else if a == 126 { [:tilde, 1] }
+    else if a == 63 { [:question, 1] }
     else if a == 33 { if b == 61 { [:bang_eq, 2] } else { [:bang, 1] } }
     else if a == 36 { if b == 40 { [:dollar_paren, 2] } else { () } }
     else if a == 35 { if b == 91 { [:hash_bracket, 2] } else { () } }
@@ -736,6 +737,8 @@ when test {
         // A `:` not followed by a name is the colon token.
         test.case "a bare colon"   $( test.eq! [:colon] (kinds ": ") ),
         test.case "cons"           $( test.eq! [:ident, :colon_colon, :ident] (kinds "x :: xs") ),
+        test.case "a postfix `?`, and `let?` still one word"
+            $( test.eq! [:ident, :ident, :ident, :question, :ident] (kinds "let? f x? y") ),
         test.case "cons onto an atom"
             $( test.eq! [:colon_colon, :atom] (kinds ":: :ok") ),
         test.case "member access"  $( test.eq! [:ident, :dot, :ident] (kinds "x.field") ),

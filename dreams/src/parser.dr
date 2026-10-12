@@ -273,13 +273,18 @@ let rec parse_apply c ts =
                 // so the head of the accumulated list is the last argument, and
                 // its span closes the application's without walking the list.
                 [:ok, args, rest2] =>
-                    if list.is_empty args { ok head rest2 }
+                    if list.is_empty args { question_tail head rest2 }
                     else {
-                        ok (ast.apply_e head (list.reverse args)
-                            (ast.span_to (ast.span head) (ast.span (list.head args)))) rest2
+                        question_tail (ast.apply_e head (list.reverse args)
+                                         (ast.span_to (ast.span head) (ast.span (list.head args)))) rest2
                     },
             },
     };
+
+/// `e?`, as many times as it is written: see "`?`" below.
+let rec question_tail e ts =
+    if at ts :question { question_tail [:question, e, peek_span ts] (list.tail ts) }
+    else { ok e ts };
 
 let rec gather_args c !acc ts =
     if not (can_start_arg c ts) { ok acc ts }
@@ -855,6 +860,166 @@ let rec unfold_let_try stmts end =
                 after => list.cons st after,
             },
     };
+
+// --- `?` -----------------------------------------------------------------------
+//
+// `f x?` is `let?` written where the value is used: carry on with what the
+// `Result.ok` or `Option.some` holds, and otherwise the block answers the
+// failure.
+//
+//     let total = price item? * count?;      let? <?a> = price item;
+//     ..                               ==     let? <?b> = count;
+//                                             let total = <?a> * <?b>;
+//                                             ..
+//
+// It applies to the application before it -- `f x?` is `(f x)?`, and
+// `f (x?)` is written so -- and is pulled out of its statement into a `let?`
+// in front of it, in the order the statement would evaluate them, inner
+// before outer. So it is `let?` and nothing else: nothing after the parser
+// knows it, and what it answers is what `let?` would. The statement it is
+// pulled in front of is the nearest one that owns a failure: a block's
+// statement, or a body -- a function's, a lambda's, a `match` arm's, a
+// `$( )`'s -- which becomes a block of the steps and itself.
+//
+// It is only pulled out of positions that are evaluated whenever the
+// statement is: not out of a lambda, a branch of an `if`, an arm, or the right
+// of `&&` and `||`, each of which may never run. One there stays where it is,
+// unless that position is a body of its own, and the resolver reports it
+// (`scope`, "`?`").
+//
+// This is a pass over the parsed module rather than part of the descent,
+// because a `?` is met deep inside an expression and has to go somewhere far
+// above it; and it only runs over a file that has a `?` in it at all.
+
+/// The name a `?`'s value is held by. Angle brackets cannot be written.
+let question_name sp = "<?" + to_string (ast.span_start sp) + ">";
+
+/// `e` with each `?` in a position evaluated whenever `e` is replaced by the
+/// name of its value: `[e, steps]`, the steps reversed, each the `let?` that
+/// binds one. Everything else is left as it is.
+let rec hoist e !steps = match e {
+    [:question, inner, sp] => {
+        let [held, before] = hoist inner steps;
+        let kw = let_try_far sp 16;
+        let name = question_name sp;
+        let step = [:let_try, ast.let_d name [] (ast.name_e let_try_name (let_try_at kw 3)) false (let_try_far sp 8),
+                    held, let_try_far sp 8, kw, ()];
+        [ast.name_e name (let_try_far sp 9), list.cons step before]
+    },
+    [:apply, f, args, sp] => {
+        let [f1, s1] = hoist f steps;
+        let [args1, s2] = hoist_all args s1;
+        [[:apply, f1, args1, sp], s2]
+    },
+    [:binary, op, l, r, sp] =>
+        if op == :and || op == :or {
+            let [l1, s1] = hoist l steps;
+            [[:binary, op, l1, r, sp], s1]
+        }
+        else {
+            let [l1, s1] = hoist l steps;
+            let [r1, s2] = hoist r s1;
+            [[:binary, op, l1, r1, sp], s2]
+        },
+    [:unary, op, x, sp] => { let [x1, s1] = hoist x steps; [[:unary, op, x1, sp], s1] },
+    [:field, o, n, sp] => { let [o1, s1] = hoist o steps; [[:field, o1, n, sp], s1] },
+    [:get, c, k, f, sp] => {
+        let [c1, s1] = hoist c steps;
+        let [k1, s2] = hoist k s1;
+        [[:get, c1, k1, f, sp], s2]
+    },
+    [:set, c, k, v, sp] => {
+        let [c1, s1] = hoist c steps;
+        let [k1, s2] = hoist k s1;
+        let [v1, s3] = hoist v s2;
+        [[:set, c1, k1, v1, sp], s3]
+    },
+    [:list, items, sp] => { let [is1, s1] = hoist_all items steps; [[:list, is1, sp], s1] },
+    [:array, items, sp] => { let [is1, s1] = hoist_all items steps; [[:array, is1, sp], s1] },
+    [:map, pairs, sp] => {
+        let [flat, s1] = hoist_all (list.concat pairs) steps;
+        [[:map, list.chunks 2 flat, sp], s1]
+    },
+    [:pipe, l, r, sp] => {
+        let [l1, s1] = hoist l steps;
+        let [r1, s2] = hoist r s1;
+        [[:pipe, l1, r1, sp], s2]
+    },
+    [:match, sc, arms, sp] => { let [sc1, s1] = hoist sc steps; [[:match, sc1, arms, sp], s1] },
+    [:if, cond, t, el, sp] => { let [c1, s1] = hoist cond steps; [[:if, c1, t, el, sp], s1] },
+    _ => [e, steps],
+};
+
+let rec hoist_all es !steps = match es {
+    [] => [[], steps],
+    [x, ..rest] => {
+        let [x1, s1] = hoist x steps;
+        let [rest1, s2] = hoist_all rest s1;
+        [list.cons x1 rest1, s2]
+    },
+};
+
+/// A body with its `?`s pulled in front of it, as a block when there were any.
+let questions_body e = {
+    let done = questions e;
+    let [held, steps] = hoist done [];
+    if list.is_empty steps { done }
+    else {
+        match unfold_let_try (list.reverse (list.cons held steps)) (ast.span e) {
+            [:error, _, _] => done,
+            stmts => ast.block_e stmts (ast.span e),
+        }
+    }
+};
+
+/// A block's statements, each with its `?`s pulled in front of it. A `let`
+/// of no parameters is a statement whose value is pulled from; one with
+/// parameters is a function, whose body owns its own.
+let questions_block stmts span = {
+    let stepped = list.concat (list.map (fn st -> {
+        let [st1, steps] = match st {
+            [:let, n, [], body, is_rec, sp] => {
+                let [b1, s1] = hoist (questions body) [];
+                [[:let, n, [], b1, is_rec, sp], s1]
+            },
+            [:let_p, pattern, body, sp] => {
+                let [b1, s1] = hoist (questions body) [];
+                [[:let_p, pattern, b1, sp], s1]
+            },
+            [:let, _, _, _, _, _] => [questions st, []],
+            other => hoist (questions other) [],
+        };
+        list.reverse (list.cons st1 steps)
+    }) stmts);
+    match unfold_let_try stepped span {
+        [:error, _, _] => stmts,
+        unfolded => unfolded,
+    }
+};
+
+/// The module, or an expression, with every `?` pulled out to where it can
+/// answer from. Every node is rebuilt with its children done; the places a
+/// failure is answered -- blocks and bodies -- are where the pulling happens.
+let rec questions e =
+    if type_of e != :list { e }
+    else {
+        match e {
+            [:block, stmts, sp] => [:block, questions_block stmts sp, sp],
+            [:lambda, ps, body, sp] => [:lambda, ps, questions_body body, sp],
+            [:thunk, body, sp] => [:thunk, questions_body body, sp],
+            [:match, sc, arms, sp] =>
+                [:match, questions sc,
+                 list.map (fn a -> ast.arm (ast.arm_pattern a) (questions (ast.arm_guard a))
+                                             (questions_body (ast.arm_body a)) (list.nth 3 a)) arms,
+                 sp],
+            [:let, n, ps, body, is_rec, sp] => [:let, n, ps, questions_body body, is_rec, sp],
+            _ => list.map (fn x -> questions x) e,
+        }
+    };
+
+/// `questions`, but only for text that could hold a `?` at all: a search of
+/// the text is one machine pass, and nearly every file has none.
+let questions_in src e = if str.contains_str "?" src { questions e } else { e };
 
 // --- signatures ---------------------------------------------------------------
 //
@@ -1809,7 +1974,7 @@ let parse_expression src =
     match parse_expr top (lexer.tokens src) {
         [:error, m, s] => Result.error [m, s],
         [:ok, e, rest] =>
-            if at_end rest { Result.ok e }
+            if at_end rest { Result.ok (questions_in src e) }
             else { Result.error ["unexpected " + describe rest + " after the expression", peek_span rest] },
         _ => Result.error ["the lexer answered something unexpected", ast.no_span],
     };
@@ -2882,7 +3047,7 @@ let parse_module src = {
     match item_list top [] ts false {
         [:error, m, s] => err m s,
         [:ok, items, _] =>
-            [:ok, items,
+            [:ok, questions_in src items,
              if str.contains_str "expand" src { expand_sites :none ts [] } else { [] }],
         _ => err "the lexer answered something unexpected" ast.no_span,
     }
@@ -3227,6 +3392,17 @@ when test {
             $( test.eq! [true, true]
                         [str.contains_str "(sig area" (items "union S { a, area : S -> :integer, area self = 1 }"),
                          str.contains_str "already" (fails_module "union S { a, area : S -> :integer, area : S -> :integer }")] ),
+        test.case "`?` is a `let?` in front of the statement it is in"
+            $( test.eq! ("(block (match (apply (name f) (name x)) [(success <let?>) (block (let <?13> (name <let?>))"
+                         + " (let y (name <?13>)) (apply (name g) (name y)))] [<let?> (name <let?>)]))")
+                        (shape "{ let y = f x?; g y }") ),
+        test.case "`?` in a lambda answers from the lambda, inner before outer"
+            $( test.eq! ("(fn x (block (match (apply (name g) (name x)) [(success <let?>) (block (let <?11> (name <let?>))"
+                         + " (match (name h) [(success <let?>) (block (let <?16> (name <let?>))"
+                         + " (binary add (name <?11>) (name <?16>)))] [<let?> (name <let?>)]))] [<let?> (name <let?>)])))")
+                        (shape "fn x -> g x? + h?") ),
+        test.case "`?` where it may not run is left for the resolver to report"
+            $( test.eq! "(block (binary and (name a) (? (name b))))" (shape "{ a && b? }") ),
         test.case "a `let?` with nothing after it has nothing to guard"
             $( test.eq! "`let?` must be followed by the statements it guards" (fails "{ let? x = f }") ),
         test.case "a `let?` binds a value, not a function"

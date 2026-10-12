@@ -629,6 +629,7 @@ let rec show e =
             "(if " + show cond + " " + show t + (if el == () { "" } else { " " + show el }) + ")",
         [:block, stmts, _]  => "(block" + (if list.is_empty stmts { "" } else { " " + show_all stmts }) + ")",
         [:thunk, x, _]      => "(thunk " + show x + ")",
+        [:question, x, _]   => "(? " + show x + ")",
         [:try, b, binder, h, _] => "(try " + show b + " " + binder + " " + show h + ")",
         [:lambda, ps, b, _] => "(fn " + show_params ps + " " + show b + ")",
         [:comp, impure, x, _] => "(" + (if impure { "comp!" } else { "comp" }) + " " + show x + ")",

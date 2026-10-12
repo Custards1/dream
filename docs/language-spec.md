@@ -382,6 +382,7 @@ From loosest to tightest:
 | `+` `-` | left |
 | `*` `/` `%` `@` | left |
 | prefix `-`, `~`, `not`, and `comp`, `comp!`, `expand` | prefix |
+| `?` after an application | postfix |
 | application `f a b` | left |
 | `.name`, `.[ ]` | postfix |
 
@@ -396,6 +397,8 @@ not f x            // not (f x)
 f x.y              // f (x.y)
 1 :: 2 :: []       // [1, 2]
 n - 1 :: rest      // (n - 1) :: rest
+parse s? + 1       // (parse s)? + 1
+f (g x)?           // (f (g x))? -- write f ((g x)?) for the inner one
 ```
 
 **A negative argument needs parentheses.** `-` cannot begin an argument, so
@@ -783,6 +786,24 @@ let port config = {
 An `[:ok, v]` list is not a result, and `let?` passes it on like any other
 value. `let?` binds one value with no parameters, `rec` or signature, and
 must be followed by the statements it guards.
+
+`e?` is the same step written where the value is used: it is `let?` pulled
+out in front of the statement it is in, so the block answers the failure.
+
+```dream
+let total a b = {
+    let sum = number a? + number b?;     // let? x = number a; let? y = number b;
+    Result.ok (sum * 10)                 // let sum = x + y; ..
+};
+```
+
+`?` applies to the whole application before it -- `f x?` is `(f x)?` -- and
+the steps are taken in the order the statement evaluates them, inner first.
+What owns a failure is the nearest block statement or body: a function's,
+a lambda's (`fn s -> parse s? + 1` answers the error), a `match` arm's or a
+`$( )`'s. A `?` that may not run whenever its statement does -- on the right
+of `&&` or `||`, in a `.[k else d]` fallback -- has nowhere to be pulled to,
+and is an error: bind it with `let?` first.
 
 What to do with a result or an option is a member of its union, each taking
 the value last so that a chain reads in order through `|>`:
@@ -1756,10 +1777,10 @@ binding     ::= 'rec'? name param* ( ':' type )? '=' expr
               | pattern '=' expr
 param       ::= name | '!' name | '(' 'strict' name ')' | '()' | '[' .. ']' | '#[' .. ']' | '%{' .. '}'
               | '(' pattern (',' pattern)* ')'
-statement   ::= binding-let | 'let?' (name | pattern) '=' expr | 'type' .. | expr
+statement   ::= binding-let | 'let?' (name | pattern) '=' expr ('else' expr)? | 'type' .. | expr
 expr        ::= expr '|>' expr | expr binop expr | ('-' | 'not') expr
               | ('comp' | 'comp!' | 'expand') application | application
-application ::= postfix postfix*
+application ::= postfix postfix* '?'*
 postfix     ::= primary ( '.' name | '.[' expr ( 'else' expr | '=>' expr )? ']' )*
 primary     ::= literal | name | '(' expr ')' | '[' exprs ']' | '#[' exprs ']'
               | '%{' (expr '=>' expr),* '}' | '$(' expr ')' | block
