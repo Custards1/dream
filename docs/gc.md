@@ -624,7 +624,13 @@ else in a held block is dead or the stub of something promoted, and is made
 name objects that have since moved. A surviving old object found pointing at a
 pinned one is put on the remembered set, since it now points at a young object.
 When the collection ends the bit is cleared, and the next collection judges the
-object like any other young one. A held block's bytes are counted as allocated
+object like any other young one. (2026-10-11: the dead are no longer marked
+`GC_FREE` one by one. A walk of every held block did that, and on a
+precompiled self-compile, where most collections run under compiled code, it
+walked 3.2 GB -- 2% of the run. The block now records how far it was filled
+when it was held and which offsets in it were pinned, and the next scan
+treats anything else below that line as dead, which is all the marks were
+for.) A held block's bytes are counted as allocated
 but neither as new nursery allocation nor as old space
 (`nursery_held_`); counted as either, the next collection was due the moment
 this one ended, and the probe ran a million minors.

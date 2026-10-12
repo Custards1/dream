@@ -1570,3 +1570,123 @@ because nothing reports it. What the experiment did buy is a target: the
 memory win comes from what suspensions *retain*, not from how many are made,
 and that can be had without changing what any program means. The switch stays
 in the compiler so this can be measured again.
+
+## Direct calls, and where a precompiled run's calls actually come from
+
+2026-10-11. **Measured, and not kept** -- except the collector's half, at the
+end. Direct calls were commit a325e9e and were reverted after it; compiled
+suspensions were never committed. The lessons are at the end of the section,
+and they are the reason it is long.
+
+`--precompile` compiles every function first, and a self-compile
+still ran in about the same CPU as the interpreter alone. Frames were 40% of
+what it allocated, and only a call between two functions of one compile -- a
+peer, at most eight a module -- avoided one. So the first thing built was a way
+for any compiled function to call any other without a frame ("Direct calls" in
+jit.cpp at a325e9e). A function publishes its body as a peer in a table by
+function index, beside the set of arguments it takes evaluated, and a call that
+is not to a peer of its own compile reads the slot: a body published for the
+set the caller assumed is called with the arguments in registers, and anything
+else is the machine's call it always was.
+
+**It is correct, and on a self-compile it buys nothing.** Same binary,
+`DREAM_JIT_DIRECT=0` against the default, interleaved: 2.21 s against 2.22 s
+of run, the image byte-identical, allocation unchanged to three figures. What
+was counted -- temporarily, by call site -- says why:
+
+| a precompiled self-compile | count |
+|---|---|
+| function entries, compiled | 9.7 M |
+| function entries, interpreted | 6.4 M |
+| -- of them because `force_nest` was past 256 | **6.0 M** |
+| frames made by interpreted code's calls | 16.1 M |
+| frames made for compiled code's suspensions | 3.7 M |
+| thunks made | 42 M |
+| calls compiled code handed to the machine | 3.4 M |
+| calls compiled code made directly | 0.5 M |
+
+Compiled code calling compiled code is rare. Almost every call starts in the
+interpreter -- in a thunk's body, which is never compiled, or in a function
+entered past `kMaxForceNestForCompiled`. That bound is the larger surprise.
+Interpreted code nests forces three or four deep; precompiled code reaches the
+256 bound constantly, at 4.5 MB of machine stack (17 KB a level -- a compiled
+body with its peers inlined has a large frame), and past it every function is
+interpreted. Two thirds of the interpreted entries are that, and none of it is
+a function the tier refused.
+
+**A published body has to be paid for.** Most functions are compiled in the
+loop shape, which reads its frame and is not a body of its arguments, so
+publishing one is a second compile -- 200 to 500 ms of LLVM for the larger
+functions here. Compiling it beside every function made `fib`'s compile 11.5 ->
+18 ms and the benchmark 38 -> 45 ms; asking for it on the 32nd miss made a
+self-compile spend 4.5 s of CPU during the run on 23 of them, and at ten
+thousand misses it was still 0.85 s for nothing the wall clock could see. So a
+recursive root publishes the body it already has, for nothing, and any other
+only when `DREAM_JIT_EXPORT_MISSES` asked.
+
+Nor does anything else miss it. The seven workloads of benchmark/benchmark with
+it on and off, twice each, interleaved, agree to the millisecond (fib 37/38,
+collatz 63/64, ...), and a program written to favour it -- a hot loop calling
+eleven helpers, two of them recursive roots in other compiles -- ran 500 ms
+against 525. Five per cent at best, for 650 lines of the tier.
+
+What this says about the next steps: a thunk compiled code makes should have a
+compiled body (most calls are made from one), and the nesting bound wants to
+be a measure of the machine stack rather than a count -- which is only
+affordable once a collection does not scan that stack word by word.
+
+**Compiled suspensions, measured the same day: off by default.** A suspension's
+node forced often enough was compiled as a body of its frame. It was correct -- every e2e
+program agrees with every suspension compiled on its first force -- and it
+loses: with the 404 hottest nodes compiled before the run, so that no compile
+is paid during it, the run took 2.52 s against 2.30 s. Counting every force of
+every node not yet compiled was 2.5% of the run, and a compiled suspension runs
+on the machine stack, which a collection under compiled code scans word by
+word: `pin_conservative` and the held blocks went from 4% of the run to 7%.
+
+**What the conservative scan costs, and what was cheap to take back.** On a
+precompiled self-compile 7,200 collections run under compiled code; they scan
+52 M words (7 K on average, 564 K at the deepest), pin 2 M objects and hold 52 K
+nursery blocks. Of the scan's 640 ms: reading the words 162, sorting the hits
+166, finding the object each hit is in 122, and marking the dead in every held
+block 198 -- a walk of 3.2 GB. The last is gone (a held block records how far
+it was filled and what was pinned in it; docs/gc.md), and a 256-entry table of
+addresses already taken drops most repeated words before the sort. Against the
+commit before, in a worktree, interleaved: 1.61 s stopped in collection against
+1.79 s -- and the run's wall clock unchanged, 2.24 s against 2.21 s. Collection
+time summed over a build's processes is not its critical path.
+
+So none of the three -- direct calls, compiled suspensions, cheaper pins -- moved
+a self-compile's wall clock, though each removed the cost it was aimed at. The
+cheaper pins are kept: they are small, inside the collector, and take back CPU
+every program spends. The other two were taken out; with `--precompile` and the
+`run:` line of `--stats`, which stay, they can be measured again from a325e9e
+if the picture changes.
+
+**What to do differently next time.**
+
+- *Find the critical path before choosing a target.* A self-compile is a
+  parallel build: 8.7 s of CPU in 2.2 s of wall. A profile of where the CPU
+  went, and collection time summed over every process, both say what the
+  machine paid and nothing about what the clock waited for. Three changes were
+  aimed by that profile and all three missed the clock.
+- *Count why the thing happens before building the fix for it.* The table above
+  took an hour of temporary counters and would have killed direct calls before
+  a line of them was written: compiled code calling compiled code is 0.5 M of
+  16 M calls. Count the origin of the events (who made the frame, who entered
+  the function), not only their number.
+- *Price the second compile.* Anything that needs a function compiled again in
+  another shape pays LLVM's 200-500 ms a function, during the run, and needs a
+  number of uses that pays for that before it is worth asking for.
+- *A/B in a worktree, always.* The VM links `build-dream/lib/libdream.so`, so a
+  copy of the binary taken before a rebuild runs the new library -- the first
+  "baseline" here measured the change against itself.
+- *Running Dream on the machine stack costs the collector.* Every frame of it
+  is scanned conservatively under compiled code, so moving work there
+  (compiled suspensions, deeper nesting) is paid for in pins until a
+  collection has precise roots. That is the order: roots first, then more
+  machine stack -- and roots only once the clock, not the CPU, says so.
+
+The next measurement, then, is what sets a self-compile's wall clock -- the
+slowest module, and the stages that wait on it -- not precise roots, whose
+whole prize is the remaining 340 ms of scanning CPU.

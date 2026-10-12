@@ -593,6 +593,7 @@ int dream_main(int argc, char** argv) {
     if (workers == 0) workers = Scheduler::default_workers();
 
     Scheduler sched(rt, workers);
+    rt.mark_run_start();
     auto root = sched.create_process();
     Value cl = root->heap().make_closure(func, 0);
     prime_apply(*root, cl, 0);

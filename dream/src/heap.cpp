@@ -180,6 +180,7 @@ Heap::Block* Heap::new_block(size_t bytes, bool exact) {
     b->dead = false;
     b->evacuate = false;
     b->pinned = false;
+    b->held_end = b->held_from = b->held_count = 0;
     block_bytes_ += size;
     if (block_bytes_ > peak_block_bytes_) {
         peak_block_bytes_ = block_bytes_;
@@ -320,6 +321,7 @@ Obj* Heap::carve_big(size_t sz) {
         b->dead = false;
         b->evacuate = false;
         b->pinned = false;
+        b->held_end = b->held_from = b->held_count = 0;
         big_pool_bytes_ -= b->size;
     }
     // Exactly the class, not the heap's minimum block. That minimum is for
@@ -1682,6 +1684,7 @@ void Heap::pin_conservative(bool full) {
     pinned_.clear();
     pinned_blocks_.clear();
     pin_refs_.clear();
+    young_pins_.clear();
     if (!cons_lo_) return;
     const uint64_t started = now_nanos();
 
@@ -1728,10 +1731,20 @@ void Heap::pin_conservative(bool full) {
     const uintptr_t lowest = ranges.front().lo;
     uintptr_t highest = 0;
     for (const Range& r : ranges) highest = std::max(highest, r.hi);
+    //
+    // A stack names the same object many times over -- the thunk being forced
+    // is in every frame between the force and the loop -- and every word that
+    // lands is a hit to sort. A small table of the addresses already taken
+    // drops most repeats before they cost a place in the sort: on a
+    // precompiled self-compile the sort had become as large as the scan.
     std::vector<std::pair<size_t, uintptr_t>> hits;
+    uintptr_t seen[256] = {};
     for (const uintptr_t* w = cons_lo_; w < cons_hi_; ++w) {
         const uintptr_t a = *w;
         if ((a & 7) != 0 || a < lowest || a >= highest) continue;
+        uintptr_t& slot = seen[(a >> 3) & 255];
+        if (slot == a) continue;
+        slot = a;
         auto it = std::upper_bound(ranges.begin(), ranges.end(), a,
                                    [](uintptr_t key, const Range& r) { return key < r.lo; });
         if (it == ranges.begin()) continue;
@@ -1762,6 +1775,15 @@ void Heap::pin_conservative(bool full) {
             }
             if (!o || o == last) continue;
             last = o;
+            // Below the line of a block the last collection held, only what
+            // it pinned is alive: everything else there was dead or moved
+            // then, and is left as it was rather than marked so.
+            if (pos < b->held_end &&
+                !std::binary_search(held_pins_.begin() + b->held_from,
+                                    held_pins_.begin() + b->held_from + b->held_count,
+                                    uint32_t(pos))) {
+                continue;
+            }
             const uint8_t gc = o->gc;
             // A hole on a free list, or what a word left over from a call long
             // returned happens to point at: nothing to keep.
@@ -1777,6 +1799,7 @@ void Heap::pin_conservative(bool full) {
                 // makes no such edge. The next collection judges it like any
                 // other: copied out if it is still reached, gone if not.
                 o->gc = uint8_t(GC_YOUNG | GC_PINNED);
+                young_pins_.push_back({b, uint32_t(pos)});
                 if (!b->pinned) {
                     b->pinned = true;
                     pinned_blocks_.push_back(b);
@@ -1815,16 +1838,28 @@ void Heap::trace_pinned(GcCtx& c) {
 }
 
 void Heap::hold_pinned_blocks() {
+    // Everything in a held block but the pinned is dead or the stub of
+    // something promoted, and stays there until a collection empties the
+    // block. A stale word on a later scan must not bring one back: its fields
+    // name objects that have moved or been overwritten. That used to be said by
+    // marking each one free, a walk of every held block -- 3.2 GB of them on a
+    // precompiled self-compile, 2% of the run. Now the block says it: how far
+    // it was filled (`held_end`) and which offsets below that were pinned,
+    // which is all `pin_conservative` asks, and nothing else walks a nursery
+    // block.
+    held_pins_.clear();
+    std::sort(young_pins_.begin(), young_pins_.end());
+    std::sort(pinned_blocks_.begin(), pinned_blocks_.end());
+    size_t at = 0;
     for (Block* b : pinned_blocks_) {
-        // Everything here but the pinned is dead or the stub of something
-        // promoted, and stays in the block until the next collection empties
-        // it. Inert, so that a stale word on a later scan cannot bring one
-        // back: its fields name objects that have moved or been overwritten.
-        for (size_t pos = 0; pos < b->used;) {
-            auto* o = reinterpret_cast<Obj*>(b->data + pos);
-            pos += o->bytes;
-            if (!(o->gc & GC_PINNED)) o->gc = GC_FREE;
+        b->held_end = uint32_t(b->used);
+        b->held_from = uint32_t(held_pins_.size());
+        // `young_pins_` is sorted by block, then offset; this block's run.
+        while (at < young_pins_.size() && young_pins_[at].first < b) ++at;
+        while (at < young_pins_.size() && young_pins_[at].first == b) {
+            held_pins_.push_back(young_pins_[at++].second);
         }
+        b->held_count = uint32_t(held_pins_.size()) - b->held_from;
         // Held, so still allocated -- but not new allocation, which is what
         // `nursery_bytes_` measures and a minor is due on. Counted there, a
         // held block made the next minor due the moment this one ended.
@@ -1960,7 +1995,7 @@ void Heap::minor_collect(RootSource& roots) {
     // A block holding a pinned object is the exception, and is counted again
     // by `hold_pinned_blocks`.
     for (Block* b : nursery_) {
-        if (!b->pinned) b->used = 0;
+        if (!b->pinned) b->used = b->held_end = 0;
     }
     nursery_at_ = 0;
     allocated_ -= nursery_bytes_ + nursery_held_;

@@ -320,6 +320,10 @@ public:
     // printed for the runs anyone actually measures.
     void enable_stats() { stats_ = true; }
     bool stats_enabled() const { return stats_; }
+    /// Where the program itself starts, for the `run:` line: after loading
+    /// and after `--precompile`, whose minute of LLVM would otherwise be most
+    /// of what a precompiled run reports.
+    void mark_run_start();
     /// A no-op unless `--stats` was asked for.
     void print_stats() const;
 
@@ -381,6 +385,8 @@ private:
     std::vector<std::atomic<uint64_t>> field_cache_;
     bool profiling_ = false;
     bool stats_ = false;
+    int64_t run_wall_ns_ = 0;
+    int64_t run_cpu_ns_ = 0;
     size_t profile_top_ = 0;
     std::vector<std::atomic<uint64_t>> profile_;
     std::vector<std::atomic<uint64_t>> alloc_;
