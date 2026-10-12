@@ -339,10 +339,8 @@ The lessons that keep coming back:
   chain: on `Result.ok v` it binds `v` and goes on, and anything else is the
   block's answer. The parser unfolds it to a `match` (`unfold_let_try`),
   and an `[:ok, v]` list is not a result to it. A native answers a result as the record too
-  (`make_result`) -- for an image whose header sets bit 1, which every image
-  this compiler writes does; an older image, a stale seed included, gets the
-  `[:ok, v]` list it was written for. Changing what a native answers is a
-  staged reseed for that reason: the seed runs on the new VM. The compiler
+  (`make_result`). Changing what a native answers needs a staged reseed,
+  because the seed runs on the new VM (docs/notes/results.md). The compiler
   also warns about an accumulator nothing forces (`dreams/src/lint.dr`).
 - `virtual dyn let f self` and a record's `derive dyn base` opt in to run-time
   dispatch: the record's values carry a table in slot 0, and `base.f x`

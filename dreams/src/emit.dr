@@ -104,13 +104,6 @@ let u64 : :integer -> :string;
 let u64 v = u32 (v % 4294967296) + u32 ((v / 4294967296) % 4294967296);
 
 /// A node index, or the all-ones word that means there is none.
-/// Header flag bit 1: this program reads a result as `Result.ok v`, the
-/// prelude's record, rather than as `[:ok, v]`. Every image this compiler
-/// writes says so; the VM answers an image that does not in the old shape
-/// (`Image::results_are_records`).
-let results_are_records : :integer;
-let results_are_records = 2;
-
 let index i = if ir.is_node i { u32 i } else { u32 4294967295 };
 
 /// A `float`, by its bit pattern, so that what comes back is exactly the value
@@ -371,10 +364,9 @@ let emit img = {
     let header = str.concat_all [
         magic,
         u16 version_major, u16 version_minor,
-        // flags: no span section yet; bit 1, results are the prelude's
-        // `Result` records, which a native answers in kind; bits 8-23 are
-        // where the image may run (`dreams/src/target.dr`), zero for anywhere.
-        u32 (ir.Image.target_flags img + results_are_records),
+        // flags: no span section yet; bits 8-23 are where the image may run
+        // (`dreams/src/target.dr`), zero for anywhere.
+        u32 (ir.Image.target_flags img),
         u32 (ir.Image.module_name img),
         u32 (ir.Image.source_name img),
         index (ir.Image.entry img),

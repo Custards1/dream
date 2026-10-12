@@ -60,7 +60,11 @@ the new `std` (reading records) but the old `emit` (no flag) and the old
 2. C2: the whole new source, built by C1. Flagged, new `std`, records.
 3. C2 rebuilt until it is a fixed point; that is the seed.
 
-Any change to what a native answers is this shape. The `receive!` scaffold
+Once the seed read records the flag had done its job, and the next change
+took it out: Dream has had no release, so no image outside this repository
+needs the lists, and the VM answers records to everything. Any later change
+to what a native answers is this shape again -- a flag for the crossing, then
+the flag removed. The `receive!` scaffold
 takes the peeked record apart by position (`_match_at`), not by
 `Result.ok(m)`: its names resolve where the `receive!` is written, and a
 module may have a `Result` of its own.

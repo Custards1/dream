@@ -4560,9 +4560,6 @@ uint32_t builtin_count() { return uint32_t(sizeof(BUILTINS) / sizeof(BUILTINS[0]
 
 Value make_result(Heap& h, Runtime& rt, bool ok, Value value) {
     const WellKnownAtoms& wk = well_known(rt);
-    if (!rt.has_image() || !rt.image().results_are_records()) {
-        return h.make_cons(make_atom(ok ? wk.ok : wk.error), h.make_cons(value, NIL));
-    }
     Value r = h.make_record((ok ? wk.result_ok : wk.result_error) | RECORD_VARIANT, 1);
     static_cast<RecordObj*>(as_obj(r))->items()[0] = value;
     return r;

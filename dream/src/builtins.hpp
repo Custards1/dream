@@ -72,9 +72,8 @@ bool map_lookup(Process& p, Value map, Value key, Value* out);
 /// prelude's union (`std.prelude`), which is how a native answers something
 /// that can fail without raising. A variant record of one field, stamped as
 /// the compiler stamps the union's own constructors, so a program's
-/// `Result.ok(v)` pattern takes it apart. An image that does not say it reads
-/// results as records (`Image::results_are_records`) gets `[:ok, value]`
-/// instead. `value` is held across the allocations, which are no safepoint.
+/// `Result.ok(v)` pattern takes it apart. `value` is held across the one
+/// allocation, which is no safepoint.
 Value make_result(Heap& h, Runtime& rt, bool ok, Value value);
 
 /// Modules this runtime provides to `import`.
