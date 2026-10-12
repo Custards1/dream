@@ -56,6 +56,15 @@ function findServer(config, folders) {
     const root = folder.uri.fsPath;
     candidates.push(path.join(root, 'build', 'lucid.dream'));
     candidates.push(path.join(root, 'build-dream', 'bin', 'lucid.dream'));
+    // Opening a package inside this checkout should still run its local build.
+    // Require the compiler and server sources so unrelated parent builds cannot win.
+    for (let parent = path.dirname(root); ; parent = path.dirname(parent)) {
+      if (fs.existsSync(path.join(parent, 'lucid', 'main.dr')) &&
+          fs.existsSync(path.join(parent, 'dreams', 'main.dr'))) {
+        candidates.push(path.join(parent, 'build', 'lucid.dream'));
+      }
+      if (path.dirname(parent) === parent) break;
+    }
   }
 
   if (process.env.LUCID_IMAGE) candidates.push(expandPath(process.env.LUCID_IMAGE));

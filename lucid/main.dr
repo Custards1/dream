@@ -27,6 +27,7 @@
 import std.cli;
 import std.console;
 import std.file;
+import std.error;
 
 import std.install;
 import std.io;
@@ -34,6 +35,7 @@ import std.json;
 import std.list;
 import std.map;
 import std.os;
+import std.proc;
 import std.path;
 import std.str;
 
@@ -43,6 +45,8 @@ import dreams.modules;
 import dreams.package;
 
 import analysis;
+import background;
+import index as indexed;
 import complete;
 import pos;
 import rpc;
@@ -55,13 +59,17 @@ let version = "0.1.0";
 ///
 /// Parses survive edits; the latest analysis survives only while its sources
 /// and package discovery still agree with the filesystem and open buffers.
-let state docs roots = %{ :docs => docs, :roots => roots, :parsed => %{} };
+let state docs roots = %{ :docs => docs, :roots => roots, :parsed => %{},
+                           :revision => 0, :pending => %{} };
 
 let docs s  = s.[:docs else (%{})];
 let roots s = s.[:roots else []];
 let parses s = s.[:parsed else (%{})];
 
-let invalidated s = map.remove :analysis s;
+let revision : :map -> :integer;
+let revision s = s.[:revision else 0];
+let invalidated : :map -> :map;
+let invalidated s = (map.remove :analysis (map.remove :analyses s)).[:revision => (revision s + 1)];
 let with_doc path text s = (invalidated s).[:docs => (((docs s)).[path => text])];
 let without_doc path s = (invalidated s).[:docs => (map.remove path (docs s))];
 let with_roots rs s = (invalidated s).[:roots => (list.unique rs)];
@@ -79,31 +87,31 @@ let with_roots rs s = (invalidated s).[:roots => (list.unique rs)];
 /// that has since changed is re-parsed rather than believed.
 let with_parses ps s = s.[:parsed => (map.merge (parses s) ps)];
 
-/// The two halves of every request that analyses. They are a pair on purpose:
-/// an analysis made without `analysed!` does not reuse the parses, and one
-/// whose state is not put back through `carrying` throws away the parses it
-/// just did.
-// Diagnostics, hover and outline commonly ask about the same revision. Keep
-// its resolution, but verify the source files and package discovery before
-// reusing it: a closed dependency can change without a document notification.
-let reusable! : :any -> :string -> :any -> :bool;
-let reusable! s path a =
-    analysis.module_index (analysis.source a) path == analysis.module_of a
-    && analysis.module_of a != ()
-    && not (modules.failed (analysis.source a))
-    && package.discover! path (roots s) == modules.packages (analysis.source a)
-    && list.all (fn f -> {
-        let p = diag.source_path f;
-        let text = ((docs s)).[p else (file.read! p)];
-        text == diag.source_text f
-    }) (modules.files (analysis.source a));
-
-let analysed! s path = match s.[:analysis else ()] {
-    () => analysis.analyse_cached! path (roots s) (docs s) (parses s),
-    a => if reusable! s path a { a }
-         else { analysis.analyse_cached! path (roots s) (docs s) (parses s) },
+/// Interactive analysis is limited to this file and the import under the
+/// cursor. A compiler worker separately owns whole-program analysis.
+let analysed! : :map -> :string -> :string -> :map;
+let analysed! s path wanted = {
+    let key = list.head (str.split "." wanted);
+    let cached = ((s.[:analyses else (%{})]).[path else (%{})]).[key else ()];
+    match cached {
+        a if a != () && analysis.current! path (roots s) (docs s) a
+            && indexed.current! path (roots s) (docs s) wanted a => a,
+        _ => indexed.analyse! path (roots s) (docs s) (parses s) wanted,
+    }
 };
-let carrying a s = (with_parses (analysis.parses a) s).[:analysis => a];
+let carrying : :map -> :string -> :string -> :map -> :map;
+let carrying a path wanted s = {
+    let all = s.[:analyses else (%{})];
+    let own = all.[path else (%{})];
+    let key = list.head (str.split "." wanted);
+    let kept = if map.size own >= 16 && not (map.has key own) {
+                   map.remove (list.head (map.keys own)) own
+               } else { own };
+    (with_parses (analysis.parses a) s).[:analyses => (all.[path => (kept.[key => a])])]
+};
+
+let snapshot : :map -> :string -> :map;
+let snapshot s path = background.snapshot path (roots s) (docs s) (revision s);
 
 // --- reading the parts of a request ---------------------------------------------
 
@@ -123,8 +131,7 @@ let character_of p = ((position_of p)).["character" else 0];
 /// problems, because that is how a diagnostic is *withdrawn*: a server that
 /// sends only what is broken leaves the last set of squiggles on screen after
 /// the code is fixed.
-let publish! out a path = {
-    let groups = analysis.diagnostics_by_path a;
+let publish! out groups path = {
     let mentioned = list.map (fn g -> list.head g) groups;
     let send! p ds =
         rpc.write_message! out
@@ -134,24 +141,24 @@ let publish! out a path = {
     if list.contains path mentioned { () } else { send! path [] }
 };
 
-/// Compile the document, say what is wrong with it, and hand back the state to
-/// go on with -- this one plus the parses the compile did.
-///
-/// A caller must bind the result as a statement and answer with the name, never
-/// drop the call straight into the `[:go, ..]` it answers with. A value in a
-/// list is a thunk, and a thunk nobody forces is a compile nobody ran: written
-/// as `[:go, refresh! ..]`, opening a document published no diagnostics at all,
-/// and published them late if some later request happened to read the state.
-/// `publish!` below is a bare statement for the same reason.
-let refresh! out s path =
-    match path {
-        "" => s,
-        p => {
-            let a = analysed! s p;
-            publish! out a p
-            carrying a s
-        },
-    };
+/// Queue checks for the current buffers and return immediately. A change to
+/// an open dependency changes its importers too. The worker coalesces queued
+/// revisions; the owner publishes only results for the current snapshot.
+let refresh! : :any -> :map -> :string -> :map;
+let refresh! out s path = {
+    if path == "" { () }
+    else {
+        list.map (fn p -> send! s.[:worker] [:check, snapshot s p]) (map.keys (docs s)) |> strict!
+    }
+    s
+};
+
+let requested! : :map -> :map -> :string -> :map;
+let requested! s m path = {
+    let job = snapshot s path;
+    send! s.[:worker] [:request, job, m]
+    s.[:pending => ((s.[:pending else (%{})]).[rpc.id m => job])]
+};
 
 // --- the requests -----------------------------------------------------------------
 
@@ -209,7 +216,18 @@ let handle! out s m = {
             [:go, with_roots (list.append (roots s) (roots_from p)) s]
         },
         "initialized" => [:go, s],
-        "workspace/didChangeWatchedFiles" => [:go, invalidated s],
+        "workspace/didChangeWatchedFiles" => {
+            let next = refresh! out (invalidated s) "workspace";
+            [:go, next]
+        },
+        "$/cancelRequest" => {
+            let id = p.["id" else ()];
+            let pending = s.[:pending else (%{})];
+            if map.has id pending {
+                rpc.write_message! out (rpc.error_response id (0 - 32800) "request cancelled")
+            }
+            [:go, s.[:pending => (map.remove id pending)]]
+        },
 
         // The client asks to shut down, then tells us to go. Answering the
         // first and waiting for the second is what the protocol asks for.
@@ -242,7 +260,7 @@ let handle! out s m = {
             [:go, s2]
         },
         "textDocument/didClose" => {
-            let s2 = without_doc path s;
+            let s2 = refresh! out (without_doc path s) path;
             // The file is back to whatever is on disk, and nothing here is
             // responsible for it any more.
             rpc.write_message! out
@@ -251,18 +269,19 @@ let handle! out s m = {
             [:go, s2]
         },
 
-        // These three want `refs`, which only the pass that walks every body
-        // fills, so they analyse the whole program. What they do not have to do
-        // is parse it again -- see `analyse_cached!`.
+        // Resolve this file's bodies against only the requested declarations.
+        // Whole-program checking continues independently in the worker.
         "textDocument/definition" => {
-            let a = analysed! s path;
+            let wanted = indexed.chain_at (((docs s)).[path else ""]) (line_of p) (character_of p);
+            let a = analysed! s path wanted;
             answer! out (rpc.id m) (analysis.definition_at a (line_of p) (character_of p))
-            [:go, carrying a s]
+            [:go, carrying a path wanted s]
         },
         "textDocument/hover" => {
-            let a = analysed! s path;
+            let wanted = indexed.chain_at (((docs s)).[path else ""]) (line_of p) (character_of p);
+            let a = analysed! s path wanted;
             answer! out (rpc.id m) (analysis.hover_at a (line_of p) (character_of p))
-            [:go, carrying a s]
+            [:go, carrying a path wanted s]
         },
         // Completion does not reuse `analysis.analyse!` the way its neighbours
         // do, because it does not analyse the document that is on screen: a
@@ -276,36 +295,16 @@ let handle! out s m = {
         },
 
         "textDocument/documentSymbol" => {
-            let a = analysed! s path;
+            let a = analysed! s path "";
             answer! out (rpc.id m) (analysis.symbols a)
-            [:go, carrying a s]
+            [:go, carrying a path "" s]
         },
 
         // The types the checker gave the bindings nobody wrote one for, in
         // the lines on screen. See "inlay hints" in analysis.dr.
-        "textDocument/inlayHint" => {
-            let a = analysed! s path;
-            let range = p.["range" else (%{})];
-            let first = (range.["start" else (%{})]).["line" else 0];
-            let last = (range.["end" else (%{})]).["line" else 1000000000];
-            answer! out (rpc.id m) (analysis.inlay_hints a first last)
-            [:go, carrying a s]
-        },
-
-        // Rename, asked first whether the cursor is on something that can be
-        // renamed and then for the edit. A refusal is an error response, which
-        // is what makes a client show the reason rather than nothing.
-        "textDocument/prepareRename" => {
-            let a = analysed! s path;
-            refusable! out (rpc.id m) (analysis.prepare_rename_at a (line_of p) (character_of p))
-            [:go, carrying a s]
-        },
-        "textDocument/rename" => {
-            let a = analysed! s path;
-            refusable! out (rpc.id m)
-                (analysis.rename_at a (line_of p) (character_of p) (p.["newName" else ""]))
-            [:go, carrying a s]
-        },
+        "textDocument/inlayHint" => [:go, requested! s m path],
+        "textDocument/prepareRename" => [:go, requested! s m path],
+        "textDocument/rename" => [:go, requested! s m path],
 
         // The compiler's formatter, on the buffer as it is. One edit that
         // replaces the whole document, which is what a formatter that keeps
@@ -336,15 +335,56 @@ let handle! out s m = {
     }
 };
 
-let rec serve! inh out s =
-    match rpc.read_message! inh {
-        // End of input without `exit`: the client is gone, and so are we.
-        () => 0,
-        m => match handle! out s m {
-                 [:exit, code] => code,
-                 [:go, s2] => serve! inh out s2,
-             },
-    };
+/// Only this process writes framed replies. Reading and compiler work have
+/// their own persistent processes, so a cold check cannot hold up navigation.
+/// Force the new state before waiting: a handler can return a suspended send
+/// inside its state, and waiting first would defer that request indefinitely.
+let events! : :any -> :map -> :integer;
+let rec events! out !s = match recv! () {
+    [:rpc, m] => match handle! out s m {
+        [:exit, code] => code,
+        [:go, next] => events! out next,
+    },
+    [:diagnostics, job, groups] => {
+        if job.[:revision] == revision s && map.has job.[:path] (docs s) {
+            publish! out groups job.[:path]
+        }
+        events! out s
+    },
+    [:background_reply, job, id, result] => {
+        let pending = s.[:pending else (%{})];
+        if map.has id pending {
+            if job.[:revision] == revision s { refusable! out id result }
+            else { rpc.write_message! out (rpc.error_response id (0 - 32801) "document changed during the request") }
+        }
+        events! out s.[:pending => (map.remove id pending)]
+    },
+    [:down, process, outcome] => {
+        let why = match outcome { [:error, e] => error.describe e, other => to_string other };
+        rpc.write_message! out (rpc.notification "window/logMessage"
+            %{ "type" => 1, "message" => "Lucid background worker stopped: " + why })
+        list.map (fn id -> rpc.write_message! out
+            (rpc.error_response id (0 - 32803) why)) (map.keys (s.[:pending else (%{})])) |> strict!
+        let worker = background.start! (self! ());
+        strict! worker
+        proc.monitor! worker
+        let next = refresh! out s.[:worker => worker].[:pending => (%{})] "worker restart";
+        events! out next
+    },
+    [:eof] => 0,
+    _ => events! out s,
+};
+
+let serve! inh out s = {
+    let owner = self! ();
+    strict! owner
+    let reader = rpc.start_reader! inh owner;
+    let worker = background.start! owner;
+    strict! reader
+    strict! worker
+    proc.monitor! worker
+    events! out s.[:worker => worker]
+};
 
 // --- the command line --------------------------------------------------------------
 

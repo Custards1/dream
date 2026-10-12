@@ -254,3 +254,40 @@ notification, not end-to-end typing latency or cold startup measurements.
 `tests/editor.py` exercises discovery, local definitions through escaped URIs,
 closed dependency edits/deletion/recreation, manifest dependency changes and
 manifest-less sibling imports against a running server.
+
+## Interactive requests during cold checking (2026-10-12)
+
+The small-file measurements above missed the important case: opening Lucid's
+own `main.dr` blocked the next request for about 5.6 seconds. Loading the full
+graph took 1975 ms, macro expansion 231 ms, resolution 2215 ms and diagnostics
+1298 ms. Reusing an analysis after that pause did not address cold opens or edits.
+
+The server now has three persistent processes: an RPC reader, the request loop
+that owns stdout, and a compiler worker. The worker owns its parse cache,
+coalesces pending checks by source path, and returns diagnostics, rename results
+and type hints. Revisions gate diagnostic publication and reject stale request
+results. Cancellation replies immediately, and a worker failure answers pending
+requests and restarts checking. A strict event-loop state matters: otherwise a
+send suspended inside a returned state waits for another event before dispatch.
+
+`index.dr` handles navigation, hover, outlines and completion using the compiler
+parser, module rewrites, declaration pass and resolver. It loads the requested
+import's declarations and walks the current source's bodies, rather than every
+transitive dependency's bodies. Derives and macro expansion still use the
+compiler. Indexed analyses are cached by file and the chain's first segment,
+with source and package discovery checks. Navigation prunes syntax subtrees
+outside the cursor, and location conversion uses indexed line starts.
+
+With the same VM, the recorded `analysis.inlay_hints` reference in the preceding
+`main.dr` now resolves in about 250–275 ms while cold checking is running;
+repeated definitions take about 8–15 ms and hover about 5–12 ms. The live
+regression against the current Lucid source measured 285 ms cold, 7 ms cached
+and 85 ms after ten edits. Full diagnostics and the first type-hint request
+still take seconds on this graph; they run independently of navigation.
+
+`tests/responsive.py` opens the `lucid` package as the workspace, queues hints
+before navigation, verifies the exact cross-file definition, cancellation and
+navigation through an edit burst. `tests/conversation.py` drives the existing
+recorded session one exchange at a time so asynchronous diagnostics and replies
+are checked before shutdown. The VS Code extension also searches parent Dream
+checkouts for the local server build when only a package folder is open.

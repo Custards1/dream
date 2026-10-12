@@ -38,6 +38,7 @@ import dreams.package;
 import dreams.scope;
 
 import analysis;
+import index as indexed;
 import pos;
 
 // --- reading the cursor's surroundings -------------------------------------------
@@ -509,12 +510,17 @@ let import_items! file roots prefix = {
 /// map holds only the buffer and would wipe the rest if it were passed on as
 /// it stands. `with_parses` in the server says what that costs.
 let analysed! path roots docs parsed src offset = {
-    let first = analysis.declared! path roots docs parsed;
+    let wanted = match context src offset {
+        [:member, segs] => str.join_str "." segs,
+        [:macro_member, segs] => str.join_str "." segs,
+        _ => "*",
+    };
+    let first = indexed.declared! path roots docs parsed wanted;
     let after_first = map.merge parsed (analysis.parses first);
     match analysis.module_of first {
         () => {
-            let patched = analysis.declared! path roots
-                              (docs.[path => (repaired src offset)]) after_first;
+            let patched = indexed.declared! path roots
+                              (docs.[path => (repaired src offset)]) after_first wanted;
             [patched, map.merge after_first (analysis.parses patched)]
         },
         _ => [first, after_first],

@@ -100,6 +100,21 @@ let rec read_message! h =
             },
     };
 
+/// The reader keeps accepting edits and requests while a compiler worker is
+/// busy. The owner of the output stream remains the server loop, so frames
+/// from concurrent work can never interleave.
+let read_to! : :any -> :process -> :any;
+let rec read_to! h target = match read_message! h {
+    () => send! target [:eof],
+    m => {
+        send! target [:rpc, m]
+        read_to! h target
+    },
+};
+
+let start_reader! : :any -> :process -> :process;
+let start_reader! h !target = spawn! $( read_to! h target );
+
 /// Write one message, header and all.
 let write_message! h v = {
     let body = json.write v;

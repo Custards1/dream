@@ -37,14 +37,14 @@ let step b =
 let is_newline text i = str.byte i text == 10;
 
 /// The byte offset where the given zero-based line begins.
-let rec line_start text line = {
-    let n = str.byte_length text;
-    let rec walk i seen =
-        if seen >= line { i }
-        else if i >= n { i }
-        else if is_newline text i { walk (i + 1) (seen + 1) }
-        else { walk (i + 1) seen };
-    walk 0 0
+let line_start : :string -> :integer -> :integer;
+let line_start text line = {
+    let starts = diag.line_starts text;
+    match line {
+        n if n <= 0 => 0,
+        n if n >= len starts => str.byte_length text,
+        n => starts.[n],
+    }
 };
 
 /// The byte offset of an LSP position, clamped to the end of its line and of

@@ -47,7 +47,7 @@
         "dream.server.path": {
           "type": "string",
           "default": "",
-          "markdownDescription": "The `lucid.dream` image to run as the language server. Left empty, the extension looks for `build/lucid.dream` and `build-dream/bin/lucid.dream` in the workspace, then `$LUCID_IMAGE`."
+          "markdownDescription": "The `lucid.dream` image to run as the language server. Left empty, the extension looks for a workspace build, a parent Dream checkout's `build/lucid.dream`, then `$LUCID_IMAGE` and the VM's installation."
         },
         "dream.packagePaths": {
           "type": "array",

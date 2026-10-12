@@ -21,6 +21,7 @@ say_fail() { echo "FAIL: $*"; fail=1; }
 "$dream" "$dreams" lucid/main.dr -L mind -L . -o "$image" >/dev/null 2>&1 || exit 1
 
 python3 lucid/tests/editor.py "$dream" "$image" || exit 1
+python3 lucid/tests/responsive.py "$dream" "$image" || exit 1
 
 # --- a workspace, and a buffer that disagrees with it -----------------------
 
@@ -156,7 +157,7 @@ navigation='import nav;\nimport nav.types as t;\nlet f : t.Count -> t.Count;\nle
   msg '{"jsonrpc":"2.0","method":"exit","params":{}}'
 } > "$tmp/in"
 
-MIND_STDLIB=${MIND_STDLIB:-mind} "$dream" "$image" < "$tmp/in" > "$tmp/out" 2> "$tmp/err"
+MIND_STDLIB=${MIND_STDLIB:-mind} python3 lucid/tests/conversation.py "$dream" "$image" "$tmp/in" "$tmp/out" "$tmp/err"
 status=$?
 
 [ "$status" -eq 0 ] || say_fail "the server exited $status"

@@ -1,0 +1,170 @@
+// Interactive questions need this file's names and the declaration being
+// pointed at. Loading every transitive dependency, resolving its bodies and
+// checking its types belongs to diagnostics, not to the next mouse click.
+// This index still uses the compiler's parser, module rewrites and resolver;
+// it loads the requested imports and walks only bodies in the current file.
+import std.file as files;
+import std.lazy;
+import std.list;
+import std.map;
+import std.path;
+import std.str;
+
+import dreams.ast;
+import dreams.config;
+import dreams.diag;
+import dreams.expand as expansion;
+import dreams.modules;
+import dreams.package;
+import dreams.parser;
+import dreams.scope;
+
+import analysis;
+import pos;
+
+/// Include dependencies inside inline modules and conditional declarations,
+/// including imports the record rewrite generates. Marking these visited lets
+/// the ordinary loader register one file without following its import graph.
+let dependencies : :any -> [:string];
+let rec dependencies tree = match tree {
+    [:import, segs, _, _, _] => [str.join_str "." segs],
+    [:derive, segs, _] => [str.join_str "." segs],
+    xs if type_of xs == :list => list.flat_map dependencies xs,
+    _ => [],
+};
+
+let parsed! : :string -> :map -> :map -> [:any];
+let parsed! file docs cache = {
+    let text = docs.[file else (match files.read! file { () => "", s => s })];
+    let result = match cache.[file else ()] {
+        [same, p] if same == text => p,
+        _ => parser.parse_module text,
+    };
+    strict! result
+    [text, result]
+};
+
+let items : :any -> [ast.Decl];
+let items parsed = match parsed { [:ok, ds, _] => ds, _ => [] };
+
+/// What import could lead to the cursor's chain. Selective and renamed
+/// imports bind the names the compiler says they do; derives are always
+/// needed because an inherited definition can be named without a prefix.
+let wanted_imports : :any -> :string -> [:string];
+let rec wanted_imports tree wanted = match tree {
+    [:import, segs, alias, selected, _] => {
+        let dep = str.join_str "." segs;
+        let first = list.head (str.split "." wanted);
+        let bound = scope.default_alias segs alias;
+        let selects = selected != () && list.any (fn pair ->
+            match list.nth 1 pair { () => list.head pair, n => n } == first) selected;
+        if wanted == "*" || selects { [dep] }
+        else if first == bound {
+            let suffix = str.slice (len first) (len wanted - len first) wanted;
+            [dep + suffix]
+        }
+        else if wanted == dep || str.starts_with (dep + ".") wanted { [wanted] }
+        else { [] }
+    },
+    [:derive, segs, _] => [str.join_str "." segs],
+    xs if type_of xs == :list => list.flat_map (fn x -> wanted_imports x wanted) xs,
+    _ => [],
+};
+
+/// An import may end in an inline module or a selected member. The nearest
+/// enclosing file owns its declaration. Package roots and source directories
+/// come from compiler discovery for the importing file, even across packages.
+let rec import_file! locator dotted = match modules.resolve_path! locator dotted {
+    file if file != () => [file, dotted],
+    _ => {
+        let segs = str.split "." dotted;
+        if list.length segs <= 1 { () }
+        else { import_file! locator (str.join_str "." (list.take (list.length segs - 1) segs)) }
+    },
+};
+
+let add! : modules.Loader -> :string -> [:string] -> :map -> :string -> [:string] -> modules.Loader;
+let rec add! l file roots docs wanted !visiting = {
+    let absolute = path.absolute! file;
+    if map.has absolute (modules.by_path l) || list.contains absolute visiting { l }
+    else {
+        let [text, parsed] = parsed! file docs (modules.parsed l);
+        let kept = modules.with_parsed ((modules.parsed l).[file => [text, parsed]]) l;
+        let locator = modules.loader (package.discover! file roots) (config.defaults! ())
+                          (modules.default_search_paths! file roots) [];
+        let requested = list.unique (wanted_imports (items parsed) wanted);
+        let before = list.fold_strict (fn acc dep -> {
+            if modules.is_host acc dep { modules.record_native dep acc }
+            else { match import_file! locator dep {
+                () => acc,
+                [target, spelling] => {
+                    let loaded = add! acc target roots docs "" (list.cons absolute visiting);
+                    let mi = (modules.by_path loaded).[(path.absolute! target) else ()];
+                    if mi == () { loaded }
+                    else { modules.Loader.set_by_name ((modules.by_name loaded).[spelling => mi]) loaded }
+                },
+            } }
+        }) kept requested;
+        let name = modules.canonical_name! before file (path.stem file);
+        let expanded = modules.expand_items name (modules.config_in before name) (items parsed);
+        let skipped = list.fold_strict (fn acc dep -> modules.mark_visited dep acc)
+                          before (dependencies expanded);
+        modules.load_text! skipped text file name file
+    }
+};
+
+let chain_at : :string -> :integer -> :integer -> :string;
+let chain_at text line character = {
+    let here = analysis.name_start text (pos.offset_of text line character);
+    let start = analysis.chain_start text here;
+    str.slice start (analysis.name_end text here - start) text
+};
+
+/// Build a small declaration environment, then resolve just the bodies whose
+/// references the client can ask about. The definition table covers imported
+/// declarations too, so cross-file locations keep the compiler's source spans.
+let prepared! : :string -> [:string] -> :map -> :map -> :string -> :bool -> :map;
+let prepared! file roots docs parsed wanted walk = {
+    let ps = package.discover! file roots;
+    let initial = modules.loader ps (config.defaults! ()) (modules.default_search_paths! file roots) []
+        |> modules.Loader.set_prefetch_enabled false
+        |> modules.Loader.set_namespaces (package.names ps)
+        |> modules.with_overlay docs
+        |> modules.with_parsed parsed
+        |> modules.with_package_roots!;
+    let src = add! initial file roots docs wanted [];
+    let l = expansion.expand! src;
+    let mi = analysis.module_index l file;
+    let declared = scope.declare! l;
+    let base = scope.resolver (scope.envs declared)
+        |> scope.Resolution.set_imports (scope.s_imports declared)
+        |> scope.Resolution.set_module_recs (scope.s_module_recs declared)
+        |> scope.Resolution.set_diags (scope.diags declared);
+    let seeded = list.fold_strict (fn r e -> scope.Resolution.set_refs
+        ((scope.refs r).[(scope.ref_key (list.nth 0 e) (list.nth 1 e) (list.nth 2 e)) => list.nth 3 e]) r)
+        base (modules.expansions l);
+    let all = scope.walk_base l declared seeded 0;
+    let source_id = match mi { () => (), i => modules.module_source (modules.module_at l i) };
+    let mine = list.filter (fn p -> list.nth 1 p == source_id) (scope.pending declared);
+    let r = if walk { list.fold_strict (fn acc p -> scope.check_body l p acc) all mine } else { all };
+    analysis.analysis l r mi src
+};
+
+let analyse! : :string -> [:string] -> :map -> :map -> :string -> :map;
+let analyse! file roots docs parsed wanted = prepared! file roots docs parsed wanted true;
+let declared! : :string -> [:string] -> :map -> :map -> :string -> :map;
+let declared! file roots docs parsed wanted = prepared! file roots docs parsed wanted false;
+
+/// Source comparisons alone cannot notice that a previously missing import
+/// has been created. Verify requested import lookups against the loaded files.
+let current! : :string -> [:string] -> :map -> :string -> :map -> :bool;
+let current! file roots docs wanted a = {
+    let locator = modules.loader (package.discover! file roots) (config.defaults! ())
+                      (modules.default_search_paths! file roots) [];
+    let parsed = (modules.parsed (analysis.source a)).[file else ()];
+    let raw = match parsed { [_, p] => items p, _ => [] };
+    list.all (fn dep -> match import_file! locator dep {
+        () => true,
+        [target, _] => map.has (path.absolute! target) (modules.by_path (analysis.loader a)),
+    }) (wanted_imports raw wanted)
+};

@@ -17,6 +17,7 @@
 // forgets it when it returns, so the one question it cannot be asked is the one
 // a cursor sitting on empty space needs answered.
 
+import std.file;
 import std.list;
 import std.http.url;
 import std.map;
@@ -105,7 +106,36 @@ let module_index l path = {
 let analyse_cached! path roots open_docs parsed = {
     let src = modules.load_overlaid_cached! path roots (config.defaults! ()) false open_docs parsed;
     let l = expansion.expand! src;
-    analysis l (scope.resolve! (l)) (module_index l path) src
+    analysis l (editor_resolution! l) (module_index l path) src
+};
+
+/// A cached result is current only while both discovery and every source it
+/// used still match. Open buffers take precedence over filesystem contents.
+let current! : :string -> [:string] -> :map -> :any -> :bool;
+let current! path roots docs a =
+    module_index (source a) path == module_of a && module_of a != ()
+    && not (modules.failed (source a))
+    && package.discover! path roots == modules.packages (source a)
+    && list.all (fn f -> {
+        let p = diag.source_path f;
+        docs.[p else (file.read! p)] == diag.source_text f
+    }) (modules.files (source a));
+
+/// Editor requests need names and declarations, not the compiler's fusion
+/// transforms. Those transforms invent executable functions and globals that
+/// navigation never reads, and can dominate a cold analysis of compiler files.
+let editor_resolution! : modules.Loader -> scope.Resolution;
+let editor_resolution! l = {
+    let declared = scope.declare! l;
+    let base = scope.resolver (scope.envs declared)
+        |> scope.Resolution.set_imports (scope.s_imports declared)
+        |> scope.Resolution.set_module_recs (scope.s_module_recs declared)
+        |> scope.Resolution.set_diags (scope.diags declared);
+    let seeded = list.fold_strict (fn r e ->
+        scope.Resolution.set_refs ((scope.refs r).[(scope.ref_key (list.nth 0 e)
+            (list.nth 1 e) (list.nth 2 e)) => (list.nth 3 e)]) r)
+        base (modules.expansions l);
+    scope.resolve_from! l declared seeded 0 scope.state
 };
 
 let analyse! path roots open_docs = analyse_cached! path roots open_docs (%{});
@@ -941,7 +971,8 @@ let declared_type a mi name =
 let location_in a source span = {
     let f = modules.file_at (loader a) source;
     %{ "uri" => path_to_uri (diag.source_path f),
-       "range" => pos.range (diag.source_text f) (ast.span_start span) (ast.span_end span) }
+       "range" => pos.range_in (diag.line_starts (diag.source_text f)) (diag.source_text f)
+                               (ast.span_start span) (ast.span_end span) }
 };
 
 /// The same, for a span known only by which module it belongs to -- which is
@@ -995,6 +1026,17 @@ let rec navigation_expr tree here end =
         [:name, _, sp] if ast.span_start sp == here => tree,
         [:field, obj, field, sp] if ast.span_end sp == end => tree,
         xs if type_of xs == :list => {
+            let span = match xs {
+                [tag, .._] if type_of tag == :atom => match list.last xs {
+                    [from, until] if type_of from == :integer && type_of until == :integer => [from, until],
+                    _ => (),
+                },
+                _ => (),
+            };
+            let outside = match span {
+                [from, until] if until > from => here < from || here >= until,
+                _ => false,
+            };
             let rec search rest = match rest {
                 [] => (),
                 [x, ..tail] => match navigation_expr x here end {
@@ -1002,7 +1044,7 @@ let rec navigation_expr tree here end =
                     e => e,
                 },
             };
-            search xs
+            if outside { () } else { search xs }
         },
         _ => (),
     };
@@ -1224,7 +1266,7 @@ let hover_at a line character =
                            %{ "kind" => "markdown",
                               "value" => describe a (pos.offset_of src line character)
                                                   (name_at src from) found },
-                       "range" => pos.range src from until }
+                       "range" => pos.range_in (diag.line_starts src) src from until }
                 },
             },
     };
