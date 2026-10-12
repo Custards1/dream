@@ -563,11 +563,8 @@ int dream_main(int argc, char** argv) {
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
         const Jit::Precompiled pc = jit_owner->precompile(jit_threads ? jit_threads : hw);
         if (stats) {
-            std::fprintf(stderr,
-                         "; precompiled %u functions (%u refused) in %.0f ms on %u threads;"
-                         " %u callable directly, %u of them disagreeing with their callers\n",
-                         pc.compiled, pc.refused, pc.ms, jit_threads ? jit_threads : hw,
-                         pc.direct, pc.disagreed);
+            std::fprintf(stderr, "; precompiled %u functions (%u refused) in %.0f ms on %u threads\n",
+                         pc.compiled, pc.refused, pc.ms, jit_threads ? jit_threads : hw);
         }
     }
 

@@ -518,6 +518,13 @@ private:
         /// A nursery block holding an object a conservative root pinned. The
         /// collection running now leaves it as it is rather than emptying it.
         bool pinned;
+        /// A nursery block the last collection held: how far it was filled
+        /// then, and which of `held_pins_` were its pinned objects. Below
+        /// `held_end` everything else is dead; see `hold_pinned_blocks`.
+        /// Zero `held_end` for any other block.
+        uint32_t held_end;
+        uint32_t held_from;
+        uint32_t held_count;
     };
 
     /// One collector thread's private state for the length of one collection.
@@ -725,6 +732,11 @@ private:
     std::vector<Obj*> pinned_;
     std::vector<Block*> pinned_blocks_;
     std::vector<Obj*> pin_refs_;
+    /// The young objects this collection pinned, as (block, offset), and the
+    /// offsets the last one pinned in each block it held -- `Block::held_from`
+    /// indexes it. See `hold_pinned_blocks`.
+    std::vector<std::pair<Block*, uint32_t>> young_pins_;
+    std::vector<uint32_t> held_pins_;
     /// What the held blocks had in them when they were held: allocated, and
     /// left out of `nursery_bytes_`. See `hold_pinned_blocks`.
     size_t nursery_held_ = 0;
