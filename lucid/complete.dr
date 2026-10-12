@@ -163,7 +163,7 @@ let item label kind detail doc rank =
 /// that answers here too -- spans are not needed, because nothing it does with
 /// this tree is reported.
 let chain_expr segs =
-    list.fold (fn e s -> ast.field_e e s ast.no_span)
+    list.fold_strict (fn e s -> ast.field_e e s ast.no_span)
               (ast.name_e (list.head segs) ast.no_span)
               (list.tail segs);
 

@@ -383,7 +383,7 @@ let rec expr_binders e offset acc =
 
             [:field, obj, _, _] => expr_binders obj offset acc,
             [:apply, callee, args, _] =>
-                list.fold (fn a x -> expr_binders x offset a) (expr_binders callee offset acc) args,
+                list.fold_strict (fn a x -> expr_binders x offset a) (expr_binders callee offset acc) args,
             [:pipe, l, r, _] => expr_binders r offset (expr_binders l offset acc),
             [:unary, _, x, _] => expr_binders x offset acc,
             [:binary, _, l, r, _] => expr_binders r offset (expr_binders l offset acc),
@@ -392,10 +392,10 @@ let rec expr_binders e offset acc =
                 match el { () => seen, x => expr_binders x offset seen }
             },
             [:thunk, x, _] => expr_binders x offset acc,
-            [:list, xs, _]  => list.fold (fn a x -> expr_binders x offset a) acc xs,
-            [:array, xs, _] => list.fold (fn a x -> expr_binders x offset a) acc xs,
+            [:list, xs, _]  => list.fold_strict (fn a x -> expr_binders x offset a) acc xs,
+            [:array, xs, _] => list.fold_strict (fn a x -> expr_binders x offset a) acc xs,
             [:map, pairs, _] =>
-                list.fold (fn a kv -> expr_binders (list.nth 1 kv) offset
+                list.fold_strict (fn a kv -> expr_binders (list.nth 1 kv) offset
                                           (expr_binders (list.nth 0 kv) offset a))
                           acc pairs,
             [:get, c, k, fallback, _] => {
@@ -744,7 +744,7 @@ let record_role r n =
 let foreign_of a mi = {
     let l = loader a;
     let full = modules.module_name (modules.module_at l mi);
-    list.fold (fn found f ->
+    list.fold_strict (fn found f ->
         if found != () { found }
         else {
             let own = foreign_owner f + "." + foreign_name f;
@@ -918,7 +918,7 @@ let shown_signature a mi name =
 /// expanded items, because that is where a record's and a union's generated
 /// signatures are; a module's own signature follows any it inherited.
 let declared_type a mi name =
-    list.fold (fn found oi -> match list.nth 1 oi {
+    list.fold_strict (fn found oi -> match list.nth 1 oi {
         [:sig, n, t, _] if n == name => t,
         _ => found,
     }) () (list.head (scope.effective_items (loader a) mi []));
@@ -1052,7 +1052,7 @@ let rec namespace_location a ref = match ref {
 let navigation_context a here = {
     let root = module_of a;
     let source_id = modules.module_source (modules.module_at (loader a) root);
-    list.fold (fn best mi -> {
+    list.fold_strict (fn best mi -> {
         let m = modules.module_at (source a) mi;
         if modules.module_source m == source_id
            && list.any (fn it -> holds it here) (modules.module_items m)
@@ -1135,7 +1135,7 @@ let definition_at a line character = match module_of a {
                                         [original, alias] => navigation_target a mi
                                             (ast.name_e (match alias { () => original, n => n }) ast.no_span),
                                         _ => navigation_target a mi
-                                            (list.fold (fn obj n -> ast.field_e obj n ast.no_span)
+                                            (list.fold_strict (fn obj n -> ast.field_e obj n ast.no_span)
                                                 (ast.name_e (list.head segs) ast.no_span) (list.tail segs)),
                                     }
                                 },
@@ -1324,19 +1324,19 @@ let binders_in toks items = {
         () => acc,
         at => acc.[at => ast.span_start span],
     };
-    let params acc ps = list.fold (fn m b -> note m (binder_name b) (binder_span b)) acc (param_binders ps);
-    let patterned acc pattern = list.fold (fn m b -> note m (binder_name b) (binder_span b)) acc (pattern_binders pattern);
+    let params acc ps = list.fold_strict (fn m b -> note m (binder_name b) (binder_span b)) acc (param_binders ps);
+    let patterned acc pattern = list.fold_strict (fn m b -> note m (binder_name b) (binder_span b)) acc (pattern_binders pattern);
     let rec walk acc e = match e {
         [:let, n, ps, body, _, span] => walk (params (note acc n span) ps) body,
         [:let_p, pattern, body, _] => walk (patterned acc pattern) body,
         [:lambda, ps, body, _] => walk (params acc ps) body,
-        [:match, subject, arms, _] => list.fold (fn m arm ->
+        [:match, subject, arms, _] => list.fold_strict (fn m arm ->
             walk (walk (patterned m (ast.arm_pattern arm)) (ast.arm_guard arm)) (ast.arm_body arm))
             (walk acc subject) arms,
-        xs if type_of xs == :list => list.fold (fn m x -> walk m x) acc xs,
+        xs if type_of xs == :list => list.fold_strict (fn m x -> walk m x) acc xs,
         _ => acc,
     };
-    let rec items_walk acc its = list.fold (fn m it -> match it {
+    let rec items_walk acc its = list.fold_strict (fn m it -> match it {
         [:let, _, ps, body, _, _] => walk (params m ps) body,
         [:macro, _, ps, body, _] => walk (params m ps) body,
         [:virtual, _, ps, body, _, _] => if body == () { m } else { walk (params m ps) body },
@@ -1544,7 +1544,7 @@ let rename_at a line character new = match rename_target a line character {
                 [:global, target, _] => global_sites a target name,
             };
             let files = list.unique (list.map (fn s -> list.head s) sites);
-            [:ok, %{ "changes" => list.fold (fn m f -> {
+            [:ok, %{ "changes" => list.fold_strict (fn m f -> {
                 let file = modules.file_at l f;
                 let text = diag.source_text file;
                 m.[path_to_uri (diag.source_path file) =>
