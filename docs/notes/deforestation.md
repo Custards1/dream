@@ -98,12 +98,16 @@ local, fuse too: the name is wrapped in a lambda that calls it
 step is a direct call the JIT can take and a local one is a free name of the
 loop. That took the compiler from 392 loops to 419.
 
-Its own compile did not get faster, and that is the honest boundary of all of
-the above: the compiler's loops are maps and lists built a turn at a time, and
-a loop that allocates is a loop the JIT does not take, so fusing one replaces
-`strict_steps` calling a closure with the interpreter running the loop -- about
-the same work. Fusion pays where the loop then compiles: numbers, and lists
-walked rather than built.
+Its own compile did not get faster, and not for the reason this note first
+gave. The JIT does take loops that allocate (since "List and map code in the
+JIT", docs/notes/vm-performance.md), and it refuses one of the compiler's
+fused loops. What it does not do is reach them: a self-compile lasts four
+seconds, the tier may spend 100 ms plus a tenth of the process's CPU
+(`jit_within_budget`), and LLVM takes 100-400 ms over a large body. On
+2026-10-12 a self-compile compiled 163 functions in 9.7 s of CPU, 21 of them
+fused loops out of 483; the rest ran interpreted, where a fused loop is about
+the work `strict_steps` calling a closure was. Fusion pays where the loop then
+compiles -- a program that runs long enough for the tier to get to it.
 
 **A chain that ends in a list** cannot be a strict loop: a list is lazy in its
 spine, and an endless one would never end. It is one lazy producer instead --
