@@ -5663,6 +5663,94 @@ unsigned default_jit_threads() {
     return 2;
 }
 
+// The rough body size the queue is ranked by.
+//
+// What a compile costs LLVM is proportional to the module it is handed, which
+// is the function's body once `let` has been written out. That is what the
+// ranking should divide the call count by -- a big dispatcher that costs a
+// second of LLVM is not worth the same slice as a tight loop that costs five
+// milliseconds -- but it is not a number the image stores. So it is counted
+// here, once per function, walking the body's nodes. The layout is `mark_refs`'s
+// (and its comment, which is the authority); the shapes it leaves out are
+// counted as one node rather than followed, and a count that is low does no
+// harm. It is a ranking, not a promise.
+struct SizeScratch {
+    /// `stamp[i] == gen` means node `i` was counted this walk, so the scratch
+    /// needs no clearing between calls.
+    std::vector<uint32_t> stamp;
+    uint32_t gen = 0;
+};
+
+uint32_t body_size(const Image& img, uint32_t root, SizeScratch& s) {
+    if (s.stamp.size() < img.node_count()) s.stamp.assign(img.node_count(), 0);
+    if (++s.gen == 0) {
+        std::fill(s.stamp.begin(), s.stamp.end(), 0);
+        s.gen = 1;
+    }
+    const uint32_t gen = s.gen;
+    std::vector<uint32_t> stack;
+    auto push = [&](uint32_t i) {
+        if (i != NO_NODE && i < img.node_count() && s.stamp[i] != gen) stack.push_back(i);
+    };
+    push(root);
+    uint32_t count = 0;
+    while (!stack.empty()) {
+        const uint32_t idx = stack.back();
+        stack.pop_back();
+        if (s.stamp[idx] == gen) continue;
+        s.stamp[idx] = gen;
+        ++count;
+        const Node& n = img.node(idx);
+        auto run = [&](uint32_t off, uint32_t count) {
+            for (uint32_t i = 0; i < count; ++i) push(img.kid(off + i));
+        };
+        switch (Op(n.op)) {
+            case Op::ConstInt: case Op::ConstFloat: case Op::ConstStr: case Op::ConstChar:
+            case Op::ConstBool: case Op::ConstAtom: case Op::Unit: case Op::Capture:
+            case Op::Local: case Op::Global: case Op::Builtin: case Op::Nop:
+            case Op::MakeClosure: case Op::MakeThunk:
+                break;
+            case Op::Field: case Op::Force: case Op::TypeIs: case Op::ListTail:
+            case Op::ListIsEmpty: case Op::Neg: case Op::Not: case Op::BitNot:
+                push(n.a);
+                break;
+            case Op::Bind:
+                push(n.b);
+                break;
+            case Op::Try: case Op::Ensure: case Op::Cons:
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor: case Op::Shl: case Op::Shr:
+            case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+            case Op::And: case Op::Or:
+                push(n.a);
+                push(n.b);
+                break;
+            case Op::If: case Op::Get: case Op::Set:
+                push(n.a);
+                push(n.b);
+                push(n.c);
+                break;
+            case Op::SetMany:
+                push(n.a);
+                run(n.b, 2 * n.c);
+                break;
+            case Op::Apply: case Op::SwitchHead: case Op::SwitchAtom:
+                push(n.a);
+                run(n.b, n.c);
+                break;
+            case Op::Block: case Op::MakeList: case Op::MakeArray: case Op::RecordMake:
+                run(n.a, n.b);
+                break;
+            case Op::MakeMap:
+                run(n.a, 2 * n.b);
+                break;
+            default:
+                break;
+        }
+    }
+    return count;
+}
+
 struct Jit::Impl {
     explicit Impl(Runtime& r) : rt(r) {}
 
@@ -5693,6 +5781,11 @@ struct Jit::Impl {
     /// CPU the compile threads have spent between them. See `jit_within_budget`.
     std::atomic<int64_t> jit_ns{0};
     const bool force_sync = std::getenv("DREAM_JIT_SYNC") != nullptr;
+    /// The queue's ranking costs and the scratch that counts them, guarded by
+    /// `queue_mutex` like the queue itself. A size of zero is not yet counted;
+    /// see `take_hottest`.
+    std::vector<uint32_t> sizes;
+    SizeScratch scratch;
 
     bool ensure_jit(std::string* error);
     bool create_jit();
@@ -5901,14 +5994,28 @@ uint32_t Jit::take_hottest() {
     // be called a handful of times more, and one that crossed it late may
     // be the loop the rest of the program runs in. `tier` keeps counting a
     // function while it waits, so the count says which is which. A linear
-    // walk, because it is short beside a compile -- a thousand entries at
-    // the very most, against milliseconds of LLVM.
+    // walk, because it is short beside a compile -- a thousand entries at the
+    // very most, against milliseconds of LLVM.
+    //
+    // The count alone is not the ranking, though: what a compile costs LLVM
+    // grows with the body it is handed, from five milliseconds to over a
+    // second on the compiler's own widest dispatchers, and under the CPU
+    // budget only so many compiles happen at all. So the queue is ranked by
+    // calls per node of body -- the count divided by `body_size`, which
+    // repays itself in calls the soonest -- and a cheap hot loop beats a big
+    // dispatcher of the same count. Each size is counted once and kept.
+    const Image& img = impl_->rt.image();
+    if (impl_->sizes.size() < img.func_count()) impl_->sizes.assign(img.func_count(), 0);
     auto best = impl_->queue.begin();
-    uint32_t most = 0;
+    double best_value = -1.0;
     for (auto it = impl_->queue.begin(); it != impl_->queue.end(); ++it) {
-        const uint32_t n = counts_[*it].load(std::memory_order_relaxed);
-        if (n > most) {
-            most = n;
+        const uint32_t fi = *it;
+        const uint32_t n = counts_[fi].load(std::memory_order_relaxed);
+        uint32_t& size = impl_->sizes[fi];
+        if (size == 0) size = body_size(img, img.func(fi).body, impl_->scratch) + 1;
+        const double value = double(n) / double(size);
+        if (value > best_value) {
+            best_value = value;
             best = it;
         }
     }

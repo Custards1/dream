@@ -176,8 +176,10 @@ private:
     /// Compile one function, from any thread; see "Several compile threads"
     /// in jit.cpp.
     CompiledFn compile_one(uint32_t func_index, std::string* error);
-    /// The queued function with the most entries counted, taken off the
-    /// queue. Caller holds the queue's lock.
+    /// The queued function with the most entries counted per node of its
+    /// body, taken off the queue -- a compile's cost grows with its body, so
+    /// it is calls divided by size that repays the budget quickest. Caller
+    /// holds the queue's lock.
     uint32_t take_hottest();
 
     struct Impl;
