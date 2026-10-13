@@ -81,6 +81,23 @@ pair of the wrong length still raises `:match_error` -- and the accumulator may
 not. Over `enumerate` a two-name pattern is bound straight from the count and
 the head, and the pair is never built.
 
+**Names from the frame around it.** A step that read a local of the function it
+was written in -- `fold (fn acc x -> acc + x * k) 0 xs`, `k` a parameter -- was
+not fused, because a loop is a global and a global has no captures; most folds
+in a real program are like that. Each such name is a parameter of the loop now,
+after the three every loop has: read in the caller's frame at the call that
+enters the loop (at an offset past the end of any file, so that its resolution
+has a key of its own) and handed straight back at every turn, which is the
+parameter the JIT keeps in place. Up to eight; past that the pipeline stays as
+written. The compiler's own image went from 152 fused loops to 392 with it.
+
+Its own compile did not get faster, and that is the honest boundary of all of
+the above: the compiler's loops are maps and lists built a turn at a time, and
+a loop that allocates is a loop the JIT does not take, so fusing one replaces
+`strict_steps` calling a closure with the interpreter running the loop -- about
+the same work. Fusion pays where the loop then compiles: numbers, and lists
+walked rather than built.
+
 **A chain that ends in a list** cannot be a strict loop: a list is lazy in its
 spine, and an endless one would never end. It is one lazy producer instead --
 a function over the source that at each cell asks the `filter`s and conses the

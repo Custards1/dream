@@ -199,7 +199,43 @@ struct Plan {
     // `:all` and `:none` at the first element that decides them, everything
     // else when the source runs out.
     sink = :fold
+    // `[name, span]` for each name of the frame around the pipeline that a
+    // stage or the sink reads: passed to the loop as a parameter after the
+    // three it always has, and handed straight back at every turn. `span` is
+    // where the caller's read of it was resolved (`free_span`).
+    free : [[:any]] = []
 }
+
+// --- names from the frame around it -----------------------------------------
+//
+// A fold's function that reads a local of the function it is written in --
+// `fold (fn acc x -> acc + x * k) 0 xs`, `k` a parameter -- was not fused: the
+// loop is a global, and a global has no captures. Most folds in a real program
+// are like that. Each such name is a parameter of the loop instead, after the
+// three every loop has, read once in the caller's frame at the call that enters
+// the loop and handed straight back at every turn -- a parameter the JIT keeps
+// in place across its self calls rather than moving it.
+
+/// The most names a loop takes from the frame around it. Past this the
+/// pipeline stays as it was written.
+let max_free : :integer;
+let max_free = 8;
+
+/// Where the caller's read of the `i`th name a pipeline at `start` takes from
+/// its frame is resolved. Name occurrences are keyed by their offset, and the
+/// read is not anywhere in the text: these offsets are past the end of any
+/// file -- of any under 64 MB, which is every file -- and distinct for every
+/// pipeline and every name.
+let free_span : :integer -> :integer -> [:integer, :integer];
+let free_span start i = {
+    let at = 2147483648 + start * 2 * max_free + i;
+    [at, at + 1]
+};
+
+/// Where the loop's own binding of that name is recorded: as distinct, and
+/// distinct from the read.
+let free_binder_span : :integer -> :integer -> [:integer, :integer];
+let free_binder_span start i = free_span start (max_free + i);
 
 // --- a chain that ends in a list ---------------------------------------------
 //

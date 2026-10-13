@@ -1185,10 +1185,12 @@ let lower_fused p l = {
             fuse.Seed.written(e) => lower_expr e (list.head inits),
             fuse.Seed.number(v)  => const_int v (list.head inits),
         };
+    // The names from the frame around it, read where they were resolved.
+    let free = lower_all (map (fn [n, sp] -> [:name, n, sp]) (fuse.Plan.free p)) (list.head seeded);
     let callee = emit (ir.node :global (fuse.Plan.gi p) ir.no_node ir.no_node)
-                      (list.head seeded);
+                      (list.head free);
     emit_apply (list.nth 1 callee)
-               (list.append (list.nth 1 inits) [list.nth 1 seeded])
+               (list.append (list.append (list.nth 1 inits) [list.nth 1 seeded]) (list.nth 1 free))
                (list.head callee)
 };
 
@@ -1351,10 +1353,15 @@ let self_turn p stag acc_at l = {
         binary :add (list.nth 1 held) (list.nth 1 one) (list.head one)
     } else { local_node fuse.carried_slot (list.head advanced) };
     let acc = acc_at (list.head carried);
+    // The names from the frame around it, handed straight back.
+    let free = list.fold (fn got i -> {
+        let read = local_node (fuse.arity + i) (list.head got);
+        [list.head read, list.append (list.nth 1 got) [list.nth 1 read]]
+    }) [list.head acc, []] (list.range 0 (list.length (fuse.Plan.free p)));
     let callee = emit (ir.node :global (fuse.Plan.gi p) ir.no_node ir.no_node)
-                      (list.head acc);
+                      (list.head free);
     emit_apply (list.nth 1 callee)
-               [list.nth 1 advanced, list.nth 1 carried, list.nth 1 acc]
+               (list.append [list.nth 1 advanced, list.nth 1 carried, list.nth 1 acc] (list.nth 1 free))
                (list.head callee)
 };
 

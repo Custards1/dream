@@ -3789,6 +3789,9 @@ struct Fusion {
     steps = []
     // The sink's tag, which `lower` reads for how the loop stops (`fuse.Plan`).
     sink = :fold
+    // The names of the frame around it the stages and the sink read, which the
+    // loop takes as parameters (see "names from the frame around it" in `fuse`).
+    free = []
 }
 
 /// The pipeline written as this call, as a `Fusion`, or `()`.
@@ -3817,9 +3820,14 @@ let collected c r tag args =
             else if not (list.all (fn st -> step_ok r st) all) { () }
             else if not (fuse.affordable all 1) { () }
             else {
-                Fusion.new (list.nth 0 src) (list.nth 1 src) (fuse.Seed.number 0) (fuse.Step.op fuse.collect) false
-                    |> Fusion.set_steps all
-                    |> Fusion.set_sink fuse.collect
+                let free = pipeline_free r (fuse.Step.op fuse.collect) all;
+                if list.length free > fuse.max_free { () }
+                else {
+                    Fusion.new (list.nth 0 src) (list.nth 1 src) (fuse.Seed.number 0) (fuse.Step.op fuse.collect) false
+                        |> Fusion.set_steps all
+                        |> Fusion.set_sink fuse.collect
+                        |> Fusion.set_free free
+                }
             }
         },
     };
@@ -3902,10 +3910,12 @@ let with_source c r over tag strict args =
             else {
                 match sink_step tag strict (list.nth 0 src) (list.nth 1 src) args (ast.span (list.last args)) {
                     () => (),
-                    shape =>
-                        if reaches_frame r (Fusion.step shape) { () }
+                    shape => {
+                        let free = pipeline_free r (Fusion.step shape) steps;
+                        if list.length free > fuse.max_free { () }
                         else if not (fuse.affordable steps (sink_uses shape)) { () }
-                        else { Fusion.set_steps steps shape }
+                        else { shape |> Fusion.set_steps steps |> Fusion.set_free free }
+                    }
                 }
             }
         },
@@ -3964,8 +3974,7 @@ let step_ok r st =
             && ast.param_pattern (list.nth 0 ps) == ()
             // The loop inlines the body and has nowhere to put the force.
             && not (ast.param_strict (list.nth 0 ps))
-            && not (list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body))
-            && not (reaches_frame r (fuse.Step.written body ps)),
+            && not (list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body)),
         _ => false,
     };
 
@@ -4033,19 +4042,29 @@ let sink_step tag strict stag src_args args span =
                          (fuse.Step.op op) strict,
     };
 
-/// Does the step reach a name the frame around it holds? The loop is a global,
-/// which has no captures, so a body that does cannot become one.
-let reaches_frame r step =
+/// The names of the frame around it a step reads: what the loop has to be
+/// handed, since a loop is a global and a global has no captures. Over-counts
+/// a name the body binds again itself, which hands the loop a parameter it
+/// does not read.
+let frame_names : Resolution -> fuse.Step -> [:string];
+let frame_names r step =
     match step {
         fuse.Step.written(body, ps) => {
             let ours = list.concat (list.map (fn p -> list.cons (ast.param_name p) (match ast.param_pattern p {
                 () => [],
                 pattern => list.map list.head (pattern_bindings pattern),
             })) ps);
-            list.any (fn n -> not (list.contains n ours) && in_scope r n) (fuse.mentioned body)
+            list.unique (filter (fn n -> not (list.contains n ours) && in_scope r n) (fuse.mentioned body))
         },
-        fuse.Step.op(_) => false,
+        fuse.Step.op(_) => [],
     };
+
+/// Every name of the frame around it a pipeline reads, its sink's and its
+/// stages', each once, in the order first met.
+let pipeline_free : Resolution -> fuse.Step -> [fuse.Stage] -> [:string];
+let pipeline_free r sink steps =
+    list.unique (frame_names r sink
+                 + list.concat (map (fn st -> frame_names r (fuse.Step.written (fuse.step_body st) (fuse.step_params st))) steps));
 
 /// Take the next global for a loop nobody wrote: `[r, index]`.
 ///
@@ -4089,12 +4108,23 @@ let check_fused c e shape r = {
     let r1 = check_chain c (list.last args) (check_expr c (list.nth 1 e) r) behind;
     let r2 = match seed { fuse.Seed.written(x) => check_expr c x r1, fuse.Seed.number(_) => r1 };
 
-    let started = begin_func (fuse.loop_name stag) fuse.arity false (impure_ok r2)
-                             true false span (ctx_source c) r2;
+    // Each name from the frame around it, read here, in the caller's frame, at
+    // an offset of its own (`fuse.free_span`).
+    let free = Fusion.free shape;
+    let numbered_free = list.zip (list.range 0 (list.length free)) free;
+    let r3 = fold (fn acc [i, n] -> check_expr c [:name, n, fuse.free_span (ast.span_start span) i] acc) r2 numbered_free;
+    let arity = fuse.arity + list.length free;
+
+    let started = begin_func (fuse.loop_name stag) arity false (impure_ok r3)
+                             true false span (ctx_source c) r3;
     let fi = list.nth 1 started;
-    // The three parameters exist whether or not anything names them, so the
-    // frame is as wide as the loop's arity before a stage takes a slot.
-    let reserved = reserve_slot (fuse.arity - 1) (list.head started);
+    // The parameters exist whether or not anything names them, so the frame
+    // is as wide as the loop's arity before a stage takes a slot. The names
+    // from the frame around it are bound to theirs, after the three every
+    // loop has.
+    let reserved = fold (fn acc [i, n] ->
+        bind_at (ctx_mi c) (ctx_source c) n (fuse.arity + i) (fuse.free_binder_span (ast.span_start span) i) acc)
+        (reserve_slot (arity - 1) (list.head started)) numbered_free;
 
     // A list's or an array's element has no slot of its own to begin from:
     // it is a slot nothing writes, read as the container at the cursor.
@@ -4137,7 +4167,8 @@ let check_fused c e shape r = {
     record_fusion (ctx_mi c) (ctx_source c) span
         (fuse.Plan.make span fi (list.nth 1 taken) [stag, Fusion.source_args shape] seed
                         (Fusion.step shape) (Fusion.strict shape) (list.nth 2 staged) (list.nth 3 staged) elem
-                        (Fusion.sink shape))
+                        (Fusion.sink shape)
+                        (map (fn [i, n] -> [n, fuse.free_span (ast.span_start span) i]) numbered_free))
         (list.head taken)
     }
 };
