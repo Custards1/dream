@@ -614,7 +614,79 @@ std::pair<uint32_t, uint32_t> cons_parts(const Image& img, const Node& n) {
 // Analysis
 // ---------------------------------------------------------------------------
 
-using SlotSet = uint64_t;  // one bit per slot; functions with >64 slots are skipped
+/// The masks over a function's local slots, one bit each, in an array of words.
+///
+/// A single machine word held these once, and a function with more than 64
+/// slots was refused for it. That was the wrong thing to give up on: the
+/// compiler's own widest dispatchers -- `infer` at 115 slots, `hoist` at 125 --
+/// are four of the five thousand functions in a self-compile and about 8% of
+/// its reductions, and they were the four the tier could not take. So the mask
+/// is wide enough for the functions that exist and then some, and `f_.slots` is
+/// capped by the width rather than by a machine word. See `Analyzer::run`,
+/// which reports the cap under `DREAM_JIT_WHY` like every other refusal.
+constexpr uint32_t kSlotSetWords = 8;  // 512 slots; the widest is 125
+constexpr uint32_t kSlotSetBits = 64 * kSlotSetWords;
+
+struct SlotSet {
+    uint64_t w[kSlotSetWords] = {};
+
+    SlotSet() = default;
+    SlotSet(uint64_t v) { w[0] = v; }
+
+    static SlotSet bit(uint32_t i) {
+        SlotSet s;
+        s.set(i);
+        return s;
+    }
+    /// The first `n` slots set, for a mask of a function's parameters.
+    static SlotSet low_bits(uint32_t n) {
+        SlotSet s;
+        for (uint32_t i = 0; i < n && i < kSlotSetBits; ++i) s.set(i);
+        return s;
+    }
+
+    bool test(uint32_t i) const {
+        return i < kSlotSetBits && ((w[i >> 6] >> (i & 63)) & 1) != 0;
+    }
+    void set(uint32_t i) {
+        if (i < kSlotSetBits) w[i >> 6] |= uint64_t(1) << (i & 63);
+    }
+    void clear(uint32_t i) {
+        if (i < kSlotSetBits) w[i >> 6] &= ~(uint64_t(1) << (i & 63));
+    }
+    bool any() const {
+        for (uint32_t i = 0; i < kSlotSetWords; ++i) {
+            if (w[i]) return true;
+        }
+        return false;
+    }
+    explicit operator bool() const { return any(); }
+    /// The low 32 bits, as a per-argument mask: call positions are capped at
+    /// 32, so the argument masks the analysis answers are these low bits.
+    uint32_t low32() const { return uint32_t(w[0]); }
+
+    SlotSet& operator|=(const SlotSet& o) {
+        for (uint32_t i = 0; i < kSlotSetWords; ++i) w[i] |= o.w[i];
+        return *this;
+    }
+    SlotSet& operator&=(const SlotSet& o) {
+        for (uint32_t i = 0; i < kSlotSetWords; ++i) w[i] &= o.w[i];
+        return *this;
+    }
+    friend SlotSet operator|(SlotSet a, const SlotSet& b) { return a |= b; }
+    friend SlotSet operator&(SlotSet a, const SlotSet& b) { return a &= b; }
+    friend SlotSet operator~(SlotSet a) {
+        for (uint32_t i = 0; i < kSlotSetWords; ++i) a.w[i] = ~a.w[i];
+        return a;
+    }
+    friend bool operator==(const SlotSet& a, const SlotSet& b) {
+        for (uint32_t i = 0; i < kSlotSetWords; ++i) {
+            if (a.w[i] != b.w[i]) return false;
+        }
+        return true;
+    }
+    friend bool operator!=(const SlotSet& a, const SlotSet& b) { return !(a == b); }
+};
 
 /// How a call is made; see `Analyzer::check_apply`.
 enum class CallKind : uint8_t { Self, Known, Native, Peer, Closure, Refused };
@@ -754,13 +826,17 @@ public:
 
     Analysis run() {
         Analysis a;
-        if (f_.slots > 64 || f_.arity == 0) return a;
+        if (f_.slots > kSlotSetBits) {
+            why(img_.node(f_.body), "more slots than the tier tracks (raise kSlotSetWords)");
+            return a;
+        }
+        if (f_.arity == 0) return a;
         if (denied_by_env(img_, fi_)) return a;
         binds_.assign(f_.slots, NO_NODE);
         reads_.assign(f_.slots, 0);
         bind_state_.assign(f_.slots, 0);
         strict_binds_.assign(f_.slots, 0);
-        const SlotSet params = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
+        const SlotSet params = SlotSet::low_bits(f_.arity);
         // Checked as though every self-call argument were evaluated, which asks
         // the most of the body: whatever the fixpoint below decides, everything
         // it leaves evaluated has been checked.
@@ -908,9 +984,7 @@ public:
                 std::vector<uint32_t> seq;
                 force_order(f_.body, 0, seq);
                 SlotSet prefix = 0;
-                for (uint32_t slot : seq) {
-                    if (slot < 64) prefix |= SlotSet(1) << slot;
-                }
+                for (uint32_t slot : seq) prefix.set(slot);
                 SlotSet pinned = 0;
                 SlotSet fs = a.float_slots;
                 while (fs & ~prefix) {
@@ -1161,7 +1235,7 @@ private:
     uint32_t check_mask(const Node& n, CallKind kind) const {
         if (kind == CallKind::Peer) {
             const Analysis* m = peer_member(*peers_, peer_target(n));
-            return m ? uint32_t(m->eager) : ~uint32_t(0);
+            return m ? m->eager.low32() : ~uint32_t(0);
         }
         return eval_mask(n, kind);
     }
@@ -1172,7 +1246,7 @@ private:
     uint32_t eval_mask(const Node& n, CallKind kind) const {
         switch (kind) {
             case CallKind::Self:
-                return uint32_t(eager_ & ~carried_);
+                return (eager_ & ~carried_).low32();
             case CallKind::Known:
                 return ~uint32_t(0);
             case CallKind::Native:
@@ -1182,7 +1256,7 @@ private:
                 // answer that claims nothing, which is always sound for the
                 // caller's strictness. The emitter reads the final answer.
                 const Analysis* m = peer_member(*peers_, peer_target(n));
-                return m ? uint32_t(m->eager) : 0;
+                return m ? m->eager.low32() : 0;
             }
             default:
                 return 0;
@@ -1364,12 +1438,12 @@ private:
     /// carried across one.
     SlotSet carried() const {
         if (call_sites_.empty()) return 0;
-        SlotSet bits = f_.arity >= 64 ? ~SlotSet(0) : ((SlotSet(1) << f_.arity) - 1);
+        SlotSet bits = SlotSet::low_bits(f_.arity);
         for (uint32_t site : call_sites_) {
             const Node& n = img_.node(site);
             for (uint32_t i = 0; i < f_.arity; ++i) {
                 const Node& arg = img_.node(img_.kid(n.b + i));
-                if (Op(arg.op) != Op::Local || arg.a != i) bits &= ~(SlotSet(1) << i);
+                if (Op(arg.op) != Op::Local || arg.a != i) bits.clear(i);
             }
         }
         return bits;
@@ -1390,7 +1464,7 @@ private:
                 if (n.a >= f_.arity && binds_[n.a] != NO_NODE) {
                     return strict_of(binds_[n.a], depth + 1);
                 }
-                return SlotSet(1) << n.a;
+                return SlotSet::bit(n.a);
             case Op::SwitchAtom: case Op::SwitchHead: {
                 SlotSet arms = strict_of(img_.kid(n.b + n.c - 1), depth + 1);
                 for (uint32_t i = 1; i < n.c; i += 2)
@@ -1477,12 +1551,12 @@ private:
     SlotSet float_slots(SlotSet seed, SlotSet pinned) {
         slot_ty_.assign(f_.slots, Ty::Unknown);
         for (uint32_t i = f_.arity; i < f_.slots; ++i) slot_ty_[i] = Ty::Any;
-        for (uint32_t i = 0; i < f_.arity && i < 64; ++i) {
+        for (uint32_t i = 0; i < f_.arity; ++i) {
             // A parameter whose arguments arrive in a lazy position arrives
             // tagged, and may arrive suspended: it cannot be a double.
-            const bool lazy = !(((eager_ | carried_) >> i) & 1);
-            if (((pinned >> i) & 1) || lazy) slot_ty_[i] = Ty::Any;
-            else if ((seed >> i) & 1) slot_ty_[i] = Ty::Float;
+            const bool lazy = !(eager_ | carried_).test(i);
+            if (pinned.test(i) || lazy) slot_ty_[i] = Ty::Any;
+            else if (seed.test(i)) slot_ty_[i] = Ty::Float;
         }
         // The sites were gathered in `run`, which needs them before this does.
 
@@ -1504,7 +1578,7 @@ private:
 
         SlotSet bits = 0;
         for (uint32_t i = 0; i < f_.slots; ++i) {
-            if (slot_ty_[i] == Ty::Float) bits |= SlotSet(1) << i;
+            if (slot_ty_[i] == Ty::Float) bits.set(i);
         }
         return bits;
     }
@@ -1633,10 +1707,10 @@ private:
         SlotSet seen = 0;
         SlotSet want = floats;
         for (uint32_t slot : seq) {
-            if (slot >= 64 || ((seen >> slot) & 1)) continue;
-            seen |= SlotSet(1) << slot;
+            if (seen.test(slot)) continue;
+            seen.set(slot);
             out->push_back(slot);
-            want &= ~(SlotSet(1) << slot);
+            want.clear(slot);
             if (!want) return true;
         }
         return false;
@@ -1897,8 +1971,8 @@ public:
                     const uint32_t gi = peer_target(n);
                     if (gi != kNoFunc) {
                         SlotSet floats = 0;
-                        for (uint32_t i = 0; i < n.c && i < 64; ++i) {
-                            if (ty(img_.kid(n.b + i), depth + 1) == Ty::Float) floats |= SlotSet(1) << i;
+                        for (uint32_t i = 0; i < n.c; ++i) {
+                            if (ty(img_.kid(n.b + i), depth + 1) == Ty::Float) floats.set(i);
                         }
                         return peer_call_ty(*peers_, gi, floats);
                     }
@@ -2091,7 +2165,7 @@ llvm::FunctionType* body_signature(llvm::LLVMContext& ctx, uint32_t arity, SlotS
     auto* dblt = llvm::Type::getDoubleTy(ctx);
     std::vector<llvm::Type*> params{ptrt, i32t, i64t};
     for (uint32_t i = 0; i < arity; ++i) {
-        params.push_back(((float_slots >> i) & 1) ? dblt : i64t);
+        params.push_back(float_slots.test(i) ? dblt : i64t);
     }
     params.push_back(ptrt);
     return llvm::FunctionType::get(i64t, params, false);
@@ -2154,9 +2228,9 @@ private:
     /// fixpoint in the analyzer and guarded on entry.
     /// Always false while the first iteration of a peeled loop is being
     /// written: every slot is tagged there.
-    bool slot_is_dbl(uint32_t i) const { return !peeling_ && ((float_slots_ >> i) & 1); }
+    bool slot_is_dbl(uint32_t i) const { return !peeling_ && float_slots_.test(i); }
     /// The same question about the loop proper, whichever is being written.
-    bool loop_slot_is_dbl(uint32_t i) const { return (float_slots_ >> i) & 1; }
+    bool loop_slot_is_dbl(uint32_t i) const { return float_slots_.test(i); }
 
     void declare_helpers();
     /// The body, as a function of `(proc, depth, frame, a0..an, status)`. Only
@@ -2291,7 +2365,7 @@ private:
     /// look at is made of, and the one read in this file that is not a demand.
     JV load_slot_raw(uint32_t slot);
     /// Is this parameter one every self call moves rather than evaluates?
-    bool slot_is_carried(uint32_t i) const { return i < 64 && ((carried_ >> i) & 1); }
+    bool slot_is_carried(uint32_t i) const { return carried_.test(i); }
     llvm::Value* force(llvm::Value* v);
 
     // --- the two representations, and the crossings between them -----------
@@ -3178,8 +3252,8 @@ Emitter::JV Emitter::bound_value(uint32_t slot) {
 }
 
 void Emitter::mark_slot(uint32_t slot) {
-    if (slot >= 64 || slot >= f_.slots || ((refs_ >> slot) & 1)) return;
-    refs_ |= SlotSet(1) << slot;
+    if (slot >= f_.slots || refs_.test(slot)) return;
+    refs_.set(slot);
     // A binding's thunk reads whatever its own expression reads.
     if (slot < binds_.size() && binds_[slot] != NO_NODE) mark_refs(binds_[slot], 0);
 }
@@ -3188,7 +3262,7 @@ void Emitter::mark_refs(uint32_t idx, int depth) {
     if (idx == NO_NODE || !ref_seen_.insert(idx).second) return;
     // Too deep to follow is too deep to be sure of: every binding, then.
     if (depth > 512) {
-        refs_ = ~SlotSet(0);
+        refs_ = ~SlotSet();
         return;
     }
     const Node& n = img_.node(idx);
@@ -3253,7 +3327,7 @@ void Emitter::mark_refs(uint32_t idx, int depth) {
             run(n.a, 2 * n.b);
             return;
         default:
-            refs_ = ~SlotSet(0);
+            refs_ = ~SlotSet();
             return;
     }
 }
@@ -3262,7 +3336,7 @@ void Emitter::finish_bind_table() {
     if (!bind_table_) return;
     std::vector<llvm::Constant*> entries;
     for (uint32_t i = 0; i < f_.slots; ++i) {
-        const bool reached = i < 64 && ((refs_ >> i) & 1);
+        const bool reached = refs_.test(i);
         const uint32_t bound = i < binds_.size() && reached ? binds_[i] : NO_NODE;
         entries.push_back(llvm::ConstantInt::get(i32_, bound));
     }
@@ -4722,7 +4796,7 @@ Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
     // on every path are evaluated; the others are in lazy positions.
     std::vector<JV> args(n.c);
     for (uint32_t i = 0; i < n.c; ++i) {
-        const bool eager = i < 64 && ((pf.eager >> i) & 1);
+        const bool eager = pf.eager.test(i);
         args[i] = eager ? node(img_.kid(n.b + i)) : lazy(img_.kid(n.b + i));
         if (failed_ || !args[i].v) return none();
     }
@@ -4734,8 +4808,8 @@ Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
     // the case that pays: the caller computed them as floats, and they go
     // across in registers without a box on either side.
     llvm::Value* all_floats = nullptr;
-    for (uint32_t i = 0; i < n.c && i < 64; ++i) {
-        if (!((pf.typed_slots >> i) & 1) || args[i].dbl) continue;
+    for (uint32_t i = 0; i < n.c; ++i) {
+        if (!pf.typed_slots.test(i) || args[i].dbl) continue;
         // A tagged value in hand -- every argument here is evaluated -- so a
         // float is a float box, and anything else (an integer the types let
         // an unannotated caller pass) goes to the generic variant, which does
@@ -4767,8 +4841,8 @@ Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
 
     b_.SetInsertPoint(typed_bb);
     std::vector<JV> unboxed = args;
-    for (uint32_t i = 0; i < n.c && i < 64; ++i) {
-        if (((pf.typed_slots >> i) & 1) && !args[i].dbl) unboxed[i] = flt(load_float(args[i].v));
+    for (uint32_t i = 0; i < n.c; ++i) {
+        if (pf.typed_slots.test(i) && !args[i].dbl) unboxed[i] = flt(load_float(args[i].v));
     }
     JV t = call_peer_variant(pf.typed, pf.typed_slots, pf.typed_ret_dbl, unboxed);
 
@@ -4801,7 +4875,7 @@ Emitter::JV Emitter::call_peer_variant(llvm::Function* fn, SlotSet dbl_slots, bo
     // double. Every double one was either a double already or has just been
     // checked to be a float box and unboxed; nothing converts here.
     for (uint32_t i = 0; i < args.size(); ++i) {
-        const bool dbl = i < 64 && ((dbl_slots >> i) & 1);
+        const bool dbl = dbl_slots.test(i);
         call.push_back(dbl ? args[i].v : box(args[i]));
     }
     call.push_back(status_);
@@ -4972,7 +5046,7 @@ bool Emitter::self_args(const Node& n, std::vector<JV>* out) {
         // Evaluated where the parameter is one the body forces on every path,
         // and in a lazy position everywhere else. See "Which arguments are
         // evaluated" in `Analyzer::run`.
-        const bool eager = i < 64 && ((eager_ >> i) & 1);
+        const bool eager = eager_.test(i);
         args[i] = eager ? node(img_.kid(n.b + i)) : lazy(img_.kid(n.b + i));
         if (failed_ || !args[i].v) return false;
     }
@@ -5236,8 +5310,8 @@ Emitter::JV Emitter::cons_step(uint32_t idx) {
     b_.CreateStore(left, ahead_left_);
     llvm::Value* go = b_.CreateAnd(b_.CreateICmpSGT(left, i64(0)),
                                    b_.CreateICmpSGT(spend_reduction(), i64(0)));
-    for (uint32_t i = 0; i < c.c && i < 64; ++i) {
-        if (!((eager_ >> i) & 1)) continue;
+    for (uint32_t i = 0; i < c.c; ++i) {
+        if (!eager_.test(i)) continue;
         // Settled: what `force` lets through without a call.
         llvm::Value* v = args[i];
         auto* test = b_.GetInsertBlock();
