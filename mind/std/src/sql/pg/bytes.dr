@@ -89,7 +89,7 @@ let cstr_at s at = {
 
 /// Every byte of `s`, as integers.
 let to_list : :string -> [:integer];
-let to_list s = list.map (fn i -> str.byte i s) (list.range 0 (len s));
+let to_list s = map (fn i -> str.byte i s) (list.range 0 (len s));
 
 // --- hex ----------------------------------------------------------------------
 
@@ -107,7 +107,7 @@ let hex_value b = match b {
 
 /// Two lowercase hex digits per byte.
 let hex_encode : :string -> :string;
-let hex_encode s = str.concat_all (list.map hex_byte (to_list s));
+let hex_encode s = str.concat_all (map hex_byte (to_list s));
 
 /// Encode a byte as two lowercase hexadecimal characters.
 priv let hex_byte : :integer -> :string;
@@ -119,7 +119,7 @@ let hex_decode : :string -> :string | :unit;
 let hex_decode s =
     if len s % 2 != 0 { () }
     else {
-        let bytes = list.map (fn i -> pair_value (str.byte (2 * i) s) (str.byte (2 * i + 1) s))
+        let bytes = map (fn i -> pair_value (str.byte (2 * i) s) (str.byte (2 * i + 1) s))
                              (list.range 0 (len s / 2));
         if list.any (fn b -> b < 0) bytes { () } else { str.of_bytes bytes }
     };
@@ -177,7 +177,7 @@ let base64_decode : :string -> :string | :unit;
 let base64_decode s =
     if len s % 4 != 0 { () }
     else {
-        let values = list.map (fn i -> base64_value (str.byte i s)) (list.range 0 (len s));
+        let values = map (fn i -> base64_value (str.byte i s)) (list.range 0 (len s));
         match base64_bytes values [] {
             () => (),
             bytes => str.of_bytes bytes,
@@ -203,12 +203,12 @@ priv let rec base64_bytes values acc = match values {
 /// the bits once, which is the only place a bit is ever examined one at a time.
 let nibble_table : (:integer -> :integer -> :integer) -> #[:integer];
 let nibble_table bit_op =
-    array.of_list (list.map (fn i -> nibble_by_bits bit_op (i / 16) (i % 16)) (list.range 0 256));
+    array.of_list (map (fn i -> nibble_by_bits bit_op (i / 16) (i % 16)) (list.range 0 256));
 
 /// Select a four-bit portion of an integer for hexadecimal output.
 priv let nibble_by_bits : (:integer -> :integer -> :integer) -> :integer -> :integer -> :integer;
 priv let nibble_by_bits bit_op a b =
-    list.fold_strict (fn acc k -> acc + bit_op (a / pow2 k % 2) (b / pow2 k % 2) * pow2 k) 0 [0, 1, 2, 3];
+    fold (fn acc k -> acc + bit_op (a / pow2 k % 2) (b / pow2 k % 2) * pow2 k) 0 [0, 1, 2, 3];
 
 /// Compute two raised to a nonnegative exponent.
 priv let pow2 : :integer -> :integer;

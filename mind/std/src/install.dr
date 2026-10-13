@@ -34,7 +34,7 @@ let holding! entry = first_dir_holding! entry (dirs! ());
 /// it -- `DIR/name` or `DIR/name.dream` in the first directory with either --
 /// or `()`.
 let image! : :string -> :string | :unit;
-let image! name = first_file! (list.flat_map (fn dir -> [dir + "/" + name, dir + "/" + name + ".dream"])
+let image! name = first_file! (flat_map (fn dir -> [dir + "/" + name, dir + "/" + name + ".dream"])
                                               (dirs! ()));
 
 /// Return the first search directory containing the named file, or `()` if absent.

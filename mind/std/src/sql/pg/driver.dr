@@ -52,8 +52,8 @@ priv let cell oid v = match v {
 
 /// Convert PostgreSQL result rows into common SQL tuples.
 priv let tuples : [:any] -> [[:any]] -> [[:any]];
-priv let tuples columns rows = list.map
-    (fn row -> list.map (fn [col, v] -> cell (wire.Column.oid col) v) (list.zip columns row)) rows;
+priv let tuples columns rows = map
+    (fn row -> map (fn [col, v] -> cell (wire.Column.oid col) v) (list.zip columns row)) rows;
 
 /// Extract the affected-row count from a PostgreSQL command result.
 priv let changed : :map -> :integer;
@@ -67,11 +67,11 @@ priv let changed result = {
 /// Convert a PostgreSQL command result to the common SQL outcome shape.
 priv let outcome : :map -> sql.Outcome;
 priv let outcome result = %{
-    :columns => list.map wire.Column.name (db.Reply.columns result),
+    :columns => map wire.Column.name (db.Reply.columns result),
     :rows => tuples (db.Reply.columns result) (db.Reply.tuples result),
     :changes => changed result,
     :last_id => (),
-    :metadata => list.map (fn col -> %{ :name => wire.Column.name col, :native_type => wire.Column.oid col,
+    :metadata => map (fn col -> %{ :name => wire.Column.name col, :native_type => wire.Column.oid col,
         :table => wire.Column.table col, :attribute => wire.Column.attribute col }) (db.Reply.columns result),
     :command => db.Reply.command result, :status => db.Reply.status result,
     :notices => db.Reply.notices result, :notifications => db.Reply.notifications result,
@@ -80,7 +80,7 @@ priv let outcome result = %{
 /// Execute a statement using the PostgreSQL driver.
 priv let run! : db.Conn -> :string -> [:any] -> sql.Outcome;
 priv let run! conn text params = try! {
-    let result = db.query_text! conn text (list.map parameter params);
+    let result = db.query_text! conn text (map parameter params);
     strict! result
     outcome result
 } catch e { fail! text e };
@@ -92,8 +92,8 @@ priv let many! : db.Conn -> :string -> [[:any]] -> :integer;
 priv let many! conn text rows = match rows {
     [] => 0,
     [first, .._] => try! {
-        let params = list.map parameter first;
-        let prepared = db.prepare_types! conn "" text (list.map value.oid_of params);
+        let params = map parameter first;
+        let prepared = db.prepare_types! conn "" text (map value.oid_of params);
         let count = try! { execute_rows! conn prepared rows 0 } catch e {
             try! { db.deallocate! conn prepared } catch ignored { () }
             raise! e
@@ -108,7 +108,7 @@ priv let execute_rows! : db.Conn -> db.Prepared -> [[:any]] -> :integer -> :inte
 priv let rec execute_rows! conn prepared rows !count = match rows {
     [] => count,
     [params, ..rest] => {
-        let result = db.execute! conn prepared (list.map parameter params);
+        let result = db.execute! conn prepared (map parameter params);
         execute_rows! conn prepared rest (count + changed result)
     },
 };
@@ -120,8 +120,8 @@ priv let script! conn text = try! { db.script! conn text; () } catch e { fail! t
 /// Fold query rows into an accumulator without retaining all rows.
 priv let fold! : db.Conn -> :string -> [:any] -> :integer -> (a -> [:string] -> [[:any]] -> a) -> a -> a;
 priv let fold! conn text params batch step! init = try! {
-    db.fold_text! conn text (list.map parameter params) batch
-        (fn acc cols rows -> step! acc (list.map wire.Column.name cols) (tuples cols rows)) init
+    db.fold_text! conn text (map parameter params) batch
+        (fn acc cols rows -> step! acc (map wire.Column.name cols) (tuples cols rows)) init
 } catch e { fail! text e };
 
 /// Close the underlying PostgreSQL connection.
@@ -135,13 +135,13 @@ priv let prepare_statement! : db.Conn -> :string -> [:any] -> db.Prepared;
 priv let prepare_statement! conn text params = try! {
     let token = spawn! $( () );
     join! token
-    db.prepare_types! conn ("dream_sql_" + to_string token) text (list.map (fn v -> value.oid_of (parameter v)) params)
+    db.prepare_types! conn ("dream_sql_" + to_string token) text (map (fn v -> value.oid_of (parameter v)) params)
 } catch e { fail! text e };
 
 /// Execute a retained statement with new parameters.
 priv let execute_statement! : db.Conn -> db.Prepared -> [:any] -> sql.Outcome;
 priv let execute_statement! conn prepared params = try! {
-    let result = db.execute! conn prepared (list.map parameter params);
+    let result = db.execute! conn prepared (map parameter params);
     strict! result
     outcome result
 } catch e { fail! (db.Prepared.text prepared) e };
@@ -155,13 +155,13 @@ priv let script_results! : db.Conn -> :string -> [sql.Outcome];
 priv let script_results! conn text = try! {
     let results = db.script! conn text;
     strict! results
-    list.map outcome results
+    map outcome results
 } catch e { fail! text e };
 
 /// Stream data into a PostgreSQL COPY operation.
 priv let copy_in! : db.Conn -> :string -> [:string] -> [[:any]] -> :integer;
 priv let copy_in! conn table columns rows = try! {
-    db.copy_in! conn table columns (list.map (list.map parameter) rows)
+    db.copy_in! conn table columns (map (map parameter) rows)
 } catch e { fail! "COPY FROM STDIN" e };
 
 /// Request cancellation of the active PostgreSQL operation.

@@ -117,7 +117,7 @@ let ast! file src =
 /// and the rest are still done; the exit code says whether any went wrong --
 /// or, checking, whether any would change.
 let format_files! files checking = {
-    let failed = list.fold_strict (fn !n file -> n + format_one! file checking) 0 files;
+    let failed = list.fold (fn !n file -> n + format_one! file checking) 0 files;
     if failed > 0 { 1 } else { 0 }
 };
 
@@ -168,14 +168,14 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
-    compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units);
+    compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units) (opt o :test != true);
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
 let show_modules! l = {
-    let width = list.fold_strict (fn w m -> num.max w (str.byte_length (modules.module_name m)))
+    let width = fold (fn w m -> num.max w (str.byte_length (modules.module_name m)))
                                  0 (modules.modules l);
-    list.map (fn m ->
+    map (fn m ->
         console.print! (str.pad_end (width + 2) " " (modules.module_name m) + modules.module_path m))
              (modules.modules l) |> strict!
     if list.is_empty (modules.natives l) { () }
@@ -190,17 +190,17 @@ let show_packages! ps = {
         () => console.print! "current package: none",
         cur => console.print! ("current package: " + package.name cur + " (" + package.root cur + ")"),
     }
-    list.map (fn p ->
+    map (fn p ->
         console.print! ("  " + package.name p + " " + package.version p + "  " + package.root p
                         + "\n      modules: " + str.join_str ", " (package.modules! p)))
              (package.packages ps) |> strict!
-    list.map (fn n -> console.error! ("warning: " + n)) (package.notes ps) |> strict!
+    map (fn n -> console.error! ("warning: " + n)) (package.notes ps) |> strict!
     0
 };
 
 /// The execution trees the program lowers to.
 let show_ir! l = {
-    let r = scope.resolve! l;
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false);
     let low = lower.lower_program r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
     if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
@@ -305,7 +305,7 @@ let copy_payload! out path n =
 /// name, and a `$` would start a variable.
 let make_escaped : :string -> :string;
 let make_escaped p =
-    str.concat_all (list.map (fn c -> match c { ' ' => "\\ ", '#' => "\\#", '$' => "$$", _ => str.of_chars [c] })
+    str.concat_all (map (fn c -> match c { ' ' => "\\ ", '#' => "\\#", '$' => "$$", _ => str.of_chars [c] })
                          (str.chars p));
 
 /// Every file the build read: each source file, each package manifest on the
@@ -316,15 +316,15 @@ let make_escaped p =
 /// one too many costs a rebuild when it changes, where one too few costs a
 /// stale image.
 let files_read l payloads = {
-    let sources = list.map diag.source_path (modules.files l);
-    let manifests = list.filter (fn m -> not (str.is_empty m))
-                                (list.map package.manifest (package.packages (modules.packages l)));
+    let sources = map diag.source_path (modules.files l);
+    let manifests = filter (fn m -> not (str.is_empty m))
+                                (map package.manifest (package.packages (modules.packages l)));
     list.append sources (list.append manifests payloads)
 };
 
 let depfile_text : :string -> [:string] -> :string;
 let depfile_text out read =
-    str.join_str " \\\n  " (list.cons (make_escaped out + ":") (list.map make_escaped read)) + "\n";
+    str.join_str " \\\n  " (list.cons (make_escaped out + ":") (map make_escaped read)) + "\n";
 
 /// Write the depfile, when one was asked for. Answers whether that went well.
 let write_depfile! path out l payloads =
@@ -356,11 +356,11 @@ let build! l out shebang depfile specs said o = {
     let with_payloads = o |> compile.Options.set_payloads sizes
       |> compile.Options.set_payload_names (list.map (fn e -> list.head e) named);
     let b = compile.build! l with_payloads;
-    let unreadable = list.filter (fn pair -> list.nth 1 pair == ()) (list.zip payloads sizes);
+    let unreadable = filter (fn pair -> list.nth 1 pair == ()) (list.zip payloads sizes);
     // Where the image may run, which is only worth reading the payloads' first
     // bytes for when nobody has said.
     let carried = if said == () && list.is_empty unreadable {
-                      target.of_payloads (list.map payload_head! payloads)
+                      target.of_payloads (map payload_head! payloads)
                   } else { () };
     let aim = target.decide said carried
                             (target.from_reads (modules.config_of l) (modules.reads l));
@@ -399,7 +399,7 @@ let build! l out shebang depfile specs said o = {
                         // from. The section table already names where it starts and how
                         // long each datum is, which is why the sizes had to be taken
                         // before any of this was laid out.
-                        let copied = list.fold_strict
+                        let copied = fold
                                          (fn ok [pth, n] -> ok && copy_payload! handle pth n)
                                          true (list.zip payloads sizes);
                         io.close! handle
@@ -436,7 +436,7 @@ let build! l out shebang depfile specs said o = {
 /// What the program contains, counted. Useful on its own, and the quickest way
 /// to see that a change to the front end did not quietly change its output.
 let show_stats! l = {
-    let r = scope.resolve! l;
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false);
     let lowered = lower.image (lower.lower_program r);
     let img = optimizer.optimize lowered;
     let count! label n = console.print! (label + str.repeat (12 - str.byte_length label) " "
@@ -527,7 +527,13 @@ let show_time! o file = {
     // parts there is no `arena` to build.
     let co = compile_options o;
     let parted = compile.Options.optimize co;
-    let resolved = timed! (compile.resolve! l co);
+    // Resolution is three steps when anything chose a member by its types,
+    // and the `resolve` row is their sum; `resolve_rows!` below breaks it up.
+    let named = timed! (compile.resolve_names! l co);
+    let kept = timed! (compile.kept l co (value_of named));
+    let selected = timed! (compile.select! l co (value_of named) (value_of kept));
+    let rechosen = timed! (compile.rechoose! l co (value_of named) (value_of selected) (value_of kept));
+    let resolved = [value_of rechosen, own_of named + own_of selected + own_of kept + own_of rechosen, 0];
     let r = value_of resolved;
     // Lowered in parts, a lowering holds a lazy `:image` as well: the parts
     // shared in this process, should the sharing process fail. A build never
@@ -559,7 +565,7 @@ let show_time! o file = {
     let stages = [["parse", read], ["expand", load], ["resolve", resolved],
                   ["lower", linked], ["types", checked], ["arena", built], ["share", shared],
                   ["emit", written]];
-    let total = list.fold (fn n st -> n + own_of (list.nth 1 st)) 0 stages;
+    let total = fold (fn n st -> n + own_of (list.nth 1 st)) 0 stages;
     let pad n text = str.pad_start n " " text;
     let line! label ms walk = {
         let pct = if total <= 0 { 0 } else { ms * 100 / total };
@@ -567,13 +573,18 @@ let show_time! o file = {
                         + pad 6 (to_string ms) + " ms  " + pad 3 (to_string pct) + "%"
                         + (match walk { () => "", w => "   (walk " + to_string w + " ms)" }))
     };
-    list.map (fn st -> line! (list.head st) (own_of (list.nth 1 st))
+    map (fn st -> line! (list.head st) (own_of (list.nth 1 st))
                              (walk_of (list.nth 1 st))) stages |> strict!
     line! "total" total ()
     console.print! ("image     " + to_string (str.byte_length bytes) + " bytes, "
                     + to_string (modules.module_count l) + " modules, "
                     + to_string (list.length (ir.Image.nodes img)) + " nodes"
                     + " (from " + to_string (list.length (lowered.[:nodes else []])) + ")")
+    console.print! ("resolve   names " + to_string (own_of named) + " ms, select "
+                    + to_string (own_of selected) + " ms, reach " + to_string (own_of kept) + " ms, again "
+                    + to_string (own_of rechosen) + " ms"
+                    + match value_of kept { () => "", keep => ", " + to_string (len keep) + " of "
+                                                   + to_string (list.length (scope.bodies (value_of selected))) + " bodies" })
     show_macros! l
     print_diags! (modules.files l) (list.append (list.append (modules.diags l) (lower.all_diags r low))
                                                 (value_of checked))
@@ -610,7 +621,7 @@ let show_macros! l = match modules.macro_meter l {
                     [:vm, "run"], [:install, "install"]];
         let at k = phases.[k else [0, 0, 0, 0]];
         let ms r = list.nth 0 r / 1000000;
-        let total = list.fold (fn n [k, _] -> n + ms (at k)) 0 rows;
+        let total = fold (fn n [k, _] -> n + ms (at k)) 0 rows;
         let pad n text = str.pad_start n " " text;
         let millions n = to_string (n / 1000000) + "." + to_string (n % 1000000 / 100000);
         let plural n one = to_string n + " " + one + (if n == 1 { "" } else { "s" });
@@ -631,12 +642,12 @@ let show_macros! l = match modules.macro_meter l {
             + (match [count :one_by_one, count :sequential, count :refused] {
                    [0, 0, 0] => "",
                    [o, q, f] => "  (" + str.join_str ", "
-                       (list.filter (fn t -> t != "")
+                       (filter (fn t -> t != "")
                            [if o == 0 { "" } else { plural o "fallback to one call at a time" },
                             if q == 0 { "" } else { "expanded again in order" },
                             if f == 0 { "" } else { plural f "module refused" }]) + ")",
                }))
-        list.map (fn r -> row! r) rows |> strict!
+        map (fn r -> row! r) rows |> strict!
         console.print! ("  " + pad 21 (to_string total) + " ms of the expand row above")
     },
 };
@@ -650,7 +661,7 @@ let show_macros! l = match modules.macro_meter l {
 /// Which loaded module came from this file, or `()`.
 let module_of! l file = {
     let want = path.absolute! file;
-    let hits = list.filter (fn i -> path.absolute! (modules.module_path (modules.module_at l i))
+    let hits = filter (fn i -> path.absolute! (modules.module_path (modules.module_at l i))
                                     == want)
                            (list.range 0 (modules.module_count l));
     if list.is_empty hits { () } else { list.head hits }
@@ -667,7 +678,7 @@ let show_symbols! l file = {
         mi => {
             let m = modules.module_at l mi;
             let src = diag.source_text (modules.file_at l (modules.module_source m));
-            list.map (fn d -> {
+            map (fn d -> {
                 let at = diag.line_col src (ast.span_start (list.nth 3 d));
                 console.print! (to_string (list.head at) + ":" + to_string (list.nth 1 at)
                                 + "  " + list.nth 2 d)
@@ -705,7 +716,7 @@ let name_at src at = {
 /// Say what is at a position, and where it came from. The primitive an editor
 /// needs for go-to-definition and for hover.
 let show_at! l file line col = {
-    let r = scope.resolve! l;
+    let r = typecheck.select_overloads l (scope.resolve! l);
     match module_of! l file {
         () => {
             console.error! ("dreams: " + file + " is not part of this program")
@@ -729,7 +740,7 @@ let show_at! l file line col = {
                             // whole of it rather than just its name, so a
                             // definition is recognised by the name sitting
                             // under the cursor being the one declared there.
-                            match list.filter (fn d ->
+                            match filter (fn d ->
                                       list.nth 2 d == name_at src at
                                       && at >= ast.span_start (list.nth 3 d)
                                       && at <= ast.span_end (list.nth 3 d))
@@ -894,7 +905,7 @@ let rec parse_args args o =
     };
 
 let usage! () = {
-    list.map (fn line -> console.error! line) [
+    map (fn line -> console.error! line) [
         "dreams " + version + " -- the Dream compiler, in Dream",
         "",
         "usage: dreams [options] FILE",
@@ -1025,7 +1036,7 @@ let run! args = {
                 :repl => repl.start! (list.append (opt o :roots) (opt o :includes))
                                      (configured! o) version,
                 :print_cfg => {
-                    list.map (fn line -> console.print! line) (config.describe (configured! o))
+                    map (fn line -> console.print! line) (config.describe (configured! o))
                         |> strict!
                     0
                 },

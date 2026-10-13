@@ -68,7 +68,7 @@ let main! = {
 
     let open = db.scalar! conn "SELECT count(*) FROM task WHERE NOT done";
     console.print! ("open: " + to_string open)
-    strict! (list.map (fn t -> console.print! (Task.describe t)) (db.rows! conn "SELECT * FROM task ORDER BY id"))
-    console.print! (to_string (list.map Task.title (tagged! "urgent" conn)))
+    strict! (map (fn t -> console.print! (Task.describe t)) (db.rows! conn "SELECT * FROM task ORDER BY id"))
+    console.print! (to_string (map Task.title (tagged! "urgent" conn)))
     db.close! conn
 };

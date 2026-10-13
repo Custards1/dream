@@ -34,6 +34,6 @@ let main! = {
     console.print! (plain.render (top 4 counts) (counter.total counts))
     console.print! ""
 
-    let lengths = list.map (fn w -> len w) words;
+    let lengths = map (fn w -> len w) words;
     console.print! (report.bullet "lengths" (stats.describe_lengths lengths))
 };

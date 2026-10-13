@@ -63,7 +63,7 @@ let link_flags tc s = match s {
 /// What this family cannot do with these settings, said before anything runs.
 let problems : cc.Toolchain -> [cc.Setting] -> [:string];
 let problems tc settings =
-    list.flat_map (fn s -> match [s, cc.Toolchain.os tc] {
+    flat_map (fn s -> match [s, cc.Toolchain.os tc] {
         [cc.Setting.sanitize(k), :windows] if k != :none =>
             ["MinGW has no " + atom.name k + " sanitizer; build with clang-cl or MSVC for :address"],
         _ => [],
@@ -80,7 +80,7 @@ let compile tc t [path, own] object depfile = {
     let lang = cc.language path;
     let program = if lang == :c { cc.Toolchain.c tc } else { cc.Toolchain.cxx tc };
     list.concat [[program],
-                 list.flat_map (compile_flags tc lang) (list.append (implied t) (cc.settings_for t own)),
+                 flat_map (compile_flags tc lang) (list.append (implied t) (cc.settings_for t own)),
                  ["-MD", "-MF", depfile, "-c", path, "-o", object]]
 };
 
@@ -107,7 +107,7 @@ let link tc t objects libraries out = match cc.kind t {
     k => [list.concat [[link_program tc t],
                        (if k == :shared { shared_flags tc t out } else { [] }),
                        objects, libraries,
-                       list.flat_map (link_flags tc) (cc.link_settings t),
+                       flat_map (link_flags tc) (cc.link_settings t),
                        ["-o", out]]],
 };
 

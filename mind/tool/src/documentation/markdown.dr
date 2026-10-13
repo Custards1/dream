@@ -7,8 +7,8 @@ let escape text = text |> str.replace "&" "&amp;" |> str.replace "<" "&lt;" |> s
 let tail n s = str.slice n (len s - n) s;
 let slug s = {
     let chars = str.chars (str.lower s);
-    let clean = str.of_chars (list.map (fn c -> if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' { c } else { '-' }) chars);
-    str.join_str "-" (list.filter (fn x -> x != "") (str.split "-" clean))
+    let clean = str.of_chars (map (fn c -> if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' { c } else { '-' }) chars);
+    str.join_str "-" (filter (fn x -> x != "") (str.split "-" clean))
 };
 let safe_url url = {
     let u = str.lower (str.trim url);
@@ -73,10 +73,10 @@ let cells line = {
     let s = str.trim line;
     let a = if str.starts_with "|" s { tail 1 s } else { s };
     let b = if str.ends_with "|" a { str.slice 0 (len a - 1) a } else { a };
-    list.map str.trim (str.split "|" b)
+    map str.trim (str.split "|" b)
 };
 let separator line = str.contains_str "-" line && list.all (fn c -> c == '-' || c == ':' || c == '|' || c == ' ') (str.chars (str.trim line));
-let row tag line = "<tr>" + str.join_str "" (list.map (fn c -> "<" + tag + ">" + inline c + "</" + tag + ">") (cells line)) + "</tr>";
+let row tag line = "<tr>" + str.join_str "" (map (fn c -> "<" + tag + ">" + inline c + "</" + tag + ">") (cells line)) + "</tr>";
 let special line = {
     let s = str.trim line;
     s == "" || heading s != () || list_item s != () || str.starts_with "```" s || str.starts_with "~~~" s || str.starts_with "> " s || s == "---" || s == "***"
@@ -120,12 +120,12 @@ let rec render_lines code_html lines seen = match lines {
         }
         else if str.starts_with "> " s {
             let quote = list.take_while (fn l -> str.starts_with "> " (str.trim l)) lines;
-            "<blockquote>" + render_lines code_html (list.map (fn l -> tail 2 (str.trim l)) quote) (%{}) + "</blockquote>"
+            "<blockquote>" + render_lines code_html (map (fn l -> tail 2 (str.trim l)) quote) (%{}) + "</blockquote>"
                 + render_lines code_html (list.drop (list.length quote) lines) seen
         }
         else if str.contains_str "|" s && not (list.is_empty rest) && separator (list.head rest) {
             let rows = list.take_while (fn l -> str.contains_str "|" l && str.trim l != "") (list.tail rest);
-            "<div class=\"table\"><table><thead>" + row "th" s + "</thead><tbody>" + str.join_str "" (list.map (row "td") rows) + "</tbody></table></div>"
+            "<div class=\"table\"><table><thead>" + row "th" s + "</thead><tbody>" + str.join_str "" (map (row "td") rows) + "</tbody></table></div>"
                 + render_lines code_html (list.drop (list.length rows + 1) rest) seen
         }
         else {

@@ -41,7 +41,7 @@ let named name = match index name {
 let text : :string -> (:string | :unit);
 let text name = match named name {
     () => (),
-    b => str.of_bytes (list.map (fn i -> str.byte i b) (list.range 0 (len b))),
+    b => str.of_bytes (map (fn i -> str.byte i b) (list.range 0 (len b))),
 };
 
 when test {

@@ -53,7 +53,7 @@ let unit = :unit;
 /// ordinary expression is handed `[a, b]`. Both mean the same list of
 /// descriptions, and unwrapping here is what lets `enum [:flag, :value]` be
 /// written in either place instead of only in one.
-priv let members : :any -> :any;
+priv let members : :any -> [:any];
 priv let members xs = match xs {
     [:tuple, items] => items,
     [:array, items] => items,
@@ -287,7 +287,7 @@ let check description value = type_assert (accepts description value) descriptio
 /// The non-raising form, for parsers and other result-returning APIs.
 let validate : Description -> a -> Result a :error;
 let validate description value =
-    if accepts description value { Result.ok value }
+    if accepts description value { ok value }
     else { Result.error (_error_new :type_error description) };
 
 /// Check elements as they are demanded, which is the form that works on an

@@ -49,22 +49,22 @@ mod worker {
                     close_quietly! conn
                     sql.fail! "a pooled driver must support session reset" :unsupported ""
                 } else { () }
-                Result.ok conn
-            } catch e { Result.error e };
+                ok conn
+            } catch e { err e };
             let [answer, next] = match opened {
-                Result.error(e) => [Result.error e, ()],
+                Result.error(e) => [err e, ()],
                 Result.ok(conn) => {
                     let result = try! {
                         let v = work! conn;
                         strict! v
-                        Result.ok v
-                    } catch e { Result.error e };
-                    let reset = try! { sql.reset! conn; [:ok] } catch e { Result.error e };
+                        ok v
+                    } catch e { err e };
+                    let reset = try! { sql.reset! conn; [:ok] } catch e { err e };
                     match reset {
                         [:ok] => [result, conn],
                         Result.error(e) => {
                             close_quietly! conn
-                            [match result { Result.error(original) => Result.error original, _ => Result.error e }, ()]
+                            [match result { Result.error(original) => err original, _ => err e }, ()]
                         },
                     }
                 },
@@ -119,12 +119,12 @@ mod keeper {
             :waiting => len (State.waiting state) } state,
         :drain => {
             let idle = State.idle state;
-            strict! (list.map worker.stop! idle)
+            strict! (map worker.stop! idle)
             reply (len idle) (state
-                |> State.set_workers (list.filter (fn w -> not (list.contains w idle)) (State.workers state))
+                |> State.set_workers (filter (fn w -> not (list.contains w idle)) (State.workers state))
                 |> State.set_idle [])
         },
-        _ => reply (Result.error :unknown_request) state,
+        _ => reply (err :unknown_request) state,
     };
 
     /// A worker that finished takes the oldest queued work, or goes idle.
@@ -146,8 +146,8 @@ mod keeper {
     let terminate! reason state = {
         let failure = error.new :sql_error %{ :code => :pool_closed, :message => "the pool is stopping", :sql => "" };
         strict! failure
-        strict! (list.map (fn [work!, from] -> reply_to! from (Result.error failure)) (State.waiting state))
-        strict! (list.map worker.stop! (State.workers state))
+        strict! (map (fn [work!, from] -> reply_to! from (err failure)) (State.waiting state))
+        strict! (map worker.stop! (State.workers state))
     };
 }
 

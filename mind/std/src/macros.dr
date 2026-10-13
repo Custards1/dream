@@ -168,7 +168,7 @@ macro with_ok binder result body = match binder {
 /// `expand macros.pipe xs [list.map f, list.filter p, list.sum]`
 /// is `xs |> list.map f |> list.filter p |> list.sum`; [] is the identity.
 macro pipe value steps = match steps {
-    [:list, expressions, _] => list.fold (fn acc step -> [:pipe, acc, step, span]) value expressions,
+    [:list, expressions, _] => fold (fn acc step -> [:pipe, acc, step, span]) value expressions,
     _ => invalid "pipe expects a literal list of pipeline stages",
 };
 
@@ -277,12 +277,12 @@ when test {
         test.case "with_some preserves absence and shares its binding"
             $( test.eq! [(), 6] [expand with_some x () test.boom, expand with_some x 3 (x + x)] ),
         test.case "with_ok binds a success"
-            $( test.eq! (Result.ok 8) (expand with_ok value (Result.ok 4) (Result.ok (value + value))) ),
+            $( test.eq! (ok 8) (expand with_ok value (ok 4) (Result.ok (value + value))) ),
         test.case "with_ok propagates an error without evaluating its body"
-            $( test.eq! (Result.error :bad) (expand with_ok value (Result.error :bad) test.boom) ),
+            $( test.eq! (err :bad) (expand with_ok value (err :bad) test.boom) ),
         test.case "result bindings compose with distinct lexical scopes"
-            $( test.eq! (Result.ok 10) (expand with_ok x (Result.ok 4)
-                (expand with_ok y (Result.ok 6) (Result.ok (x + y)))) ),
+            $( test.eq! (ok 10) (expand with_ok x (ok 4)
+                (expand with_ok y (ok 6) (Result.ok (x + y)))) ),
         test.case "pipe preserves argument-last pipeline order"
             $( test.eq! 14 (expand pipe 3 [add 4, double]) ),
         test.case "an empty pipe is the original expression"
@@ -326,16 +326,16 @@ when test {
         test.case "assert raises exactly its supplied message"
             $( test.eq! :failed (try! { expand assert false :failed } catch e { _error_payload e }) ),
         test.case "attempt returns a success result"
-            $( test.eq! (Result.ok [1, 2]) (expand attempt [1, 2]) ),
+            $( test.eq! (ok [1, 2]) (expand attempt [1, 2]) ),
         test.case "attempt catches errors deferred inside a collection"
             $({
                 let result = expand attempt [1, raise! :deferred];
-                test.eq! (Result.error :deferred)
+                test.eq! (err :deferred)
                          (match result { Result.error(e) => Result.error (_error_payload e), other => other })
             }),
         test.case "attempt evaluates and shares an effectful expression once"
             $({
-                test.eq! (Result.ok 5) (expand attempt (mark! :value 5))
+                test.eq! (ok 5) (expand attempt (mark! :value 5))
                 send! (self! ()) :end
                 test.eq! [:value, :end] [recv! (), recv! ()]
             }),

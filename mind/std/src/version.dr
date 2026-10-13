@@ -85,7 +85,7 @@ let parse text = {
     let t = str.trim text;
     let bare = if str.starts_with "v" t { str.slice 1 (str.byte_length t - 1) t } else { t };
     let [core, rest] = split_at "-" (list.head (split_at "+" bare));
-    let parts = list.map number (str.split "." core);
+    let parts = map number (str.split "." core);
     match parts {
         [ma] if ma != () => Result.ok [ma, 0, 0, rest],
         [ma, mi] if ma != () && mi != () => Result.ok [ma, mi, 0, rest],
@@ -109,7 +109,7 @@ let show v = to_string (major v) + "." + to_string (minor v) + "." + to_string (
 let compare_versions : Version -> Version -> :integer;
 let compare_versions a b = {
     let by x y = if x < y { 0 - 1 } else if x > y { 1 } else { 0 };
-    let numbers = list.fold (fn acc pair -> if acc != 0 { acc } else { by (list.head pair) (list.nth 1 pair) })
+    let numbers = fold (fn acc pair -> if acc != 0 { acc } else { by (list.head pair) (list.nth 1 pair) })
                             0 [[major a, major b], [minor a, minor b], [patch a, patch b]];
     if numbers != 0 { numbers }
     else {
@@ -158,7 +158,7 @@ let clause text = {
     let after n = str.trim (str.slice n (str.byte_length t - n) t);
     let versioned n k = {
         let rest = after n;
-        match parse rest { Result.ok(v) => Result.ok (k v (written rest)), Result.error(why) => Result.error why }
+        match parse rest { Result.ok(v) => Result.ok (k v (written rest)), Result.error(why) => err why }
     };
     if t == "*" || t == "" { Result.ok any }
     else if str.starts_with ">=" t { versioned 2 (fn v n -> [[:ge, v]]) }
@@ -174,8 +174,8 @@ let clause text = {
 /// `[:ok, requirement]` or `[:error, why]`, from comparisons joined by `,`.
 let parse_requirement : :string -> Result Requirement :string;
 let parse_requirement text =
-    list.fold (fn acc part -> match [acc, clause part] {
-        [Result.error(why), _] => Result.error why,
+    fold (fn acc part -> match [acc, clause part] {
+        [Result.error(why), _] => err why,
         [_, Result.error(why)] => Result.error ("`" + text + "`: " + why),
         [Result.ok(have), Result.ok(more)] => Result.ok (list.append have more),
     }) (Result.ok any) (str.split "," text);
@@ -205,8 +205,8 @@ let matches req v = {
 let satisfies : :string -> :string -> Result :bool :string;
 let satisfies requirement version =
     match [parse_requirement requirement, parse version] {
-        [Result.error(why), _] => Result.error why,
-        [_, Result.error(why)] => Result.error why,
+        [Result.error(why), _] => err why,
+        [_, Result.error(why)] => err why,
         [Result.ok(r), Result.ok(v)] => Result.ok (matches r v),
     };
 
@@ -214,7 +214,7 @@ let satisfies requirement version =
 let show_requirement : Requirement -> :string;
 let show_requirement req = match req {
     [] => "*",
-    cs => str.join_str ", " (list.map (fn [op, v] -> (match op { :eq => "=", :lt => "<", :le => "<=",
+    cs => str.join_str ", " (map (fn [op, v] -> (match op { :eq => "=", :lt => "<", :le => "<=",
                                                                  :gt => ">", :ge => ">=" }) + show v) cs),
 };
 
@@ -229,7 +229,7 @@ let compatible a b = {
     let both = list.append a b;
     // The candidates: nothing at all, every inclusive lower bound, and the
     // version just past every exclusive one.
-    let lows = list.concat (list.map (fn [op, v] -> match op {
+    let lows = list.concat (map (fn [op, v] -> match op {
         :ge => [v], :eq => [v],
         :gt => [make (major v) (minor v) (patch v + 1)],
         _ => [],

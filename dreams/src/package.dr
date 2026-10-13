@@ -125,10 +125,10 @@ let module_file! p segments =
         let candidates dir = {
             let base = path.join_all dir segments;
             list.append
-                (list.map (fn ext -> path.with_extension ext base) module_extensions)
-                (list.map (fn ext -> path.with_extension ext (path.join base "mod")) module_extensions)
+                (map (fn ext -> path.with_extension ext base) module_extensions)
+                (map (fn ext -> path.with_extension ext (path.join base "mod")) module_extensions)
         };
-        first_file! (list.flat_map candidates (list.cons (src p) (overlays p)))
+        first_file! (flat_map candidates (list.cons (src p) (overlays p)))
     };
 
 /// Directories that hold build output rather than source. Skipped when listing
@@ -168,7 +168,7 @@ let dotted_inside segs =
 
 let collect_modules! : :string -> :string -> [:string] -> [:string];
 let rec collect_modules! base dir acc =
-    list.fold (fn found entry ->
+    fold (fn found entry ->
         if io.is_dir! entry {
             if is_noise entry { found } else { collect_modules! base entry found }
         }
@@ -227,7 +227,7 @@ let dep_location spec =
 /// setting silently not made.
 let vm_settings : [[:any]] -> Result Vm :string;
 let vm_settings entries =
-    list.fold (fn acc [key, value] -> match acc {
+    fold (fn acc [key, value] -> match acc {
         Result.ok(settings) => match key {
             "nursery_max" => match size_of value {
                 () => Result.error ("[vm] nursery_max takes a size such as 65536 or \"64M\", not "
@@ -283,7 +283,7 @@ let load_manifest! filename =
                                         Result.ok(settings) =>
                                             Result.ok (make n (toml.get "0.0.0" doc "package" "version")
                                                       root_dir src_dir
-                                                      (list.map (fn [name, location] -> dep name (dep_location location))
+                                                      (map (fn [name, location] -> dep name (dep_location location))
                                                                 (toml.entries doc "dependencies"))
                                                       filename
                                                   |> Package.set_vm settings),
@@ -334,7 +334,7 @@ let current : Packages -> Package | :unit;
 let current s = expand macros.with_some i (current_index s) (at s i);
 
 let names : Packages -> [:string];
-let names s = list.sort (list.map (fn p -> name p) (packages s));
+let names s = list.sort (map (fn p -> name p) (packages s));
 
 let note : :string -> Packages -> Packages;
 let note message s = Packages.set_notes (list.append (notes s) [message]) s;
@@ -379,7 +379,7 @@ let add_manifest! file s =
 /// that groups packages holds them, it does not nest them arbitrarily deep.
 let packages_inside! : :string -> Packages -> Packages;
 let packages_inside! dir s =
-    list.fold (fn acc entry ->
+    fold (fn acc entry ->
         if io.is_dir! entry {
             match manifest_at! entry {
                 () => acc,
@@ -557,7 +557,7 @@ let rec find_enclosing! dir s =
 /// listed as as well as its own name.
 let add_deps! : :integer -> Packages -> Packages;
 let add_deps! i s =
-    list.fold (fn acc d -> {
+    fold (fn acc d -> {
         let owner = at acc i;
         match dep_path d {
             () => note ("package `" + name owner + "` depends on `" + dep_name d
@@ -584,7 +584,7 @@ let rec close_deps! i s =
 /// Split a search path using the runtime platform's PATH separator.
 let split_roots : :string -> [:string];
 let split_roots text =
-    list.filter (fn p -> not (str.is_empty p)) (str.split (match os.platform () { :windows => ";", _ => ":" }) text);
+    filter (fn p -> not (str.is_empty p)) (str.split (match os.platform () { :windows => ";", _ => ":" }) text);
 
 /// Find the package containing `file`, its dependencies, and any packages
 /// reachable from the extra roots.
@@ -593,11 +593,11 @@ let discover! file extra_roots = {
     let roots = list.append extra_roots
                             (match os.env! "DREAM_PACKAGES" {
                                  () => [],
-                                 v => list.map (fn r -> path.expand_home! r) (split_roots v),
+                                 v => map (fn r -> path.expand_home! r) (split_roots v),
                              });
     let found = find_enclosing! (path.dirname file) empty;
-    let closed = close_deps! 0 (list.fold (fn acc r -> add_from_root! r acc) found roots);
-    list.fold (fn acc r -> match split_overlay r { [n, dir] => overlay! n dir acc, () => acc }) closed roots
+    let closed = close_deps! 0 (fold (fn acc r -> add_from_root! r acc) found roots);
+    fold (fn acc r -> match split_overlay r { [n, dir] => overlay! n dir acc, () => acc }) closed roots
 };
 
 // --- tests -------------------------------------------------------------------

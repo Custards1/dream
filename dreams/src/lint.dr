@@ -93,7 +93,7 @@ let rec answer_uses f k i n e u =
         [:if, c, t, el, _] => answer_uses f k i n el (answer_uses f k i n t (uses f k i n c u)),
         [:block, stmts, _] if not (list.is_empty stmts) => {
             let last = list.last stmts;
-            let before = list.fold (fn acc s -> uses f k i n s acc) u (list.take (list.length stmts - 1) stmts);
+            let before = fold (fn acc s -> uses f k i n s acc) u (list.take (list.length stmts - 1) stmts);
             match last {
                 [:let, _, _, _, _, _] => uses f k i n last before,
                 [:let_p, _, _, _] => uses f k i n last before,
@@ -115,7 +115,7 @@ let rec answer_uses f k i n e u =
 let lazy_accumulators : :string -> [:any] -> :any -> [:any];
 let lazy_accumulators f ps body = {
     let k = list.length ps;
-    list.concat (list.map (fn i -> {
+    list.concat (map (fn i -> {
         let p = list.nth i ps;
         let n = ast.param_name p;
         if type_of n != :string || ast.param_strict p || ast.param_pattern p != () { [] }

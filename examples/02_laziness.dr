@@ -29,8 +29,8 @@ let main! = {
     // Infinite lists, consumed finitely.
     console.print! ("naturals:       " + to_string (list.take 5 (naturals 1)))
     console.print! ("fibs:           " + to_string (list.take 10 (fibs_from 0 1)))
-    console.print! ("mapped:         " + to_string (list.take 4 (list.map (fn x -> x * x) (naturals 1))))
-    console.print! ("filtered:       " + to_string (list.take 4 (list.filter (fn x -> x % 3 == 0) (naturals 1))))
+    console.print! ("mapped:         " + to_string (list.take 4 (map (fn x -> x * x) (naturals 1))))
+    console.print! ("filtered:       " + to_string (list.take 4 (filter (fn x -> x % 3 == 0) (naturals 1))))
     console.print! ("take_while:     " + to_string (list.take_while (fn x -> x < 6) (naturals 1)))
     console.print! ("zip stops:      " + to_string (list.zip [1, 2, 3] (naturals 10)))
 

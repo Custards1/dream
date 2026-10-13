@@ -65,7 +65,7 @@ mod keeper {
         :stats => reply %{ :size => State.size state, :open => State.open state,
                            :idle => len (State.idle state), :waiting => len (State.waiting state) } state,
         :drain => reply (State.idle state) (state |> State.set_idle [] |> State.set_open (State.open state - len (State.idle state))),
-        _ => reply (Result.error :unknown_request) state,
+        _ => reply (err :unknown_request) state,
     };
 
     /// A connection back, or the news that one is gone. Either is handed
@@ -89,7 +89,7 @@ mod keeper {
     /// Close the idle connections. Those checked out belong to their callers
     /// until they come back, and there is nowhere for them to come back to.
     let terminate! : :any -> :any -> :any;
-    let terminate! reason state = strict! (list.map (fn c -> db.close! c) (State.idle state));
+    let terminate! reason state = strict! (map (fn c -> db.close! c) (State.idle state));
 
     /// The name the pool's process is reported under.
     let server_name : :any -> :string;
@@ -120,8 +120,8 @@ let stats! pool = keeper.call! pool :stats;
 /// rather than finding out the old ones are dead.
 let drain! : :process -> :integer;
 let drain! pool = {
-    let idle = keeper.call! pool :drain;
-    strict! (list.map (fn c -> db.close! c) idle)
+    let idle : [:map] = keeper.call! pool :drain;
+    strict! (map (fn c -> db.close! c) idle)
     len idle
 };
 

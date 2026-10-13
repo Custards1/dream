@@ -414,7 +414,7 @@ let batch_norm_with opts = {
 
 /// Each example flattened to a vector.
 let flatten : Layer;
-let flatten = Layer.new "flatten" (fn _ shape -> [%{}, [list.fold_strict (fn !a b -> a * b) 1 shape]]) (fn _ x _ -> ad.flatten x);
+let flatten = Layer.new "flatten" (fn _ shape -> [%{}, [list.fold (fn !a b -> a * b) 1 shape]]) (fn _ x _ -> ad.flatten x);
 
 /// Each example reshaped to `shape`.
 let reshape : [:integer] -> Layer;
@@ -545,7 +545,7 @@ priv let steps_of : :any -> [:any];
 priv let steps_of x = {
     let [n, s, d] = tensor.shape (ad.value x);
     let by_time = ad.permute [1, 0, 2] x;
-    list.map (fn t -> ad.reshape [n, d] (ad.slice t 1 by_time)) (list.range 0 s)
+    map (fn t -> ad.reshape [n, d] (ad.slice t 1 by_time)) (list.range 0 s)
 };
 
 /// States `[n, units]`, one per step, joined back into `[n, s, units]`.
@@ -697,12 +697,12 @@ let summary model shape = {
         let [p, out] = init_layer layer i s;
         [[Layer.name layer, to_string out, tree.size p] :: acc, out, i + 1]
     }) [[], shape, 0] layers).[0]);
-    let total = list.fold_strict (fn !n [_, _, k] -> n + k) 0 rows;
-    let width = list.fold_strict (fn w [name, _, _] -> num.max w (str.length name)) 5 rows;
+    let total = list.fold (fn !n [_, _, k] -> n + k) 0 rows;
+    let width = list.fold (fn w [name, _, _] -> num.max w (str.length name)) 5 rows;
     let pad s n = str.pad_end n " " s;
     let line [name, out, k] = "  " + pad name width + "  " + pad out 16 + "  " + to_string k;
     str.join_str "\n" (["  " + pad "layer" width + "  " + pad "output" 16 + "  params"]
-        + list.map line rows
+        + map line rows
         + ["  " + to_string total + " parameters in all, for input " + to_string shape])
 };
 

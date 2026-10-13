@@ -42,8 +42,8 @@ let summary : [Stage] -> %{:atom => :any};
 let summary stages = {
     let total = len stages;
     let asleep = list.count stage.is_sleep stages;
-    let onset = list.index_of_from 0 true (list.map stage.is_sleep stages);
-    let last_sleep = total - 1 - list.index_of_from 0 true (list.reverse (list.map stage.is_sleep stages));
+    let onset = list.index_of_from 0 true (map stage.is_sleep stages);
+    let last_sleep = total - 1 - list.index_of_from 0 true (list.reverse (map stage.is_sleep stages));
     let between = if onset < 0 { [] } else { list.take (last_sleep - onset + 1) (list.drop onset stages) };
     let waso = list.count (fn s -> s == Stage.wake) between;
     let first_rem = list.index_of Stage.rem between;
@@ -107,7 +107,7 @@ let confusion : [Stage] -> [Stage] -> [[:integer]];
 let confusion truth predicted = {
     let pairs = list.zip truth predicted;
     let cell i j = list.count (fn [a, b] -> stage.index a == i && stage.index b == j) pairs;
-    list.map (fn i -> list.map (cell i) (list.range 0 stage.count)) (list.range 0 stage.count)
+    map (fn i -> map (cell i) (list.range 0 stage.count)) (list.range 0 stage.count)
 };
 
 /// The share of epochs on which two scorings agree.
@@ -125,12 +125,12 @@ let kappa truth predicted = kappa_of (confusion truth predicted);
 /// Cohen's kappa from a confusion table.
 let kappa_of : [[:integer]] -> :float;
 let kappa_of table = {
-    let n = 1.0 * list.sum (list.map list.sum table);
-    let diagonal = list.sum (list.map (fn i -> list.nth i (list.nth i table)) (list.range 0 (len table)));
-    let rows = list.map list.sum table;
-    let cols = list.map (fn j -> list.sum (list.map (list.nth j) table)) (list.range 0 (len table));
+    let n = 1.0 * list.sum (map list.sum table);
+    let diagonal = list.sum (map (fn i -> list.nth i (list.nth i table)) (list.range 0 (len table)));
+    let rows = map list.sum table;
+    let cols = map (fn j -> list.sum (map (list.nth j) table)) (list.range 0 (len table));
     let observed = diagonal / n;
-    let chance = list.sum (list.map (fn [r, c] -> r * c) (list.zip rows cols)) / (n * n);
+    let chance = list.sum (map (fn [r, c] -> r * c) (list.zip rows cols)) / (n * n);
     if n == 0.0 || chance >= 1.0 { 0.0 } else { (observed - chance) / (1.0 - chance) }
 };
 
@@ -144,10 +144,10 @@ let hypnogram stages = hypnogram_with 10 stages;
 
 let hypnogram_with : :integer -> [Stage] -> :string;
 let hypnogram_with per stages = {
-    let columns = list.map (fn i -> commonest (list.take per (list.drop (i * per) stages)))
+    let columns = map (fn i -> commonest (list.take per (list.drop (i * per) stages)))
         (list.range 0 ((len stages + per - 1) / per));
-    let row s = pad (stage.name s) + " |" + str.concat_all (list.map (fn c -> if c == s { mark s } else { " " }) columns);
-    str.join_str "\n" (list.map row [Stage.wake, Stage.rem, Stage.n1, Stage.n2, Stage.n3])
+    let row s = pad (stage.name s) + " |" + str.concat_all (map (fn c -> if c == s { mark s } else { " " }) columns);
+    str.join_str "\n" (map row [Stage.wake, Stage.rem, Stage.n1, Stage.n2, Stage.n3])
 };
 
 priv let pad : :string -> :string;
@@ -159,8 +159,8 @@ priv let mark s = match s { Stage.wake => "^", Stage.rem => "=", Stage.n1 => "-"
 /// The stage most of `stages` are; the earlier in class order on a tie.
 let commonest : [Stage] -> Stage;
 let commonest stages = {
-    let counts = list.map (fn s -> [list.count (fn x -> x == s) stages, s]) stage.all;
-    (list.fold (fn best c -> if c.[0] > best.[0] { c } else { best }) [-1, Stage.wake] counts).[1]
+    let counts = map (fn s -> [list.count (fn x -> x == s) stages, s]) stage.all;
+    (fold (fn best c -> if c.[0] > best.[0] { c } else { best }) [-1, Stage.wake] counts).[1]
 };
 
 when test {

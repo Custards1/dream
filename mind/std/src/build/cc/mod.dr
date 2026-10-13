@@ -61,13 +61,13 @@ mapping Target {
 
 /// Describe an executable target built from the supplied source files.
 let executable : :string -> [:string] -> Target;
-let executable name sources = Target.make :executable name (list.map (fn s -> [s, []]) sources) [] [] [];
+let executable name sources = Target.make :executable name (map (fn s -> [s, []]) sources) [] [] [];
 /// Describe a shared-library target built from the supplied source files.
 let shared : :string -> [:string] -> Target;
-let shared name sources = Target.make :shared name (list.map (fn s -> [s, []]) sources) [] [] [];
+let shared name sources = Target.make :shared name (map (fn s -> [s, []]) sources) [] [] [];
 /// Describe a static-library target built from the supplied source files.
 let static : :string -> [:string] -> Target;
-let static name sources = Target.make :static name (list.map (fn s -> [s, []]) sources) [] [] [];
+let static name sources = Target.make :static name (map (fn s -> [s, []]) sources) [] [] [];
 
 /// A library that was built some other way, described by what a user of it
 /// needs: `external "ffi" [Setting.include "/usr/include", Setting.system "ffi"]`.
@@ -79,12 +79,14 @@ let kind t = Target.kind t;
 /// Return the target's logical name.
 let name t = Target.name t;
 /// Return the target's source files and per-source settings.
+let sources : :map -> [[:string, [:any]]];
 let sources t = Target.sources t;
 /// Return settings applied when building this target.
 let settings t = Target.settings t;
 /// Return settings propagated to targets that use this target.
 let public t = Target.public t;
 /// Return the targets and libraries this target depends on.
+let uses : :map -> [:map];
 let uses t = Target.uses t;
 
 // --- modifiers -------------------------------------------------------------------
@@ -229,7 +231,7 @@ let import_name tc n = match [Toolchain.os tc, Toolchain.family tc] {
 /// that name (docs/build.md, "Profile-guided builds").
 let object_name : Toolchain -> :string -> :string;
 let object_name tc path = {
-    let flat = _str_concat (list.map (fn c -> match c { '/' => "#", '\\' => "#", ':' => "_", _ => _str_of_chars [c] })
+    let flat = _str_concat (map (fn c -> match c { '/' => "#", '\\' => "#", ':' => "_", _ => _str_of_chars [c] })
                                     (str.chars path));
     flat + (match Toolchain.family tc { :msvc => ".obj", _ => ".o" })
 };
@@ -240,7 +242,7 @@ let object_name tc path = {
 /// order they were used.
 let inherited : Target -> [Setting];
 let rec inherited t =
-    list.flat_map (fn u -> list.append (public u) (inherited u)) (uses t);
+    flat_map (fn u -> list.append (public u) (inherited u)) (uses t);
 
 /// Every setting that applies to one source of a target: the target's own,
 /// its public ones, what it inherits, and the source's.
@@ -253,7 +255,7 @@ let link_settings t = list.concat [settings t, public t, inherited t];
 
 /// Everything this target links against that another target makes.
 let linked_targets : Target -> [Target];
-let linked_targets t = list.filter (fn u -> kind u != :external) (uses t);
+let linked_targets t = filter (fn u -> kind u != :external) (uses t);
 
 when test {
     import std.test;

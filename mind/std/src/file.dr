@@ -97,7 +97,7 @@ let list! dir = {
         _ if str.ends_with "/" dir => dir,
         _ => dir + "/",
     };
-    list.map (fn n -> prefix + n) names
+    map (fn n -> prefix + n) names
 };
 
 // The three walks below are natives (`std.io`): each is one call where the

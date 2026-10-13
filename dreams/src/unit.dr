@@ -59,13 +59,13 @@ union Change {
 /// same, and its `Change` otherwise. A walk only ever adds to a table, so a
 /// table's difference is its new entries.
 let delta : :map -> :map -> :map;
-let delta base r = list.fold (fn acc [k, v] ->
+let delta base r = fold (fn acc [k, v] ->
     if not (map.has k base) { acc.[k => Change.is v] }
     else {
         match base.[k] {
             same if same == v => acc,
             old if type_of old == :map && type_of v == :map =>
-                acc.[k => Change.entries (list.filter (fn [ek, ev] -> not (map.has ek old) || old.[ek] != ev)
+                acc.[k => Change.entries (filter (fn [ek, ev] -> not (map.has ek old) || old.[ek] != ev)
                                                       (map.pairs v))],
             _ => acc.[k => Change.is v],
         }
@@ -133,7 +133,7 @@ let keep! cache kind k v = match cache {
 /// added to an earlier module moves every later one; kept relative, a unit
 /// survives that.
 let shifted : :integer -> [[:any]] -> [[:any]];
-let shifted by pairs = list.map (fn pair -> list.cons (list.head pair + by) (list.tail pair)) pairs;
+let shifted by pairs = map (fn pair -> list.cons (list.head pair + by) (list.tail pair)) pairs;
 
 when test {
     import std.test;

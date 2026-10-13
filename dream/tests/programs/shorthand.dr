@@ -36,7 +36,7 @@ let main! = {
     console.print! (fold_lazy discard 0 #[1, 2])
     console.print! (try! { fold discard 0 [1, 2] } catch e { error.kind e })
     console.print! (try! { fold discard 0 #[1, 2] } catch e { error.kind e })
-    console.print! (fold (fn _ x -> x) (boom 0) [1])
+    console.print! (fold_lazy (fn _ x -> x) (boom 0) [1])
     console.print! (ok 1 |> and (ok "next") |> or (ok "fallback"))
     console.print! (err "first" |> and (boom 0) |> or (ok 7))
     console.print! (some 1 |> and (some "next") |> or (some "fallback"))

@@ -267,7 +267,7 @@ priv let tz_change text = {
     };
     let seconds = match tz_offset time_text 0 { () => (), [v, _] => v };
     let day = match str.byte 0 day_text {
-        77 => match list.map (fn p -> num.parse_int p) (str.split "." (str.slice 1 (len day_text) day_text)) {
+        77 => match map (fn p -> num.parse_int p) (str.split "." (str.slice 1 (len day_text) day_text)) {
             [m, w, d] if m != () && w != () && d != () => [:m, m, w, d],
             _ => (),
         },
@@ -275,7 +275,7 @@ priv let tz_change text = {
         _ => match num.parse_int day_text { () => (), n => [:n, n] },
     };
     if day == () || seconds == () { Result.error ("not a rule date: " + text) }
-    else { Result.ok [day, seconds] }
+    else { ok [day, seconds] }
 };
 
 // --- TZif ----------------------------------------------------------------------------
@@ -300,7 +300,7 @@ let of_tzif name bytes =
 
 /// The six counts of a header at `at`: isut, isstd, leap, time, type, char.
 priv let header : :string -> :integer -> [:integer];
-priv let header bytes at = list.map (fn k -> u32 bytes (at + 20 + 4 * k)) [0, 1, 2, 3, 4, 5];
+priv let header bytes at = map (fn k -> u32 bytes (at + 20 + 4 * k)) [0, 1, 2, 3, 4, 5];
 
 /// Compute a TZif data block's size from its counts and timestamp width.
 priv let block_size : [:integer] -> :integer -> :integer;
@@ -321,9 +321,9 @@ priv let read_block name bytes counts at width = {
         let stop = str.upto "\0" ai abbrevs;
         Period.make (i32 bytes p) (str.byte (p + 4) bytes == 1) (str.slice ai (stop - ai) abbrevs)
     };
-    let periods = array.of_list (list.map period (list.range 0 types));
+    let periods = array.of_list (map period (list.range 0 types));
     let at_time k = if width == 8 { i64 bytes (at + 8 * k) } else { i32 bytes (at + 4 * k) };
-    let transitions = array.of_list (list.map (fn k -> #[at_time k, periods.[str.byte (idx_at + k) bytes]])
+    let transitions = array.of_list (map (fn k -> #[at_time k, periods.[str.byte (idx_at + k) bytes]])
                                               (list.range 0 times));
     // RFC 8536: the period before the first transition is type 0.
     let initial = if types > 0 { periods.[0] } else { Period.make 0 false "UTC" };
@@ -365,7 +365,7 @@ let search_dirs! () = {
 /// database. `"UTC"` and `"Z"` need no database.
 let load! : :string -> Result Zone :string;
 let load! name =
-    if name == "UTC" || name == "Z" || name == "Etc/UTC" { Result.ok utc }
+    if name == "UTC" || name == "Z" || name == "Etc/UTC" { ok utc }
     else if str.contains_str ".." name || str.starts_with "/" name || name == "" {
         Result.error ("not a zone name: " + name)
     } else { load_from! name (search_dirs! ()) };
@@ -419,7 +419,7 @@ priv let localtime! () = {
 priv let from_file_or_utc! : :string -> :string -> Zone;
 priv let from_file_or_utc! name path = match file.read! path {
     () => utc,
-    bytes => Result.unwrap_or utc (of_tzif name bytes),
+    bytes => unwrap_or utc (of_tzif name bytes),
 };
 
 when test {
@@ -428,6 +428,7 @@ when test {
     let denver = parse_rule "MST7MDT,M3.2.0,M11.1.0";
     let sydney = parse_rule "AEST-10AEDT,M10.1.0,M4.1.0/3";
     let at y m d h = calendar.days_from_civil y m d * 86400 + h * 3600;
+    let off : Result Rule :string -> :integer -> :integer;
     let off r t = Period.offset (rule_period (Result.unwrap_or () r) t);
 
     let tests = [
@@ -445,7 +446,7 @@ when test {
             $( test.eq! ["MST", "MDT"] [Period.abbrev (rule_period (Result.unwrap_or () denver) (at 2025 1 1 0)),
                                        Period.abbrev (rule_period (Result.unwrap_or () denver) (at 2025 7 1 0))] ),
         test.case "nonsense is refused"     $( test.true! (Result.is_error (parse_rule "7")) ),
-        test.case "UTC needs no database"   $( test.eq! (Result.ok utc) (load! "UTC") ),
+        test.case "UTC needs no database"   $( test.eq! (ok utc) (load! "UTC") ),
         test.case "paths are not names"     $( test.true! (Result.is_error (load! "../../etc/passwd")) ),
         test.case "a fixed zone"            $( test.eq! 3600 (offset_at (fixed 3600 "X") 0) ),
         test.case "a skipped local time moves forward" $( {

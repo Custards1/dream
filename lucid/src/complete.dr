@@ -166,7 +166,7 @@ let item label kind detail doc rank =
 /// that answers here too -- spans are not needed, because nothing it does with
 /// this tree is reported.
 let chain_expr segs =
-    list.fold_strict (fn e s -> ast.field_e e s ast.no_span)
+    fold (fn e s -> ast.field_e e s ast.no_span)
               (ast.name_e (list.head segs) ast.no_span)
               (list.tail segs);
 
@@ -246,15 +246,16 @@ let member_item a target e n =
           + if builtins.is_impure_name n { " Impure." } else { "" })
          rank_local;
 
+let member_items : :map -> [:string] -> [:map];
 let member_items a segs =
     match namespace_of a segs {
         scope.Ref.dream(target) => {
             let e = scope.r_env_at (analysis.resolved a) target;
-            list.map (fn n -> member_item a target e n)
+            map (fn n -> member_item a target e n)
                      (analysis.declared_members a target (scope.exports e))
         },
         scope.Ref.group(prefix) =>
-            list.map (fn n -> item n kind_module ("module " + prefix + "." + n)
+            map (fn n -> item n kind_module ("module " + prefix + "." + n)
                                    ("A module in package `" + prefix + "`.") rank_local)
                      (group_names (analysis.loader a) prefix),
         // The host owns this table, so the runtime is asked for it. A module
@@ -264,7 +265,7 @@ let member_items a segs =
         scope.Ref.native(path, _) =>
             match vm.host_members path {
                 () => [],
-                members => list.map (fn member -> host_item path member) members,
+                members => map (fn member -> host_item path member) members,
             },
         _ => [],
     };
@@ -272,7 +273,7 @@ let member_items a segs =
 // --- a bare name -------------------------------------------------------------------
 
 let local_items a src offset =
-    list.map (fn b -> {
+    map (fn b -> {
         let n = analysis.binder_name b;
         let ps = analysis.binder_params b;
         item n (if list.is_empty ps { kind_variable } else { kind_function })
@@ -300,7 +301,7 @@ let local_items a src offset =
 /// be named from anywhere else, and a virtual one is a requirement nothing has
 /// answered yet.
 let global_items a mi e =
-    list.map (fn n -> item n (entry_kind a mi e n)
+    map (fn n -> item n (entry_kind a mi e n)
                            (analysis.shown_signature a mi n)
                            ("A global of this module."
                             + match analysis.declaration_words a mi n {
@@ -309,13 +310,13 @@ let global_items a mi e =
                               }
                             + if builtins.is_impure_name n { " Impure." } else { "" })
                            rank_global)
-             (list.filter (fn n -> scope.global_kind e n != :module) (scope.visible_names e));
+             (filter (fn n -> scope.global_kind e n != :module) (scope.visible_names e));
 
 /// Everything an import put in this module's namespace: the modules it named,
 /// and the members an `import a.{x}` brought in one at a time.
 let import_items a e = {
     let aliases =
-        list.map (fn kv -> {
+        map (fn kv -> {
             let n = list.head kv;
             match list.nth 1 kv {
                 scope.Ref.dream(target) =>
@@ -341,7 +342,7 @@ let import_items a e = {
                                    + match analysis.record_fields r {
                                          [] => ", with no fields",
                                          fs => ", with " + str.join_str ", "
-                                                   (list.map (fn f -> "`" + ast.field_name f + "`")
+                                                   (map (fn f -> "`" + ast.field_name f + "`")
                                                              fs),
                                      } + ".") rank_import,
                     },
@@ -361,7 +362,7 @@ let import_items a e = {
     // `relative_path` by the time it gets here, so it is not a list of segments
     // and must not be joined again.
     let singles =
-        list.map (fn kv -> {
+        map (fn kv -> {
             let bound = list.head kv;
             let sel = list.nth 1 kv;
             let member = list.nth 1 sel;
@@ -382,13 +383,13 @@ let import_items a e = {
 /// them to somebody typing `li` is the accident that spelling was meant to
 /// prevent. What to offer instead is the `std` function that wraps each one.
 let builtin_items =
-    list.map (fn n -> item n kind_function (builtins.signature n)
+    map (fn n -> item n kind_function (builtins.signature n)
                            "A builtin: the language provides it, no module does."
                            rank_builtin)
-             (list.filter (fn n -> not (builtins.is_primitive n)) builtins.names);
+             (filter (fn n -> not (builtins.is_primitive n)) builtins.names);
 
 let keyword_items =
-    list.map (fn n -> item n kind_keyword "" "A keyword." rank_keyword) parser.keywords;
+    map (fn n -> item n kind_keyword "" "A keyword." rank_keyword) parser.keywords;
 
 /// What may follow `expand`: a macro of this module, or a name that could lead
 /// to one. An import is offered whole rather than filtered, because whether
@@ -400,9 +401,9 @@ let macro_name_items a =
         mi => {
             let e = scope.r_env_at (analysis.resolved a) mi;
             list.append
-                (list.map (fn n -> item n kind_function (analysis.shown_signature a mi n)
+                (map (fn n -> item n kind_function (analysis.shown_signature a mi n)
                                         "A macro of this module." rank_global)
-                          (list.filter (fn n -> analysis.is_macro a mi n) (scope.exports e)))
+                          (filter (fn n -> analysis.is_macro a mi n) (scope.exports e)))
                 (import_items a e)
         },
     };
@@ -412,11 +413,11 @@ let macro_member_items a segs =
     match namespace_of a segs {
         scope.Ref.dream(target) => {
             let e = scope.r_env_at (analysis.resolved a) target;
-            list.map (fn n -> item n kind_function (analysis.shown_signature a target n)
+            map (fn n -> item n kind_function (analysis.shown_signature a target n)
                                    ("A macro of module `"
                                     + modules.module_name (modules.module_at (analysis.loader a) target)
                                     + "`.") rank_local)
-                     (list.filter (fn n -> analysis.is_macro a target n) (scope.exports e))
+                     (filter (fn n -> analysis.is_macro a target n) (scope.exports e))
         },
         // A package is a step on the way to a module that has one.
         scope.Ref.group(_) => member_items a segs,
@@ -460,9 +461,9 @@ let import_prefix src offset = {
 /// `std.` offers `http`, even when no file is named `http.dr`.
 let path_children : [:string] -> :string -> [:string];
 let path_children names prefix =
-    list.sort (list.unique (list.map
+    list.sort (list.unique (map
         (fn n -> list.head (str.split "." (str.slice (len prefix) (len n - len prefix) n)))
-        (list.filter (fn n -> str.starts_with prefix n && len n > len prefix) names)));
+        (filter (fn n -> str.starts_with prefix n && len n > len prefix) names)));
 
 let import_items! : :string -> [:string] -> :string -> [:any];
 let import_items! file roots prefix = {
@@ -476,9 +477,9 @@ let import_items! file roots prefix = {
                  },
                  package.collect_modules! (path.dirname file) (path.dirname file) []],
         p => list.append modules.native_modules
-                 (list.map (fn n -> head + "." + n) (package.modules! p)),
+                 (map (fn n -> head + "." + n) (package.modules! p)),
     };
-    list.map (fn n -> item n kind_module ("module " + prefix + n)
+    map (fn n -> item n kind_module ("module " + prefix + n)
                           "An available import." rank_import)
              (path_children names prefix)
 };
@@ -597,6 +598,7 @@ when test {
     };
 
     /// What is offered after a dot, as `[label, detail]` pairs.
+    let member_details! : :string -> [:string] -> [[:string, :string]];
     let member_details! text segs =
         list.map (fn i -> [i.["label" else ()], i.["detail" else ()]])
                  (member_items (of! text) segs);

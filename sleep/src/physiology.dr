@@ -192,7 +192,7 @@ let signals : Subject -> [Stage] -> :integer -> :tensor;
 let signals s stages seed = {
     let e = len stages;
     // Each epoch's row of the signature, by its stage.
-    let rows = tensor.take (list.map stage.index stages) signature;
+    let rows = tensor.take (map stage.index stages) signature;
     let column k = tensor.reshape [e] (tensor.slice k 1 (tensor.transpose rows));
     let per_second t = tensor.repeat stage.epoch_seconds t;
     let noise k = tensor.normal (seed * 31 + k) [e, stage.epoch_seconds];

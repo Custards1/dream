@@ -60,14 +60,14 @@ type Problem = #[:integer, [:any]];
 
 /// What a parser answers: `#[:ok, value, next, problem]`, `problem` the
 /// furthest failure stepped around on the way (or `()`), or `#[:fail, problem]`.
-type Reply a = #[:ok, a, :integer, :any] | #[:fail, Problem];
+type Reply a = #[:ok, a, :integer, Problem | :unit] | #[:fail, Problem];
 
 /// A parser: the text and the byte offset to start at, to a reply.
 type Parser a = :string -> :integer -> Reply a;
 
 /// Construct a successful parser reply with its value, ending offset and accumulated
 /// problem.
-priv let ok : a -> :integer -> :any -> Reply a;
+priv let ok : a -> :integer -> Problem | :unit -> Reply a;
 priv let ok value at problem = #[:ok, value, at, problem];
 
 /// Construct a failed parser reply at a byte offset with an expected value.
@@ -75,17 +75,22 @@ priv let fail_at : :integer -> :any -> Reply :any;
 priv let fail_at at expected = #[:fail, #[at, [expected]]];
 
 /// The furthest of two problems, merging what they expected when they are
-/// equally far.
-priv let merge : :any -> :any -> :any;
-priv let merge a b = match [a, b] {
+/// equally far. A failure always has a problem, so where the second is a
+/// failure's the answer is one too -- which is what lets a `#[:fail, ..]` built
+/// from it be a `Reply`.
+priv let furthest : Problem | :unit -> Problem -> Problem;
+priv let furthest a b = match [a, b] {
     [(), _] => b,
-    [_, ()] => a,
     [#[ia, ea], #[ib, eb]] =>
-        if ia > ib { a } else if ib > ia { b } else { #[ia, ea + list.filter (fn e -> not (list.contains e ea)) eb] },
+        if ia > ib { #[ia, ea] } else if ib > ia { b } else { #[ia, ea + filter (fn e -> not (list.contains e ea)) eb] },
 };
 
+/// The same where either may be missing, as a success's may.
+priv let merge : Problem | :unit -> Problem | :unit -> Problem | :unit;
+priv let merge a b = match b { () => a, _ => furthest a b };
+
 /// Extract the furthest problem recorded in a parser reply.
-priv let reply_problem : Reply :any -> :any;
+priv let reply_problem : Reply :any -> Problem | :unit;
 priv let reply_problem r = match r { #[:ok, _, _, p] => p, #[:fail, p] => p };
 
 // --- running ------------------------------------------------------------------------
@@ -111,7 +116,7 @@ let run parser text = match (skip end parser) text 0 {
 /// `run`, with the error as a message: `line 2, column 5: expected digit,
 /// found "x"`.
 let run_text : Parser a -> :string -> Result a :string;
-let run_text parser text = Result.map_error describe (run parser text);
+let run_text parser text = map_error describe (run parser text);
 
 /// The value and the offset after it, without requiring the parser to read
 /// everything: `[:ok, [value, next]]`.
@@ -129,8 +134,8 @@ let matches parser text = Result.is_ok (run parser text);
 priv let error_of : :string -> Problem -> :map;
 priv let error_of text #[at, expectations] = {
     let [line, column] = line_col text at;
-    let messages = list.filter (fn e -> type_of e == :list) expectations;
-    let wanted = list.unique (list.filter (fn e -> type_of e == :string) expectations);
+    let messages = filter (fn e -> type_of e == :list) expectations;
+    let wanted = list.unique (filter (fn e -> type_of e == :string) expectations);
     let found = if at >= len text { "the end of the text" } else { quote (char_text text at) };
     let message = match messages {
         [[_, m], .._] => m,
@@ -450,7 +455,7 @@ let map2 : (a -> b -> c) -> Parser a -> Parser b -> Parser c;
 let map2 f pa pb s at = match pa s at {
     #[:ok, a, n1, pr1] => match pb s n1 {
         #[:ok, b, n2, pr2] => ok (f a b) n2 (merge pr1 pr2),
-        #[:fail, pr2] => #[:fail, merge pr1 pr2],
+        #[:fail, pr2] => #[:fail, furthest pr1 pr2],
     },
     #[:fail, pr] => #[:fail, pr],
 };
@@ -486,7 +491,7 @@ let and_then : (a -> Parser b) -> Parser a -> Parser b;
 let and_then f p s at = match p s at {
     #[:ok, v, next, pr] => match (f v) s next {
         #[:ok, v2, n2, pr2] => ok v2 n2 (merge pr pr2),
-        #[:fail, pr2] => #[:fail, merge pr pr2],
+        #[:fail, pr2] => #[:fail, furthest pr pr2],
     },
     #[:fail, pr] => #[:fail, pr],
 };
@@ -497,7 +502,7 @@ let or : Parser a -> Parser a -> Parser a;
 let or q p s at = match p s at {
     #[:fail, pr1] => match q s at {
         #[:ok, v, next, pr2] => ok v next (merge pr1 pr2),
-        #[:fail, pr2] => #[:fail, merge pr1 pr2],
+        #[:fail, pr2] => #[:fail, furthest pr1 pr2],
     },
     success => success,
 };
@@ -558,7 +563,7 @@ let many_till stop p s at = {
         #[:ok, _, next, pr2] => ok (list.reverse acc) next (merge pr pr2),
         #[:fail, pr2] => match p s at2 {
             #[:ok, v, next, pr3] => go next (v :: acc) (merge pr (merge pr2 pr3)),
-            #[:fail, pr3] => #[:fail, merge pr (merge pr2 pr3)],
+            #[:fail, pr3] => #[:fail, furthest pr (furthest pr2 pr3)],
         },
     };
     go at [] ()
@@ -681,7 +686,7 @@ let chain_left op p s at = match p s at {
         let rec go acc at2 pr2 = match op s at2 {
             #[:ok, f, n1, pr3] => match p s n1 {
                 #[:ok, v, n2, pr4] => go (f acc v) n2 (merge pr2 (merge pr3 pr4)),
-                #[:fail, pr4] => #[:fail, merge pr2 (merge pr3 pr4)],
+                #[:fail, pr4] => #[:fail, furthest pr2 (furthest pr3 pr4)],
             },
             #[:fail, pr3] => ok acc at2 (merge pr2 pr3),
         };
@@ -696,7 +701,7 @@ let chain_right op p s at = match p s at {
     #[:ok, first, next, pr] => match op s next {
         #[:ok, f, n1, pr2] => match chain_right op p s n1 {
             #[:ok, rest, n2, pr3] => ok (f first rest) n2 (merge pr (merge pr2 pr3)),
-            #[:fail, pr3] => #[:fail, merge pr (merge pr2 pr3)],
+            #[:fail, pr3] => #[:fail, furthest pr (furthest pr2 pr3)],
         },
         #[:fail, pr2] => ok first next (merge pr pr2),
     },
@@ -724,7 +729,7 @@ priv let level [fixity, ops] tighter = {
         :left => chain_left op tighter,
         :right => chain_right op tighter,
         :prefix => { let rec prefixed s at = or tighter (map2 (fn f v -> f v) op prefixed) s at; prefixed },
-        :postfix => map2 (fn v fs -> list.fold (fn acc f -> f acc) v fs) tighter (many op),
+        :postfix => map2 (fn v fs -> fold (fn acc f -> f acc) v fs) tighter (many op),
     }
 };
 
@@ -776,7 +781,7 @@ when test {
         test.case "many cannot loop"          $( test.eq! (Result.ok []) (run (many (span "x")) "") ),
         test.case "label names what failed"   $( test.eq! "expected a port, found \"x\"" (message (run (label "a port" natural) "x")) ),
         test.case "where_ok checks a value"   $( test.eq! "expected a byte, found \"3\"" (message (run (where_ok (fn n -> n <= 255) "a byte" natural) "300")) ),
-        test.case "try_map reports a message" $( test.eq! "too big" (message (run (try_map (fn n -> if n > 9 { Result.error "too big" } else { Result.ok n }) natural) "10")) ),
+        test.case "try_map reports a message" $( test.eq! "too big" (message (run (try_map (fn n -> if n > 9 { err "too big" } else { Result.ok n }) natural) "10")) ),
         test.case "until and capture"         $( test.eq! (Result.ok ["key", "a = b"])
                                                    (run (seq [until " =", capture (seq [text " =", rest])] |> map (fn [k, r] -> [k, "a" + r])) "key = b") ),
         test.case "many_till"                 $( test.eq! (Result.ok ['a', 'b']) (run (many_till (text "-->") any_char) "ab-->") ),

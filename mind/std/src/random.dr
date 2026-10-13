@@ -535,7 +535,7 @@ priv let secure_below! : :integer -> :integer;
 priv let rec secure_below! range = {
     let [k, bound] = bytes_for range 1 256;
     let raw = crypto.random_bytes! k;
-    let n = list.fold (fn acc i -> acc * 256 + str.byte i raw) 0 (list.range 0 k);
+    let n = fold (fn acc i -> acc * 256 + str.byte i raw) 0 (list.range 0 k);
     let limit = bound - bound % range;
     if n < limit { n % range } else { secure_below! range }
 };
@@ -582,6 +582,7 @@ when test {
 
     let rng = seed 42;
     let die = values (int 1 6) rng;
+    let counts : [:any] -> :map;
     let counts xs = list.fold (fn m x -> m.[x => m.[x else 0] + 1]) %{} xs;
 
     let tests = [

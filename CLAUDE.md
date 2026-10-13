@@ -305,7 +305,9 @@ The lessons that keep coming back:
   made in. Force what you store (`ir.settled`, `scope.forced`). `--stats` shows
   it as map branches far outnumbering map entries.
 - A reply, a message or a list element is suspended unless forced. A `strict!`
-  inside `[:ok, strict! x]` is itself suspended; force it as a statement.
+  inside `[:ok, strict! x]` is itself suspended; force it as a statement. A
+  list built to make things happen -- processes started, messages sent -- wants
+  `list.forced`, or its spawns run one at a time as a join reaches each.
 - A suspension carries its frame, so a thunk handed to `spawn!` copies
   everything that frame reaches. Make it in a small function of its own.
 - The JIT only helps where it can take the loop. Deforestation and strict

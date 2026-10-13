@@ -388,7 +388,7 @@ type Layout = %{ :size => :integer, :align => :integer, :fields => :map, :order 
 /// Compute aligned offsets, total size and alignment for named foreign fields.
 let layout : [[:atom, Scalar | :ptr]] -> Layout;
 let layout fields = {
-    let raw = list.fold place_field %{ :size => 0, :align => 1, :fields => %{}, :order => [] } fields;
+    let raw = fold place_field %{ :size => 0, :align => 1, :fields => %{}, :order => [] } fields;
     raw.[:size => round_up raw.[:size] raw.[:align]]
 };
 
@@ -530,8 +530,8 @@ mod server {
         // A statement, not an element: `[:ok, strict! x]` suspends the
         // element like any other, and it would raise after `try!` returned.
         let value = strict! (work ());
-        Result.ok value
-    } catch e { Result.error e };
+        ok value
+    } catch e { err e };
 
     // `terminate!` is left as the default. The resources go with the process,
     // released by the VM as it finishes -- which also covers a server that

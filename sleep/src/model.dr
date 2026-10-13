@@ -90,7 +90,7 @@ priv let padded f total = {
 /// The windows starting at `starts`, as `[windows, window, width]`.
 priv let windows_at : :tensor -> [:integer] -> :tensor;
 priv let windows_at f starts = {
-    let rows = list.flat_map (fn s -> list.range s (s + window)) starts;
+    let rows = flat_map (fn s -> list.range s (s + window)) starts;
     tensor.reshape [len starts, window, features.width] (tensor.take rows f)
 };
 
@@ -101,17 +101,17 @@ let training_windows r = {
     let f = features.of_signals (Recording.signals r);
     let e = recording.epochs r;
     let half = window / 2;
-    let starts = list.filter (fn s -> s + window <= e) (list.map (fn k -> k * half) (list.range 0 (e / half)));
-    let labels = tensor.of_list (list.map stage.index (Recording.stages r));
-    let label_rows = list.flat_map (fn s -> list.range s (s + window)) starts;
+    let starts = filter (fn s -> s + window <= e) (map (fn k -> k * half) (list.range 0 (e / half)));
+    let labels = tensor.of_list (map stage.index (Recording.stages r));
+    let label_rows = flat_map (fn s -> list.range s (s + window)) starts;
     [windows_at f starts, tensor.reshape [len starts, window] (tensor.take label_rows labels)]
 };
 
 /// A dataset of windows from scored nights.
 let dataset : [Recording] -> data.Dataset;
 let dataset nights = {
-    let parts = list.map training_windows (list.filter recording.is_scored nights);
-    data.make (tensor.concat (list.map (fn [x, _] -> x) parts)) (tensor.concat (list.map (fn [_, y] -> y) parts))
+    let parts = map training_windows (filter recording.is_scored nights);
+    data.make (tensor.concat (map (fn [x, _] -> x) parts)) (tensor.concat (map (fn [_, y] -> y) parts))
 };
 
 // --- training -------------------------------------------------------------------------------
@@ -154,7 +154,7 @@ let probabilities params r = {
     // Windows half a window apart, covering the night and a little more.
     let count = (e + half - 1) / half + 1;
     let total = (count + 1) * half;
-    let starts = list.map (fn k -> k * half) (list.range 0 count);
+    let starts = map (fn k -> k * half) (list.range 0 count);
     let scores = ml.predict_with network params (windows_at (padded f total) starts);
     // Each epoch's scores from the window it sits nearest the middle of:
     // window `k` covers epochs `k * half .. k * half + window`, and the
@@ -165,7 +165,7 @@ let probabilities params r = {
         k2 * window + (i - k2 * half)
     };
     let flat = tensor.reshape [count * window, stage.count] scores;
-    let rows = tensor.take (list.map pick (list.range 0 e)) flat;
+    let rows = tensor.take (map pick (list.range 0 e)) flat;
     softmax_rows rows
 };
 
@@ -180,7 +180,7 @@ priv let softmax_rows t = {
 
 /// The stages of a night.
 let stages_of : :any -> Recording -> [Stage];
-let stages_of params r = list.map (fn c -> stage.of_index (num.to_int c))
+let stages_of params r = map (fn c -> stage.of_index (num.to_int c))
     (tensor.to_list (metrics.classes_of (probabilities params r)));
 
 /// How well the model stages scored nights it was not trained on: accuracy,
@@ -188,10 +188,10 @@ let stages_of params r = list.map (fn c -> stage.of_index (num.to_int c))
 /// stage's recall (the share of its epochs found).
 let evaluate : :any -> [Recording] -> %{:atom => :any};
 let evaluate params nights = {
-    let scored = list.filter recording.is_scored nights;
-    let pairs = list.map (fn r -> [Recording.stages r, stages_of params r]) scored;
-    let truth = list.flat_map (fn [t, _] -> t) pairs;
-    let guess = list.flat_map (fn [_, g] -> g) pairs;
+    let scored = filter recording.is_scored nights;
+    let pairs = map (fn r -> [Recording.stages r, stages_of params r]) scored;
+    let truth = flat_map (fn [t, _] -> t) pairs;
+    let guess = flat_map (fn [_, g] -> g) pairs;
     let table = score.confusion truth guess;
     let recall i = {
         let row = list.nth i table;
@@ -204,7 +204,7 @@ let evaluate params nights = {
         :accuracy => score.agreement truth guess,
         :kappa => score.kappa_of table,
         :confusion => table,
-        :recall => map.from_pairs (list.map (fn s -> [s, recall (stage.index s)]) stage.all),
+        :recall => map.from_pairs (map (fn s -> [s, recall (stage.index s)]) stage.all),
     }
 };
 

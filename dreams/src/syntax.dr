@@ -48,9 +48,9 @@ let rec literal value span = match type_of value {
     :string => ast.str_e value span,
     :atom => ast.atom_e (atom.name value) span,
     :unit => ast.unit_e span,
-    :list => ast.list_e (list.map (fn v -> literal v span) value) span,
-    :array => ast.array_e (list.map (fn v -> literal v span) (array.to_list value)) span,
-    :map => ast.map_e (list.map (fn kv -> list.map (fn v -> literal v span) kv)
+    :list => ast.list_e (map (fn v -> literal v span) value) span,
+    :array => ast.array_e (map (fn v -> literal v span) (array.to_list value)) span,
+    :map => ast.map_e (map (fn kv -> map (fn v -> literal v span) kv)
                               (map.pairs value)) span,
     _ => ast.unit_e span,
 };
@@ -126,7 +126,7 @@ let rec own_names owner e =
 /// `sig`, kept in front of the definition it was written in front of.
 let member_decls : :string -> [[:any]] -> [ast.Decl];
 let member_decls owner members =
-    list.map (fn m ->
+    map (fn m ->
         if ast.is_member_sig m { ast.sig_d (ast.member_name m) (ast.member_body m) (ast.member_span m) }
         else {
             ast.let_d (ast.member_name m) (ast.member_params m)
@@ -218,22 +218,22 @@ let record_parts owner kind name fields members bases span = {
     let id = qualified owner name;
     let build of_field = match kind {
         :map => ast.map_e ((if dispatched { [[ast.int_e 0 span, table]] } else { [] })
-                           + list.map (fn f -> [ast.atom_e (ast.field_name f) (ast.field_span f), of_field f])
+                           + map (fn f -> [ast.atom_e (ast.field_name f) (ast.field_span f), of_field f])
                                       fields) span,
-        _ => constructed id false ((if dispatched { [table] } else { [] }) + list.map of_field fields) span,
+        _ => constructed id false ((if dispatched { [table] } else { [] }) + map of_field fields) span,
     };
     let constructor = ast.let_d "make"
         (if list.is_empty fields { [ast.param () span] }
-         else { list.map (fn f -> ast.field_param f) fields })
+         else { map (fn f -> ast.field_param f) fields })
         (build (fn f -> named f)) false span;
     // `new` names only the fields that have no default; the others are their
     // defaults, spliced where the value goes.
-    let required = list.filter (fn f -> ast.field_default f == ()) fields;
+    let required = filter (fn f -> ast.field_default f == ()) fields;
     let from_default = ast.let_d "new"
         (if list.is_empty required { [ast.param () span] }
-         else { list.map (fn f -> ast.field_param f) required })
+         else { map (fn f -> ast.field_param f) required })
         (build (fn f -> match default_of f span { () => named f, d => d })) false span;
-    let helpers = list.concat (list.map (fn i -> {
+    let helpers = list.concat (map (fn i -> {
         let f = list.nth i fields;
         let field = ast.field_name f;
         let obj = ast.name_e "record" span;
@@ -253,7 +253,7 @@ let record_parts owner kind name fields members bases span = {
     // Every record supplies a structural description, without changing its
     // constructors or forcing its fields. Unannotated fields accept anything.
     // Defaults are carried lazily, so membership agrees with accessor reads.
-    let type_fields = list.map (fn i -> {
+    let type_fields = map (fn i -> {
         let f = list.nth i fields;
         let key = if kind == :map { ast.atom_e (ast.field_name f) span }
                   else { ast.int_e (i + offset) span };
@@ -275,7 +275,7 @@ let record_parts owner kind name fields members bases span = {
              } else {
                 ast.list_e [ast.atom_e "constructed" span, ast.atom_e id span,
                             ast.list_e ((if dispatched { [ast.atom_e "map" span] } else { [] })
-                                        + list.map (fn f -> match ast.field_type f { () => ast.atom_e "any" span, t => t }) fields)
+                                        + map (fn f -> match ast.field_type f { () => ast.atom_e "any" span, t => t }) fields)
                                        span] span
              })] span) false span;
     // What every value of it carries, as a function: how `std.record`'s
@@ -292,7 +292,7 @@ let record_parts owner kind name fields members bases span = {
     let generated = list.take (list.length made - 1) made;
     let written = member_decls name members;
     // Each lifted default once, as a global of its own, where it was written.
-    let defaults = list.flat_map (fn f -> if lifted f {
+    let defaults = flat_map (fn f -> if lifted f {
         [ast.let_d (default_name f) [] (own_names name (ast.field_default f)) false (ast.field_span f)]
     } else { [] }) fields;
     // Each field type occurs once, so retain its written spans for diagnostics.
@@ -328,7 +328,7 @@ let record_sigs kind name fields span =
     else {
         let self = shown_as name (ast.name_e "type" span) span;
         let field_t f = match ast.field_type f { () => ast.atom_e "any" span, t => t };
-        let arrows ts result = list.fold (fn acc t -> arrow t acc) result (list.reverse ts);
+        let arrows ts result = fold (fn acc t -> arrow t acc) result (list.reverse ts);
         let required = list.filter (fn f -> ast.field_default f == ()) fields;
         let takes fs = if list.is_empty fs { [ast.atom_e "any" span] } else { list.map field_t fs };
         let reads f = match [kind, ast.field_default f] {
@@ -339,7 +339,7 @@ let record_sigs kind name fields span =
         };
         [ast.sig_d "make" (arrows (takes fields) self) span,
          ast.sig_d "new" (arrows (takes required) self) span]
-        + list.concat (list.map (fn f ->
+        + list.concat (map (fn f ->
               [ast.sig_d (ast.field_name f) (arrow (reads f) (field_t f)) span,
                ast.sig_d ("set_" + ast.field_name f) (arrow (field_t f) (arrow self self)) span]
               + match [ast.field_type f, ast.field_default f] {
@@ -406,7 +406,7 @@ let receive_e arms after span = {
     let deadline = "__receive_deadline";
     let ok_p inner = ast.list_p [ast.literal_p (ast.atom_e "ok" at_) at_, inner] () at_;
     let chooses = ast.match_e (n m)
-        (list.map (fn a -> ast.arm (ast.arm_pattern a) (ast.arm_guard a) (ast.bool_e true at_) at_) arms
+        (map (fn a -> ast.arm (ast.arm_pattern a) (ast.arm_guard a) (ast.bool_e true at_) at_) arms
          + [ast.arm (ast.wildcard_p at_) () (ast.bool_e false at_) at_]) at_;
     let take = ast.block_e [call "_mailbox_take!" [n pos],
                             ast.list_e [ast.atom_e "ok" at_, n m] at_] at_;
@@ -487,35 +487,35 @@ let union_decl owner name params variants members kind span = {
     // array to back them, and no longer has anything to choose.
     let variant_id v = qualified (qualified owner name) (ast.variant_name v);
     let described v = ast.list_e [ast.atom_e "constructed" at_, ast.atom_e (variant_id v) at_,
-                                  ast.list_e (list.map field_t (ast.variant_fields v)) at_] at_;
+                                  ast.list_e (map field_t (ast.variant_fields v)) at_] at_;
     let description = ast.let_d "type" params
         (ast.list_e [ast.atom_e "named" at_, ast.str_e name at_,
                      ast.list_e [ast.atom_e "union" at_,
-                                 ast.list_e (list.map described variants) at_] at_] at_) false at_;
-    let constructors = list.map (fn v -> {
+                                 ast.list_e (map described variants) at_] at_] at_) false at_;
+    let constructors = map (fn v -> {
         let fs = ast.variant_fields v;
         ast.let_d (ast.variant_name v)
-                  (list.map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
+                  (map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
                   (constructed (variant_id v) true
-                               (list.map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs) at_)
+                               (map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs) at_)
                   false at_
     }) variants;
     // The union's own type, applied to its parameters: `type a b`, read in
     // the generated module where `type` is the description's global.
     let self = shown_as name (match params {
         [] => ast.name_e "type" at_,
-        ps => ast.apply_e (ast.name_e "type" at_) (list.map (fn p -> ast.name_e (ast.param_name p) at_) ps) at_,
+        ps => ast.apply_e (ast.name_e "type" at_) (map (fn p -> ast.name_e (ast.param_name p) at_) ps) at_,
     }) at_;
-    let sigs = list.map (fn v ->
+    let sigs = map (fn v ->
         ast.sig_d (ast.variant_name v)
-            (list.fold (fn acc f -> arrow (field_t f) acc) self (list.reverse (ast.variant_fields v)))
+            (fold (fn acc f -> arrow (field_t f) acc) self (list.reverse (ast.variant_fields v)))
             (ast.variant_span v)) variants;
     // What the parent sees under the union's own name: the description.
     let alias = ast.let_d name params
         (match params {
             [] => ast.field_e (ast.name_e name at_) "type" at_,
             ps => ast.apply_e (ast.field_e (ast.name_e name at_) "type" at_)
-                              (list.map (fn p -> ast.name_e (ast.param_name p) at_) ps) at_,
+                              (map (fn p -> ast.name_e (ast.param_name p) at_) ps) at_,
         }) false at_;
     // Freshened together, so that no two generated nodes share an offset --
     // resolution keys names and binders by where they start. The description
@@ -559,17 +559,17 @@ let foreign_decl name library entries span = {
     let from_foreign member = ast.field_e (name_ "foreign") member at_;
     let imports = [ast.import_d ["std", "ffi"] () () at_, ast.import_d ["std", "foreign"] () () at_];
     let lib = ast.let_d "library" [] (match library { () => ast.unit_e at_, l => l }) false at_;
-    let resources = list.concat (list.map (fn e -> match e {
+    let resources = list.concat (map (fn e -> match e {
         [:resource, r, _, _] => [ast.let_d r []
             (ast.list_e [atom "named", ast.str_e r at_,
                          apply (from_foreign "Handle") [ast.str_e (name + "." + r) at_]] at_) false at_],
         _ => [],
     }) entries);
-    let structs = list.concat (list.map (fn e -> match e {
+    let structs = list.concat (map (fn e -> match e {
         [:c_struct, s, fields, sp] => [c_struct_module s fields sp],
         _ => [],
     }) entries);
-    let functions = list.concat (list.map (fn e -> match e {
+    let functions = list.concat (map (fn e -> match e {
         [:c_function, f, t, symbol, sp] => match c_function env t {
             [:ok, args, result, dream] => {
                 let bind = if str.ends_with "!" f { "function" } else { "pure_function" };
@@ -582,8 +582,8 @@ let foreign_decl name library entries span = {
         },
         _ => [],
     }) entries);
-    let lets = list.map (fn pair -> list.head pair) functions;
-    let sigs = list.map (fn pair -> list.nth 1 pair) functions;
+    let lets = map (fn pair -> list.head pair) functions;
+    let sigs = map (fn pair -> list.nth 1 pair) functions;
     let [generated, _] = fresh (imports + [lib] + resources + structs + lets)
                                (2147483648 + ast.span_start span * 128);
     [ast.mod_d name (generated + sigs) span]
@@ -598,7 +598,7 @@ priv let c_struct_module s fields at_ = {
     let apply f args = ast.apply_e f args at_;
     let from_foreign member = ast.field_e (name_ "foreign") member at_;
     let buffer = from_foreign "Buffer";
-    let described = ast.list_e (list.map (fn f ->
+    let described = ast.list_e (map (fn f ->
         ast.list_e [ast.atom_e (list.nth 0 f) (list.nth 1 f), list.nth 2 f] at_) fields) at_;
     let p n = ast.param n at_;
     ast.mod_d s [
@@ -660,14 +660,14 @@ let c_function env t = {
                 [:ok, args, dreams] => match c_type env :result result {
                     [:error, m, s] => [:error, m, s],
                     [:ok, r, rd] => {
-                        let visible = list.filter (fn i -> not (is_out (list.nth i taken)))
+                        let visible = filter (fn i -> not (is_out (list.nth i taken)))
                                                   (list.range 0 (list.length taken));
-                        let outs = list.filter (fn i -> is_out (list.nth i taken))
+                        let outs = filter (fn i -> is_out (list.nth i taken))
                                                (list.range 0 (list.length taken));
                         let answer = if list.is_empty outs { rd }
                                      else { ast.list_e [ast.atom_e "tuple" sp,
-                                                        ast.list_e (list.cons rd (list.map (fn i -> list.nth i dreams) outs)) sp] sp };
-                        let dream_args = match visible { [] => [ast.atom_e "unit" sp], is => list.map (fn i -> list.nth i dreams) is };
+                                                        ast.list_e (list.cons rd (map (fn i -> list.nth i dreams) outs)) sp] sp };
+                        let dream_args = match visible { [] => [ast.atom_e "unit" sp], is => map (fn i -> list.nth i dreams) is };
                         [:ok, args, r, arrows dream_args answer]
                     },
                 },
@@ -689,7 +689,7 @@ priv let rec arrow_parts t = match t {
     _ => [[], t],
 };
 
-priv let arrows ts result = list.fold (fn acc t -> arrow t acc) result (list.reverse ts);
+priv let arrows ts result = fold (fn acc t -> arrow t acc) result (list.reverse ts);
 
 priv let rec c_types env place ts = match ts {
     [] => [:ok, [], []],
@@ -919,7 +919,7 @@ let image_decl name source entries span = {
     let from_image member = ast.field_e (name_ "image") member at_;
     let imports = [ast.import_d ["std", "image"] () () at_];
     let lib = ast.let_d "library" [] source false at_;
-    let bindings = list.map (fn e -> match e {
+    let bindings = map (fn e -> match e {
         [:image_function, f, t, target, sp] => {
             let arity = list.length (list.head (arrow_parts t));
             let target_e = ast.str_e target at_;
@@ -931,8 +931,8 @@ let image_decl name source entries span = {
             [ast.let_d f [] body false at_, ast.sig_d f t sp]
         },
     }) entries;
-    let lets = list.map (fn pair -> list.head pair) bindings;
-    let sigs = list.map (fn pair -> list.nth 1 pair) bindings;
+    let lets = map (fn pair -> list.head pair) bindings;
+    let sigs = map (fn pair -> list.nth 1 pair) bindings;
     let [generated, _] = fresh (imports + [lib] + lets) (2147483648 + ast.span_start span * 128);
     [ast.mod_d name (generated + sigs) span]
 };
@@ -946,11 +946,11 @@ let image_decl name source entries span = {
 /// cannot be an effect: an effect of nothing takes `()`, as everywhere else.
 let image_problem : :string -> [[:any]] -> [:string, ast.Span] | :unit;
 let image_problem img entries =
-    list.fold (fn found e -> if found != () { found } else {
+    fold (fn found e -> if found != () { found } else {
         match e {
             [:image_function, f, t, _, sp] => {
                 let [params, _] = arrow_parts t;
-                let functions = list.filter (fn i -> is_arrow (list.nth i params))
+                let functions = filter (fn i -> is_arrow (list.nth i params))
                                             (list.range 0 (list.length params));
                 match functions {
                     [i, .._] => ["argument " + to_string (i + 1) + " of `" + img + "." + f

@@ -30,8 +30,8 @@ let is_input a = match a { build.Input.file(_) => true, build.Input.artifact(_, 
 /// make the same command in two checkouts two different steps.
 let placed : [:any] -> [:any];
 let placed args = {
-    let inputs = list.filter is_input args;
-    list.map (fn a -> match a {
+    let inputs = filter is_input args;
+    map (fn a -> match a {
         [:out, n] => [:out, n],
         _ if is_input a => [:in, list.index_of a inputs],
         s => s,
@@ -41,10 +41,10 @@ let placed args = {
 /// The step, for a caller that wants more than its first output.
 let step : :string -> :string -> [:any] -> :map;
 let step name program args = {
-    let inputs = list.filter is_input args;
-    let outputs = list.flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) args;
+    let inputs = filter is_input args;
+    let outputs = flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) args;
     build.step "command" name inputs [program, placed args] outputs
-        (fn job -> [build.Op.exec program (list.map (fn a -> match a {
+        (fn job -> [build.Op.exec program (map (fn a -> match a {
             [:out, n] => n,
             _ if is_input a => build.path job a,
             s => s,
@@ -72,9 +72,9 @@ let check ctx name env program args = check_in (build.Context.root ctx) name env
 /// than the package, such as the root of the repository it belongs to.
 let check_in : :string -> :string -> %{:string => :string} -> :string -> [:any] -> :map;
 let check_in dir name env program args =
-    build.uncached (build.step "check" name (list.filter is_input args) [dir, program, env, placed args]
-               (list.flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) args)
-               (fn job -> [build.Op.run dir env program (list.map (fn a -> match a {
+    build.uncached (build.step "check" name (filter is_input args) [dir, program, env, placed args]
+               (flat_map (fn a -> match a { [:out, n] => [n], _ => [] }) args)
+               (fn job -> [build.Op.run dir env program (map (fn a -> match a {
                    [:out, n] => build.out job n,
                    _ if is_input a => build.path job a,
                    s => s,

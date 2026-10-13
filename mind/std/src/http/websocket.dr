@@ -94,8 +94,8 @@ let upgrade_with! config on_open! req = {
     } else if version != "13" {
         http.status_only 426 |> http.with_header "sec-websocket-version" "13"
     } else {
-        let offered = list.map str.trim (str.split "," (match http.header "sec-websocket-protocol" req { () => "", p => p }));
-        let chosen = match list.filter (fn p -> list.contains p (config.[:protocols else []])) offered { [] => (), [p, .._] => p };
+        let offered = map str.trim (str.split "," (match http.header "sec-websocket-protocol" req { () => "", p => p }));
+        let chosen = match filter (fn p -> list.contains p (config.[:protocols else []])) offered { [] => (), [p, .._] => p };
         let resp = http.respond 101 ""
             |> http.with_header "upgrade" "websocket"
             |> http.with_header "connection" "Upgrade"
@@ -128,7 +128,7 @@ let connect_with! : :map -> :string -> Result :map :error;
 let connect_with! config address = try! {
     let socket = open! config address;
     strict! socket
-    Result.ok socket
+    ok socket
 } catch e { Result.error (if error.is_error e { e } else { error.new :error e }) };
 
 /// Establish and validate a WebSocket connection using the configured HTTP handshake.
@@ -185,8 +185,8 @@ let recv_within! : :map -> :integer -> Result :any :timeout;
 let recv_within! socket ms = {
     let reader = Socket.reader socket;
     receive! {
-        [:websocket, from, message] if from == reader => Result.ok message,
-        after ms => Result.error :timeout,
+        [:websocket, from, message] if from == reader => ok message,
+        after ms => err :timeout,
     }
 };
 
@@ -271,7 +271,7 @@ priv let be16 n = str.of_bytes [n / 256 % 256, n % 256];
 
 /// Encode an integer as eight big-endian bytes.
 priv let be64 : :integer -> :string;
-priv let be64 n = str.of_bytes (list.map (fn k -> n / pow256 (7 - k) % 256) (list.range 0 8));
+priv let be64 n = str.of_bytes (map (fn k -> n / pow256 (7 - k) % 256) (list.range 0 8));
 
 /// Compute 256 raised to a nonnegative exponent.
 priv let pow256 : :integer -> :integer;
@@ -293,7 +293,7 @@ priv let read_frame! r must_mask limit = {
     if must_mask && not masked { raise! (error.new :protocol "an unmasked frame from a client") }
     let len7 = b1 % 128;
     let [n, r2] = if len7 == 126 { let [b, rr] = http.read_exact! r1 2; [u16 b, rr] }
-                  else if len7 == 127 { let [b, rr] = http.read_exact! r1 8; [list.fold (fn acc i -> acc * 256 + str.byte i b) 0 (list.range 0 8), rr] }
+                  else if len7 == 127 { let [b, rr] = http.read_exact! r1 8; [fold (fn acc i -> acc * 256 + str.byte i b) 0 (list.range 0 8), rr] }
                   else { [len7, r1] };
     if n > limit { raise! (error.new :too_large "a frame larger than the limit") }
     let [key, r3] = if masked { http.read_exact! r2 4 } else { ["", r2] };
@@ -310,7 +310,7 @@ priv let read_loop! sock r role owner = {
     let reply! opcode payload = {
         try! { streams.write_all! sock (frame opcode payload (role == :client) (crypto.random_bytes! 4)); () } catch e { () }
     };
-    let rec go! rr partial_op parts !size = match try! { let f = read_frame! rr (role == :server) max_message; strict! f; Result.ok f } catch e { Result.error e } {
+    let rec go! rr partial_op parts !size = match try! { let f = read_frame! rr (role == :server) max_message; strict! f; ok f } catch e { err e } {
         Result.error(e) => {
             let code = match error.kind e { :protocol => 1002, :too_large => 1009, _ => 1006 };
             if code != 1006 { reply! 8 (be16 code) }
@@ -411,7 +411,7 @@ when test {
             let got = http.get! (server.local_url s);
             server.stop! s
             settled! ()
-            test.eq! (Result.ok 400) (Result.map http.status got)
+            test.eq! (ok 400) (Result.map http.status got)
         } ),
         test.case "recv_within times out" $( {
             let quiet! socket = { recv! socket; () };
@@ -422,7 +422,7 @@ when test {
             };
             server.stop! s
             settled! ()
-            test.eq! (Result.error :timeout) got
+            test.eq! (err :timeout) got
         } ),
         test.case "a handshake refused" $( {
             let s = server.serve! 0 (server.router |> server.get "/" (fn req -> http.text "no"));

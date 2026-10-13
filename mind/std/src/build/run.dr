@@ -137,7 +137,7 @@ let reach_step : :map -> :map -> :map;
 let reach_step acc s = {
     let shape = build.Step.shape s;
     if _map_has acc shape { acc }
-    else { list.fold reach (acc.[shape => s]) (build.Step.inputs s) }
+    else { fold reach (acc.[shape => s]) (build.Step.inputs s) }
 };
 
 /// The generated modules, as one step that puts each under the name it is
@@ -149,9 +149,9 @@ let overlay modules = match _map_pairs modules {
     pairs => {
         let sorted = list.sort_on list.head pairs;
         let file_of name = str.replace "." "/" name + ".dr";
-        build.step "modules" "modules" (list.map (fn [_, i] -> i) sorted)
-            (list.map (fn [name, _] -> name) sorted) (list.map (fn [name, _] -> file_of name) sorted)
-            (fn job -> list.map (fn [name, i] -> build.Op.copy (build.path job i) (file_of name)) sorted)
+        build.step "modules" "modules" (map (fn [_, i] -> i) sorted)
+            (map (fn [name, _] -> name) sorted) (map (fn [name, _] -> file_of name) sorted)
+            (fn job -> map (fn [name, i] -> build.Op.copy (build.path job i) (file_of name)) sorted)
     },
 };
 
@@ -159,15 +159,15 @@ let overlay modules = match _map_pairs modules {
 let steps_of : :map -> :any -> :map;
 let steps_of plan mods = {
     let roots = list.concat [map.values (build.Plan.payloads plan),
-                             list.map (fn s -> build.artifact s "") (build.Plan.steps plan),
-                             list.map (fn [i, _] -> i) (build.Plan.later plan),
+                             map (fn s -> build.artifact s "") (build.Plan.steps plan),
+                             map (fn [i, _] -> i) (build.Plan.later plan),
                              match mods { () => [], s => [build.artifact s ""] }];
-    list.fold reach (%{}) roots
+    fold reach (%{}) roots
 };
 
 /// The shapes of the steps `s` reads from.
 let upstream : :map -> [:string];
-let upstream s = list.unique (list.flat_map (fn i -> match i { build.Input.artifact(t, _) => [build.Step.shape t], _ => [] })
+let upstream s = list.unique (flat_map (fn i -> match i { build.Input.artifact(t, _) => [build.Step.shape t], _ => [] })
                                             (build.Step.inputs s));
 
 // --- the state -------------------------------------------------------------------------
@@ -229,7 +229,7 @@ let digest! ctx st p = match stamped! st (absolute ctx p) {
 /// Every file a tree input names, relative to the package, sorted.
 let tree_files! : :map -> :string -> :string -> [:string];
 let tree_files! ctx dir suffix =
-    list.map (fn f -> dir + "/" + f) (list.filter (fn f -> str.ends_with suffix f) (file.walk! (absolute ctx dir)));
+    map (fn f -> dir + "/" + f) (filter (fn f -> str.ends_with suffix f) (file.walk! (absolute ctx dir)));
 
 // --- keys ------------------------------------------------------------------------------
 
@@ -270,7 +270,7 @@ let keyed! ctx st s = {
         build.Input.artifact(t, n) => [acc, list.cons [:artifact, list.head ((State.done acc).[build.Step.shape t]), n] ps],
     }) [st, []] (build.Step.inputs s);
     let key = io.digest (build.encode [build.Step.shape s, list.reverse parts]);
-    let paths = map.from_pairs (list.map (fn i -> [build.input_id i, where ctx after i]) (build.Step.inputs s));
+    let paths = map.from_pairs (map (fn i -> [build.input_id i, where ctx after i]) (build.Step.inputs s));
     [after, key, paths]
 };
 
@@ -301,7 +301,7 @@ let depfile_reads text = {
         _ => "",
     };
     let ended cur acc = match cur { [] => acc, _ => list.cons (_str_of_chars (list.reverse cur)) acc };
-    let [names, current, _] = list.fold (fn [acc, cur, escaped] c -> match [escaped, c] {
+    let [names, current, _] = fold (fn [acc, cur, escaped] c -> match [escaped, c] {
         [true, _] => [acc, list.cons c cur, false],
         [_, '\\'] => [acc, cur, true],
         [_, ' '] => [ended cur acc, [], false],
@@ -309,7 +309,7 @@ let depfile_reads text = {
         [_, '\t'] => [ended cur acc, [], false],
         _ => [acc, list.cons c cur, false],
     }) [[], [], false] (str.chars body);
-    list.map (fn n -> str.replace "$$" "$" n) (list.reverse (ended current names))
+    map (fn n -> str.replace "$$" "$" n) (list.reverse (ended current names))
 };
 
 /// The first line where two texts part, for a check's failure.
@@ -379,7 +379,7 @@ let op! dir ms o = try! {
             Result.ok ()
         },
         build.Op.list(from, suffix, name) => {
-            file.write! (target! name) (str.join_str "\n" (list.filter (fn f -> str.ends_with suffix f) (file.walk! from)))
+            file.write! (target! name) (str.join_str "\n" (filter (fn f -> str.ends_with suffix f) (file.walk! from)))
             Result.ok ()
         },
         build.Op.verify(name, digest) => match io.digest! (dir + "/" + name) {
@@ -429,9 +429,9 @@ let on_path! program = {
     let windows = os.platform () == :windows;
     let dirs = str.split (if windows { ";" } else { ":" }) (match os.env! "PATH" { () => "", p => p });
     let names = if windows && not (str.ends_with ".exe" program) { [program + ".exe", program] } else { [program] };
-    let hits = list.flat_map (fn d -> list.filter (fn f -> match io.stat! f { [_, _, :file] => true, _ => false })
-                                                (list.map (fn n -> d + "/" + n) names))
-                             (list.filter (fn d -> not (str.is_empty d)) dirs);
+    let hits = flat_map (fn d -> filter (fn f -> match io.stat! f { [_, _, :file] => true, _ => false })
+                                                (map (fn n -> d + "/" + n) names))
+                             (filter (fn d -> not (str.is_empty d)) dirs);
     match hits { [] => "", [first, .._] => first }
 };
 
@@ -445,7 +445,7 @@ let perform! scratch outputs ms ops = {
     file.mkdir_all! scratch
     fold! (fn _ o -> file.mkdir_all! (file.parent (scratch + "/" + o))) () outputs
     match fold! (fn acc o -> match acc { Result.ok(_) => op! scratch ms o, failed => failed }) (Result.ok ()) ops {
-        Result.ok(_) => match list.filter (fn o -> io.stat! (scratch + "/" + o) == ()) outputs {
+        Result.ok(_) => match filter (fn o -> io.stat! (scratch + "/" + o) == ()) outputs {
             [] => Result.ok (),
             missing => Result.error ("it did not make " + str.join_str ", " missing),
         },
@@ -512,7 +512,7 @@ let rec launch! ctx run = {
         _ if room <= 0 => run,
         shape => {
             let s = (Run.steps run).[shape];
-            let rest = list.filter (fn w -> w != shape) (Run.waiting run);
+            let rest = filter (fn w -> w != shape) (Run.waiting run);
             let [st, key, paths] = keyed! ctx (Run.state run) s;
             let dir = dir_of ctx key;
             let record = if build.Step.cache s == :never { () } else { record_of! dir };
@@ -554,7 +554,7 @@ let commit! ctx st s key scratch = {
     let read = match build.Step.discovers s {
         true => match file.read! (scratch + "/deps.d") {
             () => [],
-            text => list.map (fn p -> absolute ctx p) (depfile_reads text),
+            text => map (fn p -> absolute ctx p) (depfile_reads text),
         },
         false => [],
     };
@@ -566,7 +566,7 @@ let commit! ctx st s key scratch = {
     // it reads -- so what reads it is keyed on what it wrote instead: an
     // answer that changed has to reach the steps that read it.
     let wrote = match build.Step.cache s {
-        :never => list.map (fn o -> [o, io.digest! (scratch + "/" + o)]) (build.Step.outputs s),
+        :never => map (fn o -> [o, io.digest! (scratch + "/" + o)]) (build.Step.outputs s),
         _ => [],
     };
     let kept = list.append (list.reverse reads) wrote;
@@ -593,7 +593,7 @@ let rec drive! ctx run = {
             [[], _] => started,
             [_, false] => started,
             [waiting, true] => fail! ("these steps wait on each other: "
-                                      + str.join_str ", " (list.map (fn sh -> build.Step.name ((Run.steps started).[sh])) waiting)),
+                                      + str.join_str ", " (map (fn sh -> build.Step.name ((Run.steps started).[sh])) waiting)),
         },
         false => {
             let [_, shape, outcome, ms] = recv! ();
@@ -627,8 +627,8 @@ let rec drive! ctx run = {
 /// has finished; one that keeps going answers the state, failures and all.
 let build_all! : :map -> :map -> :map -> :bool -> :map;
 let build_all! ctx st steps keep_going = {
-    let wanted = list.filter (fn sh -> not (_map_has (State.done st) sh)) (map.keys steps);
-    let deps = list.fold (fn m sh -> m.[sh => upstream (steps.[sh])]) (%{}) wanted;
+    let wanted = filter (fn sh -> not (_map_has (State.done st) sh)) (map.keys steps);
+    let deps = fold (fn m sh -> m.[sh => upstream (steps.[sh])]) (%{}) wanted;
     let bar = progress.start! "building" (len wanted);
     let finished = drive! ctx (Run.make st steps deps wanted (%{}) keep_going bar);
     progress.finish! bar
@@ -646,9 +646,9 @@ let make! : :map -> [:any] -> [:any];
 let make! ctx inputs = {
     file.mkdir_all! (build.Context.cache ctx)
     let start = State.set_stamps (known_stamps! ctx) (State.new ());
-    let after = build_all! ctx start (list.fold reach (%{}) inputs) false;
+    let after = build_all! ctx start (fold reach (%{}) inputs) false;
     keep_stamps! ctx (State.stamps after)
-    [after, list.map (fn i -> where ctx after (build.input i)) inputs]
+    [after, map (fn i -> where ctx after (build.input i)) inputs]
 };
 
 /// Why a run stopped, for a person: a step that failed is said as itself, and
@@ -672,12 +672,12 @@ let rec settle! ctx st plan = {
     let steps = steps_of plan mods;
     let files = fold! (fn acc i -> match i { build.Input.file(p) => list.head (digest! ctx acc p), _ => acc })
                       st (list.concat [map.values (build.Plan.payloads plan),
-                                       list.map (fn [i, _] -> i) (build.Plan.later plan)]);
+                                       map (fn [i, _] -> i) (build.Plan.later plan)]);
     let done = build_all! ctx files steps false;
     match build.Plan.later plan {
         [] => [plan, mods, done],
         later => {
-            let decided = list.map (fn [i, decide] -> decide (match file.read! (where ctx done i) {
+            let decided = map (fn [i, decide] -> decide (match file.read! (where ctx done i) {
                 () => "",
                 text => text,
             })) later;
@@ -703,11 +703,11 @@ let why_not st s = match (State.failures st).[build.Step.shape s else ()] {
 let run_checks! : :map -> :map -> :map -> [:any];
 let run_checks! ctx st plan = {
     let wanted = build.Context.only ctx;
-    let named = list.filter (fn [n, _] -> list.is_empty wanted || list.contains n wanted)
+    let named = filter (fn [n, _] -> list.is_empty wanted || list.contains n wanted)
                             (list.sort_on list.head (_map_pairs (build.Plan.checks plan)));
-    let steps = list.fold (fn acc [_, s] -> reach_step acc s) (%{}) named;
+    let steps = fold (fn acc [_, s] -> reach_step acc s) (%{}) named;
     let after = build_all! ctx st steps true;
-    let results = list.fold (fn m [name, s] -> m.[name => match (State.done after).[build.Step.shape s else ()] {
+    let results = fold (fn m [name, s] -> m.[name => match (State.done after).[build.Step.shape s else ()] {
         () => [false, (State.ms after).[build.Step.shape s else 0], why_not after s],
         _ => [true, (State.ms after).[build.Step.shape s else 0], ""],
     }]) (%{}) named;
@@ -720,7 +720,7 @@ let run_checks! ctx st plan = {
 /// goal `()` for a name the plan does not have.
 let goals_named : :map -> :string -> [:any];
 let rec goals_named plan name = match (build.Plan.goals plan).[name else ()] {
-    build.Goal.each(names) => list.flat_map (fn n -> goals_named plan n) names,
+    build.Goal.each(names) => flat_map (fn n -> goals_named plan n) names,
     g => [[name, g]],
 };
 
@@ -734,7 +734,7 @@ let goal_input g = match g {
 
 /// What there is to ask for, for the answer to a name the plan does not have.
 let listed : :map -> :string;
-let listed plan = str.join_str "\n" (list.map (fn n -> "  " + n + match (build.Plan.notes plan).[n else ()] {
+let listed plan = str.join_str "\n" (map (fn n -> "  " + n + match (build.Plan.notes plan).[n else ()] {
     () => "",
     t => "  -- " + t,
 }) (list.sort (map.keys (build.Plan.goals plan))));
@@ -756,13 +756,13 @@ let place_file! from dest = {
 /// goes: `[paths, state]`, each goal's name to where it is.
 let make_goals! : :map -> :map -> :map -> [:any];
 let make_goals! ctx st plan = {
-    let chosen = list.flat_map (fn n -> goals_named plan n) (build.Context.goals ctx);
-    match list.filter (fn [_, g] -> g == ()) chosen {
+    let chosen = flat_map (fn n -> goals_named plan n) (build.Context.goals ctx);
+    match filter (fn [_, g] -> g == ()) chosen {
         [[n, _], .._] => fail! ("there is no goal `" + n + "`; these are the ones there are:\n" + listed plan),
         [] => (),
     }
-    let inputs = list.map (fn [_, g] -> goal_input g) chosen;
-    let after = build_all! ctx st (list.fold reach (%{}) inputs) false;
+    let inputs = map (fn [_, g] -> goal_input g) chosen;
+    let after = build_all! ctx st (fold reach (%{}) inputs) false;
     let paths = fold! (fn m [name, g] -> {
         let made = where ctx after (goal_input g);
         match g {
@@ -780,7 +780,7 @@ let make_goals! ctx st plan = {
 /// What the compile is handed.
 let outcome : :map -> :map -> :any -> :map -> :map;
 let outcome ctx plan mods st =
-    build.Outcome.make (map.map_values (fn i -> where ctx st i) (build.Plan.payloads plan))
+    build.Outcome.make (map_values (fn i -> where ctx st i) (build.Plan.payloads plan))
                        (match mods { () => (), s => where ctx st (build.artifact s "") })
                        (build.Plan.defines plan) (build.Plan.hosts plan) (build.Plan.target plan)
                        (State.reads st) (State.built st) (State.reused st) (%{}) (%{});
@@ -861,15 +861,15 @@ let run_all! scripts = {
         },
     };
     strict! contexts
-    let chosen = list.filter (fn [key, _] -> _map_has contexts key) scripts;
+    let chosen = filter (fn [key, _] -> _map_has contexts key) scripts;
     match chosen {
         [] => (),
         [[first, _], .._] => {
             let known = known_stamps! (contexts.[first]);
             let results = proc.try_map! carry_out_elsewhere!
-                                        (list.map (fn [key, plan_of] -> [contexts.[key], known, plan_of]) chosen);
+                                        (map (fn [key, plan_of] -> [contexts.[key], known, plan_of]) chosen);
             strict! results
-            let [outcomes, stamps] = list.fold (fn [found, st] [[key, _], r] -> match r {
+            let [outcomes, stamps] = fold (fn [found, st] [[key, _], r] -> match r {
                 Result.ok([answer, more]) => [found.[key => answer], map.merge st more],
                 Result.error(e) => fail! ("the build script of `" + key + "` failed: " + stopped_by e),
             }) [%{}, known] (list.zip chosen results);

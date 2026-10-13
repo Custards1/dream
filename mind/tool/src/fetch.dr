@@ -80,7 +80,7 @@ let git_fetch! d dir = {
         Result.error(why) => Result.error why,
         _ => match rev {
             [:rev, r] => run! "git checkout" "git" ["-C", dir, "checkout", "--quiet", to_string r],
-            _ => Result.ok "",
+            _ => ok "",
         },
     }
 };
@@ -98,7 +98,7 @@ let url_fetch! d dir = {
                 Result.error(why) => Result.error why,
                 _ => {
                     io.remove! archive
-                    Result.ok ""
+                    ok ""
                 },
             }
         },
@@ -120,7 +120,7 @@ let forget! d =
     match manifest.dep_kind d {
         :git => run! "rm" "rm" ["-rf", dep_dir! d],
         :url => run! "rm" "rm" ["-rf", dep_dir! d],
-        _ => Result.ok "",
+        _ => ok "",
     };
 
 /// Where `d` is on disk, fetching it first if it is not there yet.
@@ -134,13 +134,13 @@ let resolve! from_root d = {
             // Relative to the manifest that named it, so moving a project
             // does not change what its dependencies mean.
             let p = path.join from_root (to_string (manifest.spec_get d "path"));
-            if io.is_dir! p { Result.ok p }
+            if io.is_dir! p { ok p }
             else { Result.error (manifest.dep_name d + ": no directory at " + p) }
         },
         :unknown => Result.error (manifest.dep_name d + ": needs one of `path`, `git` or `url`"),
         kind => {
             let dir = dep_dir! d;
-            if is_fetched! dir { Result.ok dir }
+            if is_fetched! dir { ok dir }
             else {
                 // A partial copy from a fetch that died is in the way of
                 // `git clone`, which refuses a directory that is not empty.
@@ -152,7 +152,7 @@ let resolve! from_root d = {
                     _ => {
                         file.write! (path.join dir marker) (manifest.dep_source d + "\n")
                         commit! d dir
-                        Result.ok dir
+                        ok dir
                     },
                 }
             }

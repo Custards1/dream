@@ -26,14 +26,16 @@ virtual let footer total = "";
 // --- what every reporter shares ---------------------------------------------
 
 /// The widest key in `pairs`, so columns can line up.
+let width : [[:string, :integer]] -> :integer;
 let width pairs =
-    list.fold_strict (fn w p -> num.max w (str.length (list.head p))) 0 pairs;
+    fold (fn w p -> num.max w (str.length (list.head p))) 0 pairs;
 
 /// `label` padded out to `n` characters.
 let pad n label = str.pad_end n " " label;
 
 /// The body: one `row` per pair, in the order given.
-let body pairs = list.map (fn p -> row (list.head p) (list.nth 1 p)) pairs;
+let body : [[:string, :integer]] -> [:string];
+let body pairs = map (fn [label, count] -> row label count) pairs;
 
 /// The whole report, as a single string.
 let render pairs total = {

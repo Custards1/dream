@@ -141,18 +141,20 @@ let reason status = match status {
 let header : :string -> :map -> (:string | :unit);
 let header name msg = {
     let key = str.lower name;
-    match list.filter (fn [k, _] -> k == key) (msg.[:headers else []]) { [] => (), [[_, v], .._] => v }
+    let headers : [[:string, :string]] = msg.[:headers else []];
+    match filter (fn [k, _] -> k == key) headers { [] => (), [[_, v], .._] => v }
 };
 
 /// Every value of a header, in order.
 let header_all : :string -> :map -> [:string];
-let header_all name msg = { let key = str.lower name; list.map (fn [_, v] -> v) (list.filter (fn [k, _] -> k == key) (msg.[:headers else []])) };
+let header_all name msg = { let key = str.lower name; map (fn [_, v] -> v) (filter (fn [k, _] -> k == key) (msg.[:headers else []])) };
 
 /// The message with this header set, replacing any it had.
 let with_header : :string -> :any -> :map -> :map;
 let with_header name value msg = {
     let key = str.lower name;
-    msg.[:headers => list.filter (fn [k, _] -> k != key) (msg.[:headers else []]) + [[key, header_value value]]]
+    let headers : [[:string, :string]] = msg.[:headers else []];
+    msg.[:headers => filter (fn [k, _] -> k != key) headers + [[key, header_value value]]]
 };
 
 /// The message with this header added after any it had.
@@ -161,13 +163,17 @@ let add_header name value msg = msg.[:headers => msg.[:headers else []] + [[str.
 
 /// The message without this header.
 let without_header : :string -> :map -> :map;
-let without_header name msg = { let key = str.lower name; msg.[:headers => list.filter (fn [k, _] -> k != key) (msg.[:headers else []])] };
+let without_header name msg = {
+    let key = str.lower name;
+    let headers : [[:string, :string]] = msg.[:headers else []];
+    msg.[:headers => filter (fn [k, _] -> k != key) headers]
+};
 
 /// Several headers set at once, from pairs or a map.
 let with_headers : :any -> :map -> :map;
 let with_headers pairs msg = {
     let ps = if type_of pairs == :map { map.pairs pairs } else { pairs };
-    list.fold (fn m [k, v] -> with_header (text_of k) v m) msg ps
+    fold (fn m [k, v] -> with_header (text_of k) v m) msg ps
 };
 
 /// A header's value as text, with any line break taken out: a value with
@@ -207,7 +213,7 @@ let body_json msg = json.decode (body msg);
 
 /// The body decoded as a form (`a=1&b=2`), the first value of each name.
 let body_form : :map -> :map;
-let body_form msg = list.fold (fn m [k, v] -> if map.has k m { m } else { m.[k => v] }) %{} (url.decode_query (body msg));
+let body_form msg = fold (fn m [k, v] -> if map.has k m { m } else { m.[k => v] }) %{} (url.decode_query (body msg));
 
 /// A query parameter of a request, or `()`.
 let query_value : :string -> :map -> (:string | :unit);
@@ -219,16 +225,16 @@ let param name req = (Request.params req).[name else ()];
 
 /// The cookies a request carries, by name.
 let cookies : :map -> :map;
-let cookies req = list.fold (fn m pair -> {
+let cookies req = fold (fn m pair -> {
     let eq = str.find "=" pair;
     if eq <= 0 { m } else { m.[str.trim (str.slice 0 eq pair) => str.trim (str.slice (eq + 1) (len pair) pair)] }
-}) %{} (list.flat_map (fn v -> str.split ";" v) (header_all "cookie" req));
+}) %{} (flat_map (fn v -> str.split ";" v) (header_all "cookie" req));
 
 /// The response itself when it is 2xx, otherwise `[:error, e]` of kind
 /// `:status` carrying the response: for a pipeline that treats any other
 /// answer as a failure.
 let expect_ok : :map -> Result :map :error;
-let expect_ok resp = if is_success resp { Result.ok resp }
+let expect_ok resp = if is_success resp { ok resp }
                      else { Result.error (error.new :status (to_string (Response.status resp) + " " + reason (Response.status resp) + " from " + Response.url resp)) };
 
 // --- building responses ---------------------------------------------------------------
@@ -282,9 +288,9 @@ let with_status code resp = Response.set_status code resp;
 /// `true` writes the bare attribute.
 let with_cookie : :string -> :string -> :map -> :map -> :map;
 let with_cookie name value attributes resp = {
-    let attrs = list.map (fn [k, v] -> if v == true { text_of k } else { text_of k + "=" + text_of v })
-                         (list.filter (fn [_, v] -> v != false && v != ())
-                                      (list.map (fn k -> [k, attributes.[k]]) (map.sorted_keys attributes)));
+    let attrs = map (fn [k, v] -> if v == true { text_of k } else { text_of k + "=" + text_of v })
+                         (filter (fn [_, v] -> v != false && v != ())
+                                      (map (fn k -> [k, attributes.[k]]) (map.sorted_keys attributes)));
     add_header "set-cookie" (str.join_str "; " ((name + "=" + value) :: attrs)) resp
 };
 
@@ -571,7 +577,7 @@ let sse_event : :any -> :string;
 let sse_event e = {
     let fields = if type_of e == :map { e } else { %{ "data" => e } };
     let line k = match fields.[k else ()] { () => [], v => [k + ": " + text_of v + "\n"] };
-    let data = match fields.["data" else ()] { () => [], d => list.map (fn l -> "data: " + l + "\n") (str.split "\n" (text_of d)) };
+    let data = match fields.["data" else ()] { () => [], d => map (fn l -> "data: " + l + "\n") (str.split "\n" (text_of d)) };
     str.concat_all (line "event" + line "id" + line "retry" + data + ["\n"])
 };
 
@@ -599,7 +605,7 @@ let encode_request req target host = {
                    |> (fn r -> if needs_length { with_header "content-length" (len body_text) r } else { r })
                    |> (fn r -> if streaming { with_header "transfer-encoding" "chunked" (without_header "content-length" r) } else { r });
     str.concat_all ([method, " ", target, " HTTP/1.1\r\n"]
-                    + list.flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Request.headers base)
+                    + flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Request.headers base)
                     + ["\r\n", body_text])
 };
 
@@ -611,7 +617,7 @@ let encode_response resp head = {
     let bodiless = code < 200 || code == 204 || code == 304;
     let with_len = if bodiless { without_header "content-length" resp } else { with_header "content-length" (len (body resp)) resp };
     str.concat_all (["HTTP/1.1 ", to_string code, " ", reason code, "\r\n"]
-                    + list.flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers with_len)
+                    + flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers with_len)
                     + ["\r\n", if head || bodiless { "" } else { body resp }])
 };
 
@@ -624,14 +630,14 @@ let encode_stream_head resp chunked = {
     let framed = without_header "content-length" resp
                  |> (fn r -> if chunked { with_header "transfer-encoding" "chunked" r } else { with_header "connection" "close" r });
     str.concat_all (["HTTP/1.1 ", to_string code, " ", reason code, "\r\n"]
-                    + list.flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers framed)
+                    + flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers framed)
                     + ["\r\n"])
 };
 
 /// `content-type` as `Content-Type`: how a header name is usually written,
 /// for peers that are fussier than the RFC lets them be.
 let canonical : :string -> :string;
-let canonical name = str.join_str "-" (list.map str.capitalize (str.split "-" name));
+let canonical name = str.join_str "-" (map str.capitalize (str.split "-" name));
 
 // --- the client --------------------------------------------------------------------------------
 //
@@ -684,8 +690,8 @@ let client_with! : :map -> :map;
 let client_with! config = {
     let idle = config.[:idle else 30000000000];
     let pool = connections.start! (time.to_milliseconds idle);
-    let opts = list.fold (fn m k -> match config.[k else ()] { () => m, v => m.[k => v] }) %{} [:timeout, :redirects, :tls, :http2];
-    Client.make pool (config.[:base else ""]) (list.map (fn [k, v] -> [str.lower k, v]) (config.[:headers else []])) opts
+    let opts = fold (fn m k -> match config.[k else ()] { () => m, v => m.[k => v] }) %{} [:timeout, :redirects, :tls, :http2];
+    Client.make pool (config.[:base else ""]) (map (fn [k, v] -> [str.lower k, v]) (config.[:headers else []])) opts
 };
 
 /// Close a client's idle connections and stop its pool.
@@ -724,7 +730,7 @@ priv let run! c req0 sink = {
     let opts = Request.options req;
     let timeout = opts.[:timeout else default_timeout];
     match time.within! timeout (follow! c req (opts.[:redirects else 10]) sink) {
-        Result.ok(resp) => Result.ok resp,
+        Result.ok(resp) => ok resp,
         Result.error(:timeout) => Result.error (error.new :timeout ("no response from " + Request.url req + " within " + time.format_duration timeout)),
         Result.error(e) => Result.error (if error.is_error e { e } else { error.new :error e }),
     }
@@ -750,7 +756,7 @@ priv let with_client_defaults c req = {
             _ => Request.url req,
         },
     };
-    let with_headers_set = list.fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req (Client.headers c);
+    let with_headers_set = fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req (Client.headers c);
     with_headers_set |> Request.set_url address |> Request.set_options (map.merge (Client.options c) (Request.options req))
 };
 
@@ -795,7 +801,7 @@ let get_text! address = {
 let get_json! : :string -> Result :any :error;
 let get_json! address = {
     let? text_body = get_text! address;
-    Result.map_error (fn why -> error.new :bad_json why) (json.decode text_body)
+    map_error (fn why -> error.new :bad_json why) (json.decode text_body)
 };
 
 /// Save the body of a 2xx response to a file, a piece at a time, so a file of
@@ -813,9 +819,9 @@ let download! address path = {
             io.rename! partial path
             let size = match io.stat! path { () => 0, [n, _, _] => n };
             strict! size
-            Result.ok size
-        } else { io.remove! partial; expect_ok resp |> Result.map (fn _ -> 0) },
-        Result.error(e) => { try! { io.remove! partial } catch ignored { () }; Result.error e },
+            ok size
+        } else { io.remove! partial; expect_ok resp |> map (fn _ -> 0) },
+        Result.error(e) => { try! { io.remove! partial } catch ignored { () }; err e },
     }
 };
 
@@ -897,7 +903,7 @@ priv let exchange! c req sink following = {
     let pool = Client.pool c;
     let pooled = match pool { () => (), pid => connections.checkout! pid key };
     let conn = match pooled { () => connect! u req, found => found };
-    match try! { let got = over! c key conn (pooled == ()) req u sink following; strict! got; Result.ok got } catch e { Result.error e } {
+    match try! { let got = over! c key conn (pooled == ()) req u sink following; strict! got; ok got } catch e { err e } {
         Result.ok(resp) => resp,
         Result.error(e) => {
             // A pooled connection the server closed while it sat idle fails
@@ -917,14 +923,14 @@ priv let over! c key conn is_new req u sink following = {
     match conn {
         [:h2, coordinator] => {
             let kept = pool != () && (not is_new || connections.share! pool key coordinator);
-            let outcome = try! { let resp = h2.request! coordinator req (if sink == () { () } else { sink }); strict! resp; Result.ok resp }
-                          catch e { Result.error e };
+            let outcome = try! { let resp = h2.request! coordinator req (if sink == () { () } else { sink }); strict! resp; ok resp }
+                          catch e { err e };
             if not kept { h2.shutdown! coordinator }
             match outcome { Result.ok(resp) => Response.set_url (Request.url req) resp, Result.error(e) => raise! e }
         },
         [:h1, sock] => {
             let keep = pool != ();
-            match try! { let got = exchange_on! sock u req sink keep following; strict! got; Result.ok got } catch e { Result.error e } {
+            match try! { let got = exchange_on! sock u req sink keep following; strict! got; ok got } catch e { err e } {
                 Result.ok([resp, reusable]) => {
                     if keep && reusable { connections.checkin! pool key sock } else { close_quietly! sock }
                     resp
@@ -950,7 +956,7 @@ priv let close_quietly! sock = connections.close_quietly! sock;
 priv let exchange_on! : :any -> :map -> :map -> :any -> :bool -> :bool -> [:map, :bool];
 priv let exchange_on! sock u req sink keep following = {
     let defaults = [["user-agent", "dream-http/1.0"], ["accept", "*/*"], ["connection", if keep { "keep-alive" } else { "close" }]];
-    let prepared = list.fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req defaults;
+    let prepared = fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req defaults;
     streams.write_all! sock (encode_request prepared (url.target u) (url.host_header u))
     match req.[:stream else ()] { () => (), s => write_stream! sock s true nothing }
     let [resp, reusable] = read_response_with! (reader sock) (Request.method req == "HEAD") sink following;

@@ -26,7 +26,7 @@ import std.char;
 /// them on one, and a checker that reports code nobody runs is one people turn
 /// off.
 let fold : (a -> :any -> a) -> a -> :string -> a;
-let fold f init s = list.fold_strict f init (_str_chars s);
+let fold f init s = list.fold f init (_str_chars s);
 
 /// Return the sequence type name, `string`.
 let name : :any -> :string;
@@ -248,7 +248,7 @@ let join_str sep parts =
     match parts {
         [] => "",
         [first, ..rest] =>
-            _str_concat (_list_cons first (list.flat_map (fn s -> [sep, s]) rest)),
+            _str_concat (_list_cons first (flat_map (fn s -> [sep, s]) rest)),
     };
 
 /// `s` repeated `n` times.
@@ -551,7 +551,7 @@ priv let rec fill_line width !used !acc ws =
 let dedent : :string -> :string;
 let dedent s = {
     let ls = lines s;
-    let margin = list.minimum (list.filter_map (fn l -> if is_blank l { () } else { _str_span l 0 " \t" }) ls);
+    let margin = list.minimum (filter_map (fn l -> if is_blank l { () } else { _str_span l 0 " \t" }) ls);
     let cut = if margin == () { 0 } else { margin };
     join_str "\n" (list.map (fn l -> if is_blank l { "" } else { _str_slice l cut (len l - cut) }) ls)
 };

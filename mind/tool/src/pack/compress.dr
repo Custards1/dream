@@ -22,13 +22,13 @@ type Compression = :none | :gzip | :xz | :zstd;
 
 let parse : :string -> Result (Compression | :auto) :string;
 let parse name = match str.lower name {
-    "auto" => Result.ok :auto,
-    "none" => Result.ok :none,
-    "gzip" => Result.ok :gzip,
-    "gz" => Result.ok :gzip,
-    "xz" => Result.ok :xz,
-    "zstd" => Result.ok :zstd,
-    "zst" => Result.ok :zstd,
+    "auto" => ok :auto,
+    "none" => ok :none,
+    "gzip" => ok :gzip,
+    "gz" => ok :gzip,
+    "xz" => ok :xz,
+    "zstd" => ok :zstd,
+    "zst" => ok :zstd,
     other => Result.error ("unknown compression `" + other + "`: say auto, none, gzip, xz or zstd"),
 };
 
@@ -67,20 +67,20 @@ let available! c = match c {
 /// `auto` the first of `accepts` that is here.
 let pick! : Compression | :auto -> [Compression] -> Result Compression :string;
 let pick! wanted accepts = match wanted {
-    :auto => match list.filter available! accepts {
-        [] => Result.error ("none of " + str.join_str ", " (list.map name accepts) + " is installed here"),
-        [c, ..] => Result.ok c,
+    :auto => match filter available! accepts {
+        [] => Result.error ("none of " + str.join_str ", " (map name accepts) + " is installed here"),
+        [c, ..] => ok c,
     },
     c if not (list.contains c accepts) =>
-        Result.error (name c + " cannot be used here: this format reads " + str.join_str ", " (list.map name accepts)),
+        Result.error (name c + " cannot be used here: this format reads " + str.join_str ", " (map name accepts)),
     c if not (available! c) => Result.error (program c + " is not installed here"),
-    c => Result.ok c,
+    c => ok c,
 };
 
 /// Compress the file at `path` in place, answering the new path.
 let file! : Compression -> :string -> Result :string :string;
 let file! c path = match c {
-    :none => Result.ok path,
+    :none => ok path,
     _ => {
         let r = os.exec! (program c) (arguments c path);
         if r.[:code] != 0 { Result.error (program c + " failed on " + path + ": " + str.trim r.[:err]) }
@@ -94,13 +94,13 @@ when test {
 
     let tests = [
         test.case "every spelling"
-            $( test.eq! [Result.ok :auto, Result.ok :zstd, Result.ok :gzip, :error]
+            $( test.eq! [ok :auto, ok :zstd, ok :gzip, :error]
                         [parse "auto", parse "zst", parse "GZIP", Result.tag (parse "lz4")] ),
         test.case "reproducible arguments"
             $( test.eq! [["-n", "-9", "-f", "a"], ["-T1", "-6", "-f", "a"]] [arguments :gzip "a", arguments :xz "a"] ),
         test.case "a format that does not read it"
             $( test.eq! :error (Result.tag (pick! :zstd [:gzip])) ),
         test.case "none is always here"
-            $( test.eq! (Result.ok :none) (pick! :none [:gzip, :none]) ),
+            $( test.eq! (ok :none) (pick! :none [:gzip, :none]) ),
     ];
 }

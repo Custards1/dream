@@ -71,7 +71,7 @@ let reader_at offset count data =
         failed :invalid_argument 0 "offset and count must be non-negative integers"
     } else if offset > len data || count > len data - offset {
         failed :truncated (offset * 8) "the byte range exceeds the input"
-    } else { Result.ok #[data, offset * 8, (offset + count) * 8, offset * 8] };
+    } else { ok #[data, offset * 8, (offset + count) * 8, offset * 8] };
 
 /// Decode a value using a layout and the supplied reader state.
 let read : :map -> Reader -> Answer [:any, Reader];
@@ -98,24 +98,26 @@ let finish b = if b.[3] != 0 {
 /// Append complete bytes to an aligned builder.
 priv let append data b = #[data :: b.[0], b.[1] + len data, 0, 0];
 /// Require a byte-aligned builder, returning an error otherwise.
-priv let aligned_write b = if b.[3] == 0 { Result.ok b }
+priv let aligned_write : Builder -> Answer Builder;
+priv let aligned_write b = if b.[3] == 0 { ok b }
     else { failed :unaligned (written_bits b) "a byte field requires byte alignment" };
 /// Check that the reader has enough remaining bits for an operation.
+priv let need : :integer -> Reader -> Answer Reader;
 priv let need n r =
     if not (aligned r) { failed :unaligned (position r) "a byte field requires byte alignment" }
     else if n > remaining_bytes r { Result.error ((problem :truncated (position r) "the field exceeds the remaining input")
             .[:needed_bits => n * 8].[:available_bits => remaining_bits r]) }
-    else { Result.ok r };
+    else { ok r };
 
 /// Encode a value with a layout and finish the builder into a byte string.
 let encode : :map -> :any -> Answer :string;
-let encode codec value = Result.and_then finish (write codec value builder);
+let encode codec value = and_then finish (write codec value builder);
 /// Decode a value from the start of a byte string and retain the remaining reader state.
 let decode_prefix codec data = read codec (reader data);
 /// Decode a value and reject trailing data after it.
 let decode codec data = match decode_prefix codec data {
-    Result.error(e) => Result.error e,
-    Result.ok([value, r]) => if remaining_bits r == 0 { Result.ok value }
+    Result.error(e) => err e,
+    Result.ok([value, r]) => if remaining_bits r == 0 { ok value }
         else { failed :trailing_data (position r) "bytes or bits remain after the value" },
 };
 
@@ -136,14 +138,14 @@ priv let signed_value bits n = if n & (1 << (bits - 1)) == 0 { n } else { n - (1
 /// Encode an integer in the selected byte order and width.
 priv let integer_bytes order width n =
     if order == :le { str.of_int_le width n }
-    else { str.of_bytes (list.map (fn k -> (n >> ((width - k - 1) * 8)) & 255) (list.range 0 width)) };
+    else { str.of_bytes (map (fn k -> (n >> ((width - k - 1) * 8)) & 255) (list.range 0 width)) };
 
 /// Build a fixed-width integer layout with explicit signedness.
 priv let integer order width signed = layout
     (fn r ->
         if not (width_ok width) || not (order_ok order) {
             failed :invalid_argument (position r) "integer fields require :be or :le and 1..65536 bytes"
-        } else { Result.map (fn rr -> {
+        } else { map (fn rr -> {
             let n = uint_value order width rr.[0] (position rr / 8);
             [if signed { signed_value (width * 8) n } else { n }, advance (width * 8) rr]
         }) (need width r) })
@@ -155,7 +157,7 @@ priv let integer order width signed = layout
             let limit = 1 << (width * 8 - if signed { 1 } else { 0 });
             if n < (if signed { -limit } else { 0 }) || n >= limit {
                 failed :out_of_range (written_bits b) "integer does not fit the field"
-            } else { Result.map (append (integer_bytes order width n)) (aligned_write b) }
+            } else { map (append (integer_bytes order width n)) (aligned_write b) }
         });
 
 /// Build an unsigned integer layout with a byte order and width.
@@ -167,12 +169,12 @@ let sint order width = integer order width true;
 let bytes count = layout
     (fn r -> if type_of count != :integer || count < 0 {
         failed :invalid_argument (position r) "byte count must be non-negative"
-    } else { Result.map (fn rr -> [str.slice (position rr / 8) count rr.[0], advance (count * 8) rr]) (need count r) })
+    } else { map (fn rr -> [str.slice (position rr / 8) count rr.[0], advance (count * 8) rr]) (need count r) })
     (fn data b -> if type_of count != :integer || count < 0 {
         failed :invalid_argument (written_bits b) "byte count must be non-negative"
     } else if type_of data != :string { failed :type_error (written_bits b) "expected bytes as a string" }
     else if len data != count { failed :out_of_range (written_bits b) "byte string has the wrong length" }
-    else { Result.map (append data) (aligned_write b) });
+    else { map (append data) (aligned_write b) });
 
 /// All bytes left in the enclosing reader. Useful as the last field of a section.
 let rest = layout (fn r -> read (bytes (remaining_bytes r)) r)
@@ -183,9 +185,9 @@ let rest = layout (fn r -> read (bytes (remaining_bytes r)) r)
 /// the position of the field. Callback errors are messages.
 let convert decode_value encode_value codec = layout
     (fn r -> match read codec r {
-        Result.error(e) => Result.error e,
+        Result.error(e) => err e,
         Result.ok([v, next]) => match decode_value v {
-            Result.ok(x) => Result.ok [x, next],
+            Result.ok(x) => ok [x, next],
             Result.error(message) => failed :invalid_value (position r) message,
         },
     })
@@ -196,30 +198,30 @@ let convert decode_value encode_value codec = layout
 
 /// A restriction is checked in both directions.
 let where predicate message codec = {
-    let check v = if predicate v { Result.ok v } else { Result.error message };
+    let check v = if predicate v { ok v } else { err message };
     convert check check codec
 };
 
 /// A fixed marker has unit as its value, e.g. magic "PNG".
 let constant codec expected = convert
-    (fn v -> if v == expected { Result.ok () } else { Result.error "constant field did not match" })
-    (fn v -> if v == () { Result.ok expected } else { Result.error "a constant field takes unit" }) codec;
+    (fn v -> if v == expected { Result.ok () } else { err "constant field did not match" })
+    (fn v -> if v == () { ok expected } else { err "a constant field takes unit" }) codec;
 /// Build a layout that requires and writes the given fixed bytes.
 let magic data = constant (bytes (len data)) data;
 
 /// Add a field name or array index to both read and write errors.
 let named name codec = layout
-    (fn r -> Result.map_error (at_path name) (read codec r))
-    (fn v b -> Result.map_error (at_path name) (write codec v b));
+    (fn r -> map_error (at_path name) (read codec r))
+    (fn v b -> map_error (at_path name) (write codec v b));
 
 /// A homogeneous fixed-count sequence. Errors include the failing index.
 let repeat count codec = layout
     (fn r -> if type_of count != :integer || count < 0 {
         failed :invalid_argument (position r) "repeat count must be non-negative"
     } else {
-        let rec go !i rr acc = if i == count { Result.ok [list.reverse acc, rr] }
+        let rec go !i rr acc = if i == count { ok [list.reverse acc, rr] }
             else { match read (named i codec) rr {
-                Result.error(e) => Result.error e,
+                Result.error(e) => err e,
                 Result.ok([v, next]) => go (i + 1) next (v :: acc),
             } };
         go 0 r []
@@ -229,9 +231,9 @@ let repeat count codec = layout
     } else if type_of values != :list { failed :type_error (written_bits b) "expected a list" }
     else {
         let rec go !i xs bb = match xs {
-            [] => if i == count { Result.ok bb } else { failed :out_of_range (written_bits bb) "too few elements" },
+            [] => if i == count { ok bb } else { failed :out_of_range (written_bits bb) "too few elements" },
             [v, ..tail] => if i >= count { failed :out_of_range (written_bits bb) "too many elements" }
-                else { Result.and_then (go (i + 1) tail) (write (named i codec) v bb) },
+                else { and_then (go (i + 1) tail) (write (named i codec) v bb) },
         };
         go 0 values b
     });
@@ -240,9 +242,9 @@ let repeat count codec = layout
 let tuple codecs = layout
     (fn r -> {
         let rec go cs rr acc !i = match cs {
-            [] => Result.ok [list.reverse acc, rr],
+            [] => ok [list.reverse acc, rr],
             [c, ..tail] => match read (named i c) rr {
-                Result.error(e) => Result.error e,
+                Result.error(e) => err e,
                 Result.ok([v, next]) => go tail next (v :: acc) (i + 1),
             },
         };
@@ -251,8 +253,8 @@ let tuple codecs = layout
     (fn values b -> if type_of values != :list { failed :type_error (written_bits b) "expected a list" }
     else {
         let rec go cs vs bb !i = match [cs, vs] {
-            [[], []] => Result.ok bb,
-            [[c, ..ct], [v, ..vt]] => Result.and_then (fn next -> go ct vt next (i + 1)) (write (named i c) v bb),
+            [[], []] => ok bb,
+            [[c, ..ct], [v, ..vt]] => and_then (fn next -> go ct vt next (i + 1)) (write (named i c) v bb),
             _ => failed :out_of_range (written_bits bb) "tuple has the wrong number of elements",
         };
         go codecs values b 0
@@ -261,34 +263,35 @@ let tuple codecs = layout
 /// Ordered named fields, represented by a map. Bare layouts are constants or
 /// padding: read and checked, written with unit, omitted from the value map.
 /// Missing and extra keys are rejected; duplicate names are invalid.
+let record : [:any] -> :map;
 let record fields = {
-    let keys = list.map (fn [key, _] -> key) (list.filter (fn f -> type_of f == :list) fields);
+    let keys = map (fn [key, _] -> key) (filter (fn f -> type_of f == :list) fields);
     let duplicate = list.length (list.unique keys) != list.length keys;
     layout
         (fn r -> if duplicate { failed :invalid_argument (position r) "duplicate record field" }
         else {
             let rec go fs rr acc = match fs {
-                [] => Result.ok [acc, rr],
+                [] => ok [acc, rr],
                 [[key, c], ..tail] => match read (named key c) rr {
-                    Result.error(e) => Result.error e,
+                    Result.error(e) => err e,
                     Result.ok([v, next]) => go tail next acc.[key => v],
                 },
-                [c, ..tail] => Result.and_then (fn [_, next] -> go tail next acc) (read c rr),
+                [c, ..tail] => and_then (fn [_, next] -> go tail next acc) (read c rr),
             };
             go fields r %{}
         })
         (fn value b -> if duplicate { failed :invalid_argument (written_bits b) "duplicate record field" }
         else if type_of value != :map { failed :type_error (written_bits b) "expected a map" }
         else {
-            let missing = list.filter (fn key -> not (maps.has key value)) keys;
-            let extra = list.filter (fn key -> not (list.contains key keys)) (maps.keys value);
+            let missing = filter (fn key -> not (maps.has key value)) keys;
+            let extra = filter (fn key -> not (list.contains key keys)) (maps.keys value);
             if missing != [] { Result.error (at_path (list.head missing) (problem :missing_field (written_bits b) "missing record field")) }
             else if extra != [] { Result.error (at_path (list.head extra) (problem :extra_field (written_bits b) "unexpected record field")) }
             else {
                 let rec go fs bb = match fs {
-                    [] => Result.ok bb,
-                    [[key, c], ..tail] => Result.and_then (go tail) (write (named key c) value.[key] bb),
-                    [c, ..tail] => Result.and_then (go tail) (write c () bb),
+                    [] => ok bb,
+                    [[key, c], ..tail] => and_then (go tail) (write (named key c) value.[key] bb),
+                    [c, ..tail] => and_then (go tail) (write c () bb),
                 };
                 go fields b
             }
@@ -298,7 +301,7 @@ let record fields = {
 /// A count-prefixed list, with an explicit element limit before allocation.
 let vector prefix limit item = layout
     (fn r -> match read prefix r {
-        Result.error(e) => Result.error e,
+        Result.error(e) => err e,
         Result.ok([n, next]) => if not (bounded n limit) {
             failed :out_of_range (position r) "sequence length exceeds its limit"
         } else { read (repeat n item) next },
@@ -308,7 +311,7 @@ let vector prefix limit item = layout
         // Inspect at most limit+1 elements, even when the input list is infinite.
         let n = if type_of limit == :integer && limit >= 0 { list.length (list.take (limit + 1) values) } else { -1 };
         if not (bounded n limit) { failed :out_of_range (written_bits b) "sequence length exceeds its limit" }
-        else { Result.and_then (write (repeat n item) values) (write prefix n b) }
+        else { and_then (write (repeat n item) values) (write prefix n b) }
     });
 
 /// Check a size against the permitted bound before reading or writing.
@@ -318,23 +321,23 @@ priv let bounded n limit = type_of n == :integer && type_of limit == :integer &&
 /// Limits are bytes; a malicious count is rejected before touching its body.
 let sized prefix limit codec = layout
     (fn r -> match read prefix r {
-        Result.error(e) => Result.error e,
+        Result.error(e) => err e,
         Result.ok([n, next]) => if not (bounded n limit) {
             failed :out_of_range (position r) "section length exceeds its limit"
-        } else { Result.and_then (fn rr -> {
+        } else { and_then (fn rr -> {
             let stop = position rr + n * 8;
             match read codec #[rr.[0], position rr, stop, position rr] {
-                Result.error(e) => Result.error e,
+                Result.error(e) => err e,
                 Result.ok([v, end]) => if position end != stop {
                     failed :trailing_data (position end) "section was not consumed exactly"
-                } else { Result.ok [v, #[rr.[0], stop, rr.[2], rr.[3]]] },
+                } else { ok [v, #[rr.[0], stop, rr.[2], rr.[3]]] },
             }
         }) (need n next) },
     })
-    (fn value b -> Result.and_then (fn built -> {
+    (fn value b -> and_then (fn built -> {
         if not (bounded (written_bytes built) limit) { failed :out_of_range (written_bits b) "section length exceeds its limit" }
-        else { Result.and_then (fn body ->
-            Result.and_then (write (bytes (len body)) body) (write prefix (len body) b)) (finish built) }
+        else { and_then (fn body ->
+            and_then (write (bytes (len body)) body) (write prefix (len body) b)) (finish built) }
     }) (write codec value builder));
 
 /// Build a length-prefixed byte-string layout with a maximum payload length.
@@ -344,13 +347,13 @@ let blob prefix limit = sized prefix limit rest;
 /// tags fail explicitly; alternatives never guess by trying decoders.
 let tagged tag_codec cases = layout
     (fn r -> match read tag_codec r {
-        Result.error(e) => Result.error e,
+        Result.error(e) => err e,
         Result.ok([tag, next]) => if not (maps.has tag cases) { failed :unknown_tag (position r) "unknown variant tag" }
-            else { Result.map (fn [v, end] -> [[tag, v], end]) (read (named tag cases.[tag]) next) },
+            else { map (fn [v, end] -> [[tag, v], end]) (read (named tag cases.[tag]) next) },
     })
     (fn value b -> match value {
         [tag, v] => if not (maps.has tag cases) { failed :unknown_tag (written_bits b) "unknown variant tag" }
-            else { Result.and_then (write (named tag cases.[tag]) v) (write tag_codec tag b) },
+            else { and_then (write (named tag cases.[tag]) v) (write tag_codec tag b) },
         _ => failed :type_error (written_bits b) "a tagged value is [tag, payload]",
     });
 
@@ -359,11 +362,11 @@ let tagged tag_codec cases = layout
 let terminated delimiter limit = layout
     (fn r -> if type_of limit != :integer || limit < 0 || len delimiter == 0 {
         failed :invalid_argument (position r) "termination needs a delimiter and a non-negative limit"
-    } else { Result.and_then (fn rr -> {
+    } else { and_then (fn rr -> {
         let count = list.minimum [remaining_bytes rr, limit + len delimiter];
         let data = str.slice (position rr / 8) count rr.[0];
         let found = str.find delimiter data;
-        if found >= 0 && found <= limit { Result.ok [str.slice 0 found data, advance ((found + len delimiter) * 8) rr] }
+        if found >= 0 && found <= limit { ok [str.slice 0 found data, advance ((found + len delimiter) * 8) rr] }
         else if count < limit + len delimiter { failed :truncated (position rr) "terminator has not arrived" }
         else { failed :out_of_range (position rr) "terminated field exceeds its limit" }
     }) (need 0 r) })
@@ -387,13 +390,13 @@ let padding count byte = {
 /// IEEE binary64, preserving signed zero and the runtime's NaN representation.
 let float64 order = convert
     (fn raw -> Result.ok (num.float_of_bytes (if order == :le { raw } else { reverse_bytes raw })))
-    (fn value -> if not (order_ok order) { Result.error "float byte order must be :be or :le" }
-        else if type_of value != :float && type_of value != :integer { Result.error "expected a number" }
+    (fn value -> if not (order_ok order) { err "float byte order must be :be or :le" }
+        else if type_of value != :float && type_of value != :integer { err "expected a number" }
         else { let raw = num.float_bytes value; Result.ok (if order == :le { raw } else { reverse_bytes raw }) })
     (where (fn _ -> order_ok order) "float byte order must be :be or :le" (bytes 8));
 
 /// Reverse bytes, including non-UTF-8 bytes. str.reverse reverses characters.
-let reverse_bytes data = str.of_bytes (list.map (fn i -> str.byte (len data - i - 1) data) (list.range 0 (len data)));
+let reverse_bytes data = str.of_bytes (map (fn i -> str.byte (len data - i - 1) data) (list.range 0 (len data)));
 
 // Variable integers: canonical unsigned LEB128 and ZigZag, with a bit limit.
 // Overlong encodings are rejected; a stream cannot choose two spellings for
@@ -404,14 +407,14 @@ let varuint max_bits = layout
         failed :invalid_argument (position r) "varint width must be 1..524288 bits"
     } else {
         let rec go rr !shift !acc = match read u8 rr {
-            Result.error(e) => Result.error e,
+            Result.error(e) => err e,
             Result.ok([byte, next]) => {
                 let payload = byte & 127;
                 let value = acc | (payload << shift);
                 if value >= (1 << max_bits) { failed :out_of_range (position rr) "varint exceeds its bit width" }
                 else if byte < 128 {
                     if shift > 0 && payload == 0 { failed :noncanonical (position rr) "redundant varint byte" }
-                    else { Result.ok [value, next] }
+                    else { ok [value, next] }
                 } else if shift + 7 >= max_bits { failed :out_of_range (position rr) "varint continuation exceeds its bit width" }
                 else { go next (shift + 7) value }
             },
@@ -424,14 +427,14 @@ let varuint max_bits = layout
     else if value < 0 || value >= (1 << max_bits) { failed :out_of_range (written_bits b) "varint exceeds its bit width" }
     else {
         let rec go n bb = if n < 128 { write u8 n bb }
-            else { Result.and_then (go (n >> 7)) (write u8 ((n & 127) | 128) bb) };
+            else { and_then (go (n >> 7)) (write u8 ((n & 127) | 128) bb) };
         go value b
     });
 
 /// Build a signed variable-length integer layout using zigzag encoding.
 let zigzag max_bits = convert
     (fn n -> Result.ok (if n & 1 == 0 { n >> 1 } else { -((n >> 1) + 1) }))
-    (fn n -> if type_of n != :integer { Result.error "expected an integer" }
+    (fn n -> if type_of n != :integer { err "expected an integer" }
         else { Result.ok (if n < 0 { (-n << 1) - 1 } else { n << 1 }) }) (varuint max_bits);
 let uvarint = varuint 64;
 let svarint = zigzag 64;
@@ -455,7 +458,7 @@ let bits order width = layout
     } else if remaining_bits r < width { Result.error ((problem :truncated (position r) "bit field exceeds the input")
             .[:needed_bits => width].[:available_bits => remaining_bits r]) }
     else {
-        let rec go !i !value = if i == width { Result.ok [value, advance width r] }
+        let rec go !i !value = if i == width { ok [value, advance width r] }
             else {
                 let at = position r + i;
                 let bit = (str.byte (at / 8) r.[0] >> (7 - at % 8)) & 1;
@@ -468,7 +471,7 @@ let bits order width = layout
     } else if type_of value != :integer { failed :type_error (written_bits b) "expected an integer" }
     else if value < 0 || value >= (1 << width) { failed :out_of_range (written_bits b) "integer does not fit the bit field" }
     else {
-        let rec go !i bb = if i == width { Result.ok bb } else {
+        let rec go !i bb = if i == width { ok bb } else {
             let shift = if order == :msb { width - i - 1 } else { i };
             go (i + 1) (push_bit ((value >> shift) & 1) bb)
         };
@@ -478,14 +481,14 @@ let bits order width = layout
 /// Build a signed two's-complement bit-field layout.
 let signed_bits order width = convert
     (fn n -> Result.ok (signed_value width n))
-    (fn n -> if not (bit_width_ok width) { Result.error "invalid bit width" }
-        else if type_of n != :integer { Result.error "expected an integer" }
-        else if n < -(1 << (width - 1)) || n >= (1 << (width - 1)) { Result.error "signed bit field overflow" }
+    (fn n -> if not (bit_width_ok width) { err "invalid bit width" }
+        else if type_of n != :integer { err "expected an integer" }
+        else if n < -(1 << (width - 1)) || n >= (1 << (width - 1)) { err "signed bit field overflow" }
         else { Result.ok (n & ((1 << width) - 1)) }) (bits order width);
 
 /// Read or write a boolean as a single bit.
 let flag = convert (fn n -> Result.ok (n == 1))
-    (fn v -> if type_of v != :bool { Result.error "expected a boolean" } else { Result.ok (if v { 1 } else { 0 }) }) (bits :msb 1);
+    (fn v -> if type_of v != :bool { err "expected a boolean" } else { Result.ok (if v { 1 } else { 0 }) }) (bits :msb 1);
 
 /// Fill/check the rest of the current byte with 0 or 1; value is unit.
 let byte_align fill = layout
@@ -522,10 +525,10 @@ let f64be = float64 :be;
 let f64le = float64 :le;
 
 /// Read a layout at a byte offset, returning [value, next_reader].
-let read_at codec offset data = Result.and_then (read codec) (reader_at offset (len data - offset) data);
+let read_at codec offset data = and_then (read codec) (reader_at offset (len data - offset) data);
 
 /// Encode into an existing byte string without extending or truncating it.
-let patch codec offset value data = Result.and_then (fn replacement ->
+let patch codec offset value data = and_then (fn replacement ->
     if type_of offset != :integer || offset < 0 { failed :invalid_argument 0 "patch offset must be non-negative" }
     else if offset > len data || len replacement > len data - offset {
         failed :out_of_range (offset * 8) "patch exceeds the destination"
@@ -538,11 +541,11 @@ let patch codec offset value data = Result.and_then (fn replacement ->
 /// selector. Unlike tagged, the selector can inspect a whole header record.
 let dependent header choose = layout
     (fn r -> match read header r {
-        Result.error(e) => Result.error e,
-        Result.ok([h, next]) => Result.map (fn [v, end] -> [[h, v], end]) (read (choose h) next),
+        Result.error(e) => err e,
+        Result.ok([h, next]) => map (fn [v, end] -> [[h, v], end]) (read (choose h) next),
     })
     (fn value b -> match value {
-        [h, v] => Result.and_then (write (choose h) v) (write header h b),
+        [h, v] => and_then (write (choose h) v) (write header h b),
         _ => failed :type_error (written_bits b) "a dependent value is [header, payload]",
     });
 
@@ -551,8 +554,8 @@ let lazy make = layout (fn r -> read (make ()) r) (fn v b -> write (make ()) v b
 
 /// A boolean as exactly one byte, 0 or 1.
 let boolean = convert
-    (fn n -> if n == 0 || n == 1 { Result.ok (n == 1) } else { Result.error "boolean byte must be 0 or 1" })
-    (fn v -> if type_of v == :bool { Result.ok (if v { 1 } else { 0 }) } else { Result.error "expected a boolean" }) u8;
+    (fn n -> if n == 0 || n == 1 { Result.ok (n == 1) } else { err "boolean byte must be 0 or 1" })
+    (fn v -> if type_of v == :bool { Result.ok (if v { 1 } else { 0 }) } else { err "expected a boolean" }) u8;
 
 /// Align to a byte boundary that is a multiple of boundary, checking fill.
 /// Alignment is relative to the enclosing section's start. Error positions
@@ -593,7 +596,7 @@ let sleb128 width = layout
     (fn r -> if not (bit_width_ok width) { failed :invalid_argument (position r) "invalid signed varint width" }
     else {
         let rec go rr !shift !acc = match read u8 rr {
-            Result.error(e) => Result.error e,
+            Result.error(e) => err e,
             Result.ok([byte, next]) => {
                 let unsigned = acc | ((byte & 127) << shift);
                 if byte >= 128 {
@@ -604,7 +607,7 @@ let sleb128 width = layout
                     let bound = 1 << (width - 1);
                     if n < -bound || n >= bound { failed :out_of_range (position rr) "signed varint is too wide" }
                     else if list.length (sleb_bytes n) != shift / 7 + 1 { failed :noncanonical (position rr) "redundant signed varint byte" }
-                    else { Result.ok [n, next] }
+                    else { ok [n, next] }
                 }
             },
         };
@@ -619,15 +622,15 @@ let sleb128 width = layout
 /// its own end (for example with sized); rest would consume the digest too.
 /// digest is a pure bytes -> bytes function, such as crypto.sha256.
 let checksummed count digest codec = layout
-    (fn r -> Result.and_then (fn start -> match read codec start {
-        Result.error(e) => Result.error e,
-        Result.ok([v, next]) => Result.and_then (fn [sum, end] -> {
+    (fn r -> and_then (fn start -> match read codec start {
+        Result.error(e) => err e,
+        Result.ok([v, next]) => and_then (fn [sum, end] -> {
             let body = str.slice (position start / 8) ((position next - position start) / 8) start.[0];
-            if crypto.equal sum (digest body) { Result.ok [v, end] }
+            if crypto.equal sum (digest body) { ok [v, end] }
             else { failed :checksum_mismatch (position next) "digest does not match the payload" }
         }) (read (bytes count) next),
     }) (need 0 r))
-    (fn v b -> Result.and_then (fn body -> {
+    (fn v b -> and_then (fn body -> {
         let sum = digest body;
-        Result.and_then (write (bytes count) sum) (write (bytes (len body)) body b)
+        and_then (write (bytes count) sum) (write (bytes (len body)) body b)
     }) (encode codec v));

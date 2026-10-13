@@ -55,7 +55,7 @@ let file_name p = Program.name p + ".dream";
 
 /// The lines of a compile's output that are warnings.
 let warnings : [:string] -> :string;
-let warnings [log] = str.join_str "\n" (list.filter (fn l -> str.contains_str "warning:" l) (str.lines log));
+let warnings [log] = str.join_str "\n" (filter (fn l -> str.contains_str "warning:" l) (str.lines log));
 
 /// The step that compiles the program.
 let image : Program -> :map;
@@ -66,11 +66,11 @@ let image p = {
                                   (list.concat [[compiler], runs_on, [build.file (Program.entry p)]])
                                   [Program.entry p, Program.paths p, Program.flags p, Program.no_warnings p]
                                   [file_name p] (fn job -> {
-        let head = list.map (fn i -> build.path job i) (list.append runs_on [compiler]);
+        let head = map (fn i -> build.path job i) (list.append runs_on [compiler]);
         // The flags after the entry: `--shebang` takes the next word as its
         // line unless it begins with `-`, and would take the entry.
         let args = list.concat [list.tail head,
-                                list.flat_map (fn r -> ["-L", r]) (Program.paths p),
+                                flat_map (fn r -> ["-L", r]) (Program.paths p),
                                 [Program.entry p],
                                 Program.flags p,
                                 ["-o", build.out job (file_name p), "--depfile", build.out job "deps.d"]];

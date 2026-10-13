@@ -46,11 +46,11 @@ let start_of zone n hours = {
 
 /// The subjects of a study seeded by `seed`: `subject-1` to `subject-n`.
 let subjects : :integer -> :integer -> [Subject];
-let subjects seed n = list.map (fn i -> physiology.subject (seed * 1000 + i) ("subject-" + to_string i)) (list.range 1 (n + 1));
+let subjects seed n = map (fn i -> physiology.subject (seed * 1000 + i) ("subject-" + to_string i)) (list.range 1 (n + 1));
 
 /// Every night of every subject: `count` subjects, `nights` nights each.
 let cohort! : :integer -> :integer -> :integer -> [Recording];
-let cohort! seed count nights = list.flat_map (fn s -> list.map (recording! s) (list.range 0 nights)) (subjects seed count);
+let cohort! seed count nights = flat_map (fn s -> map (recording! s) (list.range 0 nights)) (subjects seed count);
 
 when test {
     import std.test;

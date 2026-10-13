@@ -188,7 +188,7 @@ priv let float_text x = match to_string x {
 /// the server unquotes before it parses -- where leaving one bare would be
 /// wrong for any text holding a comma, a brace, a space or the word NULL.
 let array_literal : [:any] -> :string;
-let array_literal items = "{" + str.join_str "," (list.map array_element items) + "}";
+let array_literal items = "{" + str.join_str "," (map array_element items) + "}";
 
 /// Encode one array element using its PostgreSQL text representation.
 priv let array_element : :any -> :string;
@@ -205,7 +205,7 @@ priv let array_element v = match type_of v {
 /// Quote an array element when PostgreSQL array syntax requires it.
 priv let quote_element : :string -> :string;
 priv let quote_element text =
-    "\"" + str.concat_all (list.map escape_element (str.chars text)) + "\"";
+    "\"" + str.concat_all (map escape_element (str.chars text)) + "\"";
 
 /// Escape quotes and backslashes within a PostgreSQL array element.
 priv let escape_element : :char -> :string;

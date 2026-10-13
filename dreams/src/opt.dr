@@ -159,9 +159,9 @@ let node_runs = [
 // Asked once per node of the program, which is the shape of question that has
 // twice been the most expensive thing in a self-compile when it was answered by
 // walking a list. Both tables are built once, at module level.
-let edge_map = list.fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
+let edge_map = fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
                          (%{}) node_edges;
-let run_map = list.fold (fn m e -> m.[(list.nth 0 e) => [list.nth 1 e, list.nth 2 e, list.nth 3 e]])
+let run_map = fold (fn m e -> m.[(list.nth 0 e) => [list.nth 1 e, list.nth 2 e, list.nth 3 e]])
                         (%{}) node_runs;
 
 let edges_of : :atom -> [:integer];
@@ -174,8 +174,8 @@ let run_of op = run_map.[op else ()];
 /// `local`, `builtin`, `global`, `atom`, `int` -- and the walk below treats
 /// them differently, so the question is asked once per node and gets its own
 /// table rather than two misses on the two above.
-let leaf_map = list.fold (fn m e -> m.[(list.nth 0 e) => false])
-                         (list.fold (fn m e -> m.[(list.nth 0 e) => false])
+let leaf_map = fold (fn m e -> m.[(list.nth 0 e) => false])
+                         (fold (fn m e -> m.[(list.nth 0 e) => false])
                                     (%{}) node_edges)
                          node_runs;
 let is_leaf : :atom -> :bool;
@@ -630,7 +630,7 @@ let place_captures f s = {
     let off = f.[:captures_off else 0];
     let many = f.[:n_captures else 0];
     if many == 0 { [s, 0] }
-    else { keep_run (list.map (fn k -> kid_at (off + many - 1 - k) s) (list.range 0 many)) s }
+    else { keep_run (map (fn k -> kid_at (off + many - 1 - k) s) (list.range 0 many)) s }
 };
 
 /// Rebuild every reachable node of a finished image.
@@ -666,7 +666,7 @@ let fresh img nodes kids = {
     let strings = array.of_list (ir.Image.strs img);
     let ids = list.map (fn at -> type_codes.[strings.[at else ""] else ()])
                       (ir.Image.atoms img);
-    let type_ids = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
+    let type_ids = fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
                             %{} (list.zip (list.range 0 (list.length ids)) ids);
     ((state nodes kids) |> State.set_type_ids type_ids)
 };
@@ -684,7 +684,7 @@ let enter_body nodes kids type_ids s =
 /// in each pool's own index, so it is cheap enough to ask for every body.
 let type_ids_in : ir.Pool -> ir.Pool -> %{:integer => :integer};
 let type_ids_in strs atoms =
-    list.fold (fn m kv -> {
+    fold (fn m kv -> {
         let [name, code] = kv;
         match (ir.pool_index strs).[name else ()] {
             () => m,
@@ -774,6 +774,7 @@ when test {
     /// An image with nothing in it but nodes, kids and the bodies that reach
     /// them. Everything else `optimize` carries through untouched, so a test of
     /// the walk does not need it.
+    let image : [ir.Node] -> [:integer] -> [:integer] -> :map;
     let image nodes kids bodies =
         %{ :nodes => nodes, :kids => kids,
            :funcs => list.map (fn b -> %{ :body => b }) bodies };
@@ -786,10 +787,14 @@ when test {
                   :n_captures => list.nth 1 (list.nth 1 pair) })
                (list.zip bodies caps) };
 
+    let nodes_of : :map -> [ir.Node];
     let nodes_of img = ir.Image.nodes img;
+    let kids_of : :map -> [:integer];
     let kids_of img = ir.Image.kids img;
+    let bodies_of : :map -> [:integer];
     let bodies_of img = list.map (fn f -> f.[:body else ir.no_node])
                                  (ir.Image.funcs img);
+    let caps_of : :map -> [[:integer, :integer]];
     let caps_of img = list.map (fn f -> [f.[:captures_off else 0],
                                          f.[:n_captures else 0]])
                                (ir.Image.funcs img);

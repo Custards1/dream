@@ -84,8 +84,8 @@ let shuffle seed ds = rows (ops.permutation seed (size ds)) ds;
 let batches : :integer -> Dataset -> [Dataset];
 let batches n ds = {
     let total = size ds;
-    list.map (fn start -> slice start (if start + n > total { total - start } else { n }) ds)
-        (list.map (fn i -> i * n) (list.range 0 ((total + n - 1) / n)))
+    map (fn start -> slice start (if start + n > total { total - start } else { n }) ds)
+        (map (fn i -> i * n) (list.range 0 ((total + n - 1) / n)))
 };
 
 /// The dataset shuffled by `seed` and split in two, the first with `share`
@@ -106,7 +106,7 @@ let folds k seed ds = {
     let n = size ds;
     let order = ops.permutation seed n;
     let bounds i = [i * n / k, (i + 1) * n / k];
-    list.map (fn i -> {
+    map (fn i -> {
         let [lo, hi] = bounds i;
         let held = list.take (hi - lo) (list.drop lo order);
         let rest = list.take lo order + list.drop hi order;
@@ -191,15 +191,15 @@ let read_csv! path = match file.read! path {
 /// `Result.error why` naming the first line with a field that is not a number.
 let parse_csv : :string -> Result [[:any]] :string;
 let parse_csv text = {
-    let lines = list.filter (fn [_, l] -> not (str.is_empty l))
-        (list.enumerate (list.map str.trim (str.lines text)));
+    let lines = filter (fn [_, l] -> not (str.is_empty l))
+        (list.enumerate (map str.trim (str.lines text)));
     let body = match lines {
         [[_, first], ..rest] => if is_header first { rest } else { lines },
         [] => [],
     };
-    let parsed = list.map (fn [i, l] -> [i, list.map field (str.split "," l)]) body;
-    match list.filter (fn [_, r] -> list.contains () r) parsed {
-        [] => Result.ok (list.map (fn [_, r] -> r) parsed),
+    let parsed = map (fn [i, l] -> [i, map field (str.split "," l)]) body;
+    match filter (fn [_, r] -> list.contains () r) parsed {
+        [] => Result.ok (map (fn [_, r] -> r) parsed),
         [[i, _], .._] => Result.error ("line " + to_string (i + 1) + " has a field that is not a number"),
     }
 };
@@ -234,8 +234,8 @@ let of_rows : [[:float]] -> :integer -> Dataset;
 let of_rows table target = {
     let width = len (list.head table);
     let t = if target < 0 { width + target } else { target };
-    let inputs = list.map (fn r -> list.map (fn [_, v] -> v) (list.filter (fn [j, _] -> j != t) (list.enumerate r))) table;
-    let targets = list.map (fn r -> list.nth t r) table;
+    let inputs = map (fn r -> map (fn [_, v] -> v) (filter (fn [j, _] -> j != t) (list.enumerate r))) table;
+    let targets = map (fn r -> list.nth t r) table;
     make (tensor.of_list inputs) (tensor.of_list targets)
 };
 
@@ -251,8 +251,8 @@ let spirals seed n k = {
         let pts = tensor.concat [tensor.reshape [1, n] (t * tensor.sin theta), tensor.reshape [1, n] (t * tensor.cos theta)];
         [tensor.transpose pts, tensor.fill [n] (1.0 * c)]
     };
-    let parts = list.map one (list.range 0 k);
-    make (tensor.concat (list.map (fn [a, _] -> a) parts)) (tensor.concat (list.map (fn [_, b] -> b) parts))
+    let parts = map one (list.range 0 k);
+    make (tensor.concat (map (fn [a, _] -> a) parts)) (tensor.concat (map (fn [_, b] -> b) parts))
 };
 
 /// `k` round clusters of `n` points each in `dim` dimensions, centres drawn
@@ -261,8 +261,8 @@ let blobs : :integer -> :integer -> :integer -> :integer -> Dataset;
 let blobs seed n k dim = {
     let centres = tensor.random seed [k, dim] * 10.0 - 5.0;
     let one c = [tensor.normal (seed + 1 + c) [n, dim] + centres.[c], tensor.fill [n] (1.0 * c)];
-    let parts = list.map one (list.range 0 k);
-    make (tensor.concat (list.map (fn [a, _] -> a) parts)) (tensor.concat (list.map (fn [_, b] -> b) parts))
+    let parts = map one (list.range 0 k);
+    make (tensor.concat (map (fn [a, _] -> a) parts)) (tensor.concat (map (fn [_, b] -> b) parts))
 };
 
 /// `n` points of `dim` inputs and a target that is a fixed linear function of
@@ -300,8 +300,8 @@ when test {
         test.case "unscale undoes scale"
             $( test.true! ({ let sc = fit_minmax (x ds); tensor.maximum (tensor.abs (unscale sc (scale sc (x ds)) - x ds)) < 1.0e-9 }) ),
         test.case "minmax reaches 0 and 1" $( test.eq! [0.0, 1.0] ({ let s = scale (fit_minmax (x ds)) (x ds); [tensor.minimum s, tensor.maximum s] }) ),
-        test.case "csv with a header" $( test.eq! (Result.ok [[1.0, 2.0], [3.5, -4.0]]) (parse_csv "a,b\n1,2\n\n3.5, -4\n") ),
-        test.case "a bad field names its line" $( test.eq! (Result.error "line 3 has a field that is not a number") (parse_csv "a,b\n1,2\n3,x\n") ),
+        test.case "csv with a header" $( test.eq! (ok [[1.0, 2.0], [3.5, -4.0]]) (parse_csv "a,b\n1,2\n\n3.5, -4\n") ),
+        test.case "a bad field names its line" $( test.eq! (err "line 3 has a field that is not a number") (parse_csv "a,b\n1,2\n3,x\n") ),
         test.case "csv rows to a dataset"
             $( test.eq! [[2, 1], [2]] ({ let d = of_rows [[1.0, 9.0], [2.0, 8.0]] 0; [tensor.shape (x d), tensor.shape (y d)] }) ),
         test.case "spirals" $( test.eq! [[300, 2], 3] ({ let d = spirals 1 100 3; [tensor.shape (x d), class_count d] }) ),

@@ -170,9 +170,9 @@ let input i = match type_of i { :string => Input.file i, _ => i };
 mapping Step {
     tool
     name
-    inputs = []
+    inputs : [:any] = []
     config = ()
-    outputs = []
+    outputs : [:string] = []
     action
     shape
     discovers : :bool = false
@@ -197,9 +197,9 @@ priv let input_shape i = match i {
 /// works out the shape.
 let step : :string -> :string -> [:any] -> :any -> [:string] -> :any -> :map;
 let step tool name inputs config outputs action = {
-    let ins = list.map input inputs;
+    let ins = map input inputs;
     Step.make tool name ins config outputs action
-        (io.digest (encode [tool, config, outputs, list.map input_shape ins])) false :shared 0
+        (io.digest (encode [tool, config, outputs, map input_shape ins])) false :shared 0
 };
 
 /// A step that names what it read in `deps.d`.
@@ -306,8 +306,8 @@ mapping Plan {
     defines = %{}
     hosts = []
     target = ()
-    steps = []
-    later = []
+    steps : [:map] = []
+    later : [[:any]] = []
     conflicts = []
     checks = %{}
     goals = %{}
@@ -409,7 +409,7 @@ let listing dir suffix =
 let given_files : :string -> :string -> ([:string] -> :map) -> :map;
 let given_files dir suffix f =
     given (listing dir suffix)
-          (fn text -> f (list.map (fn l -> dir + "/" + l) (list.filter (fn l -> not (str.is_empty l)) (str.lines text))));
+          (fn text -> f (map (fn l -> dir + "/" + l) (filter (fn l -> not (str.is_empty l)) (str.lines text))));
 
 /// The table with `name => value` in it. A name already given to something
 /// else is marked as a conflict in the table itself, which is where
@@ -426,14 +426,18 @@ priv let meet : :any -> :any -> :any;
 priv let meet a b = match [a, b] {
     [(), _] => b,
     [_, ()] => a,
-    _ => list.filter (fn t -> list.contains t b) a,
+    _ => {
+        let left : [:any] = a;
+        let right : [:any] = b;
+        filter (fn t -> list.contains t right) left
+    },
 };
 
 /// Two tables merged, a name in both recorded as a conflict unless both say
 /// the same thing.
 priv let merge_table : :string -> :map -> :map -> :map;
 priv let merge_table kind a b =
-    map.fold (fn acc k v -> match acc.[k else ()] {
+    fold (fn acc k v -> match acc.[k else ()] {
         () => acc.[k => v],
         old if old == v => acc,
         _ => acc.[k => [:conflict, kind, k]],
@@ -442,7 +446,7 @@ priv let merge_table kind a b =
 /// The conflicts a table holds, as messages.
 priv let table_conflicts : :map -> [:string];
 priv let table_conflicts t =
-    list.flat_map (fn pair -> match list.nth 1 pair {
+    flat_map (fn pair -> match list.nth 1 pair {
         [:conflict, kind, name] => ["two " + kind + "s are called `" + name + "`"],
         _ => [],
     }) (_map_pairs t);
@@ -450,7 +454,7 @@ priv let table_conflicts t =
 /// Several plans as one. Merging is a union, and a name two of them give
 /// different things to is a conflict rather than one silently winning.
 let all : [:map] -> :map;
-let all plans = list.fold (fn a b ->
+let all plans = fold (fn a b ->
     Plan.make (merge_table "payload" (Plan.payloads a) (Plan.payloads b))
               (merge_table "module" (Plan.modules a) (Plan.modules b))
               (map.merge (Plan.defines a) (Plan.defines b))
@@ -515,12 +519,12 @@ let keyed : :any -> :any;
 let rec keyed v = match v {
     Input.artifact(s, n) if type_of s == :map && _map_has s :shape => [:artifact, Step.shape s, n],
     _ => match type_of v {
-        :list => list.map keyed v,
-        :map => map.map_values keyed v,
+        :list => { let values : [:any] = v; map keyed values },
+        :map => map_values keyed v,
         // A record, keyed as what it is and its fields: a key is read, never
         // used, so it need not be the record again.
         _ => if _record_id v == () { v }
-             else { %{ "<record>" => _record_id v, "<fields>" => list.map keyed (_array_to_list (_record_fields v)) } },
+             else { %{ "<record>" => _record_id v, "<fields>" => map keyed { let fields : [:any] = _array_to_list (_record_fields v); fields } } },
     },
 };
 
@@ -554,9 +558,9 @@ let rec encode v = match type_of v {
     :atom => "a" + to_string v + ";",
     :bool => if v { "T" } else { "F" },
     :unit => "U",
-    :list => "[" + str.join_str "" (list.map encode v) + "]",
-    :array => "#[" + str.join_str "" (list.map encode (_array_to_list v)) + "]",
-    :map => "{" + str.join_str "" (list.map (fn pair -> encode (list.head pair) + encode (list.nth 1 pair))
+    :list => "[" + str.join_str "" (map encode v) + "]",
+    :array => "#[" + str.join_str "" (map encode (_array_to_list v)) + "]",
+    :map => "{" + str.join_str "" (map (fn pair -> encode (list.head pair) + encode (list.nth 1 pair))
                                             (list.sort_on list.head (_map_pairs v))) + "}",
     // A record says which one it is, then its fields, as an array does.
     other => if _record_id v == () { "?" + to_string other + ";" }

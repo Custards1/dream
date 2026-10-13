@@ -35,7 +35,7 @@ let main! = {
     console.print! (bars.render top5 (counter.total counts))
     console.print! ""
 
-    let lengths = list.map (fn w -> str.length w) words;
+    let lengths = map (fn w -> str.length w) words;
     console.print! ("lengths:    " + to_string (stats.describe_lengths lengths))
     console.print! ("longest:    " + to_string (stats.longest words))
     console.print! ("significant:" + to_string (list.take 4 (tokenize.significant 4 sample)))

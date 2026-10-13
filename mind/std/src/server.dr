@@ -89,7 +89,7 @@ virtual let init! args;
 /// only takes casts should do: refuse clearly rather than hang.
 /// `from` is a `Handle`, or `:nobody` when `answer!` runs a handler in place.
 let handle_call! : :any -> :any -> :any -> Action :any :any;
-virtual let handle_call! request from state = reply (Result.error :unhandled) state;
+virtual let handle_call! request from state = reply (err :unhandled) state;
 
 /// A message that wants no answer. `noreply state` or `stop reason state`.
 let handle_cast! : :any -> :any -> Action :any :any;
@@ -307,9 +307,9 @@ priv let await_reply! pid request deadline = {
     let answer = proc.recv_until! (fn m -> is_reply_to ref m || proc.is_down_of pid m) deadline;
     proc.demonitor! pid
     match answer {
-        Result.ok([:server_reply, _, value]) => Result.ok value,
+        Result.ok([:server_reply, _, value]) => ok value,
         Result.ok([:down, _, outcome]) => raise! (error.new :down outcome),
-        _ => Result.error :timeout,
+        _ => err :timeout,
     }
 };
 

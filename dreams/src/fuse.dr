@@ -15,8 +15,9 @@
 // work threaded through a list. So the point of removing the list is not the
 // cells saved. It is that what remains is something the tier below can take.
 //
-// This module is only the vocabulary: which member of `std.list` plays which
-// role, and the shape of the plan the two passes agree on. Recognising a
+// This module is only the vocabulary: which member of `std.list`, `std.array`
+// and `std.map` plays which role, and the shape of the plan the two passes
+// agree on. Recognising a
 // pipeline is `scope`'s, because only a resolved name can say that the `range`
 // in front of you really is `std.list`'s; building the loop is `lower`'s,
 // because that is where nodes are made.
@@ -94,14 +95,51 @@ let roles = %{
     "product" => Role.sink :mul 1 false,
 };
 
+/// `std.array`'s: the same steps and sinks over an array, and no source of
+/// its own -- an array is only ever the thing a pipeline starts from. Its
+/// `map` and `filter` go through a list and keep their elements lazy, as
+/// `std.list`'s do, which is what lets a stage of one be substituted where
+/// its element is read.
+let array_roles = %{
+    "map" => Role.step :map 2,
+    "filter" => Role.step :filter 2,
+    "fold" => Role.sink :fold 3 true,
+    "sum" => Role.sink :add 1 false,
+    "product" => Role.sink :mul 1 false,
+};
+
+/// `std.map`'s: building a map from a list of pairs is a fold whose step
+/// nobody wrote down, as `sum` is.
+let map_roles = %{
+    "from_pairs" => Role.sink :pairs 1 false,
+};
+
+/// A member this pass knows, and which module's: `:list`, `:array` or `:map`.
+/// The module says what a pipeline runs over -- a sink of `std.array`'s over
+/// the steps of `std.array`'s over an array -- and a chain is only one
+/// pipeline while its pieces agree.
+struct Member { kind : :atom, role : Role }
+
 /// What a member of `std.list` is to this pass, or `()`.
 let role_of : :string -> Role | :unit;
 let role_of name = roles.[name else ()];
 
+/// What a member of the module of this kind is to this pass, or `()`.
+let member_of : :atom -> :string -> Member | :unit;
+let member_of kind name = match (match kind { :list => roles, :array => array_roles, _ => map_roles }).[name else ()] {
+    () => (),
+    role => Member.make kind role,
+};
+
+/// What a pipeline whose sink is of this kind runs over: a map is built from
+/// a list.
+let runs_over : :atom -> :atom;
+let runs_over kind = if kind == :array { :array } else { :list };
+
 /// Every name this pass knows, which is what a caller building the index of
 /// global to role has to ask about.
 let member_names : [:string];
-let member_names = list.sort (map.keys roles);
+let member_names = list.unique (list.sort (map.keys roles + map.keys array_roles + map.keys map_roles));
 
 // --- the plan ---------------------------------------------------------------
 //
@@ -149,9 +187,9 @@ struct Plan {
 /// Where the loop keeps things. Every fused loop has the same three
 /// parameters, whichever source it came from: a cursor the source advances, a
 /// second value the source carries unchanged -- `range`'s limit, `replicate`'s
-/// element -- and the accumulator. Three rather than two so that a `range`'s
-/// limit is a parameter and not a capture: the JIT compiles a function of its
-/// arguments, and a capture is a frame it would have to keep.
+/// element, an array -- and the accumulator. The carried value is a parameter
+/// and not a capture because the JIT compiles a function of its arguments, and
+/// a capture is a frame it would have to keep.
 let cursor_slot : :integer;
 let cursor_slot = 0;
 let carried_slot : :integer;
@@ -161,9 +199,41 @@ let acc_slot = 2;
 let arity : :integer;
 let arity = 3;
 
-/// Which slot holds the element a source hands to its consumer.
+/// Which slot holds the element a source hands to its consumer. A list or an
+/// array has none: its element is read where it is used (`elements`).
 let element_slot : :atom -> :integer;
 let element_slot tag = if tag == :replicate { carried_slot } else { cursor_slot };
+
+// --- a list or an array as the source ---------------------------------------
+//
+// A pipeline need not start with a producer: `fold f acc (map g xs)` over a
+// list someone already has builds the list `map` makes and throws it away,
+// and `fold f acc xs` alone calls `f` through a closure for every element when
+// the loop could have its body written in. Neither is a list to remove, but
+// both are a loop to write, and the loop is the point.
+//
+// The loop keeps its shape. Over a list the cursor is what is left of it and
+// the loop is done when that is empty; over an array the cursor counts from
+// zero and the array is carried, as `range` carries its limit. The element is
+// not a slot, since nothing computes it ahead of its use: it is read where it
+// is used -- the cursor's head, or the array at the cursor -- by the same
+// substitution a `map`'s output is (see "a stage that has no slot"), with
+// `elements` standing for the read. Unlike a `map`'s body it is a single
+// opcode, so writing it out more than once costs nothing worth counting.
+//
+// Nothing is produced twice here, so a list that is named is as good a source
+// as one written in place: the loop walks it once, as the fold it replaces
+// did.
+
+/// The read of a list's or an array's element, as the substitution for the
+/// slot a loop over one reads it from: syntax of a kind the parser never
+/// makes, which `lower` writes as the read.
+let elements : :atom -> [:any];
+let elements tag = [:fused_element, tag];
+
+/// Does this source tag stand for a container the program already has?
+let walks_container : :atom -> :bool;
+let walks_container tag = tag == :list || tag == :array;
 
 // --- a stage that has no slot -----------------------------------------------
 //
@@ -193,7 +263,7 @@ let element_slot tag = if tag == :replicate { carried_slot } else { cursor_slot 
 /// shadows the parameter is charged for uses that are not the parameter's.
 /// Over-counting can only refuse a fusion that would have been affordable.
 let uses : :string -> ast.Expr -> :integer;
-let uses name e = list.length (list.filter (fn n -> n == name) (mentioned e));
+let uses name e = list.length (filter (fn n -> n == name) (mentioned e));
 
 /// The node count of an expression built only from names, literals, operators
 /// and `if`, or `-1` when it is built from anything else. One walk answers
@@ -348,7 +418,7 @@ let rec mentioned_in deep e =
         [:thunk, x, _] => if deep { mentioned_in deep x } else { [] },
         [:lambda, ps, body, _] =>
             if deep {
-                list.append (list.map (fn p -> param_name_of p) ps) (mentioned_in deep body)
+                list.append (map (fn p -> param_name_of p) ps) (mentioned_in deep body)
             } else { [] },
         [:comp, _, x, _] => if deep { mentioned_in deep x } else { [] },
         [:list, xs, _]  => mentioned_all deep xs,
@@ -365,7 +435,7 @@ let rec mentioned_in deep e =
         _ => [],
     };
 
-let mentioned_all deep es = list.concat (list.map (fn e -> mentioned_in deep e) es);
+let mentioned_all deep es = list.concat (map (fn e -> mentioned_in deep e) es);
 
 /// A parameter is `[name, span]`, or `[(), span, pattern]` when it is written
 /// as a pattern. A pattern parameter has no name of its own, and the names it
@@ -375,14 +445,14 @@ let param_name_of : ast.Param -> :string;
 let param_name_of p = match list.nth 0 p { () => "", n => n };
 
 let rec mentioned_stmts deep stmts =
-    list.concat (list.map (fn st ->
+    list.concat (map (fn st ->
         match st {
             // `let f x = ..` is a local function, so its body is a frame of its
             // own; what is left in this one is the name it binds.
             [:let, n, ps, body, _, _] =>
                 if not (list.is_empty ps) && not deep { [n] }
                 else {
-                    list.cons n (list.append (list.map (fn p -> param_name_of p) ps)
+                    list.cons n (list.append (map (fn p -> param_name_of p) ps)
                                              (mentioned_in deep body))
                 },
             [:let_p, pattern, body, _] =>
@@ -393,7 +463,7 @@ let rec mentioned_stmts deep stmts =
         }) stmts);
 
 let rec mentioned_arms deep arms =
-    list.concat (list.map (fn a ->
+    list.concat (map (fn a ->
         list.append (pattern_names (list.nth 0 a))
                     (list.append (match list.nth 1 a { () => [], g => mentioned_in deep g })
                                  (mentioned_in deep (list.nth 2 a)))) arms);
@@ -406,15 +476,15 @@ let rec pattern_names p =
         [:literal, e, _] => mentioned e,
         [:as_p, inner, n, _, _] => list.cons n (pattern_names inner),
         [:record_p, ctor, fields, _] =>
-            list.append (mentioned ctor) (list.concat (list.map (fn f -> pattern_names f) fields)),
+            list.append (mentioned ctor) (list.concat (map (fn f -> pattern_names f) fields)),
         [:success_p, inner, _] => pattern_names inner,
         [:cons_p, head, tail, _, _] => list.append (pattern_names head) (pattern_names tail),
         [:list_p, items, rest, _]  =>
-            list.append (list.concat (list.map (fn i -> pattern_names i) items)) (rest_name rest),
+            list.append (list.concat (map (fn i -> pattern_names i) items)) (rest_name rest),
         [:array_p, items, rest, _] =>
-            list.append (list.concat (list.map (fn i -> pattern_names i) items)) (rest_name rest),
+            list.append (list.concat (map (fn i -> pattern_names i) items)) (rest_name rest),
         [:map_p, pairs, _] =>
-            list.concat (list.map (fn kv ->
+            list.concat (map (fn kv ->
                 list.append (mentioned (list.nth 0 kv)) (pattern_names (list.nth 1 kv))) pairs),
         _ => [],
     };
@@ -474,7 +544,7 @@ let stmt_reads deep st =
     match st {
         [:let, _, ps, body, _, _] =>
             if not (list.is_empty ps) && not deep { [] }
-            else { list.append (list.map (fn p -> param_name_of p) ps) (mentioned_in deep body) },
+            else { list.append (map (fn p -> param_name_of p) ps) (mentioned_in deep body) },
         [:let_p, _, body, _] => mentioned_in deep body,
         [:sig, _, _, _] => [],
         _ => mentioned_in deep st,
@@ -510,17 +580,17 @@ let staged_lets shaped stmts = {
         // `n` is read exactly once in the whole block -- but by the line above
         // its own `let`, where it means the parameter and not this binding.
         // Staging it answered 21 where the program says 55.
-        let reads = list.concat (list.map (fn st -> stmt_reads true st) stmts);
-        list.concat (list.map (fn i ->
+        let reads = list.concat (map (fn st -> stmt_reads true st) stmts);
+        list.concat (map (fn i ->
             match list.nth i stmts {
                 [:let, name, _, body, _, span] =>
                     if not (stageable shaped (list.nth i stmts)) { [] }
                     else {
                         // The statements the body would be moved past: what
                         // they bind, and what they read in this frame.
-                        let rest = list.map (fn j -> list.nth j stmts) (list.range (i + 1) n);
-                        let after = list.concat (list.map (fn st -> stmt_binds st) rest);
-                        let later = list.concat (list.map (fn st -> stmt_reads false st) rest);
+                        let rest = map (fn j -> list.nth j stmts) (list.range (i + 1) n);
+                        let after = list.concat (map (fn st -> stmt_binds st) rest);
+                        let later = list.concat (map (fn st -> stmt_reads false st) rest);
                         if list.count (fn u -> u == name) reads != 1 { [] }
                         else if list.count (fn u -> u == name) later != 1 { [] }
                         else if list.contains name after { [] }

@@ -26,7 +26,7 @@ import std.str;
 /// mean, and a `;` inside a generator expression still separates a list.
 let quoted : :string -> :string;
 let quoted s =
-    "\"" + _str_concat (list.map (fn c -> match c { '"' => "\\\"", '\\' => "/", _ => _str_of_chars [c] }) (str.chars s)) + "\"";
+    "\"" + _str_concat (map (fn c -> match c { '"' => "\\\"", '\\' => "/", _ => _str_of_chars [c] }) (str.chars s)) + "\"";
 
 /// A path from the script's root, as seen from the `CMakeLists.txt`. One that
 /// is already absolute -- a probe found it -- is left alone.
@@ -59,16 +59,16 @@ let lang_id lang = match lang { :c => "C", _ => "CXX" };
 /// is what keeps the file readable.
 let per_compiler : (cc.Toolchain -> [:string]) -> (:string -> :string) -> [:string];
 let per_compiler translate condition = {
-    let answered = list.map (fn [ids, tc] -> [ids, translate tc]) compilers;
-    let grouped = list.fold (fn groups [ids, flags] -> match flags {
+    let answered = map (fn [ids, tc] -> [ids, translate tc]) compilers;
+    let grouped = fold (fn groups [ids, flags] -> match flags {
         [] => groups,
-        _ => match list.index_of flags (list.map (fn g -> list.nth 1 g) groups) {
-            i if i >= 0 => list.map (fn [gi, g] -> if gi == i { [list.append (list.head g) ids, flags] } else { g })
+        _ => match list.index_of flags (map (fn g -> list.nth 1 g) groups) {
+            i if i >= 0 => map (fn [gi, g] -> if gi == i { [list.append (list.head g) ids, flags] } else { g })
                                     (list.enumerate groups),
             _ => list.append groups [[ids, flags]],
         },
     }) [] answered;
-    list.map (fn [ids, flags] -> quoted ("$<$<" + condition (str.join_str "," ids) + ">:"
+    map (fn [ids, flags] -> quoted ("$<$<" + condition (str.join_str "," ids) + ">:"
                                           + str.join_str ";" flags + ">"))
              grouped
 };
@@ -99,7 +99,7 @@ let native s = match s {
 
 /// Translate settings into toolchain-specific CMake compiler flags.
 let flags_of translate tc lang settings =
-    list.flat_map (fn s -> if native s { [] } else { translate tc lang s }) settings;
+    flat_map (fn s -> if native s { [] } else { translate tc lang s }) settings;
 
 /// Render compile options with language and toolchain conditions.
 let compile_options lang settings =
@@ -112,7 +112,7 @@ let compile_options lang settings =
 
 /// Render target link options as CMake expressions.
 let link_options settings =
-    per_compiler (fn tc -> list.flat_map (fn s -> if native s { [] } else {
+    per_compiler (fn tc -> flat_map (fn s -> if native s { [] } else {
         match cc.Toolchain.family tc {
             :msvc => msvc.link_flags tc s,
             _ => gnu.link_flags tc s,
@@ -121,7 +121,7 @@ let link_options settings =
                  (fn ids -> "CXX_COMPILER_ID:" + ids);
 
 /// Extract preprocessor definitions from build settings.
-let definitions settings = list.flat_map (fn s -> match s {
+let definitions settings = flat_map (fn s -> match s {
     cc.Setting.define(n, ()) => [quoted n],
     cc.Setting.define(n, v) => [quoted (n + "=" + gnu.value_text v)],
     cc.Setting.define_for(sel, n) => [quoted ("$<$<CXX_COMPILER_ID:" + str.join_str "," (family_of sel) + ">:" + n + ">")],
@@ -129,13 +129,13 @@ let definitions settings = list.flat_map (fn s -> match s {
 }) settings;
 
 /// Resolve include directories from build settings against the source root.
-let includes root settings = list.flat_map (fn s -> match s {
+let includes root settings = flat_map (fn s -> match s {
     cc.Setting.include(d) => [quoted (place root d)],
     _ => [],
 }) settings;
 
 /// Resolve linked libraries from build settings.
-let libraries root settings = list.flat_map (fn s -> match s {
+let libraries root settings = flat_map (fn s -> match s {
     cc.Setting.threads => ["Threads::Threads"],
     cc.Setting.system(l) => [l],
     cc.Setting.system_for(os, l) => [quoted ("$<$<PLATFORM_ID:" + platform_id os + ">:" + l + ">")],
@@ -144,7 +144,7 @@ let libraries root settings = list.flat_map (fn s -> match s {
 }) settings;
 
 /// Extract language-standard requirements from build settings.
-let standards settings = list.flat_map (fn s -> match s {
+let standards settings = flat_map (fn s -> match s {
     cc.Setting.standard(l) => {
         let lang = if cc.standard_is_for :cxx l { "CXX" } else { "C" };
         [lang + "_STANDARD " + cc.standard_version l, lang + "_STANDARD_REQUIRED ON", lang + "_EXTENSIONS OFF"]
@@ -164,13 +164,13 @@ let target_id all t = match cc.kind t {
 };
 
 /// Return the C/C++ languages used by a target's source files.
-let languages t = list.unique (list.filter (fn l -> l != :other) (list.map (fn [p, _] -> cc.language p) (cc.sources t)));
+let languages t = list.unique (filter (fn l -> l != :other) (map (fn [p, _] -> cc.language p) (cc.sources t)));
 
 /// Render one target and its dependency relationships as CMake source.
 let target_text : :string -> [cc.Target] -> cc.Target -> :string;
 let target_text root all t = {
     let id = target_id all t;
-    let srcs = list.map (fn [p, _] -> quoted (place root p)) (cc.sources t);
+    let srcs = map (fn [p, _] -> quoted (place root p)) (cc.sources t);
     let own = cc.settings t;
     let pub = cc.public t;
     let scope_of kind = if cc.kind t == :external { "INTERFACE" } else { kind };
@@ -191,7 +191,7 @@ let target_text root all t = {
         (match f own { [] => [], xs => list.cons (scope_of "PRIVATE") xs }),
     ];
     let languages_here = languages t;
-    let per_source = list.flat_map (fn [p, settings] -> match settings {
+    let per_source = flat_map (fn [p, settings] -> match settings {
         [] => [],
         _ => [command "set_source_files_properties"
                       [quoted (place root p), "PROPERTIES", "COMPILE_OPTIONS",
@@ -203,13 +203,13 @@ let target_text root all t = {
         [command "target_compile_definitions" (match with_scopes definitions { [] => [], xs => list.cons id xs })],
         [command "target_include_directories" (match with_scopes (includes root) { [] => [], xs => list.cons id xs })],
         [command "target_compile_options"
-                 (match list.flat_map (fn l -> compile_options l own) languages_here {
+                 (match flat_map (fn l -> compile_options l own) languages_here {
                       [] => [], xs => list.concat [[id, scope_of "PRIVATE"], xs] })],
         [command "target_link_options" (match link_options (list.append own pub) {
             [] => [], xs => list.concat [[id, scope_of "PRIVATE"], xs] })],
         [command "target_link_libraries"
                  (match list.append (with_scopes (libraries root))
-                                    (match list.map (fn u -> target_id all u) (cc.uses t) {
+                                    (match map (fn u -> target_id all u) (cc.uses t) {
                                          [] => [], ids => list.cons (scope_of "PUBLIC") ids }) {
                       [] => [], xs => list.cons id xs })],
         per_source,
@@ -223,18 +223,18 @@ let target_text root all t = {
 /// `note` is the comment the file opens with.
 let export : :string -> :string -> :string -> [cc.Target] -> :string;
 let export note project root targets = {
-    let langs = list.unique (list.flat_map languages targets);
+    let langs = list.unique (flat_map languages targets);
     let wants_threads = list.any (fn t -> list.contains cc.Setting.threads (list.append (cc.settings t) (cc.public t)))
                                  targets;
     _str_concat (list.concat [
-        list.map (fn line -> "# " + line + "\n") (str.split "\n" note),
+        map (fn line -> "# " + line + "\n") (str.split "\n" note),
         ["\ncmake_minimum_required(VERSION 3.20)\n",
          "project(" + project + " LANGUAGES "
-             + str.join_str " " (list.map lang_id (list.sort (list.map (fn l -> match l { :c => 0, _ => 1 }) langs)
-                                                    |> list.map (fn n -> if n == 0 { :c } else { :cxx })))
+             + str.join_str " " (map lang_id (list.sort (map (fn l -> match l { :c => 0, _ => 1 }) langs)
+                                                    |> map (fn n -> if n == 0 { :c } else { :cxx })))
              + ")\n\n"],
         (if wants_threads { ["find_package(Threads REQUIRED)\n\n"] } else { [] }),
-        list.map (fn t -> target_text root targets t) targets,
+        map (fn t -> target_text root targets t) targets,
     ])
 };
 

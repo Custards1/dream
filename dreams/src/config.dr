@@ -107,12 +107,12 @@ let within key c = Configuration.set_here (match key { () => (), k => canonical 
 let with_aliases : %{:string => :string} -> (:string -> :bool) -> Configuration -> [:any];
 let with_aliases aliases known c = {
     let named = Configuration.set_aliases aliases c;
-    let refiled = list.fold (fn m [k, table] -> {
+    let refiled = fold (fn m [k, table] -> {
         let to = canonical named k;
-        m.[to => list.fold (fn t [n, v] -> t.[n => v]) (m.[to else (%{})]) (map.pairs table)]
+        m.[to => fold (fn t [n, v] -> t.[n => v]) (m.[to else (%{})]) (map.pairs table)]
     }) (%{}) (map.pairs (scoped c));
     [Configuration.set_scoped refiled named,
-     list.filter (fn k -> not (known k)) (list.map (fn [k, _] -> k) (map.pairs (scoped c)))]
+     filter (fn k -> not (known k)) (map (fn [k, _] -> k) (map.pairs (scoped c)))]
 };
 
 /// A package option as a condition reads it: `Result.ok value` when the name
@@ -131,10 +131,10 @@ let option c name = {
             Result.ok (((scoped c).[canonical c key else (%{})]).[rest else ()])
         },
         false => match Configuration.here c {
-            () => Result.error :not_an_option,
+            () => err :not_an_option,
             k => match ((scoped c).[k else (%{})]).[name else ()] {
-                () => Result.error :not_an_option,
-                v => Result.ok v,
+                () => err :not_an_option,
+                v => ok v,
             },
         },
     }
@@ -228,12 +228,12 @@ let rec reads cond =
 /// Settings are quoted so that a value with a space in it still reads as one.
 let describe : Configuration -> [:string];
 let describe c = {
-    let named = list.map (fn [name, _] -> name) (map.pairs (flags c));
-    let valued = list.map (fn [name, value] -> name + " = \"" + value + "\"")
+    let named = map (fn [name, _] -> name) (map.pairs (flags c));
+    let valued = map (fn [name, value] -> name + " = \"" + value + "\"")
                           (map.pairs (values c));
     // Each package's options under its name, after the program's settings.
-    let options = list.sort (list.flat_map (fn [key, table] ->
-        list.map (fn [name, value] -> key + ":" + name + " = \"" + value + "\"") (map.pairs table))
+    let options = list.sort (flat_map (fn [key, table] ->
+        map (fn [name, value] -> key + ":" + name + " = \"" + value + "\"") (map.pairs table))
         (map.pairs (scoped c)));
     list.append (list.sort (list.append named valued)) options
 };

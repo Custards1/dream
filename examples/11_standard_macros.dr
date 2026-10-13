@@ -7,11 +7,11 @@ let main! = {
     expand macros.unless false { console.print! "unless ran" }
     console.print! (expand macros.coalesce () "fallback")
     console.print! (expand macros.with_some value 6 (value * 7))
-    console.print! (expand macros.with_ok value (Result.ok 20) (Result.ok (value + 22)))
+    console.print! (expand macros.with_ok value (ok 20) (Result.ok (value + 22)))
 
     // A literal list of pipeline stages expands to ordinary |> expressions.
     console.print! (expand macros.pipe [1, 2, 3, 4]
-        [list.map (fn x -> x * 2), list.filter (fn x -> x > 4), list.sum])
+        [map (fn x -> x * 2), filter (fn x -> x > 4), list.sum])
     console.print! (expand macros.cond [[false, "cold"], [true, "warm"]] "unknown")
     console.print! (expand macros.and_all [true, false, list.head [] == 0])
 

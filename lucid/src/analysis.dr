@@ -87,7 +87,7 @@ let source_items a mi = modules.module_items (modules.module_at (source a) mi);
 /// Compared as written rather than resolved: the overlay is keyed by the path
 /// the editor gave, and the loader records the path it was asked for.
 let module_index l path = {
-    let hits = list.filter (fn i -> modules.module_path (modules.module_at l i) == path)
+    let hits = filter (fn i -> modules.module_path (modules.module_at l i) == path)
                            (list.range 0 (modules.module_count l));
     if list.is_empty hits { () } else { list.head hits }
 };
@@ -134,11 +134,11 @@ let editor_resolution! l = {
         |> scope.Resolution.set_imports (scope.s_imports declared)
         |> scope.Resolution.set_module_recs (scope.s_module_recs declared)
         |> scope.Resolution.set_diags (scope.diags declared);
-    let seeded = list.fold_strict (fn r e ->
+    let seeded = fold (fn r e ->
         scope.Resolution.set_refs ((scope.refs r).[(scope.ref_key (list.nth 0 e)
             (list.nth 1 e) (list.nth 2 e)) => (list.nth 3 e)]) r)
         base (modules.expansions l);
-    scope.resolve_from! l declared seeded 0 scope.state
+    typecheck.select_overloads l (scope.resolve_from! l declared seeded 0 scope.state)
 };
 
 let analyse! path roots open_docs = analyse_cached! path roots open_docs (%{});
@@ -224,9 +224,9 @@ let all_diagnostics a = compile.checked (loader a) (resolved a) compile.options;
 /// the last set of squiggles on screen forever.
 let diagnostics_by_path a = {
     let ds = all_diagnostics a;
-    let paths = list.unique (list.map (fn d -> diagnostic_path a d) ds);
-    list.map (fn p -> [p, list.map (fn d -> lsp_diagnostic a d)
-                                   (list.filter (fn d -> diagnostic_path a d == p) ds)])
+    let paths = list.unique (map (fn d -> diagnostic_path a d) ds);
+    map (fn p -> [p, map (fn d -> lsp_diagnostic a d)
+                                   (filter (fn d -> diagnostic_path a d == p) ds)])
              paths
 };
 
@@ -362,19 +362,21 @@ let arm_holds a offset = covers (list.nth 3 a) offset;
 /// The names a parameter list binds. A parameter is a name, `()` -- a slot that
 /// binds nothing -- or a pattern, and only the last of those binds more than
 /// one thing.
+let param_binders : [ast.Param] -> [[:any]];
 let param_binders ps =
-    list.concat (list.map (fn p ->
+    list.concat (map (fn p ->
         match ast.param_pattern p {
             () => match ast.param_name p {
                       () => [],
                       n => [binder n (list.nth 1 p) []],
                   },
-            pattern => list.map (fn nb -> binder (list.head nb) (list.nth 1 nb) [])
+            pattern => map (fn nb -> binder (list.head nb) (list.nth 1 nb) [])
                                 (scope.pattern_bindings pattern),
         }) ps);
 
+let pattern_binders : ast.Pattern -> [[:any]];
 let pattern_binders pattern =
-    list.map (fn nb -> binder (list.head nb) (list.nth 1 nb) []) (scope.pattern_bindings pattern);
+    map (fn nb -> binder (list.head nb) (list.nth 1 nb) []) (scope.pattern_bindings pattern);
 
 /// Every local visible at `offset`, outermost first, threaded down through the
 /// constructs that contain it. `acc` is what the enclosing constructs have
@@ -417,7 +419,7 @@ let rec expr_binders e offset acc =
 
             [:field, obj, _, _] => expr_binders obj offset acc,
             [:apply, callee, args, _] =>
-                list.fold_strict (fn a x -> expr_binders x offset a) (expr_binders callee offset acc) args,
+                list.fold (fn a x -> expr_binders x offset a) (expr_binders callee offset acc) args,
             [:pipe, l, r, _] => expr_binders r offset (expr_binders l offset acc),
             [:unary, _, x, _] => expr_binders x offset acc,
             [:binary, _, l, r, _] => expr_binders r offset (expr_binders l offset acc),
@@ -426,10 +428,10 @@ let rec expr_binders e offset acc =
                 match el { () => seen, x => expr_binders x offset seen }
             },
             [:thunk, x, _] => expr_binders x offset acc,
-            [:list, xs, _]  => list.fold_strict (fn a x -> expr_binders x offset a) acc xs,
-            [:array, xs, _] => list.fold_strict (fn a x -> expr_binders x offset a) acc xs,
+            [:list, xs, _]  => list.fold (fn a x -> expr_binders x offset a) acc xs,
+            [:array, xs, _] => list.fold (fn a x -> expr_binders x offset a) acc xs,
             [:map, pairs, _] =>
-                list.fold_strict (fn a kv -> expr_binders (list.nth 1 kv) offset
+                list.fold (fn a kv -> expr_binders (list.nth 1 kv) offset
                                           (expr_binders (list.nth 0 kv) offset a))
                           acc pairs,
             [:get, c, k, fallback, _] => {
@@ -560,8 +562,8 @@ let locals_at a offset =
         () => [],
         mi => {
             let found = list.reverse (item_binders (source_items a mi) offset []);
-            let names = list.unique (list.map (fn b -> binder_name b) found);
-            list.map (fn n -> list.head (list.filter (fn b -> binder_name b == n) found)) names
+            let names = list.unique (map (fn b -> binder_name b) found);
+            map (fn n -> list.head (filter (fn b -> binder_name b == n) found)) names
         },
     };
 
@@ -677,7 +679,9 @@ let record_of a mi = {
 
 let record_owner r   = list.head r;
 let record_name r    = list.nth 2 r;
+let record_fields : :any -> [[:any]];
 let record_fields r  = list.nth 3 r;
+let record_members : :any -> [[:any]];
 let record_members r = list.nth 4 r;
 let record_span r    = list.nth 5 r;
 
@@ -707,13 +711,13 @@ let record_keyword r =
 /// is that *and* a field called `thing`, which is the clash the compiler
 /// already refuses as "conflicts with a generated helper".
 let record_field r n =
-    match list.filter (fn f -> ast.field_name f == n) (record_fields r) {
+    match filter (fn f -> ast.field_name f == n) (record_fields r) {
         [f, .._] => f,
         [] => if not (str.starts_with "set_" n) { () }
               else {
                   let stem = str.slice 4 (str.byte_length n - 4) n;
                   list.first_or ()
-                      (list.filter (fn f -> ast.field_name f == stem) (record_fields r))
+                      (filter (fn f -> ast.field_name f == stem) (record_fields r))
               },
     };
 
@@ -738,10 +742,10 @@ let record_role r n =
                   // The two constructors differ only in what they ask for, so
                   // which fields `new` is filling in is the whole of what
                   // there is to say about the difference.
-                  + match [n, list.filter (fn f -> ast.field_default f != ()) (record_fields r)] {
+                  + match [n, filter (fn f -> ast.field_default f != ()) (record_fields r)] {
                         ["new", [_, .._] as defaulted] =>
                             ", defaulting " + str.join_str ", "
-                                (list.map (fn f -> "`" + ast.field_name f + "`") defaulted),
+                                (map (fn f -> "`" + ast.field_name f + "`") defaulted),
                         _ => "",
                     },
             f => (if str.starts_with "set_" n && ast.field_name f != n {
@@ -778,13 +782,13 @@ let record_role r n =
 let foreign_of a mi = {
     let l = loader a;
     let full = modules.module_name (modules.module_at l mi);
-    list.fold_strict (fn found f ->
+    fold (fn found f ->
         if found != () { found }
         else {
             let own = foreign_owner f + "." + foreign_name f;
             if own == full { [:library, f] }
             else {
-                match list.filter (fn e -> match e {
+                match filter (fn e -> match e {
                     [:c_struct, s, _, _] => own + "." + s == full,
                     _ => false,
                 }) (foreign_entries f) {
@@ -798,6 +802,7 @@ let foreign_of a mi = {
 let foreign_owner f   = list.nth 0 f;
 let foreign_name f    = list.nth 1 f;
 let foreign_library f = list.nth 2 f;
+let foreign_entries : :any -> [[:any]];
 let foreign_entries f = list.nth 3 f;
 let foreign_span f    = list.nth 4 f;
 
@@ -872,11 +877,12 @@ let foreign_role a part n =
 /// module like any other -- `m.ffi` -- which nobody wrote and nobody should be
 /// offered. What the block declares is its entries and `library`, and a
 /// struct's module is all generated names but its own import.
+let declared_members : :map -> :integer -> [:string] -> [:string];
 let declared_members a target names =
     match foreign_of a target {
         () => names,
-        [:library, f] => list.filter (fn n -> n == "library" || foreign_entry f n != ()) names,
-        _ => list.filter (fn n -> n != "foreign") names,
+        [:library, f] => filter (fn n -> n == "library" || foreign_entry f n != ()) names,
+        _ => filter (fn n -> n != "foreign") names,
     };
 
 /// What a declaration the loader generated -- a record's or a foreign
@@ -935,7 +941,7 @@ let param_text src p =
 /// `name` followed by the parameters of `ps`.
 let signature src name ps =
     if list.is_empty ps { name }
-    else { name + " " + str.join_str " " (list.map (fn p -> param_text src p) ps) };
+    else { name + " " + str.join_str " " (map (fn p -> param_text src p) ps) };
 
 /// How to show a global or a member: its signature when the declaration can be
 /// found, and its bare name when it cannot.
@@ -952,7 +958,7 @@ let shown_signature a mi name =
 /// expanded items, because that is where a record's and a union's generated
 /// signatures are; a module's own signature follows any it inherited.
 let declared_type a mi name =
-    list.fold_strict (fn found oi -> match list.nth 1 oi {
+    list.fold (fn found oi -> match list.nth 1 oi {
         [:sig, n, t, _] if n == name => t,
         _ => found,
     }) () (list.head (scope.effective_items (loader a) mi []));
@@ -1068,9 +1074,9 @@ let rec namespace_location a ref = match ref {
         _ => {
             let m = modules.module_at (loader a) target;
             // Inline modules leave an import at their declaration's span.
-            let sites = list.flat_map (fn owner ->
+            let sites = flat_map (fn owner ->
                 if modules.module_source owner != modules.module_source m { [] }
-                else { list.filter (fn it -> match it {
+                else { filter (fn it -> match it {
                     [:import, segs, _, _, _] => str.join_str "." segs == modules.module_name m,
                     _ => false,
                 }) (modules.module_items owner) }) (modules.modules (source a));
@@ -1083,7 +1089,7 @@ let rec namespace_location a ref = match ref {
     scope.Ref.group(name) => match package.find (modules.packages (loader a)) name {
         () => (),
         p => match package.manifest p {
-            "" => match list.filter (fn m ->
+            "" => match filter (fn m ->
                 str.starts_with (package.name p + ".") (modules.module_name m))
                 (modules.modules (loader a)) {
                 [] => (),
@@ -1098,7 +1104,7 @@ let rec namespace_location a ref = match ref {
 let navigation_context a here = {
     let root = module_of a;
     let source_id = modules.module_source (modules.module_at (loader a) root);
-    list.fold_strict (fn best mi -> {
+    fold (fn best mi -> {
         let m = modules.module_at (source a) mi;
         if modules.module_source m == source_id
            && list.any (fn it -> holds it here) (modules.module_items m)
@@ -1157,7 +1163,7 @@ let definition_at a line character = match module_of a {
             _ => {
                 let is_token = list.any (fn t -> lexer.span_start t == here && lexer.kind t == :ident)
                     (lexer.tokens src);
-                let imports = list.filter (fn it -> is_token && holds it here &&
+                let imports = filter (fn it -> is_token && holds it here &&
                     (ast.kind it == :import || ast.kind it == :derive)) items;
                 match imports {
                     [imp, .._] => {
@@ -1181,7 +1187,7 @@ let definition_at a line character = match module_of a {
                                         [original, alias] => navigation_target a mi
                                             (ast.name_e (match alias { () => original, n => n }) ast.no_span),
                                         _ => navigation_target a mi
-                                            (list.fold_strict (fn obj n -> ast.field_e obj n ast.no_span)
+                                            (fold (fn obj n -> ast.field_e obj n ast.no_span)
                                                 (ast.name_e (list.head segs) ast.no_span) (list.tail segs)),
                                     }
                                 },
@@ -1278,7 +1284,7 @@ let rec docs_for a found = match found {
 /// applied the shadowing rule, so the first entry under a name is the binding
 /// this occurrence means.
 let describe_local a offset name =
-    match list.filter (fn b -> binder_name b == name) (locals_at a offset) {
+    match filter (fn b -> binder_name b == name) (locals_at a offset) {
         [] => "a local",
         [b, .._] =>
             match module_of a {
@@ -1362,7 +1368,7 @@ let hint_kind_type = 1;
 /// a search of the text would find `le` inside `let`.
 let hint_offset src span name params = match list.reverse params {
     [p, .._] => ast.span_end (list.nth 1 p),
-    [] => match list.filter (fn t -> lexer.kind t == :ident && lexer.value t == name
+    [] => match filter (fn t -> lexer.kind t == :ident && lexer.value t == name
                                      && lexer.span_start t >= ast.span_start span)
                             (lexer.tokens src) {
         [] => (),
@@ -1378,7 +1384,7 @@ let inlay_hints a first last = match module_of a {
         let si = modules.module_source (modules.module_at l mi);
         let f = modules.file_at l si;
         let src = diag.source_text f;
-        let placed = list.concat (list.map (fn hint -> {
+        let placed = list.concat (map (fn hint -> {
             let span = typecheck.Hint.span hint;
             // A span past 2^31 is generated code, which is in no file.
             if ast.span_start span >= 2147483648 { [] }
@@ -1391,7 +1397,7 @@ let inlay_hints a first last = match module_of a {
         }) (typecheck.hints l (resolved a) si));
         let once = list.unique placed;
         let starts = diag.line_starts src;
-        list.concat (list.map (fn one -> {
+        list.concat (map (fn one -> {
             let [at, shown] = one;
             let [line, character] = pos.position_in starts src at;
             if line < first || line > last { [] }
@@ -1424,8 +1430,9 @@ let inlay_hints a first last = match module_of a {
 // here is: a module used by some other program is renamed in this one only.
 
 /// The ident token spelled `name` at or after `from`, or `()`.
+let token_at_or_after : [lexer.Token] -> :string -> :integer -> :integer | :unit;
 let token_at_or_after toks name from =
-    match list.filter (fn t -> lexer.kind t == :ident && lexer.value t == name
+    match filter (fn t -> lexer.kind t == :ident && lexer.value t == name
                                && lexer.span_start t >= from) toks {
         [] => (),
         [t, .._] => lexer.span_start t,
@@ -1435,24 +1442,25 @@ let token_at_or_after toks name from =
 /// written: `name offset => binder offset`, the binder offset being the start
 /// of the span `locals_at` reports for it. A top-level `let` binds a global,
 /// so only its parameters and what is inside it are here.
+let binders_in : [lexer.Token] -> [ast.Decl] -> :map;
 let binders_in toks items = {
     let note acc n span = match token_at_or_after toks n (ast.span_start span) {
         () => acc,
         at => acc.[at => ast.span_start span],
     };
-    let params acc ps = list.fold_strict (fn m b -> note m (binder_name b) (binder_span b)) acc (param_binders ps);
-    let patterned acc pattern = list.fold_strict (fn m b -> note m (binder_name b) (binder_span b)) acc (pattern_binders pattern);
+    let params acc ps = fold (fn m b -> note m (binder_name b) (binder_span b)) acc (param_binders ps);
+    let patterned acc pattern = fold (fn m b -> note m (binder_name b) (binder_span b)) acc (pattern_binders pattern);
     let rec walk acc e = match e {
         [:let, n, ps, body, _, span] => walk (params (note acc n span) ps) body,
         [:let_p, pattern, body, _] => walk (patterned acc pattern) body,
         [:lambda, ps, body, _] => walk (params acc ps) body,
-        [:match, subject, arms, _] => list.fold_strict (fn m arm ->
+        [:match, subject, arms, _] => list.fold (fn m arm ->
             walk (walk (patterned m (ast.arm_pattern arm)) (ast.arm_guard arm)) (ast.arm_body arm))
             (walk acc subject) arms,
-        xs if type_of xs == :list => list.fold_strict (fn m x -> walk m x) acc xs,
+        xs if type_of xs == :list => list.fold (fn m x -> walk m x) acc xs,
         _ => acc,
     };
-    let rec items_walk acc its = list.fold_strict (fn m it -> match it {
+    let rec items_walk acc its = list.fold (fn m it -> match it {
         [:let, _, ps, body, _, _] => walk (params m ps) body,
         [:macro, _, ps, body, _] => walk (params m ps) body,
         [:virtual, _, ps, body, _, _] => if body == () { m } else { walk (params m ps) body },
@@ -1499,7 +1507,7 @@ let identity a mi toks binders offset name =
 
 /// The global whose declaration names it at `offset`, or `()`.
 let declared_identity a source toks offset name =
-    match list.filter (fn d -> list.nth 1 d == source && list.nth 2 d == name
+    match filter (fn d -> list.nth 1 d == source && list.nth 2 d == name
                                && token_at_or_after toks name (ast.span_start (list.nth 3 d)) == offset)
                       (scope.defs (resolved a)) {
         [d, .._] => [:global, list.head d, name],
@@ -1507,7 +1515,7 @@ let declared_identity a source toks offset name =
     };
 
 let local_identity a offset name =
-    match list.filter (fn b -> binder_name b == name) (locals_at a offset) {
+    match filter (fn b -> binder_name b == name) (locals_at a offset) {
         [] => (),
         [b, .._] => [:local, ast.span_start (binder_span b)],
     };
@@ -1530,19 +1538,19 @@ let valid_rename old new = {
     else if bang != str.ends_with "!" old {
         Result.error (if bang { "only an impure name ends with `!`" } else { "an impure name must keep its `!`" })
     }
-    else { Result.ok new }
+    else { ok new }
 };
 
 /// What the cursor is on, for a rename: `[:ok, identity, start, end, name]`
 /// or `[:error, why]`.
 let rename_target a line character = match module_of a {
-    () => Result.error "this file is not part of the program",
+    () => err "this file is not part of the program",
     mi => {
         let src = module_text a mi;
         let here = name_start src (pos.offset_of src line character);
         let name = name_at src here;
         let toks = lexer.tokens src;
-        if name == "" { Result.error "there is no name here" }
+        if name == "" { err "there is no name here" }
         else {
             match identity a mi toks (binders_in toks (source_items a mi)) here name {
                 () => Result.error ("`" + name + "` cannot be renamed here"),
@@ -1556,7 +1564,7 @@ let rename_target a line character = match module_of a {
 let prepare_rename_at a line character = match rename_target a line character {
     [:ok, _, start, end, name] => {
         let src = module_text a (module_of a);
-        Result.ok %{ "range" => pos.range src start end, "placeholder" => name }
+        ok %{ "range" => pos.range src start end, "placeholder" => name }
     },
     failed => failed,
 };
@@ -1569,7 +1577,7 @@ let global_sites a target name = {
     // Uses: the resolver's table, decoded. A key is `(ctx * 65536 + source)
     // * 2^32 + start` (`scope.ref_key`), and a member is recorded at the head
     // of its chain, so the member's own segment is found in the text.
-    let uses = list.concat (list.map (fn kv -> {
+    let uses = list.concat (map (fn kv -> {
         let [key, what] = kv;
         let start = key % 4294967296;
         let si = (key / 4294967296) % 65536;
@@ -1596,11 +1604,11 @@ let global_sites a target name = {
     };
     // Signatures and selective imports are declarations, read off the
     // program as written.
-    let declared = list.concat (list.map (fn mi -> {
+    let declared = list.concat (map (fn mi -> {
         let si = modules.module_source (modules.module_at l mi);
         let items = modules.module_items (modules.module_at (source a) mi);
         let toks = toks_of si;
-        list.concat (list.map (fn it -> match it {
+        list.concat (map (fn it -> match it {
             [:sig, n, _, sp] if n == name && mi == target => match token_at_or_after toks name (ast.span_start sp) {
                 () => [],
                 at => [[si, at]],
@@ -1638,7 +1646,7 @@ let last_segment src start name = {
 /// Every occurrence of a local, in this file: each token spelled the same
 /// whose identity is the same binder.
 let local_sites a mi toks binders name id =
-    list.concat (list.map (fn t ->
+    list.concat (map (fn t ->
         if lexer.kind t != :ident || lexer.value t != name { [] }
         else if identity a mi toks binders (lexer.span_start t) name == id { [lexer.span_start t] }
         else { [] }) toks);
@@ -1646,7 +1654,7 @@ let local_sites a mi toks binders name id =
 /// LSP's `rename`: a `WorkspaceEdit` replacing every occurrence, or an error.
 let rename_at a line character new = match rename_target a line character {
     [:ok, id, _, _, name] => match valid_rename name new {
-        Result.error(why) => Result.error why,
+        Result.error(why) => err why,
         _ => {
             let l = loader a;
             let mi = module_of a;
@@ -1655,18 +1663,18 @@ let rename_at a line character new = match rename_target a line character {
                 [:local, _] => {
                     let src = module_text a mi;
                     let toks = lexer.tokens src;
-                    list.map (fn at -> [si, at]) (local_sites a mi toks (binders_in toks (source_items a mi)) name id)
+                    map (fn at -> [si, at]) (local_sites a mi toks (binders_in toks (source_items a mi)) name id)
                 },
                 [:global, target, _] => global_sites a target name,
             };
-            let files = list.unique (list.map (fn s -> list.head s) sites);
-            Result.ok %{ "changes" => list.fold_strict (fn m f -> {
+            let files = list.unique (map (fn s -> list.head s) sites);
+            ok %{ "changes" => fold (fn m f -> {
                 let file = modules.file_at l f;
                 let text = diag.source_text file;
                 m.[path_to_uri (diag.source_path file) =>
-                    list.map (fn s -> %{ "range" => pos.range text (list.nth 1 s) (list.nth 1 s + str.byte_length name),
+                    map (fn s -> %{ "range" => pos.range text (list.nth 1 s) (list.nth 1 s + str.byte_length name),
                                          "newText" => new })
-                             (list.sort_on (fn s -> list.nth 1 s) (list.filter (fn s -> list.head s == f) sites))]
+                             (list.sort_on (fn s -> list.nth 1 s) (filter (fn s -> list.head s == f) sites))]
             }) %{} files }
         },
     },
@@ -1700,14 +1708,14 @@ let detailed words sym = if words == "" { sym } else { sym.["detail" => words] }
 /// A record's fields and members, as outline children in the order they were
 /// written. `at` is the caller's span-to-range, which needs the file's text.
 let child_symbols at r =
-    list.map (fn c -> list.nth 1 c)
+    map (fn c -> list.nth 1 c)
         (list.sort_by (fn x y -> list.head x < list.head y)
-            (list.map (fn f -> [ast.span_start (ast.field_span f),
+            (map (fn f -> [ast.span_start (ast.field_span f),
                                 %{ "name" => ast.field_name f, "kind" => symbol_field,
                                    "range" => at (ast.field_span f),
                                    "selectionRange" => at (ast.field_span f) }])
                       (record_fields r)
-             + list.map (fn m -> [ast.span_start (ast.member_span m),
+             + map (fn m -> [ast.span_start (ast.member_span m),
                                   %{ "name" => ast.member_name m, "kind" => symbol_method,
                                      "range" => at (ast.member_span m),
                                      "selectionRange" => at (ast.member_span m) }])
@@ -1741,6 +1749,7 @@ let foreign_symbols a at f = {
 /// file declares has nothing called `Point` in it and the outline of a file
 /// full of records was empty. They are merged and sorted by where they were
 /// written, since an outline out of source order reads as a different file.
+let symbols : :map -> [:map];
 let symbols a =
     match module_of a {
         () => [],
@@ -1758,7 +1767,7 @@ let symbols a =
             // source each body came from, which is what makes the two
             // separable at all.
             let own = modules.module_source (modules.module_at (loader a) mi);
-            let globals = list.map (fn d -> {
+            let globals = map (fn d -> {
                 let span = list.nth 3 d;
                 let name = list.nth 2 d;
                 [ast.span_start span,
@@ -1769,10 +1778,10 @@ let symbols a =
             // leaves under its own name, holding its description -- has a
             // generated span, past 2^31, and is in no file: the declaration
             // it came from is in the outline already, as a record.
-            }) (list.filter (fn d -> list.nth 1 d == own && ast.span_start (list.nth 3 d) < 2147483648)
+            }) (filter (fn d -> list.nth 1 d == own && ast.span_start (list.nth 3 d) < 2147483648)
                             (scope.module_defs (resolved a) mi));
             let mine = modules.module_name (modules.module_at (loader a) mi);
-            let records = list.map (fn r -> {
+            let records = map (fn r -> {
                 let span = record_span r;
                 [ast.span_start span,
                  %{ "name" => record_name r,
@@ -1790,11 +1799,11 @@ let symbols a =
                     // field and then every member would be describing a
                     // declaration nobody wrote.
                     "children" => child_symbols at r }]
-            }) (list.filter (fn r -> record_owner r == mine) (modules.records (loader a)));
+            }) (filter (fn r -> record_owner r == mine) (modules.records (loader a)));
             // A `foreign` block is missing from the globals for the same
             // reason, and its entries are its children as a record's fields
             // are -- in the order written, which is the order they are kept.
-            let foreigns = list.map (fn f -> {
+            let foreigns = map (fn f -> {
                 let span = foreign_span f;
                 [ast.span_start span,
                  %{ "name" => foreign_name f,
@@ -1803,8 +1812,8 @@ let symbols a =
                     "range" => at span,
                     "selectionRange" => at span,
                     "children" => foreign_symbols a at f }]
-            }) (list.filter (fn f -> foreign_owner f == mine) (modules.foreigns (loader a)));
-            list.map (fn s -> list.nth 1 s)
+            }) (filter (fn f -> foreign_owner f == mine) (modules.foreigns (loader a)));
+            map (fn s -> list.nth 1 s)
                      (list.sort_by (fn x y -> list.head x < list.head y)
                                    (globals + records + foreigns))
         },
@@ -1887,11 +1896,11 @@ when test {
 
     let tests = [
         test.case "a rename keeps a name a name"
-            $( test.eq! [Result.ok "b", Result.error "`1b` is not a name", Result.error "`a-b` is not a name"]
+            $( test.eq! [ok "b", err "`1b` is not a name", err "`a-b` is not a name"]
                         [valid_rename "a" "b", valid_rename "a" "1b", valid_rename "a" "a-b"] ),
         test.case "a rename keeps purity"
-            $( test.eq! [Result.ok "go!", Result.error "only an impure name ends with `!`",
-                         Result.error "an impure name must keep its `!`"]
+            $( test.eq! [ok "go!", err "only an impure name ends with `!`",
+                         err "an impure name must keep its `!`"]
                         [valid_rename "run!" "go!", valid_rename "run" "go!", valid_rename "run!" "go"] ),
         test.case "a member is the last segment of its chain"
             $( test.eq! [11, (), 0]

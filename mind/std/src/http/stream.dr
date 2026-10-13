@@ -53,4 +53,4 @@ priv let rec hex_of n = if n < 16 { str.slice n 1 "0123456789abcdef" } else { he
 
 /// A stream whose pieces are `f` of another's, as they are pulled.
 let map_stream : (:any -> :string) -> :any -> :any;
-let map_stream f s = if type_of s == :list { list.map f s } else { #[:mapped, f, s] };
+let map_stream f s = if type_of s == :list { let values : [:any] = s; map f values } else { #[:mapped, f, s] };

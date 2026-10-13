@@ -79,7 +79,7 @@ let checks ctx =
 // --- the VM -------------------------------------------------------------------------
 
 let vm_sources : [:string];
-let vm_sources = list.map (fn s -> "dream/src/" + s + ".cpp")
+let vm_sources = map (fn s -> "dream/src/" + s + ".cpp")
                           ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "ffi",
                            "io", "digest", "crypto", "regex", "bigint", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
                            "jit_rt", "tls"];
@@ -106,7 +106,7 @@ let avx2 ctx tc t = match [build.Target.arch (build.Context.target ctx), cc.Tool
 /// Archive and shared-library paths are tracked as file inputs; flags remain
 /// in the compiler's dialect.
 let link_libraries : cc.Toolchain -> [:string] -> cc.Target -> cc.Target;
-let link_libraries tc libs t = list.fold (fn target lib ->
+let link_libraries tc libs t = fold (fn target lib ->
     if (str.starts_with "/" lib || (str.byte_length lib > 2 && str.slice 1 1 lib == ":"))
        && not (str.starts_with "/LIBPATH:" lib) {
         cc.set (cc.Setting.link_file lib) target
@@ -277,7 +277,7 @@ let dependencies ctx tc config libffi openssl dir = {
                     l => {
                         // LLVM reports libxml2 for WindowsManifest, outside these
                         // JIT components. Match CMake without weakening other dependencies.
-                        let selected = l.[:libraries => list.filter (fn lib -> lib != "-lxml2") l.[:libraries]];
+                        let selected = l.[:libraries => filter (fn lib -> lib != "-lxml2") l.[:libraries]];
                         build.given (probe.shared_link tc llvm_probe [(if cc.Toolchain.family tc == :msvc { "/I" } else { "-I" }) + l.[:includes]]
                                         (list.cons ((if cc.Toolchain.family tc == :msvc { "/LIBPATH:" } else { "-L" }) + l.[:libdir]) selected.[:libraries])) (fn works ->
                         if works == "yes" { goals ctx tc selected ffi_libs openssl }

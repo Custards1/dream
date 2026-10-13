@@ -128,7 +128,7 @@ priv let folded st s = match st { :windows => str.lower s, _ => s };
 
 /// The non-empty, non-`.` names in `rest`. `..` is kept: it names a place.
 priv let names : :string -> [:string];
-priv let names rest = list.filter (fn s -> s != "" && s != ".") (str.split "/" rest);
+priv let names rest = filter (fn s -> s != "" && s != ".") (str.split "/" rest);
 
 /// `rest` without the separators it ends with.
 priv let trimmed : :string -> :string;
@@ -326,7 +326,7 @@ priv let relative_in st from to = {
     // only the disk knows; different anchors have no relative spelling.
     if folded st (anchor_in st a) != folded st (anchor_in st b) || list.contains ".." ups { b }
     else {
-        match list.append (list.map (fn _ -> "..") ups) downs {
+        match list.append (map (fn _ -> "..") ups) downs {
             [] => ".",
             segs => str.join_str "/" segs,
         }
@@ -377,7 +377,7 @@ let join a b = join_in (style ()) a b;
 
 /// `base` joined to each of `parts` in turn: `join_all "src" ["a", "b.dr"]`.
 let join_all : :string -> [:string] -> :string;
-let join_all base parts = list.fold join base parts;
+let join_all base parts = fold join base parts;
 
 /// The extension without its dot, or `""` (see `dot_at` for what counts).
 let extension : :string -> :string;
@@ -448,7 +448,7 @@ mod posix {
     let join a b = join_in :posix a b;
     /// `base` joined to each of `parts` in turn.
     let join_all : :string -> [:string] -> :string;
-    let join_all base parts = list.fold join base parts;
+    let join_all base parts = fold join base parts;
     /// The extension without its dot, or `""`.
     let extension : :string -> :string;
     let extension p = extension_in :posix p;
@@ -501,7 +501,7 @@ mod windows {
     let join a b = join_in :windows a b;
     /// `base` joined to each of `parts` in turn.
     let join_all : :string -> [:string] -> :string;
-    let join_all base parts = list.fold join base parts;
+    let join_all base parts = fold join base parts;
     /// The extension without its dot, or `""`.
     let extension : :string -> :string;
     let extension p = extension_in :windows p;

@@ -38,7 +38,7 @@ let top n counts = list.take n (ranked counts);
 let distinct counts = len counts;
 
 /// How many occurrences in total.
-let total counts = list.sum (list.map (fn p -> list.nth 1 p) (map.pairs counts));
+let total counts = list.sum (map (fn p -> list.nth 1 p) (map.pairs counts));
 
 when test {
     import std.test;

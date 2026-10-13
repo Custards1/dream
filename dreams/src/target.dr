@@ -44,8 +44,8 @@ let any = Target.new ();
 /// Kept in the order `every_os` and `every_arch` give, so two targets that
 /// allow the same things are equal and read the same way in a message.
 let make : [Os] -> [Arch] -> Target;
-let make os arch = Target.make (list.filter (fn o -> list.contains o os) every_os)
-                               (list.filter (fn a -> list.contains a arch) every_arch);
+let make os arch = Target.make (filter (fn o -> list.contains o os) every_os)
+                               (filter (fn a -> list.contains a arch) every_arch);
 
 let is_any : Target -> :bool;
 let is_any t = list.is_empty (Target.os t) && list.is_empty (Target.arch t);
@@ -100,7 +100,7 @@ let arch_bit a = match a { :x86_64 => 1, :aarch64 => 2 };
 /// byte-for-byte what it was.
 let flags : Target -> :integer;
 let flags t = {
-    let bits f xs = list.fold_strict (fn n x -> n + f x) 0 xs;
+    let bits f xs = fold (fn n x -> n + f x) 0 xs;
     bits os_bit (Target.os t) * 256 + bits arch_bit (Target.arch t) * 65536
 };
 
@@ -111,7 +111,7 @@ let flags t = {
 let join : [Target] -> Target;
 let join ts = {
     let side f = if list.any (fn t -> list.is_empty (f t)) ts { [] }
-                 else { list.concat (list.map f ts) };
+                 else { list.concat (map f ts) };
     if list.is_empty ts { any } else { make (side Target.os) (side Target.arch) }
 };
 
@@ -130,11 +130,11 @@ let meet a b = {
     let wanted x y = not (list.is_empty x && list.is_empty y);
     if list.is_empty os && wanted (Target.os a) (Target.os b)
        && not (list.is_empty (Target.os a) || list.is_empty (Target.os b)) {
-        Result.error "os"
+        err "os"
     }
     else if list.is_empty arch && wanted (Target.arch a) (Target.arch b)
             && not (list.is_empty (Target.arch a) || list.is_empty (Target.arch b)) {
-        Result.error "arch"
+        err "arch"
     }
     else { Result.ok (make os arch) }
 };
@@ -142,7 +142,7 @@ let meet a b = {
 /// `linux, macos (x86_64)`, or `any platform`, for a message.
 let describe : Target -> :string;
 let describe t = {
-    let names xs = str.join_str ", " (list.map name xs);
+    let names xs = str.join_str ", " (map name xs);
     match [Target.os t, Target.arch t] {
         [[], []] => "any platform",
         [[], arch] => names arch,
@@ -165,7 +165,7 @@ let parse spec =
     if spec == "any" { Result.ok () }
     else {
         let item acc part = match acc {
-            Result.error(why) => Result.error why,
+            Result.error(why) => err why,
             [:ok, os, arch] => {
                 let at = str.find "=" part;
                 let key = if at < 0 { "" } else { str.slice 0 at part };
@@ -184,7 +184,7 @@ let parse spec =
                 }
             },
         };
-        match list.fold item [:ok, [], []] (list.filter (fn p -> not (str.is_empty p))
+        match fold item [:ok, [], []] (filter (fn p -> not (str.is_empty p))
                                                         (str.split "," spec)) {
             Result.error(why) => Result.error ("--target " + spec + ": " + why),
             [:ok, os, arch] => Result.ok (make os arch),
@@ -196,15 +196,15 @@ let parse spec =
 /// `any` beside another target is a contradiction and is reported as one.
 let parse_all : [:string] -> Result (Target | :unit | :any) :string;
 let parse_all specs = {
-    let parsed = list.map parse specs;
-    match list.filter (fn r -> match r { Result.error(_) => true, _ => false }) parsed {
-        [Result.error(why), ..rest] => Result.error why,
+    let parsed = map parse specs;
+    match filter (fn r -> match r { Result.error(_) => true, _ => false }) parsed {
+        [Result.error(why), ..rest] => err why,
         _ => {
-            let said : [:any] = list.map (fn r -> match r { Result.ok(v) => v, _ => () }) parsed;
+            let said : [:any] = map (fn r -> match r { Result.ok(v) => v, _ => () }) parsed;
             match [list.contains () said, list.compact said] {
                 [false, []] => Result.ok (),
-                [true, []] => Result.ok :any,
-                [true, _] => Result.error "--target any cannot be given beside another target",
+                [true, []] => ok :any,
+                [true, _] => err "--target any cannot be given beside another target",
                 [false, ts] => Result.ok (join ts),
             }
         },
@@ -237,13 +237,13 @@ let from_reads cfg reads = {
     let os_now = os_named (setting "os");
     let by_os = if list.contains "os" reads && os_now != () { [os_now] } else { [] };
     let by_family = match [list.contains "family" reads, config.value "family" cfg] {
-        [true, fam] if fam != () => list.filter (fn o -> family_of o == fam) every_os,
+        [true, fam] if fam != () => filter (fn o -> family_of o == fam) every_os,
         _ => [],
     };
     let os = match [by_os, by_family] {
         [[], f] => f,
         [o, []] => o,
-        [o, f] => list.filter (fn x -> list.contains x f) o,
+        [o, f] => filter (fn x -> list.contains x f) o,
     };
     let arch_now = arch_named (setting "arch");
     make os (if list.contains "arch" reads && arch_now != () { [arch_now] } else { [] })
@@ -290,7 +290,7 @@ let fat s = {
     let n = be32 s 4;
     if n < 1 || n > 20 || str.byte_length s < 8 + n * 20 { () }
     else {
-        let archs = list.map (fn i -> macho_arch (be32 s (8 + i * 20))) (list.range 0 n);
+        let archs = map (fn i -> macho_arch (be32 s (8 + i * 20))) (list.range 0 n);
         make [:macos] (if list.contains [] archs { [] } else { list.concat archs })
     }
 };
@@ -319,7 +319,7 @@ let sniff s =
 /// binaries among them, or `()` when none is one.
 let of_payloads : [:string] -> Target | :unit;
 let of_payloads heads =
-    match list.concat (list.map (fn h -> match sniff h { () => [], t => [t] }) heads) {
+    match list.concat (map (fn h -> match sniff h { () => [], t => [t] }) heads) {
         [] => (),
         ts => join ts,
     };
@@ -337,11 +337,11 @@ let of_payloads heads =
 let decide : Target | :unit | :any -> Target | :unit -> Target -> Result Target :string;
 let decide said carried pinned =
     match said {
-        :any => Result.ok any,
+        :any => ok any,
         () => match carried {
-            () => Result.ok pinned,
+            () => ok pinned,
             c => match meet c pinned {
-                Result.ok(t) => Result.ok t,
+                Result.ok(t) => ok t,
                 Result.error(side) =>
                     Result.error ("this program can run nowhere: its payloads are for "
                              + describe c + ", but its `when` conditions chose "
@@ -349,7 +349,7 @@ let decide said carried pinned =
                              + "Say where it runs with --target, or --target any"),
             },
         },
-        t => Result.ok t,
+        t => ok t,
     };
 
 // --- tests ---------------------------------------------------------------------------
@@ -379,7 +379,7 @@ when test {
                         { let c = configure (make [:android] [:aarch64]) config.empty;
                           [config.value "os" c, config.value "family" c, config.value "arch" c] } ),
         test.case "Linux and Android are incompatible targets"
-            $( test.eq! (Result.error "os") (meet (make [:linux] []) (make [:android] [])) ),
+            $( test.eq! (err "os") (meet (make [:linux] []) (make [:android] [])) ),
         test.case "no target is the header's zero"
             $( test.eq! 0 (flags any) ),
         test.case "systems are bits 8-15 and architectures 16-23"
@@ -395,14 +395,14 @@ when test {
                         [Result.tag (parse "beos"), Result.tag (parse "os=x86_64"),
                          Result.tag (parse "cpu=arm64")] ),
         test.case "several targets are their union; any beside one is a contradiction"
-            $( test.eq! [Result.ok (make [:linux, :macos] []), Result.ok (), Result.ok :any, :error]
+            $( test.eq! [Result.ok (make [:linux, :macos] []), Result.ok (), ok :any, :error]
                         [parse_all ["linux", "macos,arm64"], parse_all [], parse_all ["any"],
                          Result.tag (parse_all ["any", "linux"])] ),
         test.case "the union of a target that allows any architecture allows any"
             $( test.eq! (make [:linux, :windows] [])
                         (join [make [:linux] [:x86_64], make [:windows] []]) ),
         test.case "meeting is intersection, with any as the identity"
-            $( test.eq! [Result.ok (make [:linux] [:x86_64]), Result.ok (make [:linux] []), Result.error "os"]
+            $( test.eq! [Result.ok (make [:linux] [:x86_64]), Result.ok (make [:linux] []), err "os"]
                         [meet (make [:linux, :windows] [:x86_64]) (make [:linux] []),
                          meet any (make [:linux] []),
                          meet (make [:windows] []) (make [:linux] [])] ),
@@ -424,7 +424,7 @@ when test {
                         { let c = configure (make [:windows] [:aarch64]) config.empty;
                           [config.value "os" c, config.value "family" c, config.value "arch" c] } ),
         test.case "what was said wins; any records nothing"
-            $( test.eq! [Result.ok (make [:macos] []), Result.ok any]
+            $( test.eq! [Result.ok (make [:macos] []), ok any]
                         [decide (make [:macos] []) (make [:linux] []) (make [:linux] []),
                          decide :any (make [:linux] []) any] ),
         test.case "a program whose payloads and conditions disagree runs nowhere"

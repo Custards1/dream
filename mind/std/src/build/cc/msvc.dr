@@ -63,7 +63,7 @@ let link_flags tc s = match s {
 /// What MSVC cannot do with these settings, said before anything runs.
 let problems : cc.Toolchain -> [cc.Setting] -> [:string];
 let problems tc settings =
-    list.flat_map (fn s -> match s {
+    flat_map (fn s -> match s {
         cc.Setting.sanitize(k) if k != :none && k != :address =>
             ["MSVC has only the address sanitizer, not " + to_string k],
         _ => [],
@@ -76,7 +76,7 @@ let compile tc t [path, own] object = {
     let lang = cc.language path;
     list.concat [[cc.Toolchain.cxx tc, "/nologo", "/showIncludes"],
                  (if lang == :cxx { ["/EHsc"] } else { [] }),
-                 list.flat_map (compile_flags tc lang) (cc.settings_for t own),
+                 flat_map (compile_flags tc lang) (cc.settings_for t own),
                  ["/c", path, "/Fo" + object]]
 };
 
@@ -86,7 +86,7 @@ let compile tc t [path, own] object = {
 /// nothing, and is dropped.
 let headers : :string -> :string -> [[:string], :string];
 let headers prefix output = {
-    let [found, rest] = list.fold (fn [hs, others] line -> {
+    let [found, rest] = fold (fn [hs, others] line -> {
         if str.starts_with prefix line {
             let n = str.byte_length prefix;
             [list.cons (str.trim (str.slice n (str.byte_length line - n) line)) hs, others]
@@ -117,7 +117,7 @@ let link tc t objects libraries out = match cc.kind t {
                                          { ["/DEF:" + def_path out] } else { [] })
                         } else { [] }),
                        objects, libraries,
-                       list.flat_map (link_flags tc) (cc.link_settings t),
+                       flat_map (link_flags tc) (cc.link_settings t),
                        ["/OUT:" + out]]],
 };
 
@@ -143,7 +143,7 @@ let private_symbol name =
 ///     010 00000000 SECT5  notype       External     | ?count@@3HA (int count)
 let def_file : :string -> :string -> :string;
 let def_file library dumped = {
-    let entries = list.flat_map (fn raw -> {
+    let entries = flat_map (fn raw -> {
         let line = str.trim raw;
         match str.split "|" line {
             [left, right] if str.contains_str " SECT" left && str.contains_str "External" left => {

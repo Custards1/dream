@@ -92,7 +92,7 @@ let setting sp format key default = match toml.get () (Spec.doc sp) ("ship." + f
 
 /// The same, as a list of strings.
 let strings : Spec -> :string -> :string -> [:string];
-let strings sp format key = list.map text_of (as_list (setting sp format key ()));
+let strings sp format key = map text_of (as_list (setting sp format key ()));
 
 /// `[ship.FORMAT] key` as text, or `default`.
 let text : Spec -> :string -> :string -> :string -> :string;
@@ -138,7 +138,7 @@ let of_doc root doc overrides scripts = {
 let read_scripts! : :string -> :map -> Result %{:string => :string} :string;
 let read_scripts! root doc = {
     let rec go! names acc = match names {
-        [] => Result.ok acc,
+        [] => ok acc,
         [hook, ..rest] => match text_of (toml.get () doc "ship.scripts" hook) {
             "" => go! rest acc,
             script => match file.read! (path.join root script) {
@@ -173,7 +173,7 @@ let full_version sp = Spec.version sp + "-" + to_string (Spec.release sp);
 /// `template` with each `{key}` replaced by its value in `vars`; a key that
 /// is not there is left as written, so a mistake shows in the output.
 let fill : :string -> %{:string => :string} -> :string;
-let fill template vars = list.fold (fn acc [k, v] -> str.replace ("{" + k + "}") v acc)
+let fill template vars = fold (fn acc [k, v] -> str.replace ("{" + k + "}") v acc)
                                    template (map.pairs vars);
 
 /// What a template may name.
@@ -188,7 +188,7 @@ let vars sp = %{
 
 /// The prefix as a path inside an archive: `/usr` is `usr`, `/` is ``.
 let prefix_path : Spec -> :string;
-let prefix_path sp = str.join_str "/" (list.filter (fn n -> n != "") (str.split "/" (Spec.prefix sp)));
+let prefix_path sp = str.join_str "/" (filter (fn n -> n != "") (str.split "/" (Spec.prefix sp)));
 
 // --- checking ------------------------------------------------------------------------
 

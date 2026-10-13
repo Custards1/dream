@@ -182,21 +182,21 @@ let chosen c = c.[:command else ()];
 /// Find an option by its long name, or return `()` when absent.
 let by_long : [Option] -> :string -> :any;
 let by_long os name = {
-    let hit = list.filter (fn o -> is_option o && long o == name) os;
+    let hit = filter (fn o -> is_option o && long o == name) os;
     if list.is_empty hit { () } else { list.head hit }
 };
 
 /// Find an option by its short spelling, or return `()` when absent.
 let by_short : [Option] -> :string -> :any;
 let by_short os c = {
-    let hit = list.filter (fn o -> is_option o && short o == c) os;
+    let hit = filter (fn o -> is_option o && short o == c) os;
     if list.is_empty hit { () } else { list.head hit }
 };
 
 /// Find a command by name, or return `()` when absent.
 let by_command : [Command] -> :string -> :any;
 let by_command cmds name = {
-    let hit = list.filter (fn cm -> command_name cm == name) cmds;
+    let hit = filter (fn cm -> command_name cm == name) cmds;
     if list.is_empty hit { () } else { list.head hit }
 };
 
@@ -237,7 +237,7 @@ let use_value : Parsed -> Option -> :any -> Arguments -> Step;
 let use_value c o v rest =
     match choice_ok o v {
         Result.ok(_) => Result.ok [record c o v, rest],
-        Result.error(m) => Result.error m,
+        Result.error(m) => err m,
     };
 
 /// Everything after `--` is a positional, whatever it looks like.
@@ -340,7 +340,7 @@ let rec walk os c args =
             // programs, and it is never an option.
             if str.starts_with "-" a && str.byte_length a > 1 {
                 match step os c a more {
-                    Result.error(m) => Result.error m,
+                    Result.error(m) => err m,
                     Result.ok([c2, rest]) => walk os c2 rest,
                 }
             }
@@ -383,7 +383,7 @@ let finalize : [Option] -> Parsed -> Outcome;
 let finalize os c = {
     let c2 = fill_default os c;
     match missing_required os c2 {
-        Result.error(m) => Result.error m,
+        Result.error(m) => err m,
         _ => Result.ok c2,
     }
 };
@@ -392,7 +392,7 @@ let finalize os c = {
 let parse : [Option] -> Arguments -> Outcome;
 let parse os args =
     match walk os (parsed (%{}) []) args {
-        Result.error(m) => Result.error m,
+        Result.error(m) => err m,
         Result.ok(c) => finalize os c,
     };
 
@@ -407,9 +407,9 @@ let finish_command globals cmds c cmd args = {
             // command name, so both tables stay open until the line ends.
             let opts = list.append globals (command_opts cm);
             match walk opts c args {
-                Result.error(m) => Result.error m,
+                Result.error(m) => err m,
                 Result.ok(c2) => match finalize opts c2 {
-                    Result.error(m) => Result.error m,
+                    Result.error(m) => err m,
                     Result.ok(c3) => Result.ok (c3.[:command => cm]),
                 },
             }
@@ -436,7 +436,7 @@ let rec scan globals cmds c args =
         [a, ..more] =>
             if str.starts_with "-" a && str.byte_length a > 1 {
                 match step globals c a more {
-                    Result.error(m) => Result.error m,
+                    Result.error(m) => err m,
                     Result.ok([c2, rest]) => scan globals cmds c2 rest,
                 }
             }
@@ -495,7 +495,7 @@ let line o =
 
 /// The options, one per line, with a heading wherever a `section` was put.
 let options_help : [Option] -> :string;
-let options_help os = str.join_str "\n" (list.map line os);
+let options_help os = str.join_str "\n" (map line os);
 
 /// One subcommand, as the help should show it.
 let command_line : Command -> :string;
@@ -503,7 +503,7 @@ let command_line cm = "  " + pad_to 22 (command_name cm) + command_help cm;
 
 /// Format a command table as newline-separated help text.
 let commands_help : [Command] -> :string;
-let commands_help cmds = str.join_str "\n" (list.map command_line cmds);
+let commands_help cmds = str.join_str "\n" (map command_line cmds);
 
 /// A whole usage message: what the program is, how it is called, its options.
 let usage : :string -> :string -> :string -> [Option] -> :string;
@@ -538,7 +538,7 @@ let shell_word s =
 
 /// A whole command line as a shell would read it back into `argv`.
 let shell_line : [:string] -> :string;
-let shell_line argv = str.join_str " " (list.map shell_word argv);
+let shell_line argv = str.join_str " " (map shell_word argv);
 
 // --- tests -------------------------------------------------------------------
 
@@ -562,7 +562,7 @@ when test {
         flag "" "version" "print the version",
     ];
 
-    let ok args = match parse specs args { Result.ok(c) => c, _ => () };
+    let accepted args = unwrap_or () (parse specs args);
     let why args = match parse specs args { Result.error(m) => m, _ => "" };
 
     let rich = [
@@ -595,41 +595,41 @@ when test {
     let tests = [
         // --- flags ---
         test.case "a long flag is set"
-            $( test.true! (flag_set (ok ["--quiet"]) "quiet") ),
+            $( test.true! (flag_set (accepted ["--quiet"]) "quiet") ),
         test.case "a short flag is set"
-            $( test.true! (flag_set (ok ["-q"]) "quiet") ),
+            $( test.true! (flag_set (accepted ["-q"]) "quiet") ),
         test.case "an absent flag is not set"
-            $( test.false! (flag_set (ok []) "quiet") ),
+            $( test.false! (flag_set (accepted []) "quiet") ),
         test.case "an option with no short form still parses long"
-            $( test.true! (flag_set (ok ["--version"]) "version") ),
+            $( test.true! (flag_set (accepted ["--version"]) "version") ),
         test.case "a flag given a value is refused"
             $( test.eq! "--quiet takes no value" (why ["--quiet=1"]) ),
 
         // --- values, both ways round ---
         test.case "a value follows its option"
-            $( test.eq! "a.dream" (get () (ok ["-o", "a.dream"]) "output") ),
+            $( test.eq! "a.dream" (get () (accepted ["-o", "a.dream"]) "output") ),
         test.case "a value may be attached to the long form"
-            $( test.eq! "a.dream" (get () (ok ["--output=a.dream"]) "output") ),
+            $( test.eq! "a.dream" (get () (accepted ["--output=a.dream"]) "output") ),
         test.case "a value may be attached to the short form"
-            $( test.eq! "a.dream" (get () (ok ["-oa.dream"]) "output") ),
+            $( test.eq! "a.dream" (get () (accepted ["-oa.dream"]) "output") ),
         test.case "the last value wins"
-            $( test.eq! "b" (get () (ok ["-o", "a", "-o", "b"]) "output") ),
+            $( test.eq! "b" (get () (accepted ["-o", "a", "-o", "b"]) "output") ),
         test.case "an empty value is a value, not a mistake"
-            $( test.eq! "" (get () (ok ["--output="]) "output") ),
+            $( test.eq! "" (get () (accepted ["--output="]) "output") ),
 
         // --- lists keep their order ---
         test.case "a list option collects"
-            $( test.eq! ["a", "b"] (all (ok ["-L", "a", "-L", "b"]) "package-path") ),
+            $( test.eq! ["a", "b"] (all (accepted ["-L", "a", "-L", "b"]) "package-path") ),
         test.case "a list option is empty when never given"
-            $( test.eq! [] (all (ok []) "package-path") ),
+            $( test.eq! [] (all (accepted []) "package-path") ),
 
         // --- positionals ---
         test.case "positionals keep their order"
-            $( test.eq! ["x", "y"] (rest (ok ["x", "-q", "y"])) ),
+            $( test.eq! ["x", "y"] (rest (accepted ["x", "-q", "y"])) ),
         test.case "`--` ends the options"
-            $( test.eq! ["-q", "--output"] (rest (ok ["--", "-q", "--output"])) ),
+            $( test.eq! ["-q", "--output"] (rest (accepted ["--", "-q", "--output"])) ),
         test.case "a bare dash is a positional"
-            $( test.eq! ["-"] (rest (ok ["-"])) ),
+            $( test.eq! ["-"] (rest (accepted ["-"])) ),
 
         // --- what is refused ---
         test.case "an unknown long option is named"

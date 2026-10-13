@@ -90,7 +90,7 @@ virtual let record_name u = "record";
 /// -- a wrong `backing` breaks construction and leaves reading alone.
 let to_fields : :any -> [:any];
 virtual let to_fields self = match type_of self {
-    :map   => list.map (fn k -> self.[k else ()]) (fields ()),
+    :map   => map (fn k -> self.[k else ()]) (fields ()),
     :array => _array_to_list self,
     :list  => self,
     _      => types.record_fields self,
@@ -138,7 +138,7 @@ let value_of m k = m.[k else m.[atom.name k else ()]];
 /// which is what every other reader in this library answers for a missing
 /// thing, and what a record's own accessor answers for a field with no default.
 let of_map : :map -> :any;
-let of_map m = of_fields (list.map (fn k -> value_of m k) (fields ()));
+let of_map m = of_fields (map (fn k -> value_of m k) (fields ()));
 
 // --- asking about a value ---------------------------------------------------------
 
@@ -168,7 +168,7 @@ let describe : :any -> :string;
 let describe self = {
     let one p = atom.name (list.nth 0 p) + ": " + to_string (list.nth 1 p);
     record_name () + "("
-        + str.join_str ", " (list.map one (list.zip (fields ()) (to_fields self))) + ")"
+        + str.join_str ", " (map one (list.zip (fields ()) (to_fields self))) + ")"
 };
 
 // --- changing one ------------------------------------------------------------------
@@ -181,7 +181,7 @@ let describe self = {
 let with_field : :any -> :atom -> :any -> :any;
 let with_field self k v = {
     let swap p = if list.nth 0 p == k { v } else { list.nth 1 p };
-    of_fields (list.map swap (list.zip (fields ()) (to_fields self)))
+    of_fields (map swap (list.zip (fields ()) (to_fields self)))
 };
 
 /// The record with every field `changes` mentions replaced. Fields it does not
@@ -195,7 +195,7 @@ let with_fields self changes = {
         if _map_has changes k || _map_has changes (atom.name k) { value_of changes k }
         else { list.nth 1 p }
     };
-    of_fields (list.map pick (list.zip (fields ()) (to_fields self)))
+    of_fields (map pick (list.zip (fields ()) (to_fields self)))
 };
 
 // The tests for all of this are in `std.all`, which is the nearest place they

@@ -39,12 +39,12 @@ let requested a m held = {
             let range = p.["range" else (%{})];
             let first = (range.["start" else (%{})]).["line" else 0];
             let last = (range.["end" else (%{})]).["line" else 1000000000];
-            let hints = match held { () => analysis.inlay_hints a 0 1000000000, hs => hs };
-            let shown = list.filter (fn h -> {
+            let hints : [:map] = match held { () => analysis.inlay_hints a 0 1000000000, hs => hs };
+            let shown = filter (fn h -> {
                 let at = (h.["position"]).["line"];
                 at >= first && at <= last
             }) hints;
-            [Result.ok shown, hints]
+            [ok shown, hints]
         },
         "textDocument/prepareRename" => [analysis.prepare_rename_at a line character, held],
         "textDocument/rename" => [analysis.rename_at a line character (p.["newName" else ""]), held],
@@ -79,12 +79,12 @@ let rec serve! parent parsed previous pending = {
             serve! parent (map.merge parsed (analysis.parses a)) [job, a, hints] pending
         },
         [:check, job] => {
-            let queued = list.fold_strict (fn acc j -> acc.[j.[:path] => j]) (%{}) pending;
+            let queued = fold (fn acc j -> acc.[j.[:path] => j]) (%{}) pending;
             let jobs = latest! (queued.[job.[:path] => job]) (proc.deadline_in! 100);
             serve! parent parsed previous jobs
         },
         [:check_now, job] => {
-            let queued = list.fold_strict (fn acc j -> acc.[j.[:path] => j]) (%{}) pending;
+            let queued = fold (fn acc j -> acc.[j.[:path] => j]) (%{}) pending;
             let newer = latest! queued 0;
             let done = checked! parent (list.head newer) parsed previous;
             serve! parent (list.head done) (list.nth 1 done) (list.tail newer)

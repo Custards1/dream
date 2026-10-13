@@ -68,12 +68,15 @@ let root_key = "";
 
 let empty_graph = %{ :order => [], :nodes => %{}, :edges => %{}, :builds => %{} };
 
+let order : :map -> [:string];
 let order g = list.reverse (g.[:order else []]);
 let node g key = (g.[:nodes else (%{})]).[key else ()];
-let nodes g = list.map (fn k -> node g k) (order g);
+let nodes : :map -> [:map];
+let nodes g = map (fn k -> node g k) (order g);
 /// `[[to, kind], ..]`, in the order they were listed.
 let edges_of g key = list.reverse ((g.[:edges else (%{})]).[key else []]);
-let children g key = list.map (fn e -> list.head e) (edges_of g key);
+let children : :map -> :string -> [:string];
+let children g key = map (fn e -> list.head e) (edges_of g key);
 /// The graph a package's build script is compiled from, or `()` when it has
 /// no build dependencies.
 let build_graph g key = (g.[:builds else (%{})]).[key else ()];
@@ -92,7 +95,7 @@ let with_node key n g = {
 /// Every build script's graph, however deep, as `[owner, graph]`: a package's
 /// build dependencies may have build dependencies of their own.
 let rec build_graphs g =
-    list.concat (list.map (fn pair -> {
+    list.concat (map (fn pair -> {
         let [owner, sub] = pair;
         list.cons [owner, sub] (build_graphs sub)
     }) (map.pairs (g.[:builds else (%{})])));
@@ -117,6 +120,7 @@ let node_abs n = n.[:abs else node_dir n];
 let node_manifest n = n.[:manifest else ()];
 let node_dep n = n.[:dep else ()];
 let node_by n = n.[:by else root_key];
+let node_wants : :map -> [[:any]];
 let node_wants n = n.[:wants else []];
 /// The manifest that first asked for it, as `shown!` writes it.
 let node_at n = n.[:at else "mind.toml"];
@@ -152,17 +156,17 @@ let step_of abs name where kind = [abs, name, where, kind];
 let cycle_message path abs name kind = {
     let inside = list.reverse path;
     let from = list.drop_while (fn st -> list.head st != abs) inside;
-    let lines = list.map (fn pair -> {
+    let lines = map (fn pair -> {
         let [a, b] = pair;
         [list.nth 1 a, edge_words (list.nth 3 b), list.nth 1 b, list.nth 2 a]
     }) (list.zip from (list.append (list.tail from) [step_of abs name "" kind]));
-    let width f = list.fold_strict (fn w l -> num.max w (str.byte_length (f l))) 0 lines;
+    let width f = fold (fn w l -> num.max w (str.byte_length (f l))) 0 lines;
     let pad n t = str.pad_end n " " t;
     let w1 = width (fn l -> list.nth 0 l);
     let w2 = width (fn l -> list.nth 1 l);
     let w3 = width (fn l -> list.nth 2 l);
     "these packages need each other, so none of them can be built first:\n"
-    + str.join_str "\n" (list.map (fn l -> "  " + pad w1 (list.nth 0 l) + "  " + pad w2 (list.nth 1 l)
+    + str.join_str "\n" (map (fn l -> "  " + pad w1 (list.nth 0 l) + "  " + pad w2 (list.nth 1 l)
                                             + "  " + pad w3 (list.nth 2 l) + "  (" + list.nth 3 l + ")")
                                    lines)
 };
@@ -213,7 +217,7 @@ let shown! p = path.relative! (os.cwd! ()) p;
 /// with the same path.
 let rec walk! owner owner_key deps kind path g =
     match deps {
-        [] => Result.ok g,
+        [] => ok g,
         [d, ..rest] => match edge_on! owner owner_key d g {
             Result.error(why) => Result.error why,
             [:off, g2] => walk! owner owner_key rest kind path g2,
@@ -282,7 +286,7 @@ let edge_on! owner owner_key d g =
             Result.error(why) => Result.error (shown! (manifest.path owner) + ": `when = \"" + text + "\"` on `"
                                       + manifest.dep_name d + "`: " + why),
             Result.ok(cond) => {
-                let reads = list.fold (fn m n -> m.[n => option_read! owner g n]) (%{}) (config.names cond);
+                let reads = fold (fn m n -> m.[n => option_read! owner g n]) (%{}) (config.names cond);
                 let option n = match reads.[n else ()] { () => (), r => Result.ok (list.nth 2 r) };
                 let kept = g.[:reads => list.append (g.[:reads else []])
                                                     (list.compact (map.values reads))];
@@ -333,7 +337,7 @@ let steady assumed reads =
 /// manifest has neither.
 let below! dm key path g =
     match dm {
-        () => Result.ok g,
+        () => ok g,
         _ => match walk! dm key (manifest.dependencies dm) :uses path g {
             Result.error(why) => Result.error why,
             Result.ok(g2) => builds! dm key path g2,
@@ -345,7 +349,7 @@ let below! dm key path g =
 /// build scripts anywhere is exactly the graph it was before they existed.
 let builds! m key path g =
     match manifest.build_dependencies m {
-        [] => Result.ok g,
+        [] => ok g,
         bdeps => match walk! m key bdeps :builds path (inherit g) {
             Result.error(why) => Result.error why,
             Result.ok(sub) => match check_versions sub {
@@ -367,7 +371,7 @@ let builds! m key path g =
 /// `[:ok, ()]`, or `[:error, why]` for the first package some requirement on
 /// it does not accept.
 let check_versions g =
-    list.fold (fn acc n -> match acc {
+    fold (fn acc n -> match acc {
         Result.error(why) => acc,
         _ => check_node n,
     }) (Result.ok ()) (nodes g);
@@ -378,8 +382,8 @@ let check_node n =
         wants => {
             let key = node_key n;
             let found = node_version n;
-            let parsed = list.map (fn w -> [w, version.parse_requirement (list.head w)]) wants;
-            match list.filter (fn p -> match list.nth 1 p { Result.error(_) => true, _ => false }) parsed {
+            let parsed = map (fn w -> [w, version.parse_requirement (list.head w)]) wants;
+            match filter (fn p -> match list.nth 1 p { Result.error(_) => true, _ => false }) parsed {
                 [[w, Result.error(why)], ..more] =>
                     Result.error (list.nth 2 w + ": the version required of `" + key + "` is not one: " + why),
                 _ => match found {
@@ -392,7 +396,7 @@ let check_node n =
                                                 + "`, which is not a version ("
                                                 + manifest.path (node_manifest n) + ")"),
                         Result.ok(v) => {
-                            let misses = list.filter (fn p -> not (version.matches (requirement p) v))
+                            let misses = filter (fn p -> not (version.matches (requirement p) v))
                                                      parsed;
                             if list.is_empty misses { Result.ok () }
                             else { Result.error (version_message key text v n parsed) }
@@ -408,13 +412,14 @@ priv let requirement pair = match list.nth 1 pair { Result.ok(r) => r, Result.er
 
 /// Every requirement on the package, the ones it misses marked, and whether
 /// any single version could have met them all -- which decides the advice.
+let version_message : :string -> :string -> :any -> :map -> [[:any]] -> :string;
 let version_message key text v n parsed = {
-    let width = list.fold_strict (fn w p -> num.max w (str.byte_length (asker (list.nth 1 (list.head p))))) 0 parsed;
-    let reqs = list.map requirement parsed;
-    let req_width = list.fold_strict (fn w p -> num.max w (str.byte_length (list.head (list.head p)))) 0 parsed;
+    let width = fold (fn w p -> num.max w (str.byte_length (asker (list.nth 1 (list.head p))))) 0 parsed;
+    let reqs = map requirement parsed;
+    let req_width = fold (fn w p -> num.max w (str.byte_length (list.head (list.head p)))) 0 parsed;
     let together = list.all (fn a -> list.all (fn b -> version.compatible a b) reqs) reqs;
     "`" + key + "` is " + text + " (" + manifest.dep_source (node_dep n) + "), but\n"
-    + str.join_str "\n" (list.map (fn p -> {
+    + str.join_str "\n" (map (fn p -> {
           let w = list.head p;
           let req = requirement p;
           let who = asker (list.nth 1 w);
@@ -440,10 +445,10 @@ let walk_graph! m o assumed = {
     let name = match manifest.name m { "" => "this project", n => n };
     let path = [step_of root_abs name (shown! (manifest.path m)) :uses];
     let start = empty_graph.[:assumed => assumed].[:settings => settings! m o];
-    let walked = list.fold (fn acc wk -> match acc {
+    let walked = fold (fn acc wk -> match acc {
         Result.error(why) => acc,
         Result.ok(g) => walk! m root_key (list.head wk) (list.nth 1 wk) path g,
-    }) (Result.ok start) (root_deps m (option o :dev false));
+    }) (ok start) (root_deps m (option o :dev false));
     match walked {
         Result.error(why) => Result.error why,
         Result.ok(g) => builds! m root_key path g,
@@ -494,7 +499,7 @@ let rec settle_graph! m o assumed round =
 
 /// Settled values by package directory, which is how a walk reads them.
 let by_dir! m g values =
-    list.fold (fn acc [key, vs] -> {
+    fold (fn acc [key, vs] -> {
         let abs = if key == root_key { path.absolute! (manifest.root m) }
                   else { node_abs (node g key) };
         acc.[abs => vs]
@@ -531,7 +536,7 @@ let all_defines m o =
 /// does not also get a `fast` of its own to leak into every package.
 let program_defines m o = {
     let own = declared m;
-    list.filter (fn d -> own.[list.head (config.split_define d) else ()] == ()) (all_defines m o)
+    filter (fn d -> own.[list.head (config.split_define d) else ()] == ()) (all_defines m o)
 };
 
 /// What a condition in a manifest reads besides options: the platform, `test`
@@ -542,7 +547,7 @@ let settings! m o = {
     let os_name = str.slice 1 (str.byte_length p - 1) p;
     let base = %{ "os" => os_name, "family" => if os_name == "windows" { "windows" } else { "unix" } };
     let tested = if option o :dev false { base.["test" => true] } else { base };
-    list.fold (fn acc d -> match config.split_define d {
+    fold (fn acc d -> match config.split_define d {
         [n, v] => acc.[n => if str.contains_str "=" d { v } else { true }],
     }) tested (program_defines m o)
 };
@@ -550,7 +555,7 @@ let settings! m o = {
 /// The packages that have a manifest, root first, as `[key, manifest]`.
 let manifests m g =
     list.cons [root_key, m]
-              (list.flat_map (fn n -> match node_manifest n { () => [], dm => [[node_key n, dm]] }) (nodes g));
+              (flat_map (fn n -> match node_manifest n { () => [], dm => [[node_key n, dm]] }) (nodes g));
 
 /// Who a setting came from, for a message.
 let setter_words key = match key { "" => "this project", k => "`" + k + "`" };
@@ -560,36 +565,37 @@ let setter_words key = match key { "" => "this project", k => "`" + k + "`" };
 let settle! m o g = {
     let packages = manifests m g;
     // Where each manifest is, as a message shows it.
-    let places = list.fold (fn acc [k, at] -> acc.[k => at]) (%{})
-                           (list.zip (list.map list.head packages)
-                                     (list.map shown! (list.map (fn p -> manifest.path (list.nth 1 p)) packages)));
+    let places = fold (fn acc [k, at] -> acc.[k => at]) (%{})
+                           (list.zip (map list.head packages)
+                                     (map shown! (map (fn p -> manifest.path (list.nth 1 p)) packages)));
     let at k = places.[k else "mind.toml"];
     let profile = profile_of o;
     // The names a package answers to in a `[config.X]` or a `-D X:..`: the
     // key it is listed under, and what it calls itself.
     let names_of key pm = list.unique [if key == root_key { manifest.name pm } else { key }, manifest.name pm];
     let addressed key pm = { let ns = names_of key pm; fn x -> list.contains x ns };
-    let every_name = list.flat_map (fn [k, pm] -> names_of k pm) packages;
-    let off_keys = list.map (fn e -> list.nth 1 e) (g.[:off else []]);
+    let every_name = flat_map (fn [k, pm] -> names_of k pm) packages;
+    let off : [[:any]] = g.[:off else []];
+    let off_keys = map (fn e -> list.nth 1 e) off;
     let known x = list.contains x every_name || list.contains x off_keys;
     // A key nobody answers to is a typo, wherever it was written.
     let stray = list.concat [
-        list.flat_map (fn [sk, sm] -> list.flat_map (fn [ck, _] ->
+        flat_map (fn [sk, sm] -> flat_map (fn [ck, _] ->
             if known ck { [] }
             else { ["[config." + ck + "] in " + at sk + ": no package here is called `" + ck + "`"] })
             (manifest.configs sm)) packages,
-        list.flat_map (fn [ck, _] ->
+        flat_map (fn [ck, _] ->
             if known ck { [] }
             else { ["[profile." + profile + ".config." + ck + "] in " + at root_key
                     + ": no package here is called `" + ck + "`"] })
             (manifest.profile_configs m profile),
-        list.flat_map (fn [k, n, _] ->
+        flat_map (fn [k, n, _] ->
             if known k { [] } else { ["-D " + k + ":" + n + ": no package here is called `" + k + "`"] })
             (option o :sets []),
     ];
-    let settled = list.map (fn [key, pm] -> settle_one m o packages at key pm (addressed key pm)) packages;
-    [list.fold (fn acc [key, vs, _] -> if map_is_empty vs { acc } else { acc.[key => vs] }) (%{}) settled,
-     list.concat (list.cons stray (list.map (fn s -> list.nth 2 s) settled))]
+    let settled = map (fn [key, pm] -> settle_one m o packages at key pm (addressed key pm)) packages;
+    [fold (fn acc [key, vs, _] -> if map_is_empty vs { acc } else { acc.[key => vs] }) (%{}) settled,
+     list.concat (list.cons stray (map (fn s -> list.nth 2 s) settled))]
 };
 
 let map_is_empty m = list.is_empty (map.pairs m);
@@ -612,33 +618,33 @@ let settle_one m o packages at key pm addressed = {
                 Result.error(why) => [vs, list.append errs [why + " (" + from + ")"]],
             },
         };
-    let entries table from = list.map (fn [n, v] -> [n, v, from]) (map.pairs table);
+    let entries table from = map (fn [n, v] -> [n, v, from]) (map.pairs table);
     let configured_by sk sm =
-        list.flat_map (fn [ck, table] -> if addressed ck { entries table ("[config." + ck + "] in " + at sk) } else { [] })
+        flat_map (fn [ck, table] -> if addressed ck { entries table ("[config." + ck + "] in " + at sk) } else { [] })
                       (manifest.configs sm);
     let from_root = configured_by root_key m;
     let from_profile =
-        list.flat_map (fn [ck, table] ->
+        flat_map (fn [ck, table] ->
             if addressed ck { entries table ("[profile." + profile_of o + ".config." + ck + "] in " + at root_key) }
             else { [] })
             (manifest.profile_configs m (profile_of o));
-    let from_cli = list.flat_map (fn [k, n, v] -> if addressed k { [[n, v, "-D " + k + ":" + n]] } else { [] })
+    let from_cli = flat_map (fn [k, n, v] -> if addressed k { [[n, v, "-D " + k + ":" + n]] } else { [] })
                                  (option o :sets []);
     // The other packages' settings, which have to agree with each other on
     // anything the root leaves unsaid.
-    let said = list.map (fn e -> list.head e) (list.concat [from_root, from_profile, from_cli]);
-    let others = list.flat_map (fn [sk, sm] ->
+    let said = map (fn e -> list.head e) (list.concat [from_root, from_profile, from_cli]);
+    let others = flat_map (fn [sk, sm] ->
         if sk == root_key || sk == key { [] }
-        else { list.map (fn e -> list.append e [sk]) (configured_by sk sm) }) packages;
-    let unsettled = list.filter (fn e -> not (list.contains (list.head e) said)) others;
-    let conflicts = list.flat_map (fn name -> {
-        let votes = list.filter (fn e -> list.head e == name) unsettled;
-        match list.unique (list.map (fn e -> config.shown (list.nth 1 e)) votes) {
+        else { map (fn e -> list.append e [sk]) (configured_by sk sm) }) packages;
+    let unsettled = filter (fn e -> not (list.contains (list.head e) said)) others;
+    let conflicts = flat_map (fn name -> {
+        let votes = filter (fn e -> list.head e == name) unsettled;
+        match list.unique (map (fn e -> config.shown (list.nth 1 e)) votes) {
             [_, _, .._] => {
                 let said_as e = list.head e + " = " + toml.encode_value (list.nth 1 e);
-                let width = list.fold_strict (fn w e -> num.max w (str.byte_length (said_as e))) 0 votes;
+                let width = fold (fn w e -> num.max w (str.byte_length (said_as e))) 0 votes;
                 [who + " is configured two ways, and this project does not say which:\n"
-                            + str.join_str "\n" (list.map (fn [n, v, from, sk] -> {
+                            + str.join_str "\n" (map (fn [n, v, from, sk] -> {
                                   let l = said_as [n, v];
                                   "  " + l + str.repeat (width - str.byte_length l) " " + "  by " + setter_words sk + " (" + from + ")"
                               }) votes)
@@ -646,11 +652,11 @@ let settle_one m o packages at key pm addressed = {
             },
             _ => [],
         }
-    }) (list.unique (list.map (fn e -> list.head e) unsettled));
-    let layered = list.fold apply [start, []]
-                            (list.concat [list.map (fn e -> list.take 3 e) others, from_root, from_profile, from_cli]);
+    }) (list.unique (map (fn e -> list.head e) unsettled));
+    let layered = fold apply [start, []]
+                            (list.concat [map (fn e -> list.take 3 e) others, from_root, from_profile, from_cli]);
     let [values, errs] = layered;
-    [key, values, list.concat [list.map (fn e -> where + ": " + e) derrs, ierrs, conflicts, errs]]
+    [key, values, list.concat [map (fn e -> where + ": " + e) derrs, ierrs, conflicts, errs]]
 };
 
 // --- the lock ------------------------------------------------------------------
@@ -672,10 +678,10 @@ let script_section parent owner name =
 /// Every package the build resolved to, as lock entries.
 let rec lock_entries! g section name =
     list.concat [
-        list.map (fn n -> lock.entry section (node_key n) (manifest.dep_source (node_dep n))
+        map (fn n -> lock.entry section (node_key n) (manifest.dep_source (node_dep n))
                                      (fetch.commit! (node_dep n) (node_dir n)) (node_version n))
                  (nodes g),
-        list.concat (list.map (fn pair -> {
+        list.concat (map (fn pair -> {
             let [owner, sub] = pair;
             lock_entries! sub (script_section section owner name) name
         }) (map.pairs (g.[:builds else (%{})]))),
@@ -684,7 +690,7 @@ let rec lock_entries! g section name =
 /// What to say about packages that moved under the lock.
 let drift_message old moved =
     "these dependencies resolved to a different commit than mind.lock records:\n"
-    + str.join_str "\n" (list.map (fn e -> {
+    + str.join_str "\n" (map (fn e -> {
           let o = lock.locked old e;
           "  " + lock.key_of e + " (" + lock.source_of e + ") is now " + short (lock.commit_of e)
           + ", but the lock says " + short (lock.commit_of o)
@@ -713,7 +719,7 @@ let resolve! m o accept =
                     // what the lock says about it.
                     let complete = option o :dev false && list.is_empty (g.[:off else []]);
                     lock.save! root (lock.merge before now complete)
-                    Result.ok g
+                    ok g
                 },
             }
         },
@@ -735,25 +741,25 @@ let package_arg n =
 /// carried, because a `when` flag is a decision about the whole program and
 /// that belongs to the program.
 let dep_includes g =
-    list.concat (list.map (fn n -> match node_manifest n { () => [], dm => manifest.includes dm })
+    list.concat (map (fn n -> match node_manifest n { () => [], dm => manifest.includes dm })
                           (nodes g));
 let dep_hosts g =
-    list.concat (list.map (fn n -> match node_manifest n { () => [], dm => manifest.host_modules dm })
+    list.concat (map (fn n -> match node_manifest n { () => [], dm => manifest.host_modules dm })
                           (nodes g));
 
 /// Every payload the program carries: the package's own and every
 /// dependency's, as `[:ok, ["--payload", "NAME=FILE", ..]]`, or `[:error, why]`
 /// for a `[payload]` that is wrong or a name two packages give two files.
 let payload_args m g = {
-    let manifests = list.cons m (list.flat_map (fn n -> match node_manifest n { () => [], dm => [dm] }) (nodes g));
-    match list.first_or () (list.flat_map (fn mm -> match manifest.payload_problem mm { () => [], why => [why] }) manifests) {
+    let manifests = list.cons m (flat_map (fn n -> match node_manifest n { () => [], dm => [dm] }) (nodes g));
+    match list.first_or () (flat_map (fn mm -> match manifest.payload_problem mm { () => [], why => [why] }) manifests) {
         () => {
-            let all = list.unique (list.flat_map manifest.payloads manifests);
+            let all = list.unique (flat_map manifest.payloads manifests);
             let clash = list.find (fn [n, p] -> list.any (fn [n2, p2] -> n2 == n && p2 != p) all) all;
             match clash {
-                () => Result.ok (repeated "--payload" (list.map (fn [n, p] -> n + "=" + p) all)),
+                () => Result.ok (repeated "--payload" (map (fn [n, p] -> n + "=" + p) all)),
                 [n, _] => Result.error ("two packages carry a payload named `" + n + "`: "
-                                   + str.join_str " and " (list.map (fn e -> list.nth 1 e) (list.filter (fn e -> list.head e == n) all))),
+                                   + str.join_str " and " (map (fn e -> list.nth 1 e) (filter (fn e -> list.head e == n) all))),
             }
         },
         why => Result.error why,
@@ -815,7 +821,7 @@ let search_paths! m o =
     match resolve! m o false {
         Result.error(why) => Result.error why,
         Result.ok(g) => [:ok, g, repeated "-L" (list.cons (stdlib_root! ())
-                                                      (list.map package_arg (nodes g)))],
+                                                      (map package_arg (nodes g)))],
     };
 
 let target_dir m = path.join (manifest.root m) "target";
@@ -893,23 +899,23 @@ let target_sides spec = {
         let at = str.find "=" part;
         if at < 0 { part } else { str.slice (at + 1) (str.byte_length part - at - 1) part }
     };
-    let names = list.map (fn p -> platform_spelled (value p))
-                         (list.filter (fn p -> not (str.is_empty p)) (str.split "," spec));
-    [list.filter (fn n -> not (list.contains n arch_names)) names,
-     list.filter (fn n -> list.contains n arch_names) names]
+    let names = map (fn p -> platform_spelled (value p))
+                         (filter (fn p -> not (str.is_empty p)) (str.split "," spec));
+    [filter (fn n -> not (list.contains n arch_names)) names,
+     filter (fn n -> list.contains n arch_names) names]
 };
 
 /// The directory an image for these `--target`s goes in, or `()` when none
 /// was stated and the program decides where it runs.
 let target_subdir : [:string] -> :string | :unit;
 let target_subdir specs = {
-    let sides = list.map target_sides specs;
+    let sides = map target_sides specs;
     let side pick known =
         if list.any (fn s -> list.is_empty (pick s)) sides { [] }
         else {
-            let named = list.concat (list.map pick sides);
-            list.append (list.filter (fn n -> list.contains n named) known)
-                        (list.unique (list.filter (fn n -> not (list.contains n known)) named))
+            let named = list.concat (map pick sides);
+            list.append (filter (fn n -> list.contains n named) known)
+                        (list.unique (filter (fn n -> not (list.contains n known)) named))
         };
     match [specs, list.contains "any" specs] {
         [[], _] => (),
@@ -954,7 +960,7 @@ let compiler_command! chosen =
     else { [chosen, []] };
 
 /// `[flag, a, flag, b, ..]` -- how a repeated option is written out.
-let repeated flag xs = list.flat_map (fn x -> [flag, x]) xs;
+let repeated flag xs = flat_map (fn x -> [flag, x]) xs;
 
 // --- build scripts ----------------------------------------------------------------
 //
@@ -973,11 +979,11 @@ let scripted! m o g = {
                                       (list.cons (stdlib_root! ())
                                                  (match build_graph g (if key == manifest.name m { root_key } else { key }) {
                                                       () => [],
-                                                      sub => list.map package_arg (nodes sub),
+                                                      sub => map package_arg (nodes sub),
                                                   }))],
     };
     list.concat (list.cons (one! (manifest.name m) m (manifest.root m))
-                           (list.map (fn n -> match node_manifest n {
+                           (map (fn n -> match node_manifest n {
                                 () => one! (node_key n) (manifest.make (node_dir n) (%{})) (node_dir n),
                                 dm => one! (node_key n) dm (node_dir n),
                             }) (nodes g)))
@@ -1010,10 +1016,10 @@ let script_setting! m o g = {
     let placed! p = if str.contains_str "/" p { path.absolute! p } else { p };
     script.Setting.make (target_dir m)
         (match compiler_command! (choose_compiler! m (option o :compiler ())) {
-             [program, lead] => list.map placed! (list.cons program lead),
+             [program, lead] => map placed! (list.cons program lead),
          })
         (placed! (vm_command! ())) (profile_of o) (script_target o m) (option o :jobs 1)
-        (list.fold (fn acc n -> match node_version n { () => acc, v => acc.[node_key n => v] }) (%{}) (nodes g))
+        (fold (fn acc n -> match node_version n { () => acc, v => acc.[node_key n => v] }) (%{}) (nodes g))
         (option o :verbose false) (option o :testing false) (option o :only []) (option o :goals [])
 };
 
@@ -1023,27 +1029,28 @@ let script_setting! m o g = {
 let checks! m o =
     match resolve! m o false {
         Result.error(why) => Result.error why,
-        Result.ok(g) => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
-            [] => Result.ok [],
+        Result.ok(g) => match filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
+            [] => ok [],
             own => match script.run_all! (script_setting! m (with_option :testing true o) g) own {
                 Result.error(why) => Result.error why,
                 Result.ok([[_, outcome], .._]) => Result.ok (list.sort_on list.head (map.pairs (Outcome.checks outcome))),
-                Result.ok([]) => Result.ok [],
+                Result.ok([]) => ok [],
             },
         },
     };
 
 /// The goals named, made by the package's own script -- `[:ok, [[name,
 /// path]]]`, each where its result is -- or why they could not be.
+let goals! : :map -> :map -> [:string] -> Result [[:string, :string]] :string;
 let goals! m o names =
     match resolve! m o false {
         Result.error(why) => Result.error why,
-        Result.ok(g) => match list.filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
+        Result.ok(g) => match filter (fn s -> script.Scripted.key s == manifest.name m) (scripted! m o g) {
             [] => Result.error ("`" + manifest.name m + "` has no build script, so it has no goals"),
             own => match script.run_all! (script_setting! m (with_option :goals names o) g) own {
                 Result.error(why) => Result.error why,
                 Result.ok([[_, outcome], .._]) => Result.ok (list.sort_on list.head (map.pairs (Outcome.goals outcome))),
-                Result.ok([]) => Result.ok [],
+                Result.ok([]) => ok [],
             },
         },
     };
@@ -1052,7 +1059,7 @@ let goals! m o names =
 /// when no package has a script.
 let script_args! m o g =
     match scripted! m o g {
-        [] => Result.ok [],
+        [] => ok [],
         found => match script.run_all! (script_setting! m o g) found {
             Result.error(why) => Result.error why,
             Result.ok(outcomes) => script.compile_args outcomes,
@@ -1101,7 +1108,7 @@ let forget_units! dir = {
         _ => {
             file.mkdir_all! dir
             file.write! stamp ""
-            strict! (list.map (fn name -> forget_unit! (path.join dir name) now) (os.list_dir! dir))
+            strict! (map (fn name -> forget_unit! (path.join dir name) now) (file.list! dir))
             ()
         },
     }
@@ -1154,9 +1161,9 @@ let compile_args! m o =
 let setting_args m o g =
     list.concat [
         repeated "-D" (program_defines m o),
-        repeated "-D" (list.flat_map (fn [key, vs] -> {
+        repeated "-D" (flat_map (fn [key, vs] -> {
             let scope = if key == root_key { manifest.name m } else { key };
-            list.map (fn [n, v] -> scope + ":" + n + "=" + config.shown v) (map.pairs vs)
+            map (fn [n, v] -> scope + ":" + n + "=" + config.shown v) (map.pairs vs)
         }) (map.pairs (g.[:options else (%{})]))),
         repeated "--target" (targets m o),
     ];

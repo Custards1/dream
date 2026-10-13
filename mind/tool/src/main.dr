@@ -331,7 +331,7 @@ let cmd_goals! m o0 names = {
             console.error! why
             os.exit! 1
         },
-        Result.ok(made) => strict! (list.map (fn [name, path] -> console.print! (name + "  " + path)) made),
+        Result.ok(made) => strict! (map (fn [name, path] -> console.print! (name + "  " + path)) made),
     }
 };
 
@@ -383,12 +383,12 @@ let units! pm o = {
 let checks! : :map -> :map -> [:string] -> [Report];
 let checks! pm o asked = {
     let prefix = manifest.name pm + ".";
-    let named = list.flat_map (fn a -> if str.starts_with prefix a { [str.slice (str.byte_length prefix) (str.byte_length a - str.byte_length prefix) a] } else { [] })
+    let named = flat_map (fn a -> if str.starts_with prefix a { [str.slice (str.byte_length prefix) (str.byte_length a - str.byte_length prefix) a] } else { [] })
                               asked;
     let only = if list.any (fn a -> a == manifest.name pm) asked { [] } else { named };
     match build.checks! pm (build.with_option :only only o) {
         Result.error(why) => [Report.make (manifest.name pm + ".checks") false 0 why],
-        Result.ok(results) => list.map (fn [n, [passed, ms, output]] -> Report.make (prefix + n) passed ms output) results,
+        Result.ok(results) => map (fn [n, [passed, ms, output]] -> Report.make (prefix + n) passed ms output) results,
     }
 };
 
@@ -406,7 +406,7 @@ let seconds ms = to_string (ms / 1000) + "." + to_string (ms % 1000 / 100) + " s
 /// The packages `mind test` covers: the project, and its members when it is
 /// a workspace.
 let tested! : :map -> [:map];
-let tested! m = list.cons m (list.map (fn d -> match manifest.load! (path.join (manifest.root m) d) {
+let tested! m = list.cons m (map (fn d -> match manifest.load! (path.join (manifest.root m) d) {
     Result.ok(pm) => pm,
     Result.error(why) => fail! ("workspace member `" + d + "`: " + why),
 }) (manifest.members m));
@@ -422,7 +422,7 @@ let cmd_test! m o0 asked = {
     };
     let wants_package pm = list.is_empty asked || list.any (fn a -> a == manifest.name pm
                                                                     || str.starts_with (manifest.name pm + ".") a) asked;
-    let tasks = list.flat_map (fn pm -> list.concat [
+    let tasks = flat_map (fn pm -> list.concat [
         if manifest.is_package pm && picked asked (manifest.name pm + ".units") && io.exists! (manifest.test_entry! pm) {
             [[:units, pm, o]]
         } else { [] },
@@ -430,7 +430,7 @@ let cmd_test! m o0 asked = {
     ]) packages;
     let outcomes = proc.try_map! test_task! tasks;
     strict! outcomes
-    let results = list.sort_on Report.name (list.flat_map (fn r -> match r {
+    let results = list.sort_on Report.name (flat_map (fn r -> match r {
         Result.ok(rs) => rs,
         Result.error(e) => [Report.make "mind" false 0 (to_string e)],
     }) outcomes);
@@ -443,14 +443,14 @@ let cmd_test! m o0 asked = {
             if not (Report.passed one) { os.exit! 1 }
         },
         _ => {
-            strict! (list.map (fn r -> {
+            strict! (map (fn r -> {
                 console.print! ((if Report.passed r { "ok   " } else { "FAIL " }) + Report.name r
                                 + "  (" + seconds (Report.ms r) + ")")
                 if not (Report.passed r) {
                     console.print! (str.indent "    " (str.trim (Report.output r)))
                 }
             }) results)
-            let failed = list.length (list.filter (fn r -> not (Report.passed r)) results);
+            let failed = list.length (filter (fn r -> not (Report.passed r)) results);
             console.print! ("\n" + to_string (list.length results - failed) + " passed, " + to_string failed + " failed")
             if failed > 0 { os.exit! 1 }
         },
@@ -499,18 +499,18 @@ let cmd_options! m o = {
             [] => (),
             pairs => {
                 console.print! (match key { "" => to_string (manifest.name m) + " (this project)", k => k })
-                let lines = list.map (fn [n, d] ->
+                let lines = map (fn [n, d] ->
                     [n + " = " + toml.encode_value ((values.[key else (%{})]).[n else config.Decl.default d]),
                      config.summary d]) (list.sort_on (fn [n, _] -> n) pairs);
-                let width = list.fold (fn w [l, _] -> if str.byte_length l > w { str.byte_length l } else { w }) 0 lines;
-                list.map (fn [l, why] -> console.print! ("  " + l + str.repeat (width - str.byte_length l + 4) " " + why))
+                let width = fold (fn w [l, _] -> if str.byte_length l > w { str.byte_length l } else { w }) 0 lines;
+                map (fn [l, why] -> console.print! ("  " + l + str.repeat (width - str.byte_length l + 4) " " + why))
                          lines |> strict!
                 ()
             },
         }
     };
     show! build.root_key m
-    strict! (list.map (fn n -> match build.node_manifest n { () => (), dm => show! (build.node_key n) dm })
+    strict! (map (fn n -> match build.node_manifest n { () => (), dm => show! (build.node_key n) dm })
                       (build.nodes g))
     if map.pairs values == [] { console.print! "no package in this build declares an option" }
     :ok
@@ -543,24 +543,24 @@ let cmd_deps! m o = {
     let g = graph_of! m o;
     let ns = build.nodes g;
     if list.is_empty ns { console.print! "  (no dependencies)" }
-    let dev_keys = list.map manifest.dep_name (manifest.dev_dependencies m);
+    let dev_keys = map manifest.dep_name (manifest.dev_dependencies m);
     let show! n = {
         let dev = if list.contains (build.node_key n) dev_keys { "  [dev]" } else { "" };
         console.print! ("  " + describe n + dev)
         console.print! ("      -> " + to_string (build.node_abs n))
     };
-    strict! (list.map show! ns)
+    strict! (map show! ns)
     // What each build script is compiled from, which is a program of its own
     // and so may hold a different package under a key the program also uses.
     let show_build! pair = {
         let [owner, sub] = pair;
         let whose = if owner == build.root_key { "this project" } else { "`" + owner + "`" };
-        list.map (fn n -> {
+        map (fn n -> {
             console.print! ("  " + describe n + "  [build: " + whose + "]")
             console.print! ("      -> " + to_string (build.node_abs n))
         }) (build.nodes sub) |> strict!
     };
-    strict! (list.map show_build! (build.build_graphs g))
+    strict! (map show_build! (build.build_graphs g))
     :ok
 };
 
@@ -572,7 +572,7 @@ let cmd_tree! m o = {
     // A package's build dependencies hang under it, marked, in the graph of
     // their own they were walked into; what they use is shown from there.
     let rec branch! g key indent shown = {
-        let seen = list.fold (fn seen k -> {
+        let seen = fold (fn seen k -> {
             let n = build.node g k;
             if list.contains k seen {
                 console.print! (indent + describe n + " (*)")
@@ -597,7 +597,7 @@ let cmd_tree! m o = {
 
 let cmd_fetch! m o = {
     let g = graph_of! m o;
-    let fetched = list.filter (fn n -> manifest.dep_kind (build.node_dep n) != :path) (build.nodes g);
+    let fetched = filter (fn n -> manifest.dep_kind (build.node_dep n) != :path) (build.nodes g);
     console.print! ("resolved " + to_string (list.length (build.nodes g)) + " packages, "
                     + to_string (list.length fetched) + " of them fetched")
 };
@@ -606,6 +606,7 @@ let cmd_fetch! m o = {
 /// named -- and fetch them again. A tag or a commit comes back the same bytes,
 /// so this is only ever interesting for a branch; it does them all because
 /// "the cache is wrong" is the other reason to run it.
+let cmd_update! : :map -> :map -> [:string] -> :any;
 let cmd_update! m o names = {
     // Not through the lock: the lock disagreeing is often why this is being
     // run, and this walk only decides what to fetch again.
@@ -616,19 +617,19 @@ let cmd_update! m o names = {
     // Every program's packages, build scripts' included: a tool pinned to a
     // branch moves the same way a library does.
     let every = list.concat (list.cons (build.nodes g)
-                                       (list.map (fn pair -> build.nodes (list.nth 1 pair))
+                                       (map (fn pair -> build.nodes (list.nth 1 pair))
                                                  (build.build_graphs g)));
-    let chosen = list.unique (list.filter wanted every);
-    let unknown = list.filter (fn k -> not (list.any (fn n -> build.node_key n == k) every)) names;
+    let chosen = list.unique (filter wanted every);
+    let unknown = filter (fn k -> not (list.any (fn n -> build.node_key n == k) every)) names;
     if not (list.is_empty unknown) { fail! ("no dependency is called " + str.join_str ", " unknown) }
-    strict! (list.map (fn n -> match fetch.forget! (build.node_dep n) {
+    strict! (map (fn n -> match fetch.forget! (build.node_dep n) {
                           Result.error(why) => fail! why,
                           _ => :ok,
                       }) chosen)
     match build.resolve! m (build.with_option :dev true o) true { Result.error(why) => fail! why, _ => () }
     match chosen {
         [] => console.print! "nothing to update: every dependency is a directory",
-        _ => strict! (list.map (fn n -> console.print! ("updated " + describe n)) chosen),
+        _ => strict! (map (fn n -> console.print! ("updated " + describe n)) chosen),
     }
     :ok
 };
@@ -640,11 +641,11 @@ let cmd_update! m o names = {
 /// of whatever the source's `#` said.
 let add_spec! source c = {
     let base = manifest.string_spec source;
-    let pins = list.filter (fn p -> cli.get () c p != ()) ["tag", "branch", "rev"];
+    let pins = filter (fn p -> cli.get () c p != ()) ["tag", "branch", "rev"];
     match pins {
         [] => base,
         [p] => {
-            let unpinned = list.fold (fn acc k -> map.remove k acc) base ["tag", "branch", "rev"];
+            let unpinned = fold (fn acc k -> map.remove k acc) base ["tag", "branch", "rev"];
             unpinned.[p => cli.get () c p]
         },
         _ => fail! "give one of --tag, --branch or --rev",
@@ -708,6 +709,7 @@ let cmd_add! m c args = {
     }
 };
 
+let cmd_remove! : :map -> [:string] -> :any;
 let cmd_remove! m names = {
     if list.is_empty names { fail! "remove needs the name of a dependency" }
     let manifest_file = path.join (manifest.root m) "mind.toml";
@@ -721,11 +723,11 @@ let cmd_remove! m names = {
             },
         },
     };
-    match list.fold step [text, []] names {
+    match fold step [text, []] names {
         [_, [_, .._] as missing] => fail! ("no dependency is called " + str.join_str ", " missing),
         [after, []] => {
             file.write! manifest_file after
-            strict! (list.map (fn k -> console.print! ("removed " + k)) names)
+            strict! (map (fn k -> console.print! ("removed " + k)) names)
             :ok
         },
     }
@@ -795,11 +797,11 @@ let rec split_at_dashes args =
 /// The program's defines: every `-D` that is not scoped to a package, and
 /// `--debug`, which is `-D debug` spelled the way people reach for it.
 let defines_of c =
-    list.append (list.filter (fn d -> config.split_scoped d == ()) (cli.all c "define"))
+    list.append (filter (fn d -> config.split_scoped d == ()) (cli.all c "define"))
                 (if cli.flag_set c "debug" { ["debug"] } else { [] });
 
 /// Every `-D KEY:name=value`, as `[key, name, value]`.
-let sets_of c = list.flat_map (fn d -> match config.split_scoped d { () => [], s => [s] }) (cli.all c "define");
+let sets_of c = flat_map (fn d -> match config.split_scoped d { () => [], s => [s] }) (cli.all c "define");
 
 /// `--profile NAME`, or `--release` for that one; `debug` when neither.
 let profile_of! c =
@@ -822,7 +824,7 @@ let jobs_of! c =
     };
 
 let options_of! c =
-    list.fold (fn o kv -> build.with_option (list.head kv) (list.nth 1 kv) o)
+    fold (fn o kv -> build.with_option (list.head kv) (list.nth 1 kv) o)
               build.options
               [[:compiler, cli.get () c "compiler"],
                [:output,   cli.get () c "output"],

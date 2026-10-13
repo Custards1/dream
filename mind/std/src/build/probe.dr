@@ -60,13 +60,13 @@ let answer text = match wire.decode text { Result.ok(v) => v, _ => () };
 
 /// `llvm-config`'s answers, as one record.
 let llvm_answer : [:string] -> :string;
-let llvm_answer said = match list.map str.trim said {
+let llvm_answer said = match map str.trim said {
     ["", .._] => wire.encode (),
     [includes, version, libdir, libs, system, rtti] if not (str.is_empty libs) => wire.encode (%{
         :version => version,
         :includes => includes,
         :libdir => libdir,
-        :libraries => list.filter (fn w -> not (str.is_empty w)) (list.append (str.split " " libs) (str.split " " system)),
+        :libraries => filter (fn w -> not (str.is_empty w)) (list.append (str.split " " libs) (str.split " " system)),
         :rtti => rtti == "YES",
     }),
     _ => wire.encode (),
@@ -79,9 +79,9 @@ let llvm_link : :string -> :string -> [:string] -> :any;
 let llvm_link program linkage components = {
     let asks = [["--includedir"], ["--version"], ["--libdir"],
                 list.concat [[linkage, "--libfiles"], components], [linkage, "--system-libs"], ["--has-rtti"]];
-    let names = list.map (fn i -> "said" + to_string i) (list.range 0 (list.length asks));
+    let names = map (fn i -> "said" + to_string i) (list.range 0 (list.length asks));
     build.artifact (build.uncached (build.step "probe" "llvm" [] [:llvm, program, linkage, components] ["answer"] (fn job ->
-        list.concat [list.map (fn [n, args] -> build.Op.capture program args n) (list.zip names asks),
+        list.concat [map (fn [n, args] -> build.Op.capture program args n) (list.zip names asks),
                      [build.Op.attempt program [linkage, "--system-libs"] "system_ok",
                       build.Op.transform (list.append names ["system_ok"]) "answer" (fn said ->
                         if list.last said != "yes" { wire.encode () } else { llvm_answer (list.take 6 said) })]])))

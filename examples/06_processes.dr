@@ -22,8 +22,9 @@ let echo! () = {
 let square_worker! n = n * n;
 
 // Spawn one process per element and join them in order.
+let parallel_map! : (a -> b) -> [a] -> [b];
 let parallel_map! f xs =
-    list.map (fn p -> join! p) (list.map (fn x -> spawn! $( f x )) xs);
+    map (fn p -> join! p) (map (fn x -> spawn! $( f x )) xs);
 
 let rec countdown n = if n <= 0 { :liftoff } else { countdown (n - 1) };
 

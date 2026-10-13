@@ -116,7 +116,7 @@ let link_file tc t = match [cc.kind t, os_of tc] {
 /// Every shared library a target uses, however deep, once each.
 let shared_used : cc.Target -> [cc.Target];
 let rec shared_used t =
-    list.unique (list.flat_map (fn u -> match cc.kind u {
+    list.unique (flat_map (fn u -> match cc.kind u {
         :shared => list.cons u (shared_used u),
         _ => shared_used u,
     }) (cc.uses t));
@@ -142,7 +142,7 @@ let with_run_path tc t = {
 /// write one: MSVC.
 let depfile_text : :string -> [:string] -> :string;
 let depfile_text object reads =
-    str.join_str " \\\n  " (list.cons (object + ":") (list.map (fn r -> str.join_str "\\ " (str.split " " r)) reads)) + "\n";
+    str.join_str " \\\n  " (list.cons (object + ":") (map (fn r -> str.join_str "\\ " (str.split " " r)) reads)) + "\n";
 
 /// What `cl /showIncludes` printed, as the depfile `gcc -MD` would have
 /// written: the source and every header named.
@@ -193,39 +193,39 @@ let exports tc t root objects =
 let link_step : cc.Toolchain -> cc.Target -> :map;
 let rec link_step tc target = {
     let t = with_run_path tc target;
-    let objects = list.map (fn src -> { let s = compile_step tc t src; build.artifact s (list.head (build.Step.outputs s)) })
+    let objects = map (fn src -> { let s = compile_step tc t src; build.artifact s (list.head (build.Step.outputs s)) })
                            (cc.sources t);
-    let libraries = list.map (fn u -> build.artifact (link_step tc u) (link_file tc u)) (cc.linked_targets t);
+    let libraries = map (fn u -> build.artifact (link_step tc u) (link_file tc u)) (cc.linked_targets t);
     let runtime = match cc.kind t {
-        :executable => list.map (fn u -> [build.artifact (link_step tc u) (main_file tc u),
+        :executable => map (fn u -> [build.artifact (link_step tc u) (main_file tc u),
                                          runtime_dir tc + cc.file_name tc :shared (cc.name u)])
                                 (shared_used t),
         _ => [],
     };
     // Explicit dependency files participate in the key, so replacing a
     // system archive at the same path relinks its consumers.
-    let files = list.flat_map (fn setting -> match setting {
+    let files = flat_map (fn setting -> match setting {
         cc.Setting.link_file(path) => [build.file path],
         _ => [],
     }) (cc.link_settings t);
     let outputs = list.concat [
         [main_file tc t],
         (if cc.kind t == :shared && os_of tc == :windows { [link_file tc t] } else { [] }),
-        list.map (fn r -> list.nth 1 r) runtime,
+        map (fn r -> list.nth 1 r) runtime,
     ];
-    build.step "cc.link" (cc.name t) (list.concat [objects, libraries, files, list.map list.head runtime]) [tc, t] outputs (fn job -> {
+    build.step "cc.link" (cc.name t) (list.concat [objects, libraries, files, map list.head runtime]) [tc, t] outputs (fn job -> {
         let root = build.Context.root (build.Job.ctx job);
-        let objs = list.map (fn o -> build.path job o) objects;
-        let libs = list.map (fn l -> build.path job l) libraries;
+        let objs = map (fn o -> build.path job o) objects;
+        let libs = map (fn l -> build.path job l) libraries;
         let out = build.out job (main_file tc t);
         let commands = match family tc {
             :msvc => msvc.link tc t objs libs out,
             _ => gnu.link tc t objs libs out,
         };
         list.concat [exports tc t root objs,
-                     list.map (fn argv -> in_root root argv) commands,
+                     map (fn argv -> in_root root argv) commands,
                      // The shared libraries a program uses, beside it.
-                     list.map (fn [i, name] -> build.Op.link (build.path job i) name) runtime]
+                     map (fn [i, name] -> build.Op.link (build.path job i) name) runtime]
     })
 };
 

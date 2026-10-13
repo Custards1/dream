@@ -79,9 +79,9 @@ priv let rec loop! idle_ms idle shared = {
             },
             _ => { send! from [:shared, false]; loop! idle_ms fresh shared },
         },
-        [:down, who, _] => loop! idle_ms fresh (map.from_pairs (list.filter (fn [_, c] -> c != who) (map.pairs shared))),
+        [:down, who, _] => loop! idle_ms fresh (map.from_pairs (filter (fn [_, c] -> c != who) (map.pairs shared))),
         [:close, from] => {
-            close_all! (list.flat_map (fn k -> fresh.[k]) (map.keys fresh))
+            close_all! (flat_map (fn k -> fresh.[k]) (map.keys fresh))
             shutdown_all! (map.values shared)
             send! from :pool_closed
             ()
@@ -91,11 +91,11 @@ priv let rec loop! idle_ms idle shared = {
 };
 
 /// Close idle connections whose expiration deadline has passed.
-priv let reap! : :integer -> :integer -> :map -> :map;
+priv let reap! : :integer -> :integer -> %{:string => [[:any, :integer]]} -> %{:string => [[:any, :integer]]};
 priv let reap! idle_ms now idle = {
-    let all = list.flat_map (fn k -> idle.[k]) (map.keys idle);
-    close_all! (list.filter (fn [_, stamp] -> now - stamp >= idle_ms) all)
-    map.from_pairs (list.map (fn k -> [k, list.filter (fn [_, stamp] -> now - stamp < idle_ms) (idle.[k])]) (map.keys idle))
+    let all = flat_map (fn k -> idle.[k]) (map.keys idle);
+    close_all! (filter (fn [_, stamp] -> now - stamp >= idle_ms) all)
+    map.from_pairs (map (fn k -> [k, filter (fn [_, stamp] -> now - stamp < idle_ms) (idle.[k])]) (map.keys idle))
 };
 
 /// Shut down every connection-owning process in the list.

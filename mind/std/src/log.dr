@@ -117,11 +117,14 @@ let default! () = {
 /// not a level or `name=level` is ignored, rather than failing a program
 /// over a typo in its environment.
 let parse_spec : :string -> [Level, :map];
-let parse_spec spec = list.fold (fn [minimum, filters] part -> match str.split "=" (str.trim part) {
+let parse_spec spec = {
+    let seed : [Level, :map] = [:info, %{}];
+    fold (fn [minimum, filters] part -> match str.split "=" (str.trim part) {
     [name, lv] => match parse_level lv { () => [minimum, filters], l => [minimum, filters.[str.trim name => l]] },
     [lv] => match parse_level lv { () => [minimum, filters], l => [l, filters] },
     _ => [minimum, filters],
-}) [:info, %{}] (str.split "," spec);
+}) seed (str.split "," spec)
+};
 
 /// A logger for a component, named below the one it came from: `named "pool"`
 /// of a logger named `db` is `db.pool`.
@@ -238,7 +241,7 @@ let error! message fields = at! (default! ()) :error message fields;
 let timed! : Logger -> Level -> :string -> :map -> a -> a;
 let timed! lg l message fields value = {
     let start = time.monotonic! ();
-    let outcome = try! { strict! value; Result.ok value } catch e { Result.error e };
+    let outcome = try! { strict! value; ok value } catch e { err e };
     let took = time.monotonic! () - start;
     match outcome {
         Result.ok(v) => { at! lg l message fields.[:took => time.format_duration took]; v },
@@ -302,7 +305,7 @@ priv let text_line stamp event color = {
     let painted = if color { console.style (level_style l) label } else { label };
     let name = match Event.name event { "" => "", n => n + ": " };
     let fields = Event.fields event;
-    let pairs = list.map (fn k -> key_text k + "=" + value_text (fields.[k])) (map.sorted_keys fields);
+    let pairs = map (fn k -> key_text k + "=" + value_text (fields.[k])) (map.sorted_keys fields);
     str.join_str " " ([stamp, painted, name + Event.message event] + pairs)
 };
 
@@ -318,14 +321,14 @@ priv let logfmt_line stamp event = {
     let head = ["time=" + stamp, "level=" + str.lower (level_name (Event.level event))]
                + (match Event.name event { "" => [], n => ["logger=" + value_text n] })
                + ["msg=" + quote_always (Event.message event)];
-    str.join_str " " (head + list.map (fn k -> key_text k + "=" + value_text (fields.[k])) (map.sorted_keys fields))
+    str.join_str " " (head + map (fn k -> key_text k + "=" + value_text (fields.[k])) (map.sorted_keys fields))
 };
 
 /// One JSON object per line, the fields beside `time`, `level`, `logger` and
 /// `msg`, which win if a field has the same name.
 priv let json_line : :string -> :map -> :string;
 priv let json_line stamp event = {
-    let fields = map.from_pairs (list.map (fn [k, v] -> [key_text k, jsonable v]) (map.pairs (Event.fields event)));
+    let fields = map.from_pairs (map (fn [k, v] -> [key_text k, jsonable v]) (map.pairs (Event.fields event)));
     let base = %{ "time" => stamp, "level" => str.lower (level_name (Event.level event)), "msg" => Event.message event };
     let named = match Event.name event { "" => base, n => base.["logger" => n] };
     json.write (map.merge fields named)
@@ -337,9 +340,9 @@ let jsonable : :any -> :any;
 let jsonable v = match type_of v {
     :integer => v, :float => v, :bool => v, :string => v, :unit => v,
     :atom => atom.name v,
-    :list => list.map jsonable v,
-    :array => list.map jsonable (_array_to_list v),
-    :map => map.from_pairs (list.map (fn [k, x] -> [key_text k, jsonable x]) (map.pairs v)),
+    :list => { let values : [:any] = v; map jsonable values },
+    :array => { let values : [:any] = _array_to_list v; map jsonable values },
+    :map => map.from_pairs (map (fn [k, x] -> [key_text k, jsonable x]) (map.pairs v)),
     :error => error.describe v,
     _ => to_string v,
 };
@@ -405,7 +408,7 @@ when test {
             (str.contains_str "\u{1b}[33mWARN \u{1b}[0m" (render new (event :warn "" "x" %{}) true)) ),
         test.case "logfmt" $( test.eq! "time=2026-10-04T12:00:00Z level=info logger=http msg=\"GET /\" status=200"
             (render (format :logfmt new) (event :info "http" "GET /" %{ :status => 200 }) false) ),
-        test.case "JSON" $( test.eq! (Result.ok %{ "time" => "2026-10-04T12:00:00Z", "level" => "error", "logger" => "app",
+        test.case "JSON" $( test.eq! (ok %{ "time" => "2026-10-04T12:00:00Z", "level" => "error", "logger" => "app",
                                              "msg" => "failed", "kind" => "timeout", "tries" => [1, 2] })
             (json.decode (render (format :json new) (event :error "app" "failed" %{ :kind => :timeout, :tries => [1, 2] }) false)) ),
         test.case "an error field is described" $( test.true!

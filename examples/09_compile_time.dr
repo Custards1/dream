@@ -29,7 +29,7 @@ let mixed = comp (1 + 2) * 10;
 // `comp!` also permits effects during compile-time evaluation.
 
 let digits = comp! str.chars "12345";
-let squares = comp! list.map (fn x -> x * x) [1, 2, 3, 4];
+let squares = comp! map (fn x -> x * x) [1, 2, 3, 4];
 
 // --- when: items that exist only under a condition --------------------------
 //

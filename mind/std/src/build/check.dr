@@ -35,14 +35,14 @@ let is_input a = match a {
 /// variables, and what it `reads`.
 let inputs_of : %{:string => :any} -> [:any] -> [:any];
 let inputs_of env argv = list.concat [
-    list.filter is_input (map.values env),
-    list.flat_map (fn a -> match a { [:reads, i] => [i], _ if is_input a => [a], _ => [] }) argv,
+    filter is_input (map.values env),
+    flat_map (fn a -> match a { [:reads, i] => [i], _ if is_input a => [a], _ => [] }) argv,
 ];
 
 /// The arguments made real for this job: an input is its path, an output its
 /// place in the step's directory, and what is only read is left out.
 let resolved : :map -> [:any] -> [:string];
-let resolved job argv = list.flat_map (fn a -> match a {
+let resolved job argv = flat_map (fn a -> match a {
     [:reads, _] => [],
     [:out, n] => [build.out job n],
     _ if is_input a => [build.path job a],
@@ -51,7 +51,7 @@ let resolved job argv = list.flat_map (fn a -> match a {
 
 /// Resolve build inputs used as values in a check's environment.
 let env_resolved : :map -> %{:string => :any} -> %{:string => :string};
-let env_resolved job env = map.map_values (fn v -> if is_input v { build.path job v } else { v }) env;
+let env_resolved job env = map_values (fn v -> if is_input v { build.path job v } else { v }) env;
 
 /// Resolve a check's executable and argument list against its inputs.
 let program_and : :map -> %{:string => :any} -> [:any] -> [:any];

@@ -17,8 +17,8 @@
 //     [dependencies]
 //     json = { git = "https://..." }
 //
-// Like `std.json`, nothing here raises: `parse` answers `[:ok, table]` or
-// `[:error, message]`, because reading a file is not an effect.
+// Like `std.json`, nothing here raises: `parse` answers `Result.ok table` or
+// `Result.error message`, because reading a file is not an effect.
 //
 // And like `std.json`, it derives `std.codec`, so it writes as well as reads
 // and gets `decode_or`, `round_trips` and framing for nothing. One thing is
@@ -324,19 +324,10 @@ let rec parse_items cs table section current = match skip_blank cs {
 let parse : :string -> Result Document :string;
 let parse text = parse_items (str.chars text) (%{}) "" (%{});
 
-/// Test whether a parse result has the success tag.
-let ok : Result a e -> :bool;
-let ok r = Result.is_ok r;
-/// Extract the payload from a parse result.
-let value : Result a e -> :any;
-let value r = match r { Result.ok(v) => v, Result.error(why) => why };
 
 /// Parse a document, returning `default` if parsing fails.
 let parse_or : :any -> :string -> :any;
-let parse_or default text = {
-    let r = parse text;
-    if ok r { value r } else { default }
-};
+let parse_or default text = unwrap_or default (parse text);
 
 // --- reading what was parsed -------------------------------------------------
 
@@ -351,7 +342,7 @@ let get default table sec key = ((section table sec)).[key else default];
 
 /// The names of every section, in the order the map holds them.
 let sections : Document -> [:string];
-let sections table = list.map (fn p -> list.head p) (_map_pairs table);
+let sections table = map (fn p -> list.head p) (_map_pairs table);
 
 /// The `key = value` pairs of one section, as `[key, value]` lists.
 let entries : Document -> :string -> [[:string, Value]];
@@ -454,9 +445,9 @@ let write_list parts = "[" + str.join_str ", " parts + "]";
 /// "there is no null" above.
 let write_map : [[:any, :any]] -> :string;
 let write_map pairs = {
-    let kept = list.filter (fn p -> list.nth 1 p != ()) pairs;
+    let kept = filter (fn p -> list.nth 1 p != ()) pairs;
     let entry p = write_key (list.nth 0 p) + " = " + encode_value (list.nth 1 p);
-    if list.is_empty kept { "{}" } else { "{ " + str.join_str ", " (list.map entry kept) + " }" }
+    if list.is_empty kept { "{}" } else { "{ " + str.join_str ", " (map entry kept) + " }" }
 };
 
 /// Return the format name used by the codec protocol.
@@ -483,20 +474,20 @@ let encode v = match type_of v {
 /// belongs to that header; then each section in `map_entries` order.
 let write_document : :map -> :string;
 let write_document table = {
-    let present m = list.filter (fn p -> list.nth 1 p != ()) (map_entries m);
+    let present m = filter (fn p -> list.nth 1 p != ()) (map_entries m);
     let line p = write_key (list.nth 0 p) + " = " + encode_value (list.nth 1 p) + "\n";
-    let lines m = str.concat_all (list.map line (present m));
+    let lines m = str.concat_all (map line (present m));
     let is_section p = type_of (list.nth 1 p) == :map && list.nth 0 p != "";
-    let loose = str.concat_all (list.map line
-        (list.filter (fn p -> not (is_section p) && list.nth 0 p != "") (present table)));
+    let loose = str.concat_all (map line
+        (filter (fn p -> not (is_section p) && list.nth 0 p != "") (present table)));
     let unnamed = match table.["" else ()] {
         m if type_of m == :map => lines m,
         () => "",
         other => line ["", other],
     };
     let section p = "[" + key_text (list.nth 0 p) + "]\n" + lines (list.nth 1 p);
-    let sections = list.map section (list.filter is_section (present table));
-    str.join_str "\n" (list.filter (fn t -> not (str.is_empty t)) (_list_cons (loose + unnamed) sections))
+    let sections = map section (filter is_section (present table));
+    str.join_str "\n" (filter (fn t -> not (str.is_empty t)) (_list_cons (loose + unnamed) sections))
 };
 
 /// The document as text: `encode` under the name a TOML caller would look for.
@@ -508,7 +499,8 @@ let write table = encode table;
 when test {
     import std.test;
 
-    let parsed text = value (parse text);
+    let parsed : :string -> Document;
+    let parsed text = parse_or %{} text;
     let at text sec key = get () (parsed text) sec key;
 
     let tests = [
@@ -551,16 +543,16 @@ when test {
         test.case "comment line"  $( test.eq! 1 (at "# hi\na = 1" "" "a") ),
         test.case "trailing comment" $( test.eq! 1 (at "a = 1 # hi" "" "a") ),
         test.case "blank lines"   $( test.eq! 1 (at "\n\n a = 1 \n\n" "" "a") ),
-        test.case "comment only"  $( test.true! (ok (parse "# nothing here")) ),
-        test.case "empty document" $( test.true! (ok (parse "")) ),
+        test.case "comment only"  $( test.true! (is_ok (parse "# nothing here")) ),
+        test.case "empty document" $( test.true! (is_ok (parse "")) ),
 
         // failures are values
-        test.case "unclosed header" $( test.false! (ok (parse "[a")) ),
-        test.case "key with no value" $( test.false! (ok (parse "a =")) ),
-        test.case "key with no equals" $( test.false! (ok (parse "a")) ),
-        test.case "junk after value" $( test.false! (ok (parse "a = 1 2")) ),
-        test.case "unclosed array" $( test.false! (ok (parse "a = [1")) ),
-        test.case "unclosed string" $( test.false! (ok (parse "a = \"x")) ),
+        test.case "unclosed header" $( test.false! (is_ok (parse "[a")) ),
+        test.case "key with no value" $( test.false! (is_ok (parse "a =")) ),
+        test.case "key with no equals" $( test.false! (is_ok (parse "a")) ),
+        test.case "junk after value" $( test.false! (is_ok (parse "a = 1 2")) ),
+        test.case "unclosed array" $( test.false! (is_ok (parse "a = [1")) ),
+        test.case "unclosed string" $( test.false! (is_ok (parse "a = \"x")) ),
         test.case "parse_or"      $( test.eq! :fallback (parse_or :fallback "[") ),
 
         // a real manifest
@@ -577,7 +569,7 @@ when test {
         test.case "\\u escape"      $( test.eq! "\t" (at "a = \"\\u0009\"" "" "a") ),
         test.case "\\U escape"      $( test.eq! "A" (at "a = \"\\U00000041\"" "" "a") ),
         test.case "\\b and \\f"      $( test.eq! 2 (str.byte_length (at "a = \"\\b\\f\"" "" "a")) ),
-        test.case "a surrogate is refused" $( test.false! (ok (parse "a = \"\\ud800\"")) ),
+        test.case "a surrogate is refused" $( test.false! (is_ok (parse "a = \"\\ud800\"")) ),
 
         // writing: the spelling of each kind
         test.case "write an integer"  $( test.eq! "42" (encode_value 42) ),

@@ -64,7 +64,7 @@ let scram_first nonce = {
 
 /// The attributes of a SCRAM message, `r=..,s=..,i=..`, by their letter.
 let scram_attributes : :string -> %{:string => :string};
-let scram_attributes message = list.fold (fn m part ->
+let scram_attributes message = fold (fn m part ->
     if len part < 2 { m } else { m.[str.slice 0 1 part => str.slice 2 (len part - 2) part] }
 ) %{} (str.split "," message);
 
@@ -79,10 +79,10 @@ let scram_final password client_nonce client_bare server_first = {
     let salt = crypto.unbase64 attrs.["s" else ""];
     let rounds = num.parse_int attrs.["i" else ""];
     if not (str.starts_with client_nonce nonce) || len nonce <= len client_nonce {
-        Result.error "the server's nonce does not extend the client's"
+        err "the server's nonce does not extend the client's"
     } else {
         match salt {
-            () => Result.error "the server's salt is not base64",
+            () => err "the server's salt is not base64",
             s => match rounds {
                 i if type_of i == :integer && i > 0 => {
                     let salted = pbkdf2_sha256 password s i;
@@ -91,10 +91,10 @@ let scram_final password client_nonce client_bare server_first = {
                     let auth = client_bare + "," + server_first + "," + without_proof;
                     let proof = crypto.xor client_key (hmac_sha256 (sha256 client_key) auth);
                     let server_signature = hmac_sha256 (hmac_sha256 salted "Server Key") auth;
-                    Result.ok [without_proof + ",p=" + crypto.base64 proof,
+                    ok [without_proof + ",p=" + crypto.base64 proof,
                            crypto.base64 server_signature]
                 },
-                _ => Result.error "the server's iteration count is not a positive integer",
+                _ => err "the server's iteration count is not a positive integer",
             },
         }
     }
@@ -133,7 +133,7 @@ when test {
                                            "abcdefghijklmnopqrstuvwxyz",
                                            str.repeat 8 "1234567890"]) ),
         test.case "SCRAM-SHA-256 against RFC 7677's exchange"
-            $( test.eq! [Result.ok ["c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
+            $( test.eq! [ok ["c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
                                 "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="], true, false]
                         [scram_final "pencil" "rOprNGfwEbeRWgbNEkqO" "n=user,r=rOprNGfwEbeRWgbNEkqO"
                                      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",

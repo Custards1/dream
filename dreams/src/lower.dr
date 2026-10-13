@@ -789,7 +789,7 @@ let rec lower_expr e l =
         [:array, xs, _] => lower_seq :make_array xs l,
         [:map, pairs, _] =>
             lower_seq :make_map
-                      (list.concat (list.map (fn kv -> [list.nth 0 kv, list.nth 1 kv]) pairs))
+                      (list.concat (map (fn kv -> [list.nth 0 kv, list.nth 1 kv]) pairs))
                       l,
 
         [:match, scrutinee, arms, span] => lower_match scrutinee arms span l,
@@ -802,9 +802,12 @@ let rec lower_expr e l =
         [:comp, _, body, span] =>
             match lookup span l {
                 scope.Meaning.compiled(fi, _) => {
-                    let inner = lower_expr body l;
-                    let done = set_func_body fi (list.nth 1 inner)
-                                             (mark_tail (list.nth 1 inner) (list.head inner));
+                    // A function of its own, so none of a fused loop's
+                    // substitution applies in it (see `lower_function`).
+                    let inner = lower_expr body (set_subst %{} l);
+                    let done = set_subst (subst l)
+                                   (set_func_body fi (list.nth 1 inner)
+                                                  (mark_tail (list.nth 1 inner) (list.head inner)));
                     // The placeholder carries the function it waits on. A
                     // bare `unit` would be shared with every other `unit` by
                     // the optimizer, and a program lowered in parts is
@@ -816,6 +819,11 @@ let rec lower_expr e l =
                 },
                 _ => emit_leaf :unit l,
             },
+
+        // The element a fused loop over a list or an array is at -- never
+        // written, only substituted for the slot it stands in (see "a list or
+        // an array as the source" in `fuse`).
+        [:fused_element, tag] => fused_element tag l,
 
         // A container read or changed at a key. A `get`'s fallback is lowered
         // where it is written and only evaluated when the key is missing; a
@@ -869,7 +877,7 @@ let fuse_set c k v l = {
     let earlier = if not (constant_key k p) { () } else {
         match ir.node_op inner {
             :set if constant_key (ir.node_b inner) p => [ir.node_b inner, ir.node_c inner],
-            :set_many => list.map (fn i -> (ir.kids p).[ir.node_b inner + i])
+            :set_many => map (fn i -> (ir.kids p).[ir.node_b inner + i])
                                   (list.range 0 (2 * ir.node_c inner)),
             _ => (),
         }
@@ -904,9 +912,16 @@ let rec lower_function span op ps body l =
     match function_at (lookup span l) {
         () => emit_leaf :unit l,
         fi => {
-            let inner = lower_body ps body l;
-            let done = set_func_body fi (list.nth 1 inner)
-                                     (mark_tail (list.nth 1 inner) (list.head inner));
+            // A function of its own has a frame of its own, numbered from
+            // zero like every frame: a fused loop's substitution is about the
+            // loop's slots, and a slot of the same number in here is another
+            // slot. What the function needs of the loop it captured, and a
+            // loop whose substituted slot is captured is never fused
+            // (`scope.captures_substituted`).
+            let inner = lower_body ps body (set_subst %{} l);
+            let done = set_subst (subst l)
+                           (set_func_body fi (list.nth 1 inner)
+                                          (mark_tail (list.nth 1 inner) (list.head inner)));
             let made = emit (ir.node op fi ir.no_node ir.no_node) done;
             // Suspending an effect is not performing one, so a thunk is a pure
             // value -- unless what it suspends is effectful, in which case
@@ -942,14 +957,14 @@ let function_at found = match found {
 let lower_body ps body l =
     if not (list.any (fn p -> has_pattern p || ast.param_strict p) ps) { lower_expr body l }
     else {
-        let forced = list.fold (fn acc pair ->
+        let forced = fold (fn acc pair ->
             if not (ast.param_strict (list.nth 0 pair)) { acc }
             else {
                 let read = emit (ir.node :local (list.nth 1 pair) ir.no_node ir.no_node) (list.head acc);
                 [set_flag (list.nth 1 read) ir.f_strict (list.head read),
                  list.append (list.nth 1 acc) [list.nth 1 read]]
             }) [l, []] (list.zip ps (list.range 0 (list.length ps)));
-        let bound = list.fold (fn acc pair ->
+        let bound = fold (fn acc pair ->
             match ast.param_pattern (list.nth 0 pair) {
                 () => acc,
                 pattern => {
@@ -1077,7 +1092,7 @@ let rec lower_block stmts span l = {
                 let parts = destructure pattern (list.nth 1 reader) (list.head reader);
                 [list.head parts,
                  list.append (list.nth 1 acc)
-                     (list.map (fn k -> [k, st]) (list.cons (list.nth 1 bound) (list.nth 1 parts)))]
+                     (map (fn k -> [k, st]) (list.cons (list.nth 1 bound) (list.nth 1 parts)))]
             },
             _ => {
                 let got = match deferred st (list.head acc) {
@@ -1098,7 +1113,7 @@ let rec lower_block stmts span l = {
     let sequenced =
         if list.length pairs <= 1 { list.head done }
         else {
-            list.fold (fn acc pair -> {
+            fold (fn acc pair -> {
                 let k = list.nth 0 pair;
                 let st = list.nth 1 pair;
                 // A bind stays lazy: the ones whose value is effectful were
@@ -1164,7 +1179,7 @@ let local_node slot l = emit (ir.node :local slot ir.no_node ir.no_node) l;
 let lower_fused p l = {
     let outer = subst l;
     let built = set_subst outer (fused_body p (set_subst (subst_of p) l));
-    let inits = lower_all (list.nth 1 (fuse.Plan.source p)) built;
+    let inits = fused_inits (fuse.Plan.source p) built;
     let seeded =
         match fuse.Plan.seed p {
             fuse.Seed.written(e) => lower_expr e (list.head inits),
@@ -1181,6 +1196,43 @@ let subst_of p =
     list.fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
               (%{}) (fuse.Plan.subst p);
 
+/// The loop's cursor and what it carries, at the call that enters it: a
+/// producer's arguments as they were written; a list as the cursor, with
+/// nothing carried; an array carried, with the cursor at zero. The container
+/// is lowered once, here, where it was always going to be evaluated.
+let fused_inits source l = match source {
+    [:list, [xs]] => {
+        let got = lower_expr xs l;
+        let none = emit_leaf :unit (list.head got);
+        [list.head none, [list.nth 1 got, list.nth 1 none]]
+    },
+    [:array, [xs]] => {
+        let zero = const_int 0 l;
+        let got = lower_expr xs (list.head zero);
+        [list.head got, [list.nth 1 zero, list.nth 1 got]]
+    },
+    [_, args] => lower_all args l,
+};
+
+/// The element a loop over a list or an array is at: the head of what is
+/// left of the list, or the array at the cursor. The loop has already asked
+/// whether there is one.
+let fused_element tag l = {
+    let cur = local_node fuse.cursor_slot l;
+    match tag {
+        :list => {
+            let zero = const_int 0 (list.head cur);
+            let made = emit (ir.node :get (list.nth 1 cur) (list.nth 1 zero) ir.no_node) (list.head zero);
+            [inherit (list.nth 1 made) [list.nth 1 cur, list.nth 1 zero] (list.head made), list.nth 1 made]
+        },
+        _ => {
+            let held = local_node fuse.carried_slot (list.head cur);
+            let made = emit (ir.node :get (list.nth 1 held) (list.nth 1 cur) ir.no_node) (list.head held);
+            [inherit (list.nth 1 made) [list.nth 1 held, list.nth 1 cur] (list.head made), list.nth 1 made]
+        },
+    }
+};
+
 /// The loop itself, emitted into the same arena as everything else -- a
 /// function is a body node and a descriptor, not an arena of its own.
 let fused_body p l = {
@@ -1189,29 +1241,38 @@ let fused_body p l = {
 
     // Done: `range` stops at its limit, `replicate` when there is nothing left
     // to repeat. Both are the condition the combinator itself tests, said
-    // about a counter instead of about a list.
+    // about a counter instead of about a list. A list is done when what is
+    // left of it is empty, and an array when the cursor reaches its length.
     let cur0 = local_node fuse.cursor_slot l;
     let done =
-        if replicating {
-            let zero = const_int 0 (list.head cur0);
-            binary :le (list.nth 1 cur0) (list.nth 1 zero) (list.head zero)
-        }
-        else {
-            let limit = local_node fuse.carried_slot (list.head cur0);
-            binary :ge (list.nth 1 cur0) (list.nth 1 limit) (list.head limit)
+        match stag {
+            :replicate => {
+                let zero = const_int 0 (list.head cur0);
+                binary :le (list.nth 1 cur0) (list.nth 1 zero) (list.head zero)
+            },
+            :list => call_builtin "_list_is_empty" [list.nth 1 cur0] (list.head cur0),
+            :array => {
+                let held = local_node fuse.carried_slot (list.head cur0);
+                let size = call_builtin "len" [list.nth 1 held] (list.head held);
+                binary :ge (list.nth 1 cur0) (list.nth 1 size) (list.head size)
+            },
+            _ => {
+                let limit = local_node fuse.carried_slot (list.head cur0);
+                binary :ge (list.nth 1 cur0) (list.nth 1 limit) (list.head limit)
+            },
         };
 
     let answer = local_node fuse.acc_slot (list.head done);
 
     // The turn that takes this element, and -- when a `filter` says it might
     // not be taken -- the turn that leaves the accumulator alone.
-    let taken = self_turn p replicating (fn l0 -> fused_step p l0) (list.head answer);
+    let taken = self_turn p stag (fn l0 -> fused_step p l0) (list.head answer);
     let advanced =
         match fuse.Plan.guards p {
             [] => taken,
             gs => {
                 let cond = lower_guards gs (list.head taken);
-                let skipped = self_turn p replicating (fn l0 -> local_node fuse.acc_slot l0)
+                let skipped = self_turn p stag (fn l0 -> local_node fuse.acc_slot l0)
                                         (list.head cond);
                 let made = emit (ir.node :if (list.nth 1 cond) (list.nth 1 taken)
                                          (list.nth 1 skipped))
@@ -1244,11 +1305,16 @@ let fused_body p l = {
 /// at twice. The arena is a tree -- a node reached from two parents would be
 /// walked twice by everything that reads it, and would take a flag meant for
 /// one of them in both places.
-let self_turn p replicating acc_at l = {
+let self_turn p stag acc_at l = {
     let cur = local_node fuse.cursor_slot l;
-    let one = const_int 1 (list.head cur);
-    let advanced = binary (if replicating { :sub } else { :add })
-                          (list.nth 1 cur) (list.nth 1 one) (list.head one);
+    let advanced = match stag {
+        :list => call_builtin "_list_tail" [list.nth 1 cur] (list.head cur),
+        _ => {
+            let one = const_int 1 (list.head cur);
+            binary (if stag == :replicate { :sub } else { :add })
+                   (list.nth 1 cur) (list.nth 1 one) (list.head one)
+        },
+    };
     let carried = local_node fuse.carried_slot (list.head advanced);
     let acc = acc_at (list.head carried);
     let callee = emit (ir.node :global (fuse.Plan.gi p) ir.no_node ir.no_node)
@@ -1276,6 +1342,14 @@ let lower_guards gs l =
 let fused_step p l =
     match fuse.Plan.step p {
         fuse.Step.written(body, _) => lower_expr body l,
+        // `from_pairs`: the pair's first element keyed to its second, read as
+        // `list.nth` reads them -- `()` for a pair that is short.
+        fuse.Step.op(:pairs) => {
+            let a = local_node fuse.acc_slot l;
+            let k = pair_part (fuse.Plan.elem p) 0 (list.head a);
+            let v = pair_part (fuse.Plan.elem p) 1 (list.head k);
+            fuse_set (list.nth 1 a) (list.nth 1 k) (list.nth 1 v) (list.head v)
+        },
         fuse.Step.op(op) => {
             let a = local_node fuse.acc_slot l;
             let x = emit_local (fuse.Plan.elem p) (list.head a);
@@ -1283,6 +1357,15 @@ let fused_step p l =
                    (list.nth 1 a) (list.nth 1 x) (list.head x)
         },
     };
+
+/// Part `i` of the pair in slot `slot`, or `()`.
+let pair_part slot i l = {
+    let x = emit_local slot l;
+    let at = const_int i (list.head x);
+    let none = emit_leaf :unit (list.head at);
+    let made = emit (ir.node :get (list.nth 1 x) (list.nth 1 at) (list.nth 1 none)) (list.head none);
+    [inherit (list.nth 1 made) [list.nth 1 x, list.nth 1 at, list.nth 1 none] (list.head made), list.nth 1 made]
+};
 
 /// `fold_strict`, which forces each step before taking the next.
 ///
@@ -1292,6 +1375,10 @@ let fused_step p l =
 /// to say it that the JIT can still take. A `let` would need a slot the frame
 /// holds, and a compiled frame's slots are registers; a statement is just a
 /// statement, and one marked strict is run where it stands.
+///
+/// The seed is forced too, on the first turn, as `list.fold` forces it: a
+/// strict fold is strict in its accumulator from the start, and `fold_lazy`
+/// is the fold for a seed that must stay unforced.
 let forced_acc call l = {
     let acc = local_node fuse.acc_slot l;
     let forced = emit (ir.node :force (list.nth 1 acc) ir.no_node ir.no_node) (list.head acc);
@@ -1363,7 +1450,7 @@ let rec record_test ctor fields subject binds span l =
             else {
                 let k = const_atom id l;
                 let is = call_builtin "_record_is" [list.nth 1 k, subject] (list.head k);
-                list.fold (fn acc pair -> {
+                fold (fn acc pair -> {
                     let at = const_int (list.nth 1 pair) (list.nth 0 acc);
                     let field = call_builtin "_match_at" [subject, list.nth 1 at] (list.head at);
                     let inner = pattern_test (list.nth 0 pair) (list.nth 1 field) (list.nth 2 acc)
@@ -1453,7 +1540,7 @@ let rec array_test items rest subject binds span l = {
         else { binary :ge (list.nth 1 length) (list.nth 1 want) (list.head want) };
     let start = bool_and (list.nth 1 typed) (list.nth 1 sized) (list.head sized);
 
-    let done = list.fold (fn acc pair -> {
+    let done = fold (fn acc pair -> {
         let l0 = list.nth 0 acc;
         let at = const_int (list.nth 1 pair) l0;
         let element = call_builtin "_match_at" [subject, list.nth 1 at] (list.head at);
@@ -1518,7 +1605,7 @@ let rec map_test pairs subject binds span l = {
 /// Where each source's lines start, by source index: `[path, starts,
 /// origins]`, where `origins` maps a macro's generated text back to its call.
 let places_of : modules.Loader -> %{ :integer => :list };
-let places_of ld = list.fold (fn acc i -> {
+let places_of ld = fold (fn acc i -> {
     let src = modules.file_at ld i;
     // The text itself is left behind: only its line starts and the ranges a
     // macro generated are wanted, and this table is shared with every part.
@@ -1534,8 +1621,8 @@ let places_of ld = list.fold (fn acc i -> {
 /// and an image should say the same thing whoever built it.
 let shown_path : modules.Loader -> :string -> :string;
 let shown_path ld p = {
-    let dirs = list.map (fn d -> if str.ends_with "/" d { d } else { d + "/" }) (modules.search_paths ld);
-    let longest = list.fold (fn best d ->
+    let dirs = map (fn d -> if str.ends_with "/" d { d } else { d + "/" }) (modules.search_paths ld);
+    let longest = fold (fn best d ->
         if str.starts_with d p && str.byte_length d > str.byte_length best { d } else { best }) "" dirs;
     str.slice (str.byte_length longest) (str.byte_length p) p
 };
@@ -1559,8 +1646,8 @@ let place_of span l = match (places (res l)).[source l else ()] {
 /// lowered against one set of line starts is not the part lowered against
 /// another, even where every span in it is the same.
 let places_key r bodies = {
-    let srcs = list.unique (list.map (fn nb -> list.nth 1 (list.nth 1 nb)) bodies);
-    list.map (fn i -> match (places r).[i else ()] {
+    let srcs = list.unique (map (fn nb -> list.nth 1 (list.nth 1 nb)) bodies);
+    map (fn i -> match (places r).[i else ()] {
         () => (),
         [path, starts, _] => [path, starts],
     }) (list.sort srcs)
@@ -1610,7 +1697,7 @@ let rec written e = match e {
 
 /// The parts at each position of an array or a record, by `_match_at`.
 let extract_at items subject want binds l =
-    list.fold (fn acc pair ->
+    fold (fn acc pair ->
         if not (wants want (list.nth 0 pair)) { acc }
         else {
             let at = const_int (list.nth 1 pair) (list.nth 0 acc);
@@ -1999,7 +2086,7 @@ let rec mark_tail i l =
     };
 
 let mark_targets n l =
-    list.fold (fn acc k -> if k % 2 == 1 || k == ir.node_c n - 1 {
+    fold (fn acc k -> if k % 2 == 1 || k == ir.node_c n - 1 {
                                mark_tail (ir.kid_at (ir.node_b n + k) (prog acc)) acc
                            } else { acc })
               l (list.range 0 (ir.node_c n));
@@ -2155,7 +2242,7 @@ let link_modules ld r l = {
 /// body is the one appended last, and a fresh compile has exactly one anyway.
 let find_entry ld r = {
     let last = modules.module_count ld - 1;
-    let hits = list.filter (fn b -> list.nth 0 b == last
+    let hits = filter (fn b -> list.nth 0 b == last
                                     && scope.decl_name (list.nth 2 b) == "main!")
                            (scope.bodies r);
     if list.is_empty hits { ir.no_node } else { list.nth 3 (list.last hits) }
@@ -2189,7 +2276,7 @@ let settle_body l =
 /// arena is safe for exactly the reason the whole-program arena always was.
 let lower_from : scope.Resolution -> Lowering -> [[:any]] -> Lowering;
 let lower_from r low bodies =
-    list.fold_strict (fn acc b -> {
+    fold (fn acc b -> {
         let src = list.nth 1 b;
         let d = list.nth 2 b;
         let fi = list.nth 3 b;
@@ -2234,10 +2321,10 @@ let rec comp_dependencies todo seen found pending p funcs globals = match todo {
         } else {
             let n = ir.node_at index p;
             let op = ir.node_op n;
-            let direct = list.map (fn k -> opt.operand k n) (opt.edges_of op);
+            let direct = map (fn k -> opt.operand k n) (opt.edges_of op);
             let run = match opt.run_of op {
                 () => [],
-                [offset, count, width] => list.map (fn i -> ir.kid_at i p)
+                [offset, count, width] => map (fn i -> ir.kid_at i p)
                     (list.range (opt.operand offset n)
                         (opt.operand offset n + opt.operand count n * width)),
             };
@@ -2267,10 +2354,10 @@ let rec comp_reach todo seen fns p funcs globals = match todo {
         } else {
             let n = ir.node_at index p;
             let op = ir.node_op n;
-            let direct = list.map (fn k -> opt.operand k n) (opt.edges_of op);
+            let direct = map (fn k -> opt.operand k n) (opt.edges_of op);
             let run = match opt.run_of op {
                 () => [],
-                [offset, count, width] => list.map (fn i -> ir.kid_at i p)
+                [offset, count, width] => map (fn i -> ir.kid_at i p)
                     (list.range (opt.operand offset n)
                         (opt.operand offset n + opt.operand count n * width)),
             };
@@ -2320,7 +2407,7 @@ let whole_image fis l = {
     let [l2, zero] = const_int 0 l1;
     let [l3, stub] = emit (ir.node :div one zero ir.no_node) l2;
     let img = ir.finish (prog l3);
-    let cut = list.map (fn pair -> {
+    let cut = map (fn pair -> {
         let [fi, f] = pair;
         if map.has fi reached { f } else { f.[:body => stub] }
     }) (list.zip (list.range 0 (list.length (ir.Image.funcs img))) (ir.Image.funcs img));
@@ -2355,7 +2442,7 @@ let rec settle_comp_order! rows done built l =
             // Each evaluation sees the constants its dependencies installed,
             // rather than the original image full of unit placeholders.
             let image = match built {
-                () => comp_image (list.map (fn r -> r.[0].[1]) rows) l,
+                () => comp_image (map (fn r -> r.[0].[1]) rows) l,
                 ready_made => ready_made,
             };
             let settled = settle_comp! (fn fi -> emit.with_entry image fi) one l;
@@ -2378,8 +2465,8 @@ let settle_comps! l = {
         let p = prog l;
         let funcs = array.of_list (ir.funcs p);
         let globals = array.of_list (ir.globals p);
-        let pending = list.fold (fn m one -> m.[one.[0] => true]) %{} pend;
-        let rows = list.map (fn one -> [one,
+        let pending = fold (fn m one -> m.[one.[0] => true]) %{} pend;
+        let rows = map (fn one -> [one,
             comp_dependencies [funcs.[one.[1]].[:body]] %{} [] pending p funcs globals]) pend;
         settle_comp_order! rows %{} () l
     }
@@ -2473,7 +2560,7 @@ let part_count = 4;
 /// of their own, share it, and answer the part `link_parts` merges.
 let lower_part : scope.Resolution -> [[:any]] -> :map;
 let lower_part r numbered = {
-    let walked = list.fold_strict (fn acc nb -> {
+    let walked = list.fold (fn acc nb -> {
         let [low, shared, bodies, notes] = acc;
         // A fresh arena for every body: the constant pools are the part's and
         // carry on, and everything else is this body's and is thrown away once
@@ -2487,7 +2574,7 @@ let lower_part r numbered = {
         // In the table's own order: a part's numbering is its own business,
         // and sharing the parts renumbers every node in function order anyway.
         let roots = map.pairs (func_bodies done);
-        let rebuilt = list.fold (fn st pair -> {
+        let rebuilt = fold (fn st pair -> {
             let got = opt.rebuild (list.nth 1 pair) (list.head st);
             [list.head got, (list.nth 1 st).[list.head pair => list.nth 1 got]]
         }) [opt.enter_body (ir.nodes p) (ir.kids p) (opt.type_ids_in (ir.strs p) (ir.atoms p)) shared,
@@ -2576,7 +2663,7 @@ let link_parallel! ld r cache = {
         () => {
             let all = scope.bodies rs;
             let numbered = list.zip (list.range 0 (list.length all)) all;
-            list.map (fn k -> [rs, list.filter (fn nb -> list.head nb % part_count == k) numbered])
+            map (fn k -> [rs, filter (fn nb -> list.head nb % part_count == k) numbered])
                      (list.range 0 part_count)
         },
         walked => {
@@ -2611,8 +2698,8 @@ let link_parallel! ld r cache = {
             }) waiting]
         }) ((pa.[k]).[:notes])
     }) (list.range 0 (list.length parts))));
-    let said = list.concat (list.map (fn note -> list.nth 1 note) notes);
-    let waiting = list.concat (list.map (fn note -> list.nth 2 note) notes);
+    let said = list.concat (map (fn note -> list.nth 1 note) notes);
+    let waiting = list.concat (map (fn note -> list.nth 2 note) notes);
     let lowered = ((set_prog (head.[:prog]) (head.[:base]))
         |> Lowering.set_diags said
         |> Lowering.set_pending_comp waiting
@@ -2629,7 +2716,7 @@ let link_parallel! ld r cache = {
 /// The wrappers a part's names reach, and the wrappers those stand for, as
 /// `[global, wrapper]` sorted: what its lowering reads of the table.
 let reached_wrappers all r = {
-    let used = list.fold (fn m [_, meaning] -> match meaning {
+    let used = fold (fn m [_, meaning] -> match meaning {
         scope.Meaning.global(_, _, gi) if gi != () => m.[gi => true],
         scope.Meaning.member(_, _, gi) if gi != () => m.[gi => true],
         _ => m,
@@ -2697,12 +2784,12 @@ let patched l img = {
     let tables = p |> ir.Program.set_nodes %{} |> ir.Program.set_node_count n_nodes
                    |> ir.Program.set_kids %{} |> ir.Program.set_kid_count n_kids
                    |> ir.Program.set_funcs (ir.Image.funcs img);
-    let placed = list.head (list.fold_strict (fn acc n -> {
+    let placed = list.head (list.fold (fn acc n -> {
         let [m, i] = acc;
         [if ir.node_op n == :unit && ir.is_node (ir.node_a n) { m.[ir.node_a n => i] } else { m }, i + 1]
     }) [%{}, 0] nodes);
     let values = comp_values l;
-    let filled = list.fold (fn acc one -> {
+    let filled = fold (fn acc one -> {
         let [_, fi, src, span] = one;
         match values.[comp_key src span else ()] {
             () => acc,
@@ -2730,8 +2817,8 @@ let patched l img = {
 let overlaid xs written n count fill =
     if len written == 0 { xs }
     else {
-        list.append (list.map (fn ix -> written.[list.head ix else list.nth 1 ix]) (list.zip (list.range 0 n) xs))
-                    (list.map (fn i -> written.[i else fill]) (list.range n count))
+        list.append (map (fn ix -> written.[list.head ix else list.nth 1 ix]) (list.zip (list.range 0 n) xs))
+                    (map (fn i -> written.[i else fill]) (list.range n count))
     };
 
 // --- running what was lowered in parts ----------------------------------------
@@ -2774,13 +2861,13 @@ let rec reach_parts todo seen fns met arenas funcs globals invented_from = match
             let n = (part.[:nodes]).[key % opt.part_base else (ir.leaf :nop)];
             let op = ir.node_op n;
             let fo = part.[:fo else 0];
-            let direct = list.map (fn e -> {
+            let direct = map (fn e -> {
                 let v = opt.operand e n;
                 if ir.is_node v { at + v } else { v }
             }) (opt.edges_of op);
             let run = match opt.run_of op {
                 () => [],
-                [off_at, count_at, width] => list.map (fn t -> {
+                [off_at, count_at, width] => map (fn t -> {
                     let kid = (part.[:kids]).[opt.operand off_at n + t else ir.no_node];
                     if ir.is_node kid { at + kid } else { kid }
                 }) (list.range 0 (opt.operand count_at n * width)),
@@ -2815,7 +2902,7 @@ let parts_image fis l = {
                                          (list.fold (fn m fi -> m.[fi => true]) %{} fis) %{}
                                          (current_arenas l3) funcs (array.of_list (ir.globals p))
                                          (Lowering.invented_from l));
-    let cut = list.map (fn pair -> {
+    let cut = map (fn pair -> {
         let [fi, f] = pair;
         if map.has fi reached { f } else { f.[:body => stub] }
     }) (list.zip (list.range 0 (list.length (ir.funcs p))) (ir.funcs p));
@@ -2830,7 +2917,7 @@ let parts_dependencies fi l = {
     let funcs = array.of_list (ir.funcs p);
     let met = list.nth 1 (reach_parts [(funcs.[fi]).[:body]] %{} (%{fi => true}) %{} (current_arenas l)
                                       funcs (array.of_list (ir.globals p)) (Lowering.invented_from l));
-    list.map (fn kv -> list.head kv) (map.pairs met)
+    map (fn kv -> list.head kv) (map.pairs met)
 };
 
 /// `settle_comps!` for a lowering made in parts: the same order, the same
@@ -2838,8 +2925,8 @@ let parts_dependencies fi l = {
 /// against its function (`:filled`) rather than over its placeholder.
 let settle_parts_comps! l = {
     let pend = pending_comp l;
-    let waiting = list.fold (fn m one -> m.[one.[1] => true]) %{} pend;
-    let rows = list.map (fn one -> [one, list.filter (fn fi -> map.has fi waiting && fi != one.[1])
+    let waiting = fold (fn m one -> m.[one.[1] => true]) %{} pend;
+    let rows = map (fn one -> [one, filter (fn fi -> map.has fi waiting && fi != one.[1])
                                                      (parts_dependencies (one.[1]) l)]) pend;
     settle_parts_order! rows %{} () l
 };
@@ -2899,7 +2986,7 @@ let settle_part_comp! bytes one l = {
 /// Intern every value of a part's pool into the program's: `[program, the
 /// program's index for each of the part's, in order]`.
 let intern_each intern vs p = {
-    let got = list.fold_strict (fn acc v -> {
+    let got = list.fold (fn acc v -> {
         let one = intern v (list.head acc);
         [list.head one, list.cons (list.nth 1 one) (list.nth 1 acc)]
     }) [p, []] vs;
@@ -2987,7 +3074,7 @@ let rec emit_const v l =
         :list    => const_seq :make_list (list.map (fn x -> x) v) l,
         :array   => const_seq :make_array (array.to_list v) l,
         :map     => const_seq :make_map
-                        (list.concat (list.map (fn kv -> [list.nth 0 kv, list.nth 1 kv])
+                        (list.concat (map (fn kv -> [list.nth 0 kv, list.nth 1 kv])
                                                (map.pairs v))) l,
         _ => match types.record_id v {
             () => emit_leaf :unit l,
@@ -3071,7 +3158,7 @@ let dump l = {
     let name_of i = if i < list.length strs { list.nth i strs } else { "?" };
     str.join_str "\n"
         (list.append
-            (list.map (fn i -> {
+            (map (fn i -> {
                 let f = list.nth i fs;
                 "fn" + to_string i + " " + name_of (f.[:name else 0])
                 + "/" + to_string (f.[:arity else 0])

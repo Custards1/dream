@@ -228,7 +228,7 @@ let within! d value = {
             // innocent `recv!` in the caller saw.
             proc.kill! worker :timeout
             proc.recv_where! (fn m -> proc.is_down_of worker m)
-            Result.error :timeout
+            err :timeout
         },
     }
 };
@@ -358,11 +358,11 @@ let zone! name = tz.load! name;
 /// stand. Right for any date the rule covers; for history before it, use
 /// `zone!`.
 let posix_zone : :string -> Result Zone :string;
-let posix_zone rule = Result.map (fn r -> tz.Zone.make rule #[] (tz.Rule.standard r) r) (tz.parse_rule rule);
+let posix_zone rule = map (fn r -> tz.Zone.make rule #[] (tz.Rule.standard r) r) (tz.parse_rule rule);
 
 /// The same, falling back to UTC when this machine does not know the name.
 let zone_or_utc! : :string -> Zone;
-let zone_or_utc! name = Result.unwrap_or utc (tz.load! name);
+let zone_or_utc! name = unwrap_or utc (tz.load! name);
 
 /// The zone this machine's clock is set to (`$TZ`, then `/etc/localtime`).
 let local_zone! : :unit -> Zone;
@@ -659,7 +659,7 @@ priv let expand_pattern : :string -> :string;
 priv let expand_pattern p =
     if str.find "%" p < 0 { p }
     else {
-        list.fold (fn acc [from, to] -> str.replace from to acc) p
+        fold (fn acc [from, to] -> str.replace from to acc) p
                   [["%%", "\u{1}"], ["%F", "%Y-%m-%d"], ["%T", "%H:%M:%S"], ["%R", "%H:%M"],
                    ["%D", "%m/%d/%y"], ["%r", "%I:%M:%S %p"], ["%c", "%a %b %e %H:%M:%S %Y"],
                    ["\u{1}", "%%"]]
@@ -678,14 +678,14 @@ let parse : :string -> :string -> Result DateTime :string;
 let parse pattern text = {
     let p = expand_pattern pattern;
     match read_fields p 0 text 0 %{} {
-        Result.error(why) => Result.error why,
+        Result.error(why) => err why,
         Result.ok(fields) => build fields,
     }
 };
 
 /// `parse`, answering the instant.
 let parse_instant : :string -> :string -> Result Instant :string;
-let parse_instant pattern text = Result.map to_instant (parse pattern text);
+let parse_instant pattern text = map to_instant (parse pattern text);
 
 /// Parse formatted date-time fields into an accumulator map.
 priv let read_fields : :string -> :integer -> :string -> :integer -> :map -> Result :map :string;
@@ -884,7 +884,7 @@ priv let build f = {
 /// at all is refused, because it does not name an instant; read one with
 /// `parse_local` and say where it was.
 let parse_rfc3339 : :string -> Result Instant :string;
-let parse_rfc3339 text = Result.map to_instant (parse_iso text);
+let parse_rfc3339 text = map to_instant (parse_iso text);
 
 /// The same, as a DateTime keeping the offset it was written with.
 let parse_iso : :string -> Result DateTime :string;
@@ -922,7 +922,7 @@ let parse_local : Zone -> :string -> Result DateTime :string;
 let parse_local zone text = {
     let s = str.replace " " "T" (str.trim text);
     let patterns = ["%Y-%m-%dT%H:%M:%S.%N", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"];
-    match list.filter Result.is_ok (list.map (fn p -> parse p s) patterns) {
+    match filter Result.is_ok (map (fn p -> parse p s) patterns) {
         [Result.ok(dt), .._] => Result.ok (localize zone dt),
         _ => Result.error ("not a local date-time: " + text),
     }
@@ -934,7 +934,7 @@ let parse_http_date : :string -> Result Instant :string;
 let parse_http_date text = {
     let s = str.trim text;
     let forms = ["%a, %d %b %Y %H:%M:%S GMT", "%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"];
-    match list.filter Result.is_ok (list.map (fn p -> parse_instant p s) forms) {
+    match filter Result.is_ok (map (fn p -> parse_instant p s) forms) {
         [found, .._] => found,
         [] => Result.error ("not an HTTP date: " + text),
     }
@@ -1003,9 +1003,9 @@ let parse_duration text = {
                 }
             }
         };
-    if body == "" { Result.error "an empty duration" }
+    if body == "" { err "an empty duration" }
     else if body == "0" { Result.ok 0 }
-    else { Result.map (fn d -> if negative { 0 - d } else { d }) (parts 0 0) }
+    else { map (fn d -> if negative { 0 - d } else { d }) (parts 0 0) }
 };
 
 /// Resolve a duration unit name to its size in nanoseconds.
@@ -1120,7 +1120,7 @@ when test {
         test.case "parse names and 12 hours"   $( test.eq! (Result.ok "2026-10-04T18:21:00-06:00")
                                                     (Result.map datetime_text (parse "%a %b %e %Y %I:%M %p %z" "sun OCT  4 2026 6:21 pm -06:00")) ),
         test.case "parse refuses a bad day"    $( test.true! (Result.is_error (parse "%Y-%m-%d" "2025-02-29")) ),
-        test.case "parse says what it wanted"  $( test.eq! (Result.error "expected a month at byte 5, found xx-01") (parse "%Y-%m-%d" "2025-xx-01") ),
+        test.case "parse says what it wanted"  $( test.eq! (err "expected a month at byte 5, found xx-01") (parse "%Y-%m-%d" "2025-xx-01") ),
         test.case "format and parse agree"     $( test.eq! (Result.ok t) (parse_instant "%Y-%m-%dT%H:%M:%S.%L%z" (format "%Y-%m-%dT%H:%M:%S.%L%z" (to_utc t))) ),
         test.case "epoch seconds"              $( test.eq! (Result.ok (1700000000 * second)) (parse_instant "%s" "1700000000") ),
         test.case "RFC 3339 parses"            $( test.eq! [Result.ok t, Result.ok (t - hours 2), Result.ok (t - 512 * millisecond)]
@@ -1128,7 +1128,7 @@ when test {
                                                      parse_rfc3339 "2026-10-04 18:21:07z"] ),
         test.case "ISO's other forms"          $( test.eq! [Result.ok (to_instant (date 2026 10 4)), Result.ok (t - 7512 * millisecond)]
                                                     [parse_rfc3339 "2026-10-04", parse_rfc3339 "2026-10-04T18:21+0000"] ),
-        test.case "no offset, no instant"      $( test.eq! (Result.error "a time with no offset is not an instant: 2026-10-04T18:21:07")
+        test.case "no offset, no instant"      $( test.eq! (err "a time with no offset is not an instant: 2026-10-04T18:21:07")
                                                     (parse_rfc3339 "2026-10-04T18:21:07") ),
         test.case "a local time in a zone"     $( test.eq! (Result.ok "2026-07-04T09:00:00-06:00")
                                                     (Result.map datetime_text (parse_local denver "2026-07-04 09:00")) ),
@@ -1151,7 +1151,7 @@ when test {
             test.true! (monotonic! () - start >= milliseconds 20)
         } ),
         test.case "within, in time"            $( test.eq! (Result.ok 3) (within! second (1 + 2)) ),
-        test.case "within, too slow"           $( test.eq! (Result.error :timeout) (within! (milliseconds 20) (list.length (list.from 1))) ),
+        test.case "within, too slow"           $( test.eq! (err :timeout) (within! (milliseconds 20) (list.length (list.from 1))) ),
         test.case "a real zone, when the machine has one" $( match zone! "America/Denver" {
             Result.ok(z) => test.eq! ["-06:00", "-07:00", "1966-01-01T00:00:00-07:00"]
                                  [offset_text ":" (offset_in z t), offset_text ":" (offset_in z (to_instant (date 2026 1 1))),

@@ -278,10 +278,7 @@ let bad h span message ds =
 
 /// A `type` declaration's body, as the parser writes it: `[:named, "Name",
 /// description]`. Records and unions generate their `type` in the same shape.
-let named_body body = match body {
-    [:list, [[:atom, "named", _], [:str, shown, _], desc], _] => [shown, desc],
-    _ => (),
-};
+let named_body body = scope.named_type_of body;
 
 let env_of k mi = scope.r_env_at (res k) mi;
 
@@ -362,7 +359,7 @@ let shape_type k ev kind fields = {
         _ => [:any, :any, false],
     }) fields;
     let types = list.map (fn p -> list.nth 1 p) parts;
-    let shortest = list.fold (fn n ip -> if list.nth 2 (list.nth 1 ip) { n } else { list.nth 0 ip + 1 })
+    let shortest = fold (fn n ip -> if list.nth 2 (list.nth 1 ip) { n } else { list.nth 0 ip + 1 })
                              0 (list.enumerate parts);
     let lengths = list.range shortest (list.length parts + 1);
     match kind {
@@ -405,7 +402,7 @@ let named_type k gi args = match (Checker.named k).[gi else ()] {
 /// An evaluation scope with a declaration's parameters standing for these.
 let bound ev params args = {
     let [mi, subst, ltypes] = ev;
-    [mi, list.fold (fn m pa -> m.[list.nth 0 pa => list.nth 1 pa]) subst (list.zip params args), ltypes]
+    [mi, fold (fn m pa -> m.[list.nth 0 pa => list.nth 1 pa]) subst (list.zip params args), ltypes]
 };
 
 /// The global a type name denotes in module `mi`, or `()`.
@@ -557,7 +554,7 @@ let unfolded_now k gi args = match (Checker.named k).[gi else ()] {
 /// Every parameterless named type's description, evaluated: `gi => type`. A
 /// name inside one stays folded, so this terminates on a recursive type as
 /// `unfold` does.
-let unfolded_table k = list.fold (fn acc kv -> match list.nth 1 kv {
+let unfolded_table k = fold (fn acc kv -> match list.nth 1 kv {
     [mi, [], desc, _] => acc.[list.nth 0 kv => eval_type k (in_module mi) desc],
     _ => acc,
 }) %{} (map.pairs (Checker.named k));
@@ -762,7 +759,7 @@ let rec solve k p a subst = {
         // another shape is left alone, so that what is reported about it is
         // the shape, `[a]`, and not a list of what the other members held.
         _ if not (is_flex p) && is_union a2 && same_shapes k p (members a2) =>
-            list.fold (fn m t -> solve k p t m) subst (members a2),
+            fold (fn m t -> solve k p t m) subst (members a2),
         Ty.flex(n) => subst.[n => match subst.[n else ()] { () => widen a, prev => join prev (widen a) }],
         Ty.arrow(pa, pb) => match a2 {
             Ty.arrow(aa, ab) => solve k pb ab (solve k pa aa subst),
@@ -775,7 +772,7 @@ let rec solve k p a subst = {
         },
         Ty.tuple(ps) => match a2 {
             Ty.tuple(ts) if list.length ps == list.length ts =>
-                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip ps ts),
+                fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip ps ts),
             _ => subst,
         },
         Ty.array_of(pe) => match a2 {
@@ -791,12 +788,12 @@ let rec solve k p a subst = {
         },
         Ty.nominal(id, ps) => match a2 {
             Ty.nominal(id2, ts) if id == id2 && list.length ps == list.length ts =>
-                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip ps ts),
+                fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip ps ts),
             _ => subst,
         },
         Ty.named(_, g, pargs) => match a {
             Ty.named(_, g2, aargs) if g == g2 && list.length pargs == list.length aargs =>
-                list.fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip pargs aargs),
+                fold (fn m pa -> solve k (list.nth 0 pa) (list.nth 1 pa) m) subst (list.zip pargs aargs),
             _ => subst,
         },
         _ => subst,
@@ -1056,14 +1053,14 @@ let held k h e expected why ds = {
 let undeclared_keys : Checker -> Here -> [[ast.Expr]] -> (Ty | :atom) -> [:any] -> [:any];
 let undeclared_keys k h kvs expected ds = match declared_fields k expected fuel {
     () => ds,
-    [names, keys] => list.fold (fn acc kv -> {
+    [names, keys] => fold (fn acc kv -> {
         let key = list.nth 0 kv;
         match key {
             [:atom, n, sp] if not (list.contains (Ty.lit :atom n) keys) =>
                 // The fields by name: a `derive dyn` mapping's table is a key
                 // too, `0`, and nobody writes that one.
                 bad h sp ("`:" + n + "` is not a field of `" + str.join_str "` or `" names + "`, which has "
-                          + str.join_str ", " (list.flat_map (fn f -> match f { Ty.lit(:atom, _) => [show f], _ => [] }) keys)) acc,
+                          + str.join_str ", " (flat_map (fn f -> match f { Ty.lit(:atom, _) => [show f], _ => [] }) keys)) acc,
             _ => acc,
         }
     }) ds kvs,
@@ -1097,7 +1094,7 @@ let declared_fields k t n =
             },
             Ty.one_of(ts) => {
                 let each = list.map (fn m -> declared_fields k m (n - 1)) ts;
-                let maps = list.filter (fn i -> admits_map k (list.nth i ts)) (list.range 0 (list.length ts));
+                let maps = filter (fn i -> admits_map k (list.nth i ts)) (list.range 0 (list.length ts));
                 if list.is_empty maps || list.any (fn i -> list.nth i each == ()) maps { () }
                 else {
                     let found = list.map (fn i -> list.nth i each) maps;
@@ -1397,13 +1394,13 @@ let infer_overload k h form expected ds = {
             || (not (is_dispatch d) && not (is_contract d) && not (is_hint d) && diag.is_error d)) found;
         [candidate, t, found, not errors && (expected == () || fits k t expected)]
     }) choices;
-    let viable = list.filter (fn trial -> list.nth 3 trial) tried;
+    let viable = filter (fn trial -> list.nth 3 trial) tried;
     match viable {
         [[[mi, field, gi], t, found, _]] =>
             [t, list.cons (Choice.make (dispatch_key h callee) (scope.Meaning.member (scope.Ref.dream mi) field gi)) (found + ds)],
         _ => {
             let qualified = str.join_str ", " (list.map (fn [mi, field, _] -> {
-                let aliases = list.filter (fn [_, ref] -> ref == scope.Ref.dream mi)
+                let aliases = filter (fn [_, ref] -> ref == scope.Ref.dream mi)
                     (map.pairs (scope.aliases (scope.r_env_at (res k) (Here.mi h))));
                 let prefix = match aliases {
                     [] => list.last (str.split "." (scope.env_name (scope.r_env_at (res k) mi))),
@@ -1450,7 +1447,7 @@ let typed_apply k h f ft args sp ds1 = {
     // lambda among the arguments is best checked against a parameter type
     // whose variables are already known -- `list.map (fn x -> ..) xs` learns
     // what `x` is from `xs`, which is written after it.
-    let [plain, subst, ds3] = list.fold (fn acc ia -> {
+    let [plain, subst, ds3] = fold (fn acc ia -> {
         let [i, a] = ia;
         if deferred_argument k h a { [list.cons () (list.nth 0 acc), list.nth 1 acc, list.nth 2 acc] }
         else {
@@ -1462,7 +1459,7 @@ let typed_apply k h f ft args sp ds1 = {
     let known = list.reverse plain;
     // `[subst, subst admitting (), diagnostics]`: the second made again only
     // when a lambda has solved more, not for every argument.
-    let [subst2, _, ds4] = list.fold (fn acc ia -> {
+    let [subst2, _, ds4] = fold (fn acc ia -> {
         let [i, a] = ia;
         let [s, admitted, d] = acc;
         if i >= given {
@@ -1483,7 +1480,7 @@ let typed_apply k h f ft args sp ds1 = {
                     let s2 = solve k param lt s;
                     let a2 = admit_unit s2;
                     let wanted = solved s2 param true;
-                    let d3 = if Checker.dispatch k && not (fits k lt wanted) {
+                    let d3 = if Checker.dispatch k && not (answers_fit k a lt wanted) {
                         mismatch k h lt wanted (ast.span a) ("argument " + to_string (i + 1) + " of " + who) d2
                     } else { d2 };
                     [s2, a2, d3]
@@ -1517,7 +1514,7 @@ let typed_apply k h f ft args sp ds1 = {
 /// `c` and then asks whether the default fits `v`, and `list.head [n, ()]`
 /// solves `a` from `n` and asks whether the `()` does.
 let admit_unit subst =
-    list.fold (fn m p -> m.[list.nth 0 p => union_of [list.nth 1 p, :unit]]) subst (map.pairs subst);
+    fold (fn m p -> m.[list.nth 0 p => union_of [list.nth 1 p, :unit]]) subst (map.pairs subst);
 
 /// A function type with what is solved put into its first `n` parameters and
 /// nowhere else.
@@ -1531,6 +1528,21 @@ let rec solved_inputs subst t n =
     };
 
 let lambda_arity a = match a { [:lambda, ps, _, _] => list.length ps, _ => 0 };
+
+/// Whether a deferred argument suits a candidate, once what it answers has
+/// been solved into `wanted`. A lambda is asked only about its answer: its
+/// parameters were given it from the same solution, so they agree by
+/// construction except where a literal decided a variable before the lambda
+/// could. `fold (fn acc c -> list.cons c acc) [] cs` solves the accumulator
+/// as `[:never]` from the seed, the lambda answers `[:char]`, and the joined
+/// `[:never] | [:char]` is not something a function taking `[:never]` accepts
+/// -- held to that, every fold seeded with `[]` would rule `list.fold` out.
+let answers_fit : Checker -> ast.Expr -> (Ty | :atom) -> (Ty | :atom) -> :bool;
+let answers_fit k a lt wanted =
+    if is_lambda a {
+        let n = lambda_arity a;
+        fits k (arrows k lt n []).[1] (arrows k wanted n []).[1]
+    } else { fits k lt wanted };
 
 let infer_lambda_at k h a p ds = match a {
     [:lambda, ps, body, sp] => lambda k h ps body p sp ds,
@@ -1555,7 +1567,7 @@ let lambda k h ps body expected sp ds = {
     };
     let types = list.map (fn i -> if i < list.length params { list.nth i params } else { :any })
                          (list.range 0 n);
-    let [h2, ds2] = list.fold (fn acc pt -> bind_param k (list.head acc) (list.nth 0 pt) (list.nth 1 pt) (list.nth 1 acc))
+    let [h2, ds2] = fold (fn acc pt -> bind_param k (list.head acc) (list.nth 0 pt) (list.nth 1 pt) (list.nth 1 acc))
                               [h, ds1] (list.zip ps types);
     let answers = list.length params == n && stuck == ();
     let [body_t, ds3] =
@@ -1563,7 +1575,7 @@ let lambda k h ps body expected sp ds = {
             [rest, check k h2 body rest "what this function answers" ds2]
         }
         else { infer k h2 body ds2 };
-    [list.fold (fn t p -> Ty.arrow p t) body_t (list.reverse types), ds3]
+    [fold (fn t p -> Ty.arrow p t) body_t (list.reverse types), ds3]
 };
 
 let rec has_flex t = match t {
@@ -1615,7 +1627,7 @@ let rec block k h stmts expected ds = match stmts {
 
 /// A block signature that no `let` below it took up.
 let finish_block h ds =
-    list.fold (fn acc kv -> bad h (list.nth 1 (list.nth 1 kv))
+    fold (fn acc kv -> bad h (list.nth 1 (list.nth 1 kv))
                                 ("the signature of `" + list.nth 0 kv + "` has no `let` after it in this block") acc)
               ds (map.pairs (Here.pending h));
 
@@ -1677,7 +1689,7 @@ let rec bind_pattern k h p t = match p {
         }) (flat_members k t));
         let at i = if list.is_empty made { :any }
                    else { union_of (list.map (fn ts -> list.nth i ts) made) };
-        list.fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (list.enumerate fields)
+        fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (list.enumerate fields)
     },
     [:as_p, inner, n, _, _] => with_local n t (bind_pattern k h inner t),
     // `let?`'s pattern: the value of whichever of `Result.ok` and
@@ -1845,7 +1857,7 @@ let bind_items k h items rest found kind = {
         [:rep, e] => if kind == :list { Ty.list_of e } else { Ty.array_of e },
         _ => :any,
     }) found);
-    let h1 = list.fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (list.enumerate items);
+    let h1 = fold (fn acc ip -> bind_pattern k acc (list.nth 1 ip) (at (list.nth 0 ip))) h (list.enumerate items);
     match rest {
         [n2, _] => with_local n2 (if list.is_empty found { :any } else { rest_t }) h1,
         _ => h1,
@@ -1984,7 +1996,7 @@ let flat_members k t = {
 /// still folded if it was a name -- when that is all of them or none.
 let keeping k t keep = {
     let ms = flat_members k t;
-    let kept = list.filter keep ms;
+    let kept = filter keep ms;
     if list.length kept == list.length ms || list.is_empty kept { t } else { union_of kept }
 };
 
@@ -2015,7 +2027,7 @@ let left_of k p m = {
     else {
         match [p, pm] {
             [[:list_p, items, (), _], Ty.tuple(ts)] if list.length items == list.length ts =>
-                match list.filter (fn j -> not (takes_all (list.nth j items))) (list.range 0 (list.length ts)) {
+                match filter (fn j -> not (takes_all (list.nth j items))) (list.range 0 (list.length ts)) {
                     [j] => match without k (list.nth j ts) (list.nth j items) {
                         same if same == list.nth j ts => [m],
                         :never => [],
@@ -2888,7 +2900,7 @@ let refined_table k named depth = {
     let rec deepen below n =
         if n > depth { below }
         else {
-            let found = list.fold (fn acc kv -> {
+            let found = fold (fn acc kv -> {
                 let [mi, _, desc, _] = list.nth 1 kv;
                 if mentions_refine k mi desc n below { acc.[list.nth 0 kv => true] } else { acc }
             }) %{} pairs;
@@ -2947,7 +2959,7 @@ let contract_place c = Contract.source c * 4294967296 + ast.span_start (Contract
 let with_comp_globals r k =
     if len (Checker.comps k) == 0 { k }
     else {
-        k |> Checker.set_uses (list.fold (fn uses b -> {
+        k |> Checker.set_uses (fold (fn uses b -> {
             let [mi, source, d, _] = b;
             match [scope.decl_params d, scope.decl_body d] {
                 [[], [:comp, _, _, sp]] => match gi_of k mi (scope.decl_name d) {
@@ -2998,7 +3010,7 @@ let rec unknown_types k ev t source ds = match t {
 /// Every `type` declaration the program resolved, by the global it became:
 /// `gi => [module, parameter names, description, name]`.
 let named_table l r =
-    list.fold (fn acc b -> {
+    fold (fn acc b -> {
         let mi = list.nth 0 b;
         let d = list.nth 2 b;
         match named_body (scope.decl_body d) {
@@ -3050,13 +3062,13 @@ let checker l r = {
     let named = named_table l r;
     let [sigs, ds] = sig_table l r;
     let k0 = Checker.make l r named sigs %{} %{} %{} %{} false false %{};
-    let evaluated = list.fold (fn acc kv -> {
+    let evaluated = fold (fn acc kv -> {
         let [owner, t, _] = list.nth 1 kv;
         acc.[list.nth 0 kv => eval_type k0 (in_module owner) t]
     }) %{} (map.pairs sigs);
-    let uses = list.fold (fn acc kv -> acc.[list.nth 0 kv => flexible (list.nth 1 kv)]) %{}
+    let uses = fold (fn acc kv -> acc.[list.nth 0 kv => flexible (list.nth 1 kv)]) %{}
                          (map.pairs evaluated);
-    let unknown = list.fold (fn d kv -> {
+    let unknown = fold (fn d kv -> {
         let [owner, t, _] = list.nth 1 kv;
         unknown_types k0 (in_module owner) t (modules.module_source (modules.module_at l owner)) d
     }) ds (map.pairs sigs);
@@ -3069,7 +3081,7 @@ let checker l r = {
 /// The globals that are `std.list`'s `head`, which a test reads a tag with
 /// (see "narrowing"). By index, as fusion knows `range`, so that a `head` of
 /// the program's own is not taken for it.
-let heads_of k l = list.fold (fn acc i ->
+let heads_of k l = fold (fn acc i ->
     match [modules.module_name (modules.module_at l i), gi_of k i "head"] {
         ["std.list", gi] if gi != () => acc.[gi => true],
         _ => acc,
@@ -3171,11 +3183,11 @@ let hints l r source = {
     let bodies = scope.bodies r;
     let found = list.map (fn b -> list.nth 1 (check_decl_inferring k b [])) bodies;
     let k2 = Checker.set_hints true (match inferring k found { () => k, better => better });
-    let mine = list.filter (fn b -> list.nth 1 b == source) bodies;
+    let mine = filter (fn b -> list.nth 1 b == source) bodies;
     list.concat (list.map (fn b -> {
         let [mi, _, d, _] = b;
         let [ds, own] = check_decl_inferring k2 b [];
-        let local = list.filter (fn x -> is_hint x) ds;
+        let local = filter (fn x -> is_hint x) ds;
         // A declaration's own hint, from what its walk answered, when nothing
         // wrote a signature for it.
         match own {
@@ -3246,7 +3258,7 @@ let answer_type t = {
 };
 
 let without_nothing t = match t {
-    Ty.one_of(ts) => union_of (list.filter (fn m -> m != :unit) ts),
+    Ty.one_of(ts) => union_of (filter (fn m -> m != :unit) ts),
     _ => t,
 };
 
@@ -3297,12 +3309,12 @@ let rec has_unknowns t = match t {
 let inferring : Checker -> [:any] -> Checker | :unit;
 let inferring k found = {
     let uses = Checker.uses k;
-    let added = list.fold (fn acc one -> match one {
+    let added = fold (fn acc one -> match one {
         [gi, t] if not (map.has gi uses) => acc.[gi => t],
         _ => acc,
     }) %{} found;
     if len added == 0 { () }
-    else { Checker.set_uses (list.fold (fn m kv -> m.[list.nth 0 kv => list.nth 1 kv]) uses (map.pairs added)) k }
+    else { Checker.set_uses (fold (fn m kv -> m.[list.nth 0 kv => list.nth 1 kv]) uses (map.pairs added)) k }
 };
 
 /// What a body's second check said that its first did not, as warnings: the
@@ -3429,15 +3441,24 @@ let select_overloads l r = if not (has_overloads r) { r } else {
     let found = list.concat (list.map (fn p ->
         if len (scope.Resolution.overload_uses p) == 0 { [] }
         else { list.concat (list.map (fn b -> check_decl (with_resolution k2 p) b []) (body_of p)) }) parts);
-    let choices = list.fold (fn acc x -> match x {
+    apply_choices r found
+};
+
+/// The resolution with the members `found` chose put in place: the choices
+/// and unresolved calls a second check of the bodies that use shorthand
+/// reported. Shared by the check above and the one `compile.select!` makes in
+/// parts.
+let apply_choices : scope.Resolution -> [:any] -> scope.Resolution;
+let apply_choices r found = {
+    let choices = fold (fn acc x -> match x {
         Choice(key, meaning) => acc.[key => meaning], _ => acc,
     }) (scope.Resolution.selections r) found;
-    let errors = list.fold (fn acc x -> match x {
+    let errors = fold (fn acc x -> match x {
         Unresolved(key, d) if not (map.has key choices) => if list.contains d acc { acc } else { list.cons d acc },
         _ => acc,
     }) [] found;
     let selected p = p |> scope.Resolution.set_selections choices
-        |> scope.Resolution.set_refs (list.fold (fn acc [key, meaning] ->
+        |> scope.Resolution.set_refs (fold (fn acc [key, meaning] ->
             if map.has key acc { acc.[key => meaning] } else { acc }) (scope.refs p) (map.pairs choices));
     selected r |> scope.Resolution.set_parts (if scope.parts r == () { () } else { list.map selected (scope.parts r) })
         |> scope.Resolution.set_diags (errors + scope.r_diags r)
@@ -3452,17 +3473,17 @@ let select_overloads l r = if not (has_overloads r) { r } else {
 let concluded : Checker -> scope.Resolution -> [:any] -> [[:any]] -> [[:any]] -> Analysis;
 let concluded k r ds0 said again = {
     let inferred = list.map (fn pair -> warned (list.head pair) (list.nth 1 pair)) (list.zip said again);
-    let found = list.fold (fn ds c -> c + ds) ds0 (said + inferred);
-    let contracts = list.filter (fn x -> is_contract x) found;
+    let found = fold (fn ds c -> c + ds) ds0 (said + inferred);
+    let contracts = filter (fn x -> is_contract x) found;
     let dispatch = list.concat (list.map (fn [first, second] -> if list.is_empty second { first } else { second }) (list.zip said again));
-    let chosen = list.fold (fn acc x -> match x { Choice(key, _) => acc.[key => true], _ => acc }) %{} dispatch;
-    let unresolved = list.fold (fn acc x -> match x {
+    let chosen = fold (fn acc x -> match x { Choice(key, _) => acc.[key => true], _ => acc }) %{} dispatch;
+    let unresolved = fold (fn acc x -> match x {
         Unresolved(key, d) if not (map.has key chosen) => list.cons d acc,
         _ => acc,
     }) [] dispatch;
-    let diags = unresolved + list.filter (fn x -> not (is_contract x) && not (is_dispatch x)) found;
-    let once = list.fold (fn acc d -> if list.contains d acc { acc } else { list.cons d acc }) [] diags;
-    let settled = list.fold (fn acc c -> if list.contains c acc { acc } else { list.cons c acc }) [] contracts;
+    let diags = unresolved + filter (fn x -> not (is_contract x) && not (is_dispatch x)) found;
+    let once = fold (fn acc d -> if list.contains d acc { acc } else { list.cons d acc }) [] diags;
+    let settled = fold (fn acc c -> if list.contains c acc { acc } else { list.cons c acc }) [] contracts;
     Analysis.make (list.sort_by (fn a b -> place a < place b) once)
                   (list.sort_by (fn a b -> contract_place a < contract_place b) settled)
                   (param_masks k r is_float_type)
@@ -3518,7 +3539,7 @@ let rec param_mask k accepts t i arity bit !acc =
 let declared_params l r accepts = param_masks (list.head (checker l r)) r accepts;
 
 let param_masks k r accepts =
-    list.fold (fn acc b -> {
+    fold (fn acc b -> {
         let [mi, _, d, _] = b;
         let arity = list.length (scope.decl_params d);
         match gi_of k mi (scope.decl_name d) {

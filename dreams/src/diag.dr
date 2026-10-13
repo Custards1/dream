@@ -41,7 +41,7 @@ let origins s = Source.origins s;
 /// falls in a range macro expansion made.
 let origin_span : Source -> ast.Span -> ast.Span;
 let origin_span s sp = {
-    let found = list.filter (fn r -> ast.span_start sp >= list.nth 0 r
+    let found = filter (fn r -> ast.span_start sp >= list.nth 0 r
                                  && ast.span_start sp < list.nth 1 r) (origins s);
     match found { [] => sp, [r, .._] => list.nth 2 r }
 };
@@ -191,14 +191,14 @@ let render sources d = {
                + ": " + label (severity d) + ": " + message d;
     match note d {
         () => [head],
-        n  => list.append [head] (list.map (fn line -> "    = " + line) (str.split "\n" n)),
+        n  => list.append [head] (map (fn line -> "    = " + line) (str.split "\n" n)),
     }
 };
 
 /// Every diagnostic, as one block of text.
 let render_all : [:any] -> [:map] -> :string;
 let render_all sources ds =
-    str.join_str "\n" (list.concat (list.map (fn d -> render sources d) ds));
+    str.join_str "\n" (list.concat (map (fn d -> render sources d) ds));
 
 // --- tests -------------------------------------------------------------------
 

@@ -120,11 +120,11 @@ priv let attempt! gen holds tape = {
         let [value, after] = gen (random.of_tape tape);
         let used = random.tape_used after;
         strict! value
-        [:ok, value, used]
-    } catch e { Result.error e };
+        ok [value, used]
+    } catch e { err e };
     match drawn {
         Result.error(e) => [:broken_generator, e],
-        [:ok, value, used] => {
+        Result.ok([value, used]) => {
             let verdict = try! {
                 let answer = holds value;
                 strict! answer
@@ -233,11 +233,11 @@ priv let candidates : [:integer] -> [[:integer]];
 priv let candidates tape = {
     let n = list.length tape;
     let positions k = list.range 0 (n - k + 1);
-    let chunk_sizes = list.filter (fn k -> k <= n) [8, 4, 2, 1];
-    let truncations = list.map (fn k -> list.take k tape) (list.unique [0, n / 2, n - 1]);
-    let deletions = list.flat_map (fn k -> list.map (fn i -> list.take i tape + list.drop (i + k) tape) (positions k)) chunk_sizes;
-    let zeroings = list.flat_map (fn k -> list.map (fn i -> list.take i tape + list.replicate k 0 + list.drop (i + k) tape)
-                                                   (list.filter (fn i -> list.any (fn w -> w != 0) (list.take k (list.drop i tape))) (positions k)))
+    let chunk_sizes = filter (fn k -> k <= n) [8, 4, 2, 1];
+    let truncations = map (fn k -> list.take k tape) (list.unique [0, n / 2, n - 1]);
+    let deletions = flat_map (fn k -> map (fn i -> list.take i tape + list.drop (i + k) tape) (positions k)) chunk_sizes;
+    let zeroings = flat_map (fn k -> map (fn i -> list.take i tape + list.replicate k 0 + list.drop (i + k) tape)
+                                                   (filter (fn i -> list.any (fn w -> w != 0) (list.take k (list.drop i tape))) (positions k)))
                                  chunk_sizes;
     truncations + deletions + zeroings
 };

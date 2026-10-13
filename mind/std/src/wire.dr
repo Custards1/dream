@@ -194,14 +194,14 @@ let write_map : [[:any, :any]] -> :string;
 let write_map pairs = {
     let entry p = _str_concat [encode_value (list.nth 0 p), encode_value (list.nth 1 p)];
     _str_concat (_list_cons (byte tag_map)
-                               (_list_cons (count (list.length pairs)) (list.map entry pairs)))
+                               (_list_cons (count (list.length pairs)) (map entry pairs)))
 };
 
 /// Device values travel as host doubles: shape and numeric values survive,
 /// while device placement belongs to the receiving process.
 let write_tensor : :tensor -> :string;
 let write_tensor t = byte 12 + byte (tensor.rank t)
-    + str.concat_all (list.map count (tensor.shape t)) + tensor.to_bytes t;
+    + str.concat_all (map count (tensor.shape t)) + tensor.to_bytes t;
 
 /// Return the codec format name, `wire`.
 let format_name : :any -> :string;
@@ -372,8 +372,8 @@ priv let read_tensor buf at = {
     let rank = _str_byte buf at;
     if rank < 1 || rank > 6 || not (has buf (at + 1) (rank * 4)) { () }
     else {
-        let shape = list.map (fn i -> le buf (at + 1 + i * 4) 4) (list.range 0 rank);
-        let n = list.fold_strict (fn !n d -> n * d) 1 shape;
+        let shape = map (fn i -> le buf (at + 1 + i * 4) 4) (list.range 0 rank);
+        let n = fold (fn !n d -> n * d) 1 shape;
         let start = at + 1 + rank * 4;
         if list.any (fn d -> d == 0) shape || n > 536870897 || not (has buf start (n * 8)) { () }
         else { [tensor.of_bytes shape (str.slice start (n * 8) buf), start + n * 8] }
@@ -393,7 +393,7 @@ let decode_by_hand : :string -> Result :any :string;
 let decode_by_hand text = match read text 0 {
     () => Result.error ("not a " + format_name () + " value"),
     [v, at] =>
-        if at == len text { Result.ok v }
+        if at == len text { ok v }
         else { Result.error ("trailing bytes after a " + format_name () + " value") },
 };
 
@@ -434,8 +434,8 @@ when test {
             $( {
                 let t = tensor.random 19 [2, 3, 4] * 2.0;
                 test.eq! (write_tensor t) (encode t)
-                test.eq! (Result.ok t) (decode (encode t))
-                test.eq! (Result.ok t) (decode_by_hand (encode t))
+                test.eq! (ok t) (decode (encode t))
+                test.eq! (ok t) (decode_by_hand (encode t))
                 test.true! (trip [%{"weights" => t}])
             } ),
         test.case "malformed tensor shapes and payloads are refused"
@@ -551,7 +551,7 @@ when test {
         test.case "a frame is longer than its body"
             $( test.eq! (len (encode 1) + 4) (len (frame 1)) ),
         test.case "one frame"
-            $( test.eq! (Result.ok 42) (list.nth 0 (next_frame (frame 42))) ),
+            $( test.eq! (ok 42) (list.nth 0 (next_frame (frame 42))) ),
         test.case "a frame leaves nothing over"
             $( test.eq! "" (list.nth 1 (next_frame (frame 42))) ),
         test.case "half a frame is not an answer"
@@ -559,11 +559,11 @@ when test {
         test.case "half a body is not an answer either"
             $( test.eq! () (next_frame (_str_slice (frame "hello") 0 8)) ),
         test.case "two frames come back in order"
-            $( test.eq! [Result.ok 1, Result.ok :two] (list.nth 0 (frames (frame_all [1, :two]))) ),
+            $( test.eq! [ok 1, ok :two] (list.nth 0 (frames (frame_all [1, :two]))) ),
         test.case "a partial frame is left for later"
             $( test.eq! 3 (len (list.nth 1 (frames (frame 1 + _str_slice (frame 2) 0 3)))) ),
         test.case "a frame whose body is nonsense still says where the next one starts"
-            $( test.eq! (Result.ok 9)
+            $( test.eq! (ok 9)
                         (list.nth 1 (list.nth 0 (frames (_str_concat
                             [_str_le 1 4, _str_of_bytes [99], frame 9])))) ),
         test.case "nothing at all frames to nothing"

@@ -51,7 +51,7 @@ import std.vm;
 /// The `strict!` is the whole function: without it the spawns are thunks and
 /// the work is serialized behind whoever forces them.
 let start_all! : [:any] -> [Process];
-let start_all! thunks = strict! (list.map (fn t -> spawn! t) thunks);
+let start_all! thunks = strict! (map (fn t -> spawn! t) thunks);
 
 /// Start `start! x` for each `x`, in parallel.
 ///
@@ -59,7 +59,7 @@ let start_all! thunks = strict! (list.map (fn t -> spawn! t) thunks);
 /// here: `$( start! x )` inside the lambda is built fresh for every `x`, which
 /// is exactly what is wanted, and what makes this safe to call twice.
 let start_each! : (a -> :any) -> [a] -> [Process];
-let start_each! start! xs = start_all! (list.map (fn x -> $( start! x )) xs);
+let start_each! start! xs = start_all! (map (fn x -> $( start! x )) xs);
 
 // --- waiting ----------------------------------------------------------------
 
@@ -68,7 +68,7 @@ let start_each! start! xs = start_all! (list.map (fn x -> $( start! x )) xs);
 /// Order is the order of the list, not the order they finish: a caller that
 /// wants results as they arrive wants a mailbox, not this.
 let wait_all! : [Process] -> [:any];
-let wait_all! ps = list.map (fn p -> join! p) ps |> strict!;
+let wait_all! ps = map (fn p -> join! p) ps |> strict!;
 
 /// What a process came to, as a value: `[:ok, v]` or `[:error, e]`, where `e`
 /// is the error itself -- ask `std.error` for its kind or payload.
@@ -84,12 +84,12 @@ let outcome! p = try! {
     // forces the element -- long past the `catch`. Binding it is what forces
     // it here, because a statement of an impure block is sequenced.
     let value = join! p;
-    Result.ok value
-} catch e { Result.error e };
+    ok value
+} catch e { err e };
 
 /// Wait for all processes, returning each success or error outcome in input order.
 let outcomes! : [Process] -> [Outcome :any];
-let outcomes! ps = list.map (fn p -> outcome! p) ps |> strict!;
+let outcomes! ps = map (fn p -> outcome! p) ps |> strict!;
 
 /// Run these in parallel and answer their values, in order.
 ///
@@ -141,7 +141,7 @@ let map_reporting! n done! f xs = {
     let me = self! ();
     let ref = vm.unique! ();
     let results = pool! me ref done! f items (if n < 1 { 1 } else { n }) 0 0 (%{});
-    strict! (list.map (fn i -> match results.[i] {
+    strict! (map (fn i -> match results.[i] {
         Result.ok(v) => v,
         Result.error(e) => error.rethrow! e,
     }) (list.range 0 total))
@@ -176,8 +176,8 @@ priv let answer! : Process -> :integer -> (a -> b) -> :integer -> a -> :any;
 priv let answer! me ref f i x = {
     let outcome = try! {
         let v = strict! (f x);
-        Result.ok v
-    } catch e { Result.error e };
+        ok v
+    } catch e { err e };
     send! me [:mapped, ref, i, outcome]
 };
 
@@ -253,9 +253,9 @@ priv let await_reply! target body deadline = {
     let answer = recv_until! (fn m -> is_reply_of ref m || is_down_of target m) deadline;
     demonitor! target
     match answer {
-        Result.ok([:reply, _, value]) => Result.ok value,
+        Result.ok([:reply, _, value]) => ok value,
         Result.ok([:down, _, outcome]) => raise! (error.new :down outcome),
-        _ => Result.error :timeout,
+        _ => err :timeout,
     }
 };
 
@@ -293,12 +293,12 @@ priv let rec scan! wanted deadline !at = match vm.mailbox_peek! at {
     Result.ok(m) =>
         if wanted m {
             vm.mailbox_take! at
-            Result.ok m
+            ok m
         }
         else { scan! wanted deadline (at + 1) },
     _ => match vm.await_message! at deadline {
         :ok => scan! wanted deadline at,
-        _ => Result.error :timeout,
+        _ => err :timeout,
     },
 };
 
@@ -444,7 +444,7 @@ when test {
                 test.eq! [[:tick, 1], [:tick, 2], [:tick, 3]] [a, b, c]
             } ),
         test.case "outcome! of a value"
-            $( test.eq! (Result.ok 7) (outcome! (spawn! $( 7 ))) ),
+            $( test.eq! (ok 7) (outcome! (spawn! $( 7 ))) ),
         // `catch` binds the error itself, not what was raised: `raise! :boom`
         // wraps `:boom` in a box whose kind is the catch-all `:error` and whose
         // payload is the atom. That is why the payload is what is compared
@@ -454,7 +454,7 @@ when test {
         test.case "try_map! keeps going past a failure"
             $( {
                 let got = try_map! (fn x -> if x == 1 { 1 } else { raise! :bad }) [1, 2];
-                test.eq! [Result.ok 1, Result.error :bad]
+                test.eq! [ok 1, err :bad]
                          [list.nth 0 got,
                           match list.nth 1 got { Result.error(e) => Result.error (error.payload e), other => other }]
             } ),
@@ -484,17 +484,17 @@ when test {
                 test.eq! [[:b, 1], :a, :c] [got, recv! (), recv! ()]
             } ),
         test.case "recv_within! times out"
-            $( test.eq! (Result.error :timeout) (recv_within! 20) ),
+            $( test.eq! (err :timeout) (recv_within! 20) ),
         test.case "recv_within! answers a message that is there"
             $( {
                 send! (self! ()) :here
-                test.eq! (Result.ok :here) (recv_within! 1000)
+                test.eq! (ok :here) (recv_within! 1000)
             } ),
         test.case "recv_where_within! waits for a late message"
             $( {
                 let me = self! ();
                 spawn! $( { sleep! 20; send! me :late } )
-                test.eq! (Result.ok :late) (recv_where_within! (fn m -> m == :late) 5000)
+                test.eq! (ok :late) (recv_where_within! (fn m -> m == :late) 5000)
             } ),
         test.case "kill! stops a loop that reads nothing"
             $( {
@@ -509,7 +509,7 @@ when test {
             $( {
                 let p = spawn! $( 6 * 7 );
                 monitor! p
-                test.eq! (Result.ok 42) (list.nth 2 (recv_where! (fn m -> is_down_of p m)))
+                test.eq! (ok 42) (list.nth 2 (recv_where! (fn m -> is_down_of p m)))
             } ),
         test.case "demonitor! takes back a report already sent"
             $( {
@@ -517,7 +517,7 @@ when test {
                 join! p
                 monitor! p
                 demonitor! p
-                test.eq! (Result.error :timeout) (recv_within! 0)
+                test.eq! (err :timeout) (recv_within! 0)
             } ),
         test.case "call! raises when the target dies first"
             $( {
@@ -534,7 +534,7 @@ when test {
                 kill! p :done
                 // Taken, so its end is handled rather than reported at exit.
                 outcome! p
-                test.eq! (Result.error :timeout) got
+                test.eq! (err :timeout) got
             } ),
         test.case "a reply after a timeout is not the next call's answer"
             $( {
@@ -550,7 +550,7 @@ when test {
                 let missed = call_within! p 1 10;
                 sleep! 80
                 let next = call! p 2;
-                test.eq! [Result.error :timeout, :prompt] [missed, next]
+                test.eq! [err :timeout, :prompt] [missed, next]
             } ),
         test.case "kill! reaches a force that never ends, through a try!"
             $( {

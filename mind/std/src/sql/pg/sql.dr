@@ -92,7 +92,7 @@ let parts f = f.[1];
 
 /// Several fragments, one after another.
 let concat : [Fragment] -> Fragment;
-let concat fragments = [:sql, list.map (fn f -> [:splice, f]) fragments];
+let concat fragments = [:sql, map (fn f -> [:splice, f]) fragments];
 
 /// Several fragments with `separator` between each.
 let join : :string -> [Fragment] -> Fragment;
@@ -100,7 +100,7 @@ let join separator fragments = match fragments {
     [] => raw "",
     [first, ..rest] =>
         [:sql, list.cons [:splice, first]
-                         (list.flat_map (fn f -> [separator, [:splice, f]]) rest)],
+                         (flat_map (fn f -> [separator, [:splice, f]]) rest)],
 };
 
 /// Values as a list of parameters, `$1, $2, $3`, for `IN (..)` and `VALUES`.
@@ -108,7 +108,7 @@ let join separator fragments = match fragments {
 /// An empty list renders as nothing, which makes `IN ()` -- a syntax error. A
 /// list that can be empty is better compared as an array: `= ANY({ids})`.
 let params : [:any] -> Fragment;
-let params vs = join ", " (list.map param vs);
+let params vs = join ", " (map param vs);
 
 // --- rendering -------------------------------------------------------------------
 
@@ -186,7 +186,7 @@ let ident name = raw (quote_ident name);
 
 /// `"schema"."table"`, from its parts.
 let qualified : [:any] -> Fragment;
-let qualified names = raw (str.join_str "." (list.map quote_ident names));
+let qualified names = raw (str.join_str "." (map quote_ident names));
 
 /// Quote an identifier, doubling embedded double quotes.
 let quote_ident : :any -> :string;
@@ -219,7 +219,7 @@ let and : [Fragment] -> Fragment;
 let and conditions = match conditions {
     [] => raw "TRUE",
     [one] => one,
-    many => join " AND " (list.map parenthesised many),
+    many => join " AND " (map parenthesised many),
 };
 
 /// Conditions joined by OR. None is `FALSE`.
@@ -227,7 +227,7 @@ let or : [Fragment] -> Fragment;
 let or conditions = match conditions {
     [] => raw "FALSE",
     [one] => one,
-    many => join " OR " (list.map parenthesised many),
+    many => join " OR " (map parenthesised many),
 };
 
 /// Wrap a condition in SQL NOT.
@@ -245,7 +245,7 @@ type Conditions = :map | Fragment | [Fragment];
 /// Normalize a value to a SQL condition fragment.
 let condition : Conditions -> Fragment;
 let condition c = match type_of c {
-    :map => and (list.map (fn [k, v] -> eq k v) (map.pairs c)),
+    :map => and (map (fn [k, v] -> eq k v) (map.pairs c)),
     _ => if c.[0 else ()] == :sql { c } else { and c },
 };
 
@@ -276,8 +276,8 @@ let insert_all : :any -> [:map] -> Fragment;
 let insert_all table rows = {
     let columns = map.keys (list.head rows);
     concat [raw "INSERT INTO ", table_name table,
-            raw " (", join ", " (list.map ident columns), raw ") VALUES ",
-            join ", " (list.map (fn row -> concat [raw "(", join ", " (list.map (fn c -> inserted row.[c else ()]) columns), raw ")"])
+            raw " (", join ", " (map ident columns), raw ") VALUES ",
+            join ", " (map (fn row -> concat [raw "(", join ", " (map (fn c -> inserted row.[c else ()]) columns), raw ")"])
                                 rows)]
 };
 
@@ -292,7 +292,7 @@ priv let inserted v = match v {
 let update : :any -> :map -> Conditions -> Fragment;
 let update table changes conditions =
     concat [raw "UPDATE ", table_name table, raw " SET ",
-            join ", " (list.map (fn [k, v] -> concat [ident k, raw " = ", param v]) (map.pairs changes)),
+            join ", " (map (fn [k, v] -> concat [ident k, raw " = ", param v]) (map.pairs changes)),
             where conditions];
 
 /// `DELETE FROM table WHERE ..`.
@@ -302,20 +302,20 @@ let delete table conditions = concat [raw "DELETE FROM ", table_name table, wher
 /// `SELECT "a", "b" FROM table WHERE ..`; no columns is `*`.
 let select : :any -> [:any] -> Conditions -> Fragment;
 let select table columns conditions =
-    concat [raw "SELECT ", (if list.is_empty columns { raw "*" } else { join ", " (list.map ident columns) }),
+    concat [raw "SELECT ", (if list.is_empty columns { raw "*" } else { join ", " (map ident columns) }),
             raw " FROM ", table_name table, where conditions];
 
 /// ` RETURNING "a", "b"`, appended; no columns is `*`.
 let returning : [:any] -> Fragment -> Fragment;
 let returning columns statement =
     concat [statement, raw " RETURNING ",
-            (if list.is_empty columns { raw "*" } else { join ", " (list.map ident columns) })];
+            (if list.is_empty columns { raw "*" } else { join ", " (map ident columns) })];
 
 /// A statement written with `$1`, `$2` .. and the values they stand for, as a
 /// fragment -- so text from elsewhere composes with everything above. A `$n`
 /// past the end of `vs` is NULL.
 let text_with : :string -> [:any] -> Fragment;
-let text_with sql vs = [:sql, list.map (fn t -> match t {
+let text_with sql vs = [:sql, map (fn t -> match t {
     [:positional, n] => [:param, vs.[n - 1 else ()]],
     other => token_text other,
 }) (scan sql false)];
@@ -386,7 +386,7 @@ macro fragment template = match template {
     [:str, text, _] => {
         let tokens = scan text true;
         match lint_as false tokens false false {
-            () => assemble (list.map template_part tokens),
+            () => assemble (map template_part tokens),
             message => invalid message,
         }
     },
@@ -410,7 +410,7 @@ priv let from_template : :string -> Syntax;
 priv let from_template text = {
     let tokens = scan text true;
     match lint tokens false false {
-        () => assemble (list.map template_part tokens),
+        () => assemble (map template_part tokens),
         message => invalid message,
     }
 };
@@ -432,12 +432,12 @@ priv let template_part t = match t {
 };
 
 /// A placeholder's name as syntax: `x`, or `m.x.y` for a module member.
-priv let path : :string -> :any;
+priv let path : :string -> [:any] | :unit;
 priv let path text = {
     let segments = str.split "." text;
     if text == "" || not (list.all is_name segments) { () }
     else {
-        list.fold (fn e seg -> [:field, e, seg, span])
+        fold (fn e seg -> [:field, e, seg, span])
                   [:name, list.head segments, span] (list.tail segments)
     }
 };
@@ -456,9 +456,9 @@ priv let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234
 
 /// The syntax of `[:sql, [parts]]` from the parts, with adjacent text merged.
 priv let assemble : [:any] -> Syntax;
-priv let assemble pieces = match list.filter (fn p -> type_of p == :list && p.[0] == :error) pieces {
+priv let assemble pieces = match filter (fn p -> type_of p == :list && p.[0] == :error) pieces {
     [[:error, message], .._] => invalid message,
-    _ => tagged "sql" (list_s (list.map part_syntax (merge_text pieces [] ""))),
+    _ => tagged "sql" (list_s (map part_syntax (merge_text pieces [] ""))),
 };
 
 /// Combine adjacent SQL text fragments.
@@ -484,13 +484,13 @@ priv let part_syntax p = match p {
 /// placeholder standing in for each value.
 priv let from_items : [Syntax] -> Syntax;
 priv let from_items items = {
-    let tokens = list.flat_map (fn item -> match item {
+    let tokens = flat_map (fn item -> match item {
         [:str, text, _] => scan text true,
         e => [[:value, e]],
     }) items;
-    let as_lint = list.map (fn t -> match t { [:value, _] => [:placeholder, "value"], other => other }) tokens;
+    let as_lint = map (fn t -> match t { [:value, _] => [:placeholder, "value"], other => other }) tokens;
     match lint as_lint false false {
-        () => assemble (list.map (fn t -> match t {
+        () => assemble (map (fn t -> match t {
             [:value, e] => [:param_s, e],
             other => template_part other,
         }) tokens),

@@ -167,9 +167,9 @@ priv let gather acc t =
     if not (is_branch t) { t :: acc }
     else { match type_of t {
         :list => list.fold gather acc t,
-        :array => list.fold gather acc (array.to_list t),
-        :map => list.fold (fn a k -> gather a t.[k]) acc (maps.sorted_keys t),
-        _ => list.fold gather acc (types.record_fields t),
+        :array => fold gather acc (array.to_list t),
+        :map => fold (fn a k -> gather a t.[k]) acc (maps.sorted_keys t),
+        _ => fold gather acc (types.record_fields t),
     } };
 
 /// Every numeric leaf with the path that reaches it -- a list of positions
@@ -182,10 +182,10 @@ priv let walk : [:any] -> [:any] -> :any -> [[[:any], :any]];
 priv let walk acc at t =
     if not (is_branch t) { if is_numeric t { [list.reverse at, t] :: acc } else { acc } }
     else { match type_of t {
-        :list => list.fold (fn a [i, x] -> walk a (i :: at) x) acc (list.enumerate t),
-        :array => list.fold (fn a [i, x] -> walk a (i :: at) x) acc (list.enumerate (array.to_list t)),
-        :map => list.fold (fn a k -> walk a (k :: at) t.[k]) acc (maps.sorted_keys t),
-        _ => list.fold (fn a [i, x] -> walk a (i :: at) x) acc (list.enumerate (types.record_fields t)),
+        :list => fold (fn a [i, x] -> walk a (i :: at) x) acc (list.enumerate t),
+        :array => fold (fn a [i, x] -> walk a (i :: at) x) acc (list.enumerate (array.to_list t)),
+        :map => fold (fn a k -> walk a (k :: at) t.[k]) acc (maps.sorted_keys t),
+        _ => fold (fn a [i, x] -> walk a (i :: at) x) acc (list.enumerate (types.record_fields t)),
     } };
 
 /// The leaf at `path` (as `paths` gives it), or `()`.
@@ -203,7 +203,7 @@ let at path t = match path {
 
 /// How many numbers the tree holds: a tensor counts its size, a number one.
 let size : :any -> :integer;
-let size t = list.fold_strict (fn !n x -> n + count x) 0 (leaves t);
+let size t = fold (fn !n x -> n + count x) 0 (leaves t);
 
 /// Count the scalar elements of one numeric leaf; nonnumeric metadata counts as zero.
 priv let count : :any -> :integer;
@@ -211,7 +211,7 @@ priv let count x = match type_of x { :tensor => tensor.size x, :float => 1, :int
 
 /// The sum of `f` over every numeric leaf, as a float.
 let sum_of : (:any -> :float) -> :any -> :float;
-let sum_of f t = list.fold_strict (fn !acc x -> if is_numeric x { acc + f x } else { acc }) 0.0 (leaves t);
+let sum_of f t = fold (fn !acc x -> if is_numeric x { acc + f x } else { acc }) 0.0 (leaves t);
 
 /// The Euclidean length of every number in the tree together: what gradient
 /// clipping measures.

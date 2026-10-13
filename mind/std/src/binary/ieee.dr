@@ -21,7 +21,7 @@ priv let round_shift n shift = if shift <= 0 { n << (-shift) } else {
 
 /// Internal: eb/fb are (5,10) or (8,23).
 let to_bits eb fb value =
-    if type_of value != :float && type_of value != :integer { Result.error "expected a number" }
+    if type_of value != :float && type_of value != :integer { err "expected a number" }
     else {
         let raw = raw64 value;
         let sign = (raw >> 63) << (eb + fb);

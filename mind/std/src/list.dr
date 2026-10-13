@@ -84,6 +84,48 @@ let length xs = len xs;
 let nth : :integer -> [a] -> :any;
 let nth n xs = xs.[n else ()];
 
+/// The list, with every element computed now, first to last.
+///
+/// An element is suspended until something reads it, which is what laziness
+/// means and is nearly always right. It is wrong when the elements are things
+/// that must *happen* -- processes started, messages sent -- and the list is
+/// only the way they are collected: `strict!` on the list computes its spine,
+/// and `[spawn! $( a ), spawn! $( b )]` starts each process only when a reader
+/// comes to it, so a join over them runs them one at a time. `forced` is the
+/// fix, said once:
+///
+/// ```dream
+/// import std.console;
+/// import std.list;
+/// import std.proc;
+///
+/// let square n = n * n;
+///
+/// let main! = {
+///     // A process for each even number, every one started before any is joined.
+///     let running = list.forced (list.flat_map (fn n -> if n % 2 == 0 { [spawn! $( square n )] } else { [] })
+///                                              [1, 2, 3, 4]);
+///     console.print! (proc.wait_all! running)
+/// };
+/// ```
+///
+/// It forces each element, not what each element holds; `lazy.settled` is
+/// the deep form.
+let forced : [a] -> [a];
+let forced xs = after (force_each xs) xs;
+
+/// `xs`, once `done` has been computed: a strict parameter is how a pure
+/// function orders one computation before another.
+priv let after : :unit -> [a] -> [a];
+priv let after !done xs = xs;
+
+/// `forced`'s loop: the strict parameter is where each element is computed.
+priv let force_each : [a] -> :unit;
+priv let rec force_each xs = if _list_is_empty xs { () } else { force_one (xs.[0]) (_list_tail xs) };
+/// One element computed -- on entry, by the strict parameter -- and then the rest.
+priv let force_one : a -> [a] -> :unit;
+priv let force_one !x rest = force_each rest;
+
 /// Return the last element, or `()` for an empty list. Traverses the entire list.
 let last : [a] -> :any;
 let last xs = {
@@ -199,11 +241,14 @@ let rec filter keep xs =
 ///     console.print! (list.fold (fn total x -> total + x) 0 [1, 2, 3])
 /// };
 /// ```
-/// Each intermediate accumulator is forced to its outer value. Contents and
-/// elements stay lazy, and the first callback receives the seed unforced.
+/// Each accumulator is forced to its outer value before the next element is
+/// taken, the seed included; contents and elements stay lazy. A seed that
+/// must stay unforced -- one the function may drop -- wants `fold_lazy`.
+/// This is the order a fused loop keeps (`dreams/src/fuse.dr`), so a fold
+/// means the same whether or not the compiler wrote it as one.
 let fold : (b -> a -> b) -> b -> [a] -> b;
 let fold f acc xs =
-    if _list_is_empty xs { acc } else { strict_steps f (f acc (xs.[0])) (_list_tail xs) };
+    if _list_is_empty xs { acc } else { strict_steps f acc xs };
 
 /// A left fold with suspended accumulator steps. Use when a later step must
 /// be able to discard an earlier step without evaluating it. Long numeric
@@ -542,7 +587,7 @@ let contains x xs = any (fn y -> y == x) xs;
 
 /// Count elements satisfying `pred`.
 let count : (a -> :bool) -> [a] -> :integer;
-let count pred xs = fold_strict (fn acc x -> if pred x { acc + 1 } else { acc }) 0 xs;
+let count pred xs = fold (fn acc x -> if pred x { acc + 1 } else { acc }) 0 xs;
 
 /// The first element satisfying `pred`, or `()` when none does. Stops at the
 /// first match, so it finds one in an endless list.
@@ -606,10 +651,10 @@ let index_of x xs = index_of_from 0 x xs;
 /// };
 /// ```
 let sum : [(:integer | :float)] -> (:integer | :float);
-let sum xs = fold_strict (fn a b -> a + b) 0 xs;
+let sum xs = fold (fn a b -> a + b) 0 xs;
 /// Multiply all elements, returning 1 for an empty list.
 let product : [(:integer | :float)] -> (:integer | :float);
-let product xs = fold_strict (fn a b -> a * b) 1 xs;
+let product xs = fold (fn a b -> a * b) 1 xs;
 
 // `best` is strict because `next` below is a suspended `if` that names the
 // last one, so a lazy `best` is a chain as long as the list. Both callers
@@ -813,6 +858,10 @@ when test {
         test.case "first_or"            $( test.eq! 1 (first_or :none [1]) ),
         test.case "nth"                 $( test.eq! 3 (nth 2 [1, 2, 3]) ),
         test.case "nth past the end"    $( test.eq! () (nth 9 [1, 2, 3]) ),
+        test.case "forced computes every element before answering"
+            $( test.eq! [1, 2] (forced [1, 2]) ),
+        test.case "forced reaches an element nothing else reads"
+            $( test.eq! :error (type_of (try! { forced [1, 1 / len []]; () } catch e { e })) ),
         test.case "nth of empty"        $( test.eq! () (nth 0 []) ),
         test.case "nth below zero"      $( test.eq! () (nth (0 - 1) [1, 2, 3]) ),
         test.case "last"                $( test.eq! 3 (last [1, 2, 3]) ),

@@ -256,7 +256,7 @@ let rec brace_end s i depth = {
     let b = str.byte i s;
     if b == eof { [:error, "unterminated `{` in an interpolated string", i] }
     else if b == 123 { brace_end s (i + 1) (depth + 1) }
-    else if b == 125 { if depth == 0 { Result.ok i } else { brace_end s (i + 1) (depth - 1) } }
+    else if b == 125 { if depth == 0 { ok i } else { brace_end s (i + 1) (depth - 1) } }
     else if b == 34 {
         let r = string_body s (i + 1) [] i;
         if list.head r == :error { r } else { brace_end s (list.nth 2 r) depth }
@@ -572,8 +572,8 @@ let lex : :string -> Result [Token] [:string, :integer];
 let lex s = {
     let ts = tokens s;
     let bad = find_error ts;
-    if bad == () { Result.ok ts }
-    else { Result.error [value bad, span_start bad] }
+    if bad == () { ok ts }
+    else { err [value bad, span_start bad] }
 };
 
 // --- many files -------------------------------------------------------------

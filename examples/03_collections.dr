@@ -16,9 +16,9 @@ let main! = {
     console.print! ("list:       " + to_string nums)
     console.print! ("length:     " + to_string (list.length nums))
     console.print! ("head/tail:  " + to_string (list.head nums) + " " + to_string (list.tail nums))
-    console.print! ("map:        " + to_string (list.map (fn x -> x * 2) nums))
-    console.print! ("filter:     " + to_string (list.filter (fn x -> x > 4) nums))
-    console.print! ("fold:       " + to_string (list.fold (fn a b -> a + b) 0 nums))
+    console.print! ("map:        " + to_string (map (fn x -> x * 2) nums))
+    console.print! ("filter:     " + to_string (filter (fn x -> x > 4) nums))
+    console.print! ("fold:       " + to_string (fold (fn a b -> a + b) 0 nums))
     console.print! ("sum/product:" + to_string (list.sum nums) + " " + to_string (list.product [1, 2, 3, 4]))
     console.print! ("sort:       " + to_string (list.sort nums))
     console.print! ("sort_by:    " + to_string (list.sort_by (fn a b -> a > b) nums))
@@ -31,7 +31,7 @@ let main! = {
     console.print! ("min/max:    " + to_string (list.minimum nums) + " " + to_string (list.maximum nums))
     console.print! ("any/all:    " + to_string (list.any (fn x -> x > 8) nums) + " " + to_string (list.all (fn x -> x > 0) nums))
     console.print! ("enumerate:  " + to_string (list.enumerate [:a, :b]))
-    console.print! ("flat_map:   " + to_string (list.flat_map (fn x -> [x, x]) [1, 2]))
+    console.print! ("flat_map:   " + to_string (flat_map (fn x -> [x, x]) [1, 2]))
 
     // --- arrays ---
     let arr = #[5, 3, 8];

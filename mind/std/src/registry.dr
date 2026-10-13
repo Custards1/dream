@@ -92,7 +92,7 @@ mod table {
                 let next = list.nth 1 pair;
                 reply (list.nth 0 pair) [next, watch_new! next watched]
             },
-            _ => reply (Result.error :unknown_request) state,
+            _ => reply (err :unknown_request) state,
         }
     };
 
@@ -109,8 +109,8 @@ mod table {
     /// the processes watched now. Forced as it goes: a monitor is an effect,
     /// and one left in a lazy list would be asked for by nobody.
     let watch_new! names watched = {
-        let fresh = list.unique (list.filter (fn p -> not (list.contains p watched)) (map.values names));
-        strict! (list.map (fn p -> proc.monitor! p) fresh)
+        let fresh = list.unique (filter (fn p -> not (list.contains p watched)) (map.values names));
+        strict! (map (fn p -> proc.monitor! p) fresh)
         list.append fresh watched
     };
 }
@@ -157,8 +157,8 @@ let claim! : server.Handle -> :any -> :process -> Result :process [:taken, :proc
 let claim! reg name pid = {
     let p = strict! pid;
     server.call! reg [:get_and_update, fn m -> match map.get () name m {
-        ()    => [Result.ok p, map.put name p m],
-        other => [Result.error [:taken, other], m],
+        ()    => [ok p, map.put name p m],
+        other => [err [:taken, other], m],
     }]
 };
 
@@ -171,7 +171,7 @@ let unregister! reg name =
 let forget! : server.Handle -> :process -> :ok;
 let forget! reg pid = {
     let p = strict! pid;
-    server.call! reg [:get_and_update, fn m -> [:ok, map.filter (fn _ v -> v != p) m]]
+    server.call! reg [:get_and_update, fn m -> [:ok, filter (fn _ v -> v != p) m]]
 };
 
 // --- asking it things -------------------------------------------------------
@@ -291,7 +291,7 @@ when test {
         let handle_call! request from state = match request {
             :value    => reply state state,
             [:add, n] => reply (state + n) (state + n),
-            _         => reply (Result.error :unknown) state,
+            _         => reply (err :unknown) state,
         };
 
         let handle_cast! message state = match message {
@@ -392,7 +392,7 @@ when test {
                    let p = counter.start! 0;
                    let got = claim! reg "c" p;
                    counter.stop! p
-                   got == (Result.ok p)
+                   got == (ok p)
                })) ),
         test.case "claim! refuses a taken one, and names the holder"
             $( test.true! (with_registry! (fn reg -> {
@@ -403,7 +403,7 @@ when test {
                    let now = whereis! reg "c";
                    counter.stop! one
                    counter.stop! two
-                   got == Result.error [:taken, one] && now == one
+                   got == err [:taken, one] && now == one
                })) ),
 
         test.case "unregister! forgets the name and answers the pid"

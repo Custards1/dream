@@ -62,7 +62,7 @@ let main! = {
     let title s = {
         let cap w = if str.is_empty w { w }
                     else { str.upper (str.slice 0 1 w) + str.slice 1 (str.byte_length w) w };
-        str.join_str " " (list.map cap (str.split " " s))
+        str.join_str " " (map cap (str.split " " s))
     };
     console.print! ("title case:  " + to_string (title "the quick brown fox"))
 };

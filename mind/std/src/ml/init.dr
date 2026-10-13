@@ -34,7 +34,7 @@ let fans shape = match shape {
     [a, b] => [a, b],
     _ => {
         let r = len shape;
-        let field = list.fold_strict (fn !a b -> a * b) 1 (list.take (r - 2) shape);
+        let field = fold (fn !a b -> a * b) 1 (list.take (r - 2) shape);
         [shape.[r - 2] * field, shape.[r - 1] * field]
     },
 };
@@ -104,9 +104,9 @@ let orthogonal gain seed shape = match shape {
     [r, c] => {
         let tall = r >= c;
         let [n, m] = if tall { [r, c] } else { [c, r] };
-        let cols = list.map (fn j -> tensor.normal (seed + j) [n]) (list.range 0 m);
+        let cols = map (fn j -> tensor.normal (seed + j) [n]) (list.range 0 m);
         let q = gram_schmidt cols;
-        let qm = tensor.transpose (tensor.concat (list.map (fn v -> tensor.reshape [1, n] v) q));
+        let qm = tensor.transpose (tensor.concat (map (fn v -> tensor.reshape [1, n] v) q));
         (if tall { qm } else { tensor.transpose qm }) * gain
     },
     _ => normal gain seed shape,
@@ -114,8 +114,8 @@ let orthogonal gain seed shape = match shape {
 
 /// Orthonormalize vectors using Gram-Schmidt for orthogonal initialization.
 priv let gram_schmidt : [:tensor] -> [:tensor];
-priv let gram_schmidt vs = list.reverse (list.fold (fn done v -> {
-    let w = list.fold (fn acc u -> acc - tensor.dot acc u * u) v done;
+priv let gram_schmidt vs = list.reverse (fold (fn done v -> {
+    let w = fold (fn acc u -> acc - tensor.dot acc u * u) v done;
     (w / tensor.norm w) :: done
 }) [] vs);
 

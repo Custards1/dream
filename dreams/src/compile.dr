@@ -25,6 +25,7 @@
 
 import std.progress;
 import std.list;
+import std.path;
 
 import dreams.diag;
 import dreams.emit;
@@ -71,6 +72,10 @@ mapping Options {
     // or `()`: only a parallel build is in parts, so only one reads or keeps
     // them.
     units = ()
+    // Compile a dependency only as far as the program reaches it (`reached`).
+    // The command line turns it on for a build and off for `--test`; a check
+    // and an editor never prune, since what they are for is every diagnostic.
+    prune = false
 }
 
 /// The defaults: checked, shared, no payload.
@@ -80,7 +85,7 @@ let options = Options.new ();
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
 let scratch : Options;
-let scratch = Options.make false false [] false [] ();
+let scratch = Options.make false false [] false [] () false;
 
 // --- a build --------------------------------------------------------------------
 
@@ -106,15 +111,110 @@ mapping Build {
 
 /// Resolve names and select standard members from their types. Walk again
 /// with the choices known so the usual fusion and scratch-slot plans apply.
+///
+/// Three steps, each its own function so that `--time` can charge them
+/// separately: the walk (`resolve_names!`), the choice of each shorthand's
+/// member (`select!`), and the walk again with the choices (`rechoose!`).
 let resolve! : modules.Loader -> Options -> scope.Resolution;
 let resolve! l o = {
-    let parted = Options.parallel o && Options.optimize o;
-    let initial = if parted { scope.resolve_parts! l (Options.units o) } else { scope.resolve! l };
-    let selected = typecheck.select_overloads l initial;
-    if not (typecheck.has_overloads initial) || diag.error_count (scope.r_diags selected) > 0 { selected }
-    else if parted { scope.resolve_parts_chosen! l (Options.units o) (scope.Resolution.selections selected) }
-    else { scope.resolve_chosen! l (scope.Resolution.selections selected) }
+    let initial = resolve_names! l o;
+    let keep = kept l o initial;
+    let selected = select! l o initial keep;
+    rechoose! l o initial selected keep
 };
+
+/// The first walk: every name resolved, a shorthand call to every member it
+/// may mean.
+let resolve_names! : modules.Loader -> Options -> scope.Resolution;
+let resolve_names! l o =
+    if parted o { scope.resolve_parts! l (Options.units o) } else { scope.resolve! l };
+
+/// Which member each shorthand call means, found from the types.
+///
+/// It is the type check's two passes -- every body for what it answers, then
+/// again with what was inferred -- and in parts it is made as the type check
+/// is, a process per part (`checked_in_parts!`), and kept as the type check is
+/// under `--units`. Made in one process it was the largest stage of a
+/// self-compile, 1.2 s against the 0.6 s of the walk it follows. The second
+/// pass asks only the parts with a shorthand call in them.
+///
+/// Only the bodies `keep` names are asked, when it names any: what nothing
+/// reaches has no call whose member matters, and a body that is reached has
+/// every function it calls reached with it, so what the first pass infers
+/// for those is all the second needs.
+let select! : modules.Loader -> Options -> scope.Resolution -> (%{:integer => :bool} | :unit) -> scope.Resolution;
+let select! l o initial keep =
+    if not (typecheck.has_overloads initial) { initial }
+    else if not (parted o) || scope.parts initial == () { typecheck.select_overloads l initial }
+    else {
+        let cache = Options.units o;
+        let k = vm.share! (list.head (typecheck.prepared l initial %{}));
+        let first = checked_in_parts! :first cache [k] initial keep;
+        let k2 = match typecheck.inferring k (map (fn one -> list.nth 1 one) first) {
+            () => k,
+            next => vm.share! next,
+        };
+        typecheck.apply_choices initial (list.concat (checked_in_parts! :select cache [k2] initial keep))
+    };
+
+/// The walk again with the choices known and only the bodies `keep` names, or
+/// the selection as it is when there was nothing to choose and nothing to
+/// leave out, or choosing failed.
+let rechoose! : modules.Loader -> Options -> scope.Resolution -> scope.Resolution -> (%{:integer => :bool} | :unit) -> scope.Resolution;
+let rechoose! l o initial selected keep =
+    if diag.error_count (scope.r_diags selected) > 0 { selected }
+    else if not (typecheck.has_overloads initial) && keep == () { selected }
+    else if parted o {
+        // A part walked before is kept only when nothing is left out: with a
+        // body gone, every position after it has moved.
+        let previous = if keep == () { scope.parts initial } else { () };
+        scope.resolve_parts_chosen! l (Options.units o) (scope.Resolution.selections selected) previous keep
+    }
+    else { scope.resolve_chosen! l (scope.Resolution.selections selected) keep };
+
+// --- compiling what is reached ----------------------------------------------------
+//
+// A program loads every module it imports and reaches a sliver of most: an
+// example that prints a few strings loads 469 bodies of the standard library
+// and calls 59 of them. Everything after the first walk -- choosing, the walk
+// again, lowering, the type check -- costs by the body, so a build that keeps
+// only what is reached does a fraction of the work.
+//
+// Only a dependency is cut down. The package being built is compiled whole,
+// reached or not, so that every mistake in it is still reported; a dependency
+// has its own tests for its own mistakes. What is reached is read off the
+// first walk, and a shorthand call reaches every member it might mean, since
+// it is asked before anything is chosen (`scope.reached`).
+
+/// The bodies to compile, or `()` for all of them. Asked of the first walk,
+/// before anything is chosen, so a shorthand call reaches every member it
+/// might mean: more than the program needs, and what lets the choosing be
+/// asked of these bodies alone.
+let kept : modules.Loader -> Options -> scope.Resolution -> %{:integer => :bool} | :unit;
+let kept l o initial =
+    if not (Options.prune o) || scope.parts initial == () || diag.error_count (scope.r_diags initial) > 0 { () }
+    else {
+        let keep = scope.reached initial (root_modules l);
+        if len keep >= list.length (scope.bodies initial) { () } else { keep }
+    };
+
+/// The modules compiled whole: every one not inside another package -- the
+/// package being built, or a program's own files when there is none.
+let root_modules : modules.Loader -> %{:integer => :bool};
+let root_modules l = {
+    let ps = modules.packages l;
+    let here = package.current_index ps;
+    let elsewhere = list.concat (map (fn [i, p] -> if i == here { [] } else { [package.src p] })
+                                     (list.enumerate (package.packages ps)));
+    fold (fn acc mi -> {
+        let file = modules.module_path (modules.module_at l mi);
+        if list.any (fn dir -> path.relative_to dir file != ()) elsewhere { acc } else { acc.[mi => true] }
+    }) %{} (list.range 0 (modules.module_count l))
+};
+
+/// Whether resolution runs in parts, one process per module.
+let parted : Options -> :bool;
+let parted o = Options.parallel o && Options.optimize o;
 
 /// Resolve, lower, link and check the program. Lowering settles compile-time
 /// expressions and checking runs contracts on a VM.
@@ -199,12 +299,12 @@ let analyze_parallel! : modules.Loader -> scope.Resolution -> :map -> :any -> ty
 let analyze_parallel! l r comps cache = {
     let kd = vm.share! (typecheck.prepared l r comps);
     let k = list.head kd;
-    let first = checked_in_parts! :first cache [k] r;
-    let found = list.map (fn one -> list.nth 1 one) first;
-    let said = list.map (fn one -> list.head one) first;
+    let first = checked_in_parts! :first cache [k] r ();
+    let found = map (fn one -> list.nth 1 one) first;
+    let said = map (fn one -> list.head one) first;
     let again = match typecheck.inferring k found {
-        () => list.map (fn _ -> []) said,
-        k2 => checked_in_parts! :second cache [k, vm.share! k2] r,
+        () => map (fn _ -> []) said,
+        k2 => checked_in_parts! :second cache [k, vm.share! k2] r (),
     };
     strict! (typecheck.concluded k r (list.nth 1 kd) said again)
 };
@@ -214,30 +314,45 @@ let analyze_parallel! l r comps cache = {
 /// asks -- the one, or the first and the one made from what it inferred. Each
 /// kept under a kind of its own, since the two answer different things about
 /// the same walk.
-let checked_in_parts! : :atom -> :any -> [typecheck.Checker] -> scope.Resolution -> [:any];
-let checked_in_parts! how cache ks r = {
+let checked_in_parts! : :atom -> :any -> [typecheck.Checker] -> scope.Resolution -> (%{:integer => :bool} | :unit) -> [:any];
+let checked_in_parts! how cache ks r keep = {
+    let asked : [[:any]] -> [[:any]];
+    let asked nbs = match keep { () => nbs, _ => filter (fn nb -> map.has (list.head nb) keep) nbs };
     let tables = match cache { () => (), _ => unit.digest (typecheck.tables (list.last ks)) };
     strict! tables
-    let kind = match how { :first => "check", _ => "infer" };
-    let key_of pr = match tables {
+    let kind = kind_of how;
+    // Which of a part's bodies are asked is part of the key when not all of
+    // them are, so that a part checked whole is never read back for a part
+    // cut down, nor the other way round. A part asked whole keeps the key it
+    // always had, which the type check after lowering shares.
+    let key_of : scope.Resolution -> [[:any]] -> :string | :unit;
+    let key_of pr nbs = match tables {
         () => (),
-        digest => match scope.unit_key pr { () => (), walk => unit.key [kind, walk, digest] },
+        digest => match scope.unit_key pr {
+            () => (),
+            walk =>
+                if list.length nbs == list.length (scope.part_bodies pr) { unit.key [kind, walk, digest] }
+                else { unit.key [kind, walk, digest, unit.digest (map list.head nbs)] },
+        },
     };
     let work = match scope.parts r {
         () => {
             let all = scope.bodies r;
             let numbered = list.zip (list.range 0 (list.length all)) all;
-            list.map (fn j -> [ks, list.filter (fn nb -> list.head nb % lower.part_count == j) numbered, ()])
+            map (fn j -> [ks, asked (filter (fn nb -> list.head nb % lower.part_count == j) numbered), ()])
                      (list.range 0 lower.part_count)
         },
-        walked => list.map (fn pr -> [list.map (fn k -> typecheck.with_resolution k pr) ks,
-                                      scope.part_bodies pr, key_of pr]) walked,
+        walked => list.map (fn pr -> {
+            let nbs = if how == :select && len (scope.Resolution.overload_uses pr) == 0 { [] }
+                      else { asked (scope.part_bodies pr) };
+            [map (fn k -> typecheck.with_resolution k pr) ks, nbs, key_of pr nbs]
+        }) walked,
     };
     strict! work
     let running = strict! (list.map (fn w -> check_elsewhere! how (match list.nth 2 w { () => (), _ => cache })
                                                               (list.nth 2 w) (list.head w) (list.nth 1 w)) work);
-    let said = list.concat (progress.join_all! (if how == :first { "checking" } else { "inferring" }) running);
-    list.map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said)
+    let said = list.concat (progress.join_all! (match how { :first => "checking", :select => "choosing", _ => "inferring" }) running);
+    map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said)
 };
 
 /// A process checking some bodies against a shared checker. Its own function
@@ -254,7 +369,7 @@ let check_unit! how cache key ks slice = match [cache, slice] {
     [(), _] => check_bodies how ks slice,
     [_, []] => check_bodies how ks slice,
     [_, [[from, .._], .._]] => {
-        let kind = match how { :first => "check", _ => "infer" };
+        let kind = kind_of how;
         let said = match unit.recall! cache kind key {
             () => {
                 let fresh = check_bodies how ks (unit.shifted (0 - from) slice);
@@ -269,12 +384,21 @@ let check_unit! how cache key ks slice = match [cache, slice] {
 
 /// `[position, answer]` for each body: the first check's answer is
 /// `[diagnostics, inferred]` (`typecheck.check_decl_inferring`), the second's
-/// the diagnostics alone (`typecheck.check_again`).
+/// the diagnostics alone (`typecheck.check_again`), and the selecting check's
+/// what a check against the inferred types said, choices included
+/// (`typecheck.check_decl`).
 let check_bodies : :atom -> [typecheck.Checker] -> [[:any]] -> [[:any]];
 let check_bodies how ks slice = match how {
-    :first => list.map (fn nb -> [list.head nb, typecheck.check_decl_inferring (list.head ks) (list.nth 1 nb) []]) slice,
-    _ => list.map (fn nb -> [list.head nb, typecheck.check_again (list.head ks) (list.nth 1 ks) (list.nth 1 nb)]) slice,
+    :first => map (fn nb -> [list.head nb, typecheck.check_decl_inferring (list.head ks) (list.nth 1 nb) []]) slice,
+    :select => map (fn nb -> [list.head nb, typecheck.check_decl (list.head ks) (list.nth 1 nb) []]) slice,
+    _ => map (fn nb -> [list.head nb, typecheck.check_again (list.head ks) (list.nth 1 ks) (list.nth 1 nb)]) slice,
 };
+
+/// What a pass's answers are kept as in the unit cache. The selecting check
+/// has a kind of its own: it is asked of the same walk as the first, against
+/// different tables, and answers something else.
+let kind_of : :atom -> :string;
+let kind_of how = match how { :first => "check", :select => "select", _ => "infer" };
 
 /// What a program's signatures and contracts say is wrong with it, given what
 /// the earlier stages said. Nothing, when they already found an error or the
@@ -293,7 +417,7 @@ let type_diags! types facts low ds =
 /// check never runs one -- which is why its type pass cannot see what a `comp`
 /// came to, and why a contract on one is a build's to report, not a check's.
 let check! : modules.Loader -> Options -> Diagnostics;
-let check! l o = checked l (scope.resolve! l) o;
+let check! l o = checked l (typecheck.select_overloads l (scope.resolve! l)) o;
 
 /// The same, for a program already resolved. Separate because a language
 /// server keeps the resolution -- it is what hover and go-to-definition read --

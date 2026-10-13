@@ -163,8 +163,8 @@ let rec encode_value v = match type_of v {
     :char    => write_char v,
     :string  => write_string v,
     :atom    => write_atom v,
-    :list    => write_list (list.map encode_value v),
-    :array   => write_array (list.map encode_value (_array_to_list v)),
+    :list    => write_list (map encode_value v),
+    :array   => write_array (map encode_value (_array_to_list v)),
     :map     => write_map (map_entries v),
     :tensor  => write_tensor v,
     _ if types.record_id v != () => encode_value (as_written v),
@@ -211,20 +211,20 @@ virtual let encode v = encode_value v;
 /// Every value, each encoded on its own. Not the encoding of the list -- that
 /// is `encode xs`.
 let encode_all : [:any] -> [:string];
-let encode_all vs = list.map encode vs;
+let encode_all vs = map encode vs;
 
 // --- decoding, once a format can ---------------------------------------------
 
 /// The value, or `default` when the text does not decode. The form for when a
 /// fallback is more use than a diagnosis.
 let decode_or : :any -> :string -> :any;
-let decode_or default text = Result.unwrap_or default (decode text);
+let decode_or default text = unwrap_or default (decode text);
 
 /// Does this value survive the trip? What a format's own tests are written
 /// with, and the honest way to state its limits: a format says which values
 /// round trip by listing the ones for which this is true.
 let round_trips : :any -> :bool;
-let round_trips v = decode (encode v) == Result.ok v;
+let round_trips v = decode (encode v) == ok v;
 
 /// Every value in the text, where the text is a sequence of whole messages --
 /// see framing below.
@@ -263,7 +263,7 @@ let frame v = {
 /// Every value, each as its own message, back to back. A batch is bytes that
 /// can be split again, not a bigger message.
 let frame_all : [:any] -> :string;
-let frame_all vs = _str_concat (list.map frame vs);
+let frame_all vs = _str_concat (map frame vs);
 
 /// The length of the message whose prefix is at the front of `buf`, or `-1`
 /// when `buf` does not yet hold a whole prefix.

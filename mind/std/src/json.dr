@@ -7,8 +7,9 @@
 //
 // Nothing here raises. A parser that raised could not be used from a pure
 // function, and reading a configuration file is not an effect. `parse` answers
-// `[:ok, value]` or `[:error, message]` instead, and `parse_or` is the form for
-// when a default is more useful than a diagnosis.
+// `Result.ok value` or `Result.error message` instead, read with the
+// prelude's members (`is_ok`, `unwrap_or`, `let?`), and `parse_or` is the form
+// for when a default is more useful than a diagnosis.
 //
 // | JSON      | Dream                                     |
 // |-----------|------------------------------------------ |
@@ -244,27 +245,18 @@ let rec parse_array cs acc first = match skip_ws cs {
 let parse : :string -> Result :any :string;
 let parse text = {
     let r = parse_value (str.chars text);
-    if r == () { Result.error "not valid JSON" }
+    if r == () { err "not valid JSON" }
     else {
         let rest = skip_ws (step_rest r);
         if list.is_empty rest { Result.ok (step_value r) }
-        else { Result.error "trailing characters after the JSON value" }
+        else { err "trailing characters after the JSON value" }
     }
 };
 
-/// Test whether a parse result has the success tag.
-let ok : Result a e -> :bool;
-let ok r = Result.is_ok r;
-/// Extract the payload from a parse result.
-let value : Result a e -> :any;
-let value r = match r { Result.ok(v) => v, Result.error(why) => why };
 
 /// The parsed value, or `default` if the text is not valid JSON.
 let parse_or : :any -> :string -> :any;
-let parse_or default text = {
-    let r = parse text;
-    if ok r { value r } else { default }
-};
+let parse_or default text = unwrap_or default (parse text);
 
 // --- writing ----------------------------------------------------------------
 //
@@ -362,7 +354,7 @@ let write_list parts = "[" + str.join_str "," parts + "]";
 let write_map : [[:any, :any]] -> :string;
 let write_map pairs = {
     let entry p = quote (key_text (list.nth 0 p)) + ":" + encode_value (list.nth 1 p);
-    "{" + str.join_str "," (list.map entry pairs) + "}"
+    "{" + str.join_str "," (map entry pairs) + "}"
 };
 
 /// Return the format name used by the codec protocol.
@@ -405,7 +397,7 @@ priv let indented_items depth items =
     if list.is_empty items { "[]" }
     else {
         let one x = indent (depth + 1) + write_indented (depth + 1) x;
-        "[\n" + str.join_str ",\n" (list.map one items) + "\n" + indent depth + "]"
+        "[\n" + str.join_str ",\n" (map one items) + "\n" + indent depth + "]"
     };
 
 /// Format object members on indented lines.
@@ -416,7 +408,7 @@ priv let indented_members depth v = {
     else {
         let one p = indent (depth + 1) + quote (key_text (list.nth 0 p)) + ": "
                     + write_indented (depth + 1) (list.nth 1 p);
-        "{\n" + str.join_str ",\n" (list.map one entries) + "\n" + indent depth + "}"
+        "{\n" + str.join_str ",\n" (map one entries) + "\n" + indent depth + "}"
     }
 };
 
@@ -438,7 +430,7 @@ let pretty v = write_indented 0 v;
 when test {
     import std.test;
 
-    let parsed text = value (parse text);
+    let parsed text = unwrap_or_else (fn why -> [:not_parsed, why]) (parse text);
 
     struct Point { x, y }
     union Shape { circle(radius), empty }
@@ -489,12 +481,12 @@ when test {
         test.case "newlines"       $( test.eq! [1, 2] (parsed "[\n1,\n2\n]") ),
 
         // failures are values, not raises
-        test.case "unquoted key"   $( test.false! (ok (parse "{a:1}")) ),
-        test.case "trailing comma" $( test.false! (ok (parse "[1,]")) ),
-        test.case "unclosed"       $( test.false! (ok (parse "[1")) ),
-        test.case "trailing text"  $( test.false! (ok (parse "1 2")) ),
-        test.case "empty input"    $( test.false! (ok (parse "")) ),
-        test.case "bare word"      $( test.false! (ok (parse "nope")) ),
+        test.case "unquoted key"   $( test.false! (is_ok (parse "{a:1}")) ),
+        test.case "trailing comma" $( test.false! (is_ok (parse "[1,]")) ),
+        test.case "unclosed"       $( test.false! (is_ok (parse "[1")) ),
+        test.case "trailing text"  $( test.false! (is_ok (parse "1 2")) ),
+        test.case "empty input"    $( test.false! (is_ok (parse "")) ),
+        test.case "bare word"      $( test.false! (is_ok (parse "nope")) ),
         test.case "parse_or"       $( test.eq! :fallback (parse_or :fallback "{") ),
 
         // writing

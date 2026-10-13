@@ -106,6 +106,7 @@ let entry! m =
 /// A list-valued key, tolerant of the one-item shorthand: `defines = "debug"`
 /// means the same as `defines = ["debug"]`, because a single item written as a
 /// list is the sort of thing only a config file makes you do.
+let build_list : :map -> :string -> [:any];
 let build_list m key =
     match toml.get () (doc m) "build" key {
         () => [],
@@ -116,10 +117,10 @@ let build_list m key =
 let defines m = build_list m "defines";
 
 /// Extra directories to search for packages, relative to the manifest.
-let package_paths m = list.map (fn d -> path.join (root m) d) (build_list m "package-paths");
+let package_paths m = map (fn d -> path.join (root m) d) (build_list m "package-paths");
 
 /// Directories to search for loose modules: the compiler's `-I`.
-let includes m = list.map (fn d -> path.join (root m) d) (build_list m "includes");
+let includes m = map (fn d -> path.join (root m) d) (build_list m "includes");
 
 /// Modules the host registers at run time, so importing them compiles.
 let host_modules m = build_list m "host-modules";
@@ -139,13 +140,13 @@ let host_modules m = build_list m "host-modules";
 /// This package's payloads as `[name, path]`, sorted by name so the image
 /// does not depend on the order a table happens to be read in.
 let payloads m =
-    list.sort (list.map (fn [n, p] -> [n, path.join (root m) (to_string p)])
+    list.sort (map (fn [n, p] -> [n, path.join (root m) (to_string p)])
                         (map.pairs (toml.section (doc m) "payload")));
 
 /// What is wrong with this manifest's `[payload]`, or `()`. A name is how the
 /// compiler is told it -- `NAME=FILE` -- so it cannot hold a `/` or an `=`.
 let payload_problem m =
-    list.first_or () (list.flat_map (fn [n, p] ->
+    list.first_or () (flat_map (fn [n, p] ->
         if n == "" || str.contains_str "/" n || str.contains_str "=" n {
             [root m + "/mind.toml: [payload] name `" + n + "` cannot be empty or hold `/` or `=`"]
         } else if type_of p != :string {
@@ -228,7 +229,7 @@ let options m = toml.section (doc m) "options";
 /// The sections whose name is `prefix` followed by one more part, as
 /// `[[part, table], ..]`: `[config.sqlite]` is `["sqlite", ..]` under `config.`.
 let sections_under m prefix =
-    list.flat_map (fn [name, table] ->
+    flat_map (fn [name, table] ->
         if str.starts_with prefix name {
             let rest = str.slice (str.byte_length prefix) (str.byte_length name - str.byte_length prefix) name;
             if str.is_empty rest || str.contains_str "." rest { [] } else { [[rest, table]] }
@@ -239,7 +240,7 @@ let sections_under m prefix =
 let configs m = sections_under m "config.";
 
 /// The profiles a manifest declares, by name.
-let profiles m = list.map (fn [n, _] -> n) (sections_under m "profile.");
+let profiles m = map (fn [n, _] -> n) (sections_under m "profile.");
 
 /// Is `name` a profile this manifest can be built with? `debug` and `release`
 /// always are, declared or not.
@@ -319,18 +320,21 @@ let normalize_spec spec =
     };
 
 let section_deps m section =
-    list.map (fn e -> [list.head e, normalize_spec (list.nth 1 e)])
+    map (fn e -> [list.head e, normalize_spec (list.nth 1 e)])
              (toml.entries (doc m) section);
 
 /// `[[key, spec], ..]` from `[dependencies]`, every spec a map.
+let dependencies : :map -> [[:string, :map]];
 let dependencies m = section_deps m "dependencies";
 
 /// `[dev-dependencies]`: what `mind test` also sees, and nothing else does.
+let dev_dependencies : :map -> [[:string, :map]];
 let dev_dependencies m = section_deps m "dev-dependencies";
 
 /// `[build-dependencies]`: what the package's build script is compiled with.
 /// A separate program from the package's own, so a separate namespace: a tool
 /// may use one `json` while the program uses another.
+let build_dependencies : :map -> [[:string, :map]];
 let build_dependencies m = section_deps m "build-dependencies";
 
 /// The manifest file itself, for a message that has to say where a line was.
@@ -392,7 +396,7 @@ let load! dir = {
         text => match toml.parse text {
             Result.ok(d) => {
                 let m = make dir d;
-                if is_package m || is_workspace m { Result.ok m }
+                if is_package m || is_workspace m { ok m }
                 else { Result.error (path + ": [package] has no `name`") }
             },
             Result.error(why) => Result.error (path + ": " + why),
@@ -424,7 +428,7 @@ let rec find! dir =
     match file.read! (path.join dir "mind.toml") {
         () => {
             let parent = path.dirname dir;
-            if parent == dir || dir == "." || dir == "/" { Result.error "no mind.toml here or above" }
+            if parent == dir || dir == "." || dir == "/" { err "no mind.toml here or above" }
             else { find! parent }
         },
         _ => load! dir,
@@ -443,7 +447,7 @@ let quoted s = "\"" + s + "\"";
 
 let spec_line key spec = {
     let field k = match spec.[k else ()] { () => [], v => [k + " = " + quoted (to_string v)] };
-    let fields = list.concat (list.map field ["path", "git", "url", "tag", "branch", "rev"]);
+    let fields = list.concat (map field ["path", "git", "url", "tag", "branch", "rev"]);
     key + " = { " + str.join_str ", " fields + " }"
 };
 
@@ -462,6 +466,7 @@ let sets_key key line = {
 
 /// `[before, header, body, after]`: the lines of the file split around
 /// `[section]`, the header `()` when there is no such section.
+let split_section : :string -> [:string] -> [[:string], :string | :unit, [:string], [:string]];
 let split_section section lines = {
     let header = "[" + section + "]";
     let rec in_body pre h acc ls =
@@ -484,9 +489,10 @@ let split_section section lines = {
 /// The body with `line` in place of the one setting `key`, or added after the
 /// last line that is not blank, so the blank line before the next section stays
 /// where it was.
+let put_line : :string -> :string -> [:string] -> [:string];
 let put_line key line body =
     match list.any (sets_key key) body {
-        true => list.map (fn l -> if sets_key key l { line } else { l }) body,
+        true => map (fn l -> if sets_key key l { line } else { l }) body,
         false => {
             let trailing = list.reverse (list.take_while (fn l -> str.is_empty (str.trim l))
                                                          (list.reverse body));
@@ -516,7 +522,7 @@ let without_dependency section key text =
     match split_section section (str.split "\n" text) {
         [_, (), _, _] => [text, false],
         [pre, h, body, post] => {
-            let kept = list.filter (fn l -> not (sets_key key l)) body;
+            let kept = filter (fn l -> not (sets_key key l)) body;
             [join_lines (list.concat [pre, [h], kept, post]),
              list.length kept != list.length body]
         },
@@ -525,7 +531,7 @@ let without_dependency section key text =
 when test {
     import std.test;
 
-    let of text = make "." (toml.value (toml.parse text));
+    let of text = make "." (toml.parse_or %{} text);
     let dep_of text = list.head (dependencies (of text));
 
     let tests = [
@@ -547,8 +553,8 @@ when test {
             $( test.eq! [] (defines (of "[package]\nname = \"d\"")) ),
         test.case "package paths are relative to the manifest"
             $( test.eq! ["/p/vendor"]
-                        (package_paths (make "/p" (toml.value (toml.parse
-                            "[build]\npackage-paths = [\"vendor\"]")))) ),
+                        (package_paths (make "/p" (toml.parse_or %{}
+                            "[build]\npackage-paths = [\"vendor\"]"))) ),
         test.case "a manifest in the working directory adds no prefix"
             $( test.eq! ["vendor"] (package_paths (of "[build]\npackage-paths = [\"vendor\"]")) ),
         test.case "the compiler is unset unless the manifest says"

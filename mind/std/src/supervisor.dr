@@ -149,7 +149,7 @@ let default_limits = limits 5 5000;
 /// The restart times inside the window, newest first, with `now` added.
 let recent : :integer -> :integer -> [:integer] -> [:integer];
 let recent window now times =
-    _list_cons now (list.filter (fn t -> now - t < window) times);
+    _list_cons now (filter (fn t -> now - t < window) times);
 
 // --- the supervisor's own state -------------------------------------------------
 
@@ -167,19 +167,19 @@ let state strategy children lim =
 let s_strategy : State -> :any;
 let s_strategy s = map.get :one_for_one :strategy s;
 /// Read the child specifications from supervisor state.
-let s_children : State -> :any;
+let s_children : :map -> [:map];
 let s_children s = map.get [] :children s;
 /// Read the restart and shutdown limits from supervisor state.
 let s_limits : State -> :any;
 let s_limits s   = map.get default_limits :lim s;
 /// Read the map of currently running child processes.
-let s_running : State -> :any;
+let s_running : State -> %{:any => :process};
 let s_running s  = map.get map.empty :running s;
 /// Read the recorded restart timestamps.
 let s_restarts : State -> :any;
 let s_restarts s = map.get [] :restarts s;
 /// Read the processes waiting for supervisor notifications.
-let s_watchers : State -> :any;
+let s_watchers : :map -> [:process];
 let s_watchers s = map.get [] :watchers s;
 /// Test whether shutdown is in progress.
 let s_stopping : State -> :any;
@@ -201,12 +201,12 @@ let stopping s = map.put :stopping true s;
 /// The children in start order. Order is part of `:rest_for_one`'s meaning, so
 /// it is kept as a list and never as a map.
 let names_of : State -> [:string];
-let names_of s = list.map (fn c -> child_name c) (s_children s);
+let names_of s = map (fn c -> child_name c) (s_children s);
 
 /// Find a child specification by name, returning `()` when absent.
 let child_named : State -> :string -> :any;
 let child_named s name = {
-    let hit = list.filter (fn c -> child_name c == name) (s_children s);
+    let hit = filter (fn c -> child_name c == name) (s_children s);
     if _list_is_empty hit { () } else { hit.[0] }
 };
 
@@ -225,7 +225,7 @@ let start_child! c = {
 /// The name of the running child that is process `p`, or `()` for one the
 /// supervisor no longer counts as running.
 let name_of : State -> :process -> :any;
-let name_of s p = map.fold (fn found name q -> if q == p { name } else { found }) () (s_running s);
+let name_of s p = fold (fn found name q -> if q == p { name } else { found }) () (s_running s);
 
 /// Start the child called `name` and record it as running.
 ///
@@ -275,7 +275,7 @@ let stop_child! s name =
 
 /// Stop the named children and return the updated supervisor state.
 let stop_all! : State -> [:string] -> State;
-let stop_all! s names = list.fold (fn acc n -> stop_child! acc n) s names |> strict!;
+let stop_all! s names = fold (fn acc n -> stop_child! acc n) s names |> strict!;
 
 // --- the loop -------------------------------------------------------------------
 
@@ -291,7 +291,7 @@ let over_limit s times =
 /// Anything that must not miss a death registers before the work starts.
 let tell_watchers! : State -> :string -> :any -> [:any];
 let tell_watchers! s name outcome =
-    list.map (fn w -> send! w [:down, name, outcome]) (s_watchers s) |> strict!;
+    map (fn w -> send! w [:down, name, outcome]) (s_watchers s) |> strict!;
 
 /// One `[:down, name, outcome]`.
 let handle_down! : State -> :string -> :any -> ([:go, State] | [:stop, :any]);
@@ -313,9 +313,9 @@ let handle_down! s name outcome = {
             let group = affected (s_strategy gone) (names_of gone) name;
             // The dead one is already gone; the rest of its group is asked to
             // stop before any of them is started again.
-            let others = list.filter (fn n -> n != name) group;
+            let others = filter (fn n -> n != name) group;
             let cleared = stop_all! (with_restarts times gone) others;
-            let next = list.fold (fn acc n -> start_named! acc n) cleared group;
+            let next = fold (fn acc n -> start_named! acc n) cleared group;
             // Forcing here, in a statement, and not inside the answer below.
             // Starting a child is an effect held in a lazy position -- the
             // state's `:running` values are the spawns themselves -- and an
@@ -359,7 +359,7 @@ let handle! s m =
             let cleared = stop_all! s (names_of s);
             strict! cleared
             answer! from :stopped
-            [:stop, Result.ok :stopped]
+            [:stop, ok :stopped]
         },
         _ => [:go, s],
     };
@@ -376,7 +376,7 @@ let start_with! : Strategy -> [Child] -> Limits -> :process;
 let start_with! strategy children lim = {
     let s = state strategy children lim;
     spawn! $( {
-        let started = list.fold (fn acc n -> start_named! acc n) s (names_of s) |> strict!;
+        let started = fold (fn acc n -> start_named! acc n) s (names_of s) |> strict!;
         serve! started
     } )
 };
@@ -569,14 +569,14 @@ when test {
             $( {
                 let sup = start_with! :one_for_one [child "deaf" deaf!] (with_shutdown 50 default_limits);
                 let ended = stop! sup;
-                test.eq! (Result.ok (Result.ok :stopped)) ended
+                test.eq! (Result.ok (ok :stopped)) ended
             } ),
 
         test.case "stop! takes the children down with it"
             $( {
                 let sup = start! :one_for_one [child "x" counter!, child "y" counter!];
                 let ended = stop! sup;
-                test.eq! (Result.ok (Result.ok :stopped)) ended
+                test.eq! (Result.ok (ok :stopped)) ended
             } ),
 
         // --- the strategy tables, which are pure and can be checked directly ---
@@ -589,12 +589,12 @@ when test {
 
         test.case "a transient child is restarted only when it fails"
             $( test.eq! [true, false]
-                        [should_restart (child_with "t" quitter! :transient) (Result.error :x),
-                         should_restart (child_with "t" quitter! :transient) (Result.ok 1)] ),
+                        [should_restart (child_with "t" quitter! :transient) (err :x),
+                         should_restart (child_with "t" quitter! :transient) (ok 1)] ),
         test.case "a permanent child is restarted either way"
             $( test.eq! [true, true]
-                        [should_restart (child "p" quitter!) (Result.error :x),
-                         should_restart (child "p" quitter!) (Result.ok 1)] ),
+                        [should_restart (child "p" quitter!) (err :x),
+                         should_restart (child "p" quitter!) (ok 1)] ),
 
         test.case "the window drops old restarts"
             $( test.eq! [1000, 900] (recent 500 1000 [900, 100]) ),

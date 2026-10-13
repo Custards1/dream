@@ -192,17 +192,17 @@ let col name = {
 
 /// Fragments one after another. A string among them is SQL text.
 let concat : [:any] -> Sql;
-let concat parts = frag (list.map sql_of parts);
+let concat parts = frag (map sql_of parts);
 
 /// Fragments with `sep` between them: `join ", " (list.map sql.col names)`.
 let join : :string -> [:any] -> Sql;
-let join sep parts = frag (interleave sep (list.map sql_of parts));
+let join sep parts = frag (interleave sep (map sql_of parts));
 
 /// Alternate list elements with a separator fragment.
 priv let interleave : :any -> [:any] -> [:any];
 priv let interleave sep xs = match xs {
     [] => [],
-    [x, ..rest] => list.cons x (list.flat_map (fn y -> [sep, y]) rest),
+    [x, ..rest] => list.cons x (flat_map (fn y -> [sep, y]) rest),
 };
 
 /// `( .. )` around a fragment.
@@ -288,7 +288,7 @@ let problem text = lint.problem text;
 /// here and is renumbered, or made `?`, for the dialect it is run against. A
 /// A missing or nonpositive parameter index is rejected on render.
 let positional : :string -> [:any] -> Sql;
-let positional text values = frag (list.map (fn t -> match t {
+let positional text values = frag (map (fn t -> match t {
     [:positional, n] => if n > 0 && n <= len values { [:value, values.[n - 1]] }
                         else { [:unsupported, "numbered parameter has no value: $" + to_string n] },
     other => lint.token_text other,
@@ -341,7 +341,7 @@ macro query template = match template {
     [:str, text, _] => {
         let tokens = lint.scan text true;
         match lint.lint tokens false false {
-            () => assemble (list.map template_part tokens),
+            () => assemble (map template_part tokens),
             message => invalid message,
         }
     },
@@ -358,7 +358,7 @@ macro fragment template = match template {
     [:str, text, _] => {
         let tokens = lint.scan text true;
         match lint.lint_as false tokens false false {
-            () => assemble (list.map template_part tokens),
+            () => assemble (map template_part tokens),
             message => invalid message,
         }
     },
@@ -391,12 +391,12 @@ priv let template_part t = match t {
 };
 
 /// A placeholder's name as syntax: `x`, or `m.x.y` for a module member.
-priv let path : :string -> :any;
+priv let path : :string -> [:any] | :unit;
 priv let path text = {
     let segments = str.split "." text;
     if text == "" || not (list.all is_name segments) { () }
     else {
-        list.fold (fn e seg -> [:field, e, seg, span])
+        fold (fn e seg -> [:field, e, seg, span])
                   [:name, list.head segments, span] (list.tail segments)
     }
 };
@@ -414,9 +414,9 @@ priv let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234
 
 /// The syntax of `[:sql, [pieces]]` from the pieces, with adjacent text merged.
 priv let assemble : [:any] -> Syntax;
-priv let assemble pieces = match list.filter (fn p -> type_of p == :list && p.[0] == :error) pieces {
+priv let assemble pieces = match filter (fn p -> type_of p == :list && p.[0] == :error) pieces {
     [[:error, message], .._] => invalid message,
-    _ => tagged "sql" (list_s (list.map part_syntax (merge_text pieces [] ""))),
+    _ => tagged "sql" (list_s (map part_syntax (merge_text pieces [] ""))),
 };
 
 /// Join adjacent text fragments to simplify a SQL template.
@@ -442,13 +442,13 @@ priv let part_syntax p = match p {
 /// placeholder standing in for each value.
 priv let from_items : [Syntax] -> Syntax;
 priv let from_items items = {
-    let tokens = list.flat_map (fn item -> match item {
+    let tokens = flat_map (fn item -> match item {
         [:str, text, _] => lint.scan text true,
         e => [[:item, e]],
     }) items;
-    let as_lint = list.map (fn t -> match t { [:item, _] => [:placeholder, "value"], other => other }) tokens;
+    let as_lint = map (fn t -> match t { [:item, _] => [:placeholder, "value"], other => other }) tokens;
     match lint.lint as_lint false false {
-        () => assemble (list.map (fn t -> match t {
+        () => assemble (map (fn t -> match t {
             [:item, e] => [:value_s, e],
             other => template_part other,
         }) tokens),
@@ -558,14 +558,14 @@ let is_not_null c = frag [column_of c, " IS NOT NULL"];
 let in_list : :any -> [:any] -> Sql;
 let in_list c values = match values {
     [] => raw "1 = 0",
-    _ => frag [column_of c, " IN (", join ", " (list.map expr_of values), ")"],
+    _ => frag [column_of c, " IN (", join ", " (map expr_of values), ")"],
 };
 
 /// `c NOT IN (..)`, true of everything when the list is empty.
 let not_in : :any -> [:any] -> Sql;
 let not_in c values = match values {
     [] => raw "1 = 1",
-    _ => frag [column_of c, " NOT IN (", join ", " (list.map expr_of values), ")"],
+    _ => frag [column_of c, " NOT IN (", join ", " (map expr_of values), ")"],
 };
 
 /// `c IN (subquery)`.
@@ -590,7 +590,7 @@ let all_of : [:any] -> Sql;
 let all_of conds = match conds {
     [] => raw "1 = 1",
     [one] => sql_of one,
-    _ => join " AND " (list.map parens conds),
+    _ => join " AND " (map parens conds),
 };
 
 /// Any condition. False when there are none.
@@ -598,12 +598,12 @@ let any_of : [:any] -> Sql;
 let any_of conds = match conds {
     [] => raw "1 = 0",
     [one] => sql_of one,
-    _ => join " OR " (list.map parens conds),
+    _ => join " OR " (map parens conds),
 };
 
 /// A function call. The arguments are values, so a column is `sql.col "x"`.
 let call : :string -> [:any] -> Sql;
-let call name args = frag [name, "(", join ", " (list.map expr_of args), ")"];
+let call name args = frag [name, "(", join ", " (map expr_of args), ")"];
 
 let count_all : Sql;
 let count_all = raw "COUNT(*)";
@@ -639,7 +639,7 @@ let desc c = frag [column_of c, " DESC"];
 let case_when : [[:any, :any]] -> :any -> Sql;
 let case_when arms otherwise = frag [
     "CASE ",
-    join " " (list.map (fn [c, v] -> frag ["WHEN ", sql_of c, " THEN ", expr_of v]) arms),
+    join " " (map (fn [c, v] -> frag ["WHEN ", sql_of c, " THEN ", expr_of v]) arms),
     " ELSE ", expr_of otherwise, " END",
 ];
 
@@ -718,8 +718,8 @@ let ansi = %{
     :types => ansi_types, :add_column => "ADD COLUMN ", :default_in_values => true,
     :accepts => [],
     :begin => "BEGIN", :commit => "COMMIT", :rollback => "ROLLBACK",
-    :begin_with => fn options -> [raw (str.join_str " " (list.filter (fn w -> w != "")
-        ["START TRANSACTION", str.join_str ", " (list.filter (fn w -> w != "")
+    :begin_with => fn options -> [raw (str.join_str " " (filter (fn w -> w != "")
+        ["START TRANSACTION", str.join_str ", " (filter (fn w -> w != "")
             [isolation_words options, read_only_words options])]))],
     :savepoint => fn n -> "SAVEPOINT " + n,
     :release => fn n -> "RELEASE SAVEPOINT " + n,
@@ -762,7 +762,7 @@ let postgres = extend ansi %{
     :accepts => [:list, :array, :map, :atom, :char],
     :array => fn items -> if list.is_empty items { "'{}'" } else { "ARRAY[" + str.join_str ", " items + "]" },
     :json => fn text -> "'" + doubled "'" text + "'::jsonb",
-    :begin_with => fn options -> [raw (str.join_str " " (list.filter (fn w -> w != "") [
+    :begin_with => fn options -> [raw (str.join_str " " (filter (fn w -> w != "") [
         "BEGIN", isolation_words options, read_only_words options,
         match Transaction.deferrable options { true => "DEFERRABLE", false => "NOT DEFERRABLE", _ => "" },
     ]))],
@@ -920,7 +920,7 @@ priv let rec write d inline_values !n !chunks !params !problems leaves = match l
         },
         [:ident, names] => {
             let quote = d.[:quote];
-            write d inline_values n (push (str.join_str "." (list.map quote names)) chunks) params problems rest
+            write d inline_values n (push (str.join_str "." (map quote names)) chunks) params problems rest
         },
         [:unsupported, why] => write d inline_values n chunks params (list.cons why problems) rest,
         text => if type_of text == :string { write d inline_values n (push text chunks) params problems rest }
@@ -1103,16 +1103,16 @@ let values row query = values_list [row] query;
 /// Many rows, in one statement. The columns are every column any row names.
 let values_list : [:map] -> Query -> Query;
 let values_list rows query = {
-    let named = list.map (fn row -> map.from_pairs (list.map (fn [k, v] -> [key_text k, v]) (map.pairs row))) rows;
-    let fresh = list.unique (list.flat_map (fn row -> map.sorted_keys row) named);
-    let cols = query.[:columns] + list.filter (fn c -> not (list.contains c query.[:columns])) fresh;
+    let named = map (fn row -> map.from_pairs (map (fn [k, v] -> [key_text k, v]) (map.pairs row))) rows;
+    let fresh = list.unique (flat_map (fn row -> map.sorted_keys row) named);
+    let cols = query.[:columns] + filter (fn c -> not (list.contains c query.[:columns])) fresh;
     query.[:columns => cols].[:rows => query.[:rows] + named]
 };
 
 /// Rows by position, against columns named once.
 let values_in : [:any] -> [[:any]] -> Query -> Query;
 let values_in cols rows query =
-    values_list (list.map (fn row -> map.from_pairs (list.zip (list.map key_text cols) row)) rows) query;
+    values_list (map (fn row -> map.from_pairs (list.zip (map key_text cols) row)) rows) query;
 
 /// `INSERT INTO t (cols) SELECT ..`: the rows of a query.
 let insert_select : [:any] -> :any -> Query -> Query;
@@ -1140,7 +1140,7 @@ let update table = %{ :kind => :update, :table => table, :set => [] };
 /// Columns to change, as a map from column to value or fragment:
 /// `sql.set %{ "n" => sql.q "n + 1" [] }`.
 let set : :map -> Query -> Query;
-let set changes query = query.[:set => query.[:set] + list.map (fn k -> [k, changes.[k]]) (map.sorted_keys changes)];
+let set changes query = query.[:set => query.[:set] + map (fn k -> [k, changes.[k]]) (map.sorted_keys changes)];
 
 /// Begin a DELETE builder for a table.
 let delete_from : :string -> Query;
@@ -1191,17 +1191,17 @@ let check cond c = c.[:check => cond];
 
 /// Describe a primary-key constraint over one or more columns.
 let primary_key_on : [:string] -> Sql;
-let primary_key_on cols = frag ["PRIMARY KEY (", join ", " (list.map ident cols), ")"];
+let primary_key_on cols = frag ["PRIMARY KEY (", join ", " (map ident cols), ")"];
 
 /// Describe a uniqueness constraint over one or more columns.
 let unique_on : [:string] -> Sql;
-let unique_on cols = frag ["UNIQUE (", join ", " (list.map ident cols), ")"];
+let unique_on cols = frag ["UNIQUE (", join ", " (map ident cols), ")"];
 
 /// Describe a table-level foreign-key constraint.
 let foreign_key : [:string] -> :string -> [:string] -> Sql;
 let foreign_key cols table targets = frag [
-    "FOREIGN KEY (", join ", " (list.map ident cols), ") REFERENCES ",
-    col table, " (", join ", " (list.map ident targets), ")",
+    "FOREIGN KEY (", join ", " (map ident cols), ") REFERENCES ",
+    col table, " (", join ", " (map ident targets), ")",
 ];
 
 /// Describe a table-level CHECK constraint.
@@ -1251,7 +1251,7 @@ let to_sql query = per_dialect (fn d -> query_sql d query);
 priv let query_sql : Dialect -> Query -> Sql;
 priv let query_sql d query = match query.[:kind] {
     :select => select_sql d query,
-    :compound => join query.[:op] (list.map statement_of query.[:parts]),
+    :compound => join query.[:op] (map statement_of query.[:parts]),
     :insert => insert_sql d query,
     :update => update_sql d query,
     :delete => delete_sql d query,
@@ -1260,7 +1260,7 @@ priv let query_sql d query = match query.[:kind] {
     :create_index => frag [
         if query.[:unique else false] { "CREATE UNIQUE INDEX " } else { "CREATE INDEX " },
         query.[:guard else ""], ident query.[:name], " ON ", col query.[:table],
-        " (", join ", " (list.map column_of query.[:columns]), ")",
+        " (", join ", " (map column_of query.[:columns]), ")",
     ],
     :drop_index => match dialect_name d {
         :mysql => frag ["DROP INDEX ", ident query.[:name], " ON ", col query.[:table]],
@@ -1289,15 +1289,15 @@ priv let select_sql d query = {
     clauses [
         with_sql d query,
         frag ["SELECT ", if query.[:distinct else false] { "DISTINCT " } else { "" },
-              if list.is_empty cols { raw "*" } else { join ", " (list.map column_of cols) }],
-        when_some query.[:from else []] (fn xs -> frag ["FROM ", join ", " (list.map column_of xs)]),
-        when_some query.[:joins else []] (fn js -> join " " (list.map join_sql js)),
+              if list.is_empty cols { raw "*" } else { join ", " (map column_of cols) }],
+        when_some query.[:from else []] (fn xs -> frag ["FROM ", join ", " (map column_of xs)]),
+        when_some query.[:joins else []] (fn js -> join " " (map join_sql js)),
         when_some query.[:where else []] (fn cs -> frag ["WHERE ", all_of cs]),
-        when_some query.[:group else []] (fn gs -> frag ["GROUP BY ", join ", " (list.map column_of gs)]),
+        when_some query.[:group else []] (fn gs -> frag ["GROUP BY ", join ", " (map column_of gs)]),
         when_some query.[:having else []] (fn cs -> frag ["HAVING ", all_of cs]),
         if list.is_empty order {
             if needs_order { raw "ORDER BY (SELECT NULL)" } else { () }
-        } else { frag ["ORDER BY ", join ", " (list.map column_of order)] },
+        } else { frag ["ORDER BY ", join ", " (map column_of order)] },
         paging_sql d query.[:limit else ()] query.[:offset else ()],
     ]
 };
@@ -1306,7 +1306,7 @@ priv let select_sql d query = {
 priv let with_sql : Dialect -> Query -> :any;
 priv let with_sql d query = when_some query.[:with else []] (fn ctes -> frag [
     "WITH ", if query.[:recursive else false] { d.[:recursive else ""] } else { "" },
-    join ", " (list.map (fn [name, sub] -> frag [ident name, " AS ", parens (statement_of sub)]) ctes),
+    join ", " (map (fn [name, sub] -> frag [ident name, " AS ", parens (statement_of sub)]) ctes),
 ]);
 
 /// Render one join clause and its condition.
@@ -1343,7 +1343,7 @@ priv let paging_sql d n skip =
 priv let output_sql : Dialect -> :string -> Query -> :any;
 priv let output_sql d side query = match [d.[:returning else :none], query.[:returning else ()]] {
     [:output, cols] => if cols == () { () } else {
-        frag ["OUTPUT ", join ", " (list.map (fn c -> frag [side + ".", column_of c]) cols)]
+        frag ["OUTPUT ", join ", " (map (fn c -> frag [side + ".", column_of c]) cols)]
     },
     _ => (),
 };
@@ -1352,7 +1352,7 @@ priv let output_sql d side query = match [d.[:returning else :none], query.[:ret
 priv let returning_sql : Dialect -> Query -> :any;
 priv let returning_sql d query = match [d.[:returning else :none], query.[:returning else ()]] {
     [_, ()] => (),
-    [:returning, cols] => frag ["RETURNING ", join ", " (list.map column_of cols)],
+    [:returning, cols] => frag ["RETURNING ", join ", " (map column_of cols)],
     [:output, _] => (),
     _ => unsupported (to_string (dialect_name d) + " cannot return the rows a statement wrote"),
 };
@@ -1379,14 +1379,14 @@ priv let insert_sql d query = {
             [[], []] => default_values d,
             [[], [_]] => default_values d,
             [[], _] => unsupported "every row of this insert is all defaults, and VALUES cannot say that of several rows",
-            _ => frag ["VALUES ", join ", " (list.map (fn row ->
-                    parens (join ", " (list.map (fn c -> inserted d row.[c else ()]) cols))) rows)],
+            _ => frag ["VALUES ", join ", " (map (fn row ->
+                    parens (join ", " (map (fn c -> inserted d row.[c else ()]) cols))) rows)],
         },
         source => statement_of source,
     };
     clauses [
         frag [start, col query.[:table]],
-        when_some cols (fn cs -> parens (join ", " (list.map (fn c -> ident (key_text c)) cs))),
+        when_some cols (fn cs -> parens (join ", " (map (fn c -> ident (key_text c)) cs))),
         output_sql d "INSERTED" query,
         body,
         conflict_sql d conflict,
@@ -1428,19 +1428,19 @@ priv let conflict_sql d conflict = match [d.[:upsert else :none], conflict] {
 priv let target_sql : [:string] -> :any;
 priv let target_sql target = match target {
     [] => "",
-    _ => frag [" (", join ", " (list.map ident target), ")"],
+    _ => frag [" (", join ", " (map ident target), ")"],
 };
 
 /// Render the assignments used by a conflict-update action.
 priv let upsert_changes : :any -> [[:any, :any]];
 priv let upsert_changes changes = match type_of changes {
-    :map => list.map (fn k -> [k, changes.[k]]) (map.sorted_keys changes),
-    _ => list.map (fn c -> [c, excluded c]) changes,
+    :map => map (fn k -> [k, changes.[k]]) (map.sorted_keys changes),
+    _ => map (fn c -> [c, excluded c]) changes,
 };
 
 /// Render column/value assignments with values kept as parameters.
 priv let assignments : [[:any, :any]] -> Sql;
-priv let assignments pairs = join ", " (list.map (fn [k, v] -> frag [ident (key_text k), " = ", expr_of v]) pairs);
+priv let assignments pairs = join ", " (map (fn [k, v] -> frag [ident (key_text k), " = ", expr_of v]) pairs);
 
 /// Render an UPDATE query and its predicates.
 priv let update_sql : Dialect -> Query -> Sql;
@@ -1464,7 +1464,7 @@ priv let delete_sql d query = clauses [
 priv let create_table_sql : Dialect -> Query -> Sql;
 priv let create_table_sql d query = frag [
     "CREATE TABLE ", query.[:guard else ""], col query.[:table], " (",
-    join ", " (list.map (fn p -> if is_sql p { p } else { column_sql d p }) query.[:parts]),
+    join ", " (map (fn p -> if is_sql p { p } else { column_sql d p }) query.[:parts]),
     ")",
 ];
 
@@ -1473,7 +1473,7 @@ priv let type_sql : Dialect -> :any -> :string;
 priv let type_sql d kind = {
     let named = fn t -> d.[:types].[t else str.upper (key_text t)];
     match kind {
-        [t, ..args] => named t + "(" + str.join_str ", " (list.map to_string args) + ")",
+        [t, ..args] => named t + "(" + str.join_str ", " (map to_string args) + ")",
         _ => if type_of kind == :string { kind } else { named kind },
     }
 };
@@ -1618,7 +1618,7 @@ let describe_error e =
     if not (is_sql_error e) { to_string e }
     else {
         let p = error.payload e;
-        let extra = list.filter (fn s -> s != "") (list.map (fn k -> match p.[k else ()] {
+        let extra = filter (fn s -> s != "") (map (fn k -> match p.[k else ()] {
             () => "",
             v => key_text k + ": " + (if type_of v == :string { v } else { to_string v }),
         }) [:detail, :hint, :sql]);
@@ -1672,7 +1672,7 @@ let query! c x = { let outcome = run! c x; rows_of outcome };
 let rows_of : Outcome -> [Row];
 let rows_of outcome = {
     let keys = list.map column_key outcome.[:columns];
-    list.map (fn row -> map.from_pairs (list.zip keys row)) outcome.[:rows]
+    map (fn row -> map.from_pairs (list.zip keys row)) outcome.[:rows]
 };
 
 /// What a column named `name` is read by: its atom, when the program has one
@@ -1685,7 +1685,7 @@ let column_key name = match atom.existing name { () => name, a => a };
 /// The rows of a query, each checked against `description` (`std.types`):
 /// `sql.query_as! (types.record %{ "id" => :integer }) db q`.
 let query_as! : :any -> Connection -> Runnable -> [Row];
-let query_as! description c x = list.map (fn row -> types.check description row) (query! c x);
+let query_as! description c x = map (fn row -> types.check description row) (query! c x);
 
 /// The first row, or `()`.
 let first! : Connection -> Runnable -> (Row | :unit);
@@ -1708,7 +1708,7 @@ let scalar! c x = match (run! c x).[:rows] {
 
 /// The first column of every row.
 let column! : Connection -> Runnable -> [:any];
-let column! c x = list.map (fn row -> list.first_or () row) (run! c x).[:rows];
+let column! c x = map (fn row -> list.first_or () row) (run! c x).[:rows];
 
 /// Run many statements, and answer how many rows they changed between them.
 /// Statements that render to the same text one after another are handed to
@@ -1717,12 +1717,12 @@ let column! c x = list.map (fn row -> list.first_or () row) (run! c x).[:rows];
 ///
 ///     sql.exec_many! db (list.map (fn u -> sql.insert_into "users" |> sql.values u) users)
 let exec_many! : Connection -> [Runnable] -> :integer;
-let exec_many! c xs = run_groups! c (group_runs (list.map (fn x -> prepare! c x) xs)) 0;
+let exec_many! c xs = run_groups! c (group_runs (map (fn x -> prepare! c x) xs)) 0;
 
 /// `[[text, [params, ..]], ..]`, a run of statements of one text to a group.
-priv let group_runs : [Rendered] -> [[:any]];
-priv let group_runs sts = list.reverse (list.map (fn [t, ps] -> [t, list.reverse ps])
-    (list.fold_strict (fn groups st -> match groups {
+priv let group_runs : [:map] -> [[:string, [:any]]];
+priv let group_runs sts = list.reverse (map (fn [t, ps] -> [t, list.reverse ps])
+    (fold (fn groups st -> match groups {
         [[t, ps], ..rest] => if t == st.[:text] { list.cons [t, list.cons st.[:params] ps] rest }
                              else { list.cons [st.[:text], [st.[:params]]] groups },
         _ => [[st.[:text], [st.[:params]]]],
@@ -1848,8 +1848,8 @@ let rec retrying! c attempts options work = {
     let outcome = try! {
         let v = transaction_with! c options work;
         strict! v
-        Result.ok v
-    } catch e { Result.error e };
+        ok v
+    } catch e { err e };
     match outcome {
         Result.ok(v) => v,
         Result.error(e) => if attempts > 1 && is_retryable e { retrying! c (attempts - 1) options work }
@@ -1873,7 +1873,7 @@ let serializable! c attempts work =
 
 /// Fold `f` over the rows of `x`, `batch` at a time, holding one batch.
 let fold! : Connection -> Runnable -> :integer -> (a -> Row -> a) -> a -> a;
-let fold! c x batch f init = stream! c x batch (fn acc cols rows -> list.fold_strict f acc (rows_of_batch cols rows)) init;
+let fold! c x batch f init = stream! c x batch (fn acc cols rows -> fold f acc (rows_of_batch cols rows)) init;
 
 /// Run `handle!` on each row of `x`, `batch` at a time, and answer how many
 /// rows there were.
@@ -1936,7 +1936,7 @@ let using! c work = {
 /// Optional native operations this connection actually implements. Portable
 /// bulk insertion and ping work even without native acceleration.
 let capabilities : Connection -> [:atom];
-let capabilities c = list.filter (fn key -> map.has key c)
+let capabilities c = filter (fn key -> map.has key c)
     [:fold, :run_many, :prepare_statement, :script, :script_results, :copy_in,
      :cancel, :listen, :unlisten, :notify, :next_notification, :info, :reset];
 
@@ -2020,7 +2020,7 @@ let execute! statement params = {
 /// Validate parameter values before handing them to the driver.
 priv let validate_params! : Connection -> [:any] -> :string -> :unit;
 priv let validate_params! c params text = {
-    let problems = list.filter_map (value_problem_in (dialect_of c)) params;
+    let problems = filter_map (value_problem_in (dialect_of c)) params;
     if list.is_empty problems { () } else { fail! (str.join_str "; " problems) :parameters text }
 };
 
@@ -2054,13 +2054,13 @@ let copy_in! c table columns rows = {
     if list.is_empty columns || len (list.unique columns) != len columns {
         fail! "bulk insertion needs distinct column names" :parameters ""
     } else { () }
-    strict! (list.map (fn row -> {
+    strict! (map (fn row -> {
         if len row != len columns { fail! "bulk row width does not match its columns" :parameters "" } else { () }
         validate_params! c row ""
     }) rows)
     if list.is_empty rows { 0 } else {
         transaction! c (fn tx -> match tx.[:copy_in else ()] {
-            () => exec_many! tx (list.map (fn row -> insert_into table |> values_in columns [list.map param row]) rows),
+            () => exec_many! tx (map (fn row -> insert_into table |> values_in columns [map param row]) rows),
             f => { let copy_rows! = f; copy_rows! tx.[:state] table columns rows },
         })
     }
@@ -2096,7 +2096,7 @@ let subscribe! open! channels !target = {
     strict! c
     try! {
         require! c :next_notification
-        strict! (list.map (fn channel -> listen! c channel) channels)
+        strict! (map (fn channel -> listen! c channel) channels)
     } catch e { try! { close! c } catch ignored { () }; raise! e }
     let process = notification_process! c target;
     %{ :connection => c, :process => process }
@@ -2108,7 +2108,7 @@ priv let notification_process! c !target = spawn! $( forward_notifications! c ta
 /// Forward notifications to the receiving process until stopped.
 priv let forward_notifications! : Connection -> :process -> :atom;
 priv let rec forward_notifications! c target = {
-    let next = try! { let n = next_notification! c; strict! n; Result.ok n } catch e { Result.error e };
+    let next = try! { let n = next_notification! c; strict! n; ok n } catch e { err e };
     match next {
         Result.ok(n) => { send! target [:sql_notification, n]; forward_notifications! c target },
         Result.error(_) => :stopped,
@@ -2141,7 +2141,7 @@ let migrate! c migrations = {
     ] |> if_not_exists)
     let seen = map.set_of (column! c (select ["id"] |> from "dream_migrations"));
     let pending = list.sort_on (fn m -> list.nth 0 m)
-                               (list.filter (fn m -> not (map.member (list.nth 0 m) seen)) migrations);
+                               (filter (fn m -> not (map.member (list.nth 0 m) seen)) migrations);
     apply_migrations! c pending []
 };
 
@@ -2378,6 +2378,7 @@ when test {
             $( test.eq! [(), "`SELEC` does not begin an SQL statement"] [problem "SELECT 1", problem "SELEC 1"] ),
     ];
 
+    priv let call_with_options : :map -> :map -> [[:any]];
     priv let call_with_options d options = {
         let begin_with = d.[:begin_with];
         begin_with options

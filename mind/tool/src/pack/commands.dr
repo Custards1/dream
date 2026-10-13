@@ -158,7 +158,7 @@ let format_problems : Spec -> Layout -> [:string];
 let format_problems sp lay = {
     let deb_ok = match deb.problems sp { Result.ok(_) => deb.control sp lay, other => other };
     let outcomes = [["deb", deb_ok], ["rpm", rpm.relations sp :xz], ["arch", arch.pkginfo sp lay]];
-    list.flat_map (fn [format, r] -> match r {
+    flat_map (fn [format, r] -> match r {
         Result.error(why) => [if str.starts_with (format + ":") why { why } else { format + ": " + why }],
         _ => [],
     }) outcomes

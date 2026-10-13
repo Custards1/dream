@@ -44,7 +44,7 @@ let long_lines : Spec -> :string;
 let long_lines sp = match str.trim (Spec.description sp) {
     "" => "",
     d if d == Spec.summary sp => "",
-    d => str.concat_all (list.map (fn l -> if str.trim l == "" { "\n ." } else { "\n " + str.trim_end l })
+    d => str.concat_all (map (fn l -> if str.trim l == "" { "\n ." } else { "\n " + str.trim_end l })
                                   (str.split "\n" d)),
 };
 
@@ -57,7 +57,7 @@ let installed_kib : Layout -> :integer;
 let installed_kib lay = {
     let items = Layout.items lay;
     let one = fn i -> match i { item.Item.link(_, _) => 1, _ => (item.size i + 1023) / 1024 };
-    list.fold_strict (fn !acc i -> acc + one i) 0 items + list.length (layout.dirs items)
+    fold (fn !acc i -> acc + one i) 0 items + list.length (layout.dirs items)
 };
 
 /// The relationships Debian has, in policy's order.
@@ -69,7 +69,7 @@ let relations : [[:string, :string]] = [
 
 let control : Spec -> Layout -> Result :string :string;
 let control sp lay = {
-    let? lines = Result.all (list.map (fn [label, key] -> Result.map (fn v -> field label v)
+    let? lines = Result.all (map (fn [label, key] -> map (fn v -> field label v)
                                                                        (deps.deb_list (spec.strings sp "deb" key)))
                                       relations);
     Result.ok (field "Package" (Spec.name sp)
@@ -87,22 +87,22 @@ let control sp lay = {
 /// What Debian needs that the other formats do not.
 let problems : Spec -> Result :unit :string;
 let problems sp =
-    if str.is_empty (Spec.maintainer sp) { Result.error "deb: a Debian package needs a maintainer: set maintainer = \"Name <email>\" in [ship]" }
+    if str.is_empty (Spec.maintainer sp) { err "deb: a Debian package needs a maintainer: set maintainer = \"Name <email>\" in [ship]" }
     else { Result.ok () };
 
 /// The files, from the root: every directory above them, then each in order.
 let data_items : Layout -> [Item];
 let data_items lay = {
     let items = Layout.items lay;
-    let dirs = list.map (fn d -> item.Item.dir ("./" + d + "/") item.executable) (layout.dirs items);
+    let dirs = map (fn d -> item.Item.dir ("./" + d + "/") item.executable) (layout.dirs items);
     list.sort_on item.path (item.Item.dir "./" item.executable :: dirs
-                            + list.map (fn i -> item.renamed (fn p -> "./" + p) i) items)
+                            + map (fn i -> item.renamed (fn p -> "./" + p) i) items)
 };
 
 /// `md5sums`: the digest of each file, as debsums reads it.
 let md5sums! : Layout -> :string;
 let md5sums! lay = {
-    let lines = list.map (fn i -> match i {
+    let lines = map (fn i -> match i {
         item.Item.file(path, _, source, _) => crypto.hex (crypto.digest_file! :md5 source) + "  " + path + "\n",
         _ => "",
     }) (Layout.items lay);
@@ -114,8 +114,8 @@ let control_items! : Spec -> Layout -> :string -> [Item];
 let control_items! sp lay text = {
     let sums = md5sums! lay;
     strict! sums
-    let conffiles = str.concat_all (list.map (fn p -> "/" + p + "\n") (Layout.config lay));
-    let scripts = list.flat_map (fn hook -> match (Spec.scripts sp).[hook else ()] {
+    let conffiles = str.concat_all (map (fn p -> "/" + p + "\n") (Layout.config lay));
+    let scripts = flat_map (fn hook -> match (Spec.scripts sp).[hook else ()] {
         () => [],
         body => [item.Item.text ("./" + hook) item.executable body],
     }) spec.hooks;
@@ -141,7 +141,7 @@ let build! sp lay text c dir out = {
                          ["data.tar" + compress.extension c, data_tar]]
     let target = out + "/" + file_name sp;
     scratch.place! made target
-    Result.ok target
+    ok target
 };
 
 /// Make the package in `out`, answering its path.

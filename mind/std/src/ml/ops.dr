@@ -121,7 +121,7 @@ priv let on_gpu_as dtype t = match dtype { :f32 => tensor.gpu t, _ => tensor.gpu
 let permutation : :integer -> :integer -> [:integer];
 let permutation seed n = {
     let keys = tensor.to_list (tensor.random seed [n]);
-    list.map (fn [_, i] -> i) (list.sort_on (fn [k, _] -> k) (list.zip keys (list.range 0 n)))
+    map (fn [_, i] -> i) (list.sort_on (fn [k, _] -> k) (list.zip keys (list.range 0 n)))
 };
 
 /// The number of rows of `t`, the length of its first axis.

@@ -1080,14 +1080,12 @@ a member that was absent from one that was explicitly `null`. Neither can JSON.
 | Name | Description |
 |------|-------------|
 | `parse text` | `Result.ok value`, or `Result.error message`. Trailing characters after the value are an error. |
-| `ok result` | `true` if a `parse` result succeeded. |
-| `value result` | The value out of a `parse` result. Meaningless unless `ok` is `true`. |
 | `parse_or default text` | The parsed value, or `default` if `text` is not valid JSON. The form to use when a fallback is more useful than a diagnosis. |
 
 ```dream
 let r = json.parse "{\"a\": 1, \"b\": [true, null, 2.5]}";
-json.ok r                       // true
-json.value r                    // %{"a" => 1, "b" => [true, (), 2.5]}
+is_ok r                         // true
+unwrap_or %{} r                 // %{"a" => 1, "b" => [true, (), 2.5]}
 
 json.parse "{oops}"             // Result.error("not valid JSON")
 json.parse_or %{} "not json"    // %{}
@@ -1190,7 +1188,7 @@ map — which is what lets a dependency carry `path`, `git`, `tag` and the rest.
 | `entries table name` | One section's `key = value` pairs as `[key, value]` lists — `map.pairs` of that section. |
 
 ```dream
-let t = toml.value (toml.parse text);
+let t = toml.parse_or %{} text;
 toml.get "0.0.0" t "package" "version"
 toml.sections t                        // ["", "package", "dependencies"]
 toml.entries t "package"               // [["name", "demo"], ["ver", 2]]

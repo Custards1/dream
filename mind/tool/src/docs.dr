@@ -43,7 +43,8 @@ let page url title body text = %{ :url => url, :title => title, :body => body, :
 let html_path path = str.slice 0 (len path - 3) path + ".html";
 let relative_root url = str.repeat (list.length (str.split "/" url) - 1) "../";
 let ignored path = list.any (fn p -> list.contains p ["target", "build", ".git", ".hg", ".svn", "node_modules", "tests", "examples"]) (str.split "/" path);
-let files! dir = if io.is_dir! dir { list.sort (list.filter (fn p -> not (ignored p)) (io.walk! dir)) } else { [] };
+let files! : :string -> [:string];
+let files! dir = if io.is_dir! dir { list.sort (filter (fn p -> not (ignored p)) (file.walk! dir)) } else { [] };
 /// A guide, read: its page and its Markdown.
 let guide! dir rel = %{ :url => "guides/" + html_path rel, :rel => rel, :text => read! (path.join dir rel) };
 let guide_page ctx g = page g.[:url] (markdown.title g.[:rel] g.[:text])
@@ -65,7 +66,7 @@ let module_pages ctx info = {
     let name = label + (if stem == "" { "" } else { "." + str.replace "/" "." stem });
     if list.is_empty entries { [] } else {
         [page url name ("<h1>" + markdown.escape name + "</h1>" + api.render ctx.[:page => url] (relative_root url + source) entries)
-             (str.join_str "\n" (list.map (fn e -> e.[:name] + " " + e.[:signature] + " " + e.[:doc]) entries)),
+             (str.join_str "\n" (map (fn e -> e.[:name] + " " + e.[:signature] + " " + e.[:doc]) entries)),
          page source (name + " source") ("<h1>" + markdown.escape name + " source</h1>" + api.source_html info.[:text]) ""]
     }
 };
@@ -73,11 +74,11 @@ let package_modules! m = {
     let label = manifest.name m;
     if label == "" || markdown.slug label != label { fail! "package names used in docs must contain only lowercase letters, digits, hyphens and underscores" }
     let dir = manifest.src! m;
-    list.map (fn rel -> module! m label dir rel) (list.filter (str.ends_with ".dr") (files! dir)) |> strict!
+    map (fn rel -> module! m label dir rel) (filter (str.ends_with ".dr") (files! dir)) |> strict!
 };
 let api_modules! m = {
     let own = if manifest.is_package m { package_modules! m } else { [] };
-    let children = list.flat_map (fn member -> match manifest.find! (path.join (manifest.root m) member) {
+    let children = flat_map (fn member -> match manifest.find! (path.join (manifest.root m) member) {
         Result.ok(child) => package_modules! child,
         Result.error(why) => fail! why,
     }) (manifest.members m) |> strict!;
@@ -99,7 +100,7 @@ const headings=article.querySelectorAll('h2[id],h3[id]'),toc=document.getElement
 ";
 let shell title version pages p = {
     let root = relative_root p.[:url];
-    let nav = str.join_str "" (list.map (fn other -> "<li><a " + (if other.[:url] == p.[:url] { "aria-current=\"page\" " } else { "" })
+    let nav = str.join_str "" (map (fn other -> "<li><a " + (if other.[:url] == p.[:url] { "aria-current=\"page\" " } else { "" })
         + "href=\"" + markdown.escape (root + other.[:url]) + "\">" + markdown.escape other.[:title] + "</a></li>") pages);
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>"
         + markdown.escape p.[:title] + " · " + markdown.escape title + "</title><link rel=\"stylesheet\" href=\"" + root + "assets/docs.css\"></head><body data-root=\"" + root + "\">"
@@ -131,18 +132,18 @@ let build! c m = {
         () => (vm.scheduler! ()).[:workers else 1],
         n => match num.parse_int n { j if j != () && j > 0 => j, _ => fail! ("-j wants a number of jobs, not `" + n + "`") },
     };
-    let read_guides = list.map (guide! guide_dir) (list.filter (str.ends_with ".md") guide_files) |> strict!;
+    let read_guides = map (guide! guide_dir) (filter (str.ends_with ".md") guide_files) |> strict!;
     let modules = if cli.flag_set c "no-api" || toml.get true cfg "docs" "api" == false { [] } else { api_modules! m };
     // Every example, from every page, run before any page is drawn.
-    let sources = list.append (list.map (fn g -> [g.[:url], g.[:text], m]) read_guides)
-                              (list.map (fn i -> [i.[:url], str.join_str "\n" (list.map (fn e -> e.[:doc]) i.[:entries]), i.[:manifest]]) modules);
+    let sources = list.append (map (fn g -> [g.[:url], g.[:text], m]) read_guides)
+                              (map (fn i -> [i.[:url], str.join_str "\n" (map (fn e -> e.[:doc]) i.[:entries]), i.[:manifest]]) modules);
     let [results, unexpected] = examples.run_all! (examples.context m (cli.get () c "compiler") timeout scratch) jobs sources;
     let ctx = (examples.context m (cli.get () c "compiler") timeout scratch).[:results => results];
-    let guides = list.map (guide_page ctx) read_guides;
-    let apis = list.flat_map (module_pages ctx) modules;
-    let listed = list.append guides (list.filter (fn p -> str.starts_with "api/" p.[:url]) apis);
+    let guides = map (guide_page ctx) read_guides;
+    let apis = flat_map (module_pages ctx) modules;
+    let listed = list.append guides (filter (fn p -> str.starts_with "api/" p.[:url]) apis);
     let overview = "<h1>" + markdown.escape title + "</h1><p>Browse the guides and API reference, or search for a function or topic.</p><ul>"
-        + str.join_str "" (list.map (fn p -> "<li><a href=\"" + markdown.escape p.[:url] + "\">" + markdown.escape p.[:title] + "</a></li>") listed) + "</ul>";
+        + str.join_str "" (map (fn p -> "<li><a href=\"" + markdown.escape p.[:url] + "\">" + markdown.escape p.[:title] + "</a></li>") listed) + "</ul>";
     let index = page "index.html" "Overview" overview title;
     let navigation = list.cons index listed;
     let pages = list.cons index (list.append guides apis);
@@ -159,10 +160,10 @@ let build! c m = {
         let to = path.join out ("guides/" + rel);
         file.mkdir_all! (file.parent to)
         file.copy! (path.join guide_dir rel) to
-    }) (list.filter (fn rel -> not (str.ends_with ".md" rel)) guide_files)
+    }) (filter (fn rel -> not (str.ends_with ".md" rel)) guide_files)
     write! out "assets/docs.css" css
     write! out "assets/docs.js" javascript
-    let search = list.map (fn p -> %{ "title" => p.[:title], "url" => p.[:url], "text" => p.[:text] }) listed;
+    let search = map (fn p -> %{ "title" => p.[:title], "url" => p.[:url], "text" => p.[:text] }) listed;
     write! out "assets/search.js" ("window.mindDocs=" + json.write search + ";\n")
     write! out "search-index.json" (json.write search)
     file.remove_all! scratch

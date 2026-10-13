@@ -19,7 +19,7 @@ import std.num;
 
 /// `#[#[..]]`, the same numbers as `t`.
 let nested : :tensor -> #[#[:float]];
-let nested t = array.of_list (list.map array.of_list (tensor.to_list t));
+let nested t = array.of_list (map array.of_list (tensor.to_list t));
 
 let naive : #[#[:float]] -> #[#[:float]] -> #[#[:float]];
 let naive a b = {

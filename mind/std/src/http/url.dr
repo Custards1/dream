@@ -62,7 +62,7 @@ let parse text = {
         let authority = str.slice 2 (auth_end - 2) hier;
         let path = str.slice auth_end (len hier - auth_end) hier;
         match parse_authority authority {
-            Result.error(why) => Result.error why,
+            Result.error(why) => err why,
             Result.ok([user, password, host, port]) =>
                 Result.ok (Url.make scheme user password host port path query fragment true has_query),
         }
@@ -105,11 +105,11 @@ priv let parse_authority a = {
         if c >= 0 { [str.slice 0 c hostport, str.slice (c + 1) (len hostport) hostport] } else { [hostport, ""] }
     };
     if port_text == () { Result.error ("an unclosed [ in " + a) }
-    else if port_text == "" { Result.ok [user, password, str.lower host, ()] }
+    else if port_text == "" { ok [user, password, str.lower host, ()] }
     else {
         match num.parse_int port_text {
             n if n != () && n >= 0 && n <= 65535 && str.span "0123456789" 0 port_text == len port_text =>
-                Result.ok [user, password, str.lower host, n],
+                ok [user, password, str.lower host, n],
             _ => Result.error ("not a port: " + port_text),
         }
     }
@@ -223,7 +223,7 @@ let encode_path s = encode_except "/" s;
 
 /// HTML forms' encoding (`application/x-www-form-urlencoded`): a space is `+`.
 let encode_form : :string -> :string;
-let encode_form s = str.join_str "+" (list.map encode (str.split " " s));
+let encode_form s = str.join_str "+" (map encode (str.split " " s));
 
 priv let unreserved : :string;
 priv let unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
@@ -287,18 +287,18 @@ priv let hexd b = if b <= 57 { b - 48 } else if b <= 70 { b - 55 } else { b - 87
 /// `a=1&b=x+y` as `[["a", "1"], ["b", "x y"]]`, decoded, in order, keeping
 /// repeated names. A name with no `=` has the value `""`.
 let decode_query : :string -> [[:string]];
-let decode_query q = list.map (fn part -> {
+let decode_query q = map (fn part -> {
     let eq = str.find "=" part;
     if eq < 0 { [decode_form part, ""] }
     else { [decode_form (str.slice 0 eq part), decode_form (str.slice (eq + 1) (len part - eq - 1) part)] }
-}) (list.filter (fn p -> p != "") (str.split "&" q));
+}) (filter (fn p -> p != "") (str.split "&" q));
 
 /// The pairs written as a query string, form-encoded. Takes a list of pairs
 /// or a map; a value that is not a string is written as it prints.
 let encode_query : :any -> :string;
 let encode_query pairs = {
-    let ps = if type_of pairs == :map { list.map (fn k -> [k, pairs.[k]]) (map.sorted_keys pairs) } else { pairs };
-    str.join_str "&" (list.map (fn [k, v] -> encode_form (text_of k) + "=" + encode_form (text_of v)) ps)
+    let ps = if type_of pairs == :map { map (fn k -> [k, pairs.[k]]) (map.sorted_keys pairs) } else { pairs };
+    str.join_str "&" (map (fn [k, v] -> encode_form (text_of k) + "=" + encode_form (text_of v)) ps)
 };
 
 /// Convert a query-field value to its string representation.
@@ -311,7 +311,7 @@ let query_pairs u = decode_query (Url.query u);
 
 /// A URL's query as a map; the first value wins for a repeated name.
 let query_map : Url -> :map;
-let query_map u = list.fold (fn m [k, v] -> if map.has k m { m } else { m.[k => v] }) %{} (query_pairs u);
+let query_map u = fold (fn m [k, v] -> if map.has k m { m } else { m.[k => v] }) %{} (query_pairs u);
 
 /// The URL with these pairs added to its query.
 let add_query : :any -> Url -> Url;

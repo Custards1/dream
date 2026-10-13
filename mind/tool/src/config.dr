@@ -47,12 +47,12 @@ mapping Decl {
 let kind_of : :any -> Result Kind :string;
 let kind_of t =
     match [type_of t, t] {
-        [:string, "bool"] => Result.ok :bool,
-        [:string, "integer"] => Result.ok :integer,
-        [:string, "string"] => Result.ok :string,
-        [:list, []] => Result.error "a list of choices needs at least one",
-        [:list, cs] => if list.all (fn c -> type_of c == :string) cs { Result.ok [:choice, cs] }
-                       else { Result.error "a list of choices must be strings" },
+        [:string, "bool"] => ok :bool,
+        [:string, "integer"] => ok :integer,
+        [:string, "string"] => ok :string,
+        [:list, []] => err "a list of choices needs at least one",
+        [:list, cs] => if list.all (fn c -> type_of c == :string) cs { ok [:choice, cs] }
+                       else { err "a list of choices must be strings" },
         _ => Result.error ("`type` is \"bool\", \"integer\", \"string\", or a list of choices, not "
                       + toml.encode_value t),
     };
@@ -61,7 +61,7 @@ let kind_of t =
 let kind_words : Kind -> :string;
 let kind_words k =
     match k {
-        [:choice, cs] => "one of " + str.join_str ", " (list.map toml.quote cs),
+        [:choice, cs] => "one of " + str.join_str ", " (map toml.quote cs),
         :bool => "bool",
         :integer => "integer",
         _ => "string",
@@ -104,12 +104,14 @@ let declare name spec =
 /// Every declaration in a manifest's `[options]`, as `[decls, errors]`, the
 /// declarations a map of name to `Decl`.
 let declarations : %{ :string => :any } -> [%{ :string => :any }, [:string]];
-let declarations section =
-    list.fold (fn [ds, errs] [name, spec] ->
+let declarations section = {
+    let seed : [%{:string => :any}, [:string]] = [%{}, []];
+    fold (fn [ds, errs] [name, spec] ->
         match declare name spec {
             Result.ok(d) => [ds.[name => d], errs],
             Result.error(why) => [ds, list.append errs [why]],
-        }) [%{}, []] (map.pairs section);
+        }) seed (map.pairs section)
+};
 
 // --- values -----------------------------------------------------------------
 
@@ -121,12 +123,12 @@ let check decl v = {
     let wrong = Result.error ("`" + Decl.name decl + "` is " + kind_words (Decl.kind decl) + ", and "
                          + toml.encode_value v + " is not");
     match [Decl.kind decl, type_of v] {
-        [:bool, :bool] => Result.ok v,
-        [:bool, :string] => match v { "true" => Result.ok true, "false" => Result.ok false, _ => wrong },
-        [:integer, :integer] => Result.ok v,
-        [:integer, :string] => match num.parse_int v { () => wrong, n => Result.ok n },
-        [:string, :string] => Result.ok v,
-        [[:choice, cs], :string] => if list.contains v cs { Result.ok v } else { wrong },
+        [:bool, :bool] => ok v,
+        [:bool, :string] => match v { "true" => ok true, "false" => ok false, _ => wrong },
+        [:integer, :integer] => ok v,
+        [:integer, :string] => match num.parse_int v { () => wrong, n => ok n },
+        [:string, :string] => ok v,
+        [[:choice, cs], :string] => if list.contains v cs { ok v } else { wrong },
         _ => wrong,
     }
 };
@@ -155,7 +157,7 @@ let listing : %{ :string => :any } -> :string;
 let listing decls =
     match map.pairs decls {
         [] => "it declares no options",
-        pairs => "its options:\n" + str.join_str "\n" (list.map (fn [_, d] -> "  " + describe d)
+        pairs => "its options:\n" + str.join_str "\n" (map (fn [_, d] -> "  " + describe d)
                                                                 (list.sort_on (fn [n, _] -> n) pairs)),
     };
 
@@ -188,8 +190,9 @@ let split_scoped text = {
 /// defines` for the options they name. `[values, errors]`.
 let initial : %{ :string => :any } -> [:string] -> [%{ :string => :any }, [:string]];
 let initial decls defines = {
-    let defaults = list.fold (fn m [n, d] -> m.[n => Decl.default d]) (%{}) (map.pairs decls);
-    list.fold (fn [vs, errs] text -> {
+    let defaults = fold (fn m [n, d] -> m.[n => Decl.default d]) (%{}) (map.pairs decls);
+    let seed : [%{:string => :any}, [:string]] = [defaults, []];
+    fold (fn [vs, errs] text -> {
         let [name, raw] = split_define text;
         match decls.[name else ()] {
             () => [vs, errs],
@@ -198,7 +201,7 @@ let initial decls defines = {
                 Result.error(why) => [vs, list.append errs [why + " ([build] defines)"]],
             },
         }
-    }) [defaults, []] defines
+    }) seed defines
 };
 
 // --- conditions ---------------------------------------------------------------
@@ -215,7 +218,7 @@ let is_name_char c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '
 
 let rec lex_string cs acc =
     match cs {
-        [] => Result.error "a string in a condition is not closed",
+        [] => err "a string in a condition is not closed",
         ['"', ..rest] => [:ok, str.of_chars (list.reverse acc), rest],
         [c, ..rest] => lex_string rest (list.cons c acc),
     };
@@ -270,7 +273,7 @@ let rec parse_unary ts =
         },
         [:lparen, ..rest] => match parse_or rest {
             [:ok, e, [:rparen, ..more]] => [:ok, e, more],
-            [:ok, _, _] => Result.error "a `(` in the condition is not closed",
+            [:ok, _, _] => err "a `(` in the condition is not closed",
             e => e,
         },
         [[:name, "true"], ..rest] => [:ok, [:const, true], rest],
@@ -280,18 +283,18 @@ let rec parse_unary ts =
         [[:name, n], :eq, [:name, v], ..rest] => [:ok, [:equals, n, v], rest],
         [[:name, n], :ne, [:name, v], ..rest] => [:ok, [:not, [:equals, n, v]], rest],
         [[:name, n], ..rest] => [:ok, [:flag, n], rest],
-        [] => Result.error "the condition ends where a name was expected",
-        _ => Result.error "expected a name, `not` or `(` in the condition",
+        [] => err "the condition ends where a name was expected",
+        _ => err "expected a name, `not` or `(` in the condition",
     };
 
 /// A condition from its text, or why it is not one.
 let parse_condition : :string -> Result :any :string;
 let parse_condition text =
     match lex (str.chars text) [] {
-        Result.error(why) => Result.error why,
+        Result.error(why) => err why,
         Result.ok(ts) => match parse_or ts {
-            [:ok, cond, []] => Result.ok cond,
-            [:ok, _, _] => Result.error "the condition has more after its end",
+            [:ok, cond, []] => ok cond,
+            [:ok, _, _] => err "the condition has more after its end",
             e => e,
         },
     };
@@ -359,7 +362,7 @@ when test {
         test.case "an unknown type is refused"
             $( test.eq! :error (Result.tag (declare "n" (%{ "type" => "float" }))) ),
         test.case "text from -D is read as the kind asks"
-            $( test.eq! [Result.ok true, Result.ok 128, Result.ok "multi"]
+            $( test.eq! [ok true, ok 128, ok "multi"]
                         [check (decl_of "v" false) "true", check (decl_of "c" 64) "128",
                          check (decl_of "t" (%{ "type" => ["off", "multi"] })) "multi"] ),
         test.case "a choice outside the list is refused"
@@ -382,9 +385,9 @@ when test {
             $( test.eq! [:error, :error] [Result.tag (parse_condition "a b"), Result.tag (parse_condition "(a")] ),
         test.case "an option answers before the program's settings"
             $( test.eq! [false, true, true]
-                        [holds (fn n -> Result.ok false) (%{ "v" => true }) [:flag, "v"],
+                        [holds (fn n -> ok false) (%{ "v" => true }) [:flag, "v"],
                          holds none (%{ "v" => true }) [:flag, "v"],
-                         holds (fn n -> Result.ok 64) (%{}) [:equals, "c", "64"]] ),
+                         holds (fn n -> ok 64) (%{}) [:equals, "c", "64"]] ),
         test.case "a flag has no value to compare"
             $( test.false! (holds none (%{ "test" => true }) [:equals, "test", "true"]) ),
     ];

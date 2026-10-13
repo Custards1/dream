@@ -166,10 +166,10 @@ let stop_serving! listener = io.close! listener;
 priv let reply_bytes! : (:unit -> :any) -> :any -> :string;
 priv let reply_bytes! find! request = try! {
     match find! () {
-        () => strict! (wire.frame (Result.error "nothing is serving this listener now")),
+        () => strict! (wire.frame (err "nothing is serving this listener now")),
         pid => {
             let value = server.call! pid request;
-            strict! (wire.frame (Result.ok value))
+            strict! (wire.frame (ok value))
         },
     }
 } catch e { wire.frame (Result.error (error.describe e)) };
@@ -222,8 +222,8 @@ priv let accept_loop! : :any -> (:unit -> :any) -> :atom;
 priv let rec accept_loop! listener find! =
     match try! {
         let sock = net.accept! listener;
-        Result.ok sock
-    } catch e { Result.error e } {
+        ok sock
+    } catch e { err e } {
         Result.ok(sock) => {
             spawn! $( serve_connection! sock find! )
             accept_loop! listener find!
@@ -289,10 +289,10 @@ let try_call! : :any -> :any -> Result :any :any;
 let try_call! conn request = {
     streams.write_all! conn (wire.frame [:call, request])
     match next! conn {
-        () => Result.error "the connection ended before a reply arrived",
+        () => err "the connection ended before a reply arrived",
         Result.error(why) => Result.error ("cannot read the reply: " + to_string why),
-        Result.ok(Result.ok(value)) => Result.ok value,
-        Result.ok(Result.error(why)) => Result.error why,
+        Result.ok(Result.ok(value)) => ok value,
+        Result.ok(Result.error(why)) => err why,
         Result.ok(other) => Result.error ("not a reply: " + to_string other),
     }
 };
@@ -332,7 +332,7 @@ when test {
             [:get, k]    => reply (map.get :missing k state) state,
             [:put, k, v] => reply :ok (map.put k v state),
             :keys        => reply (map.sorted_keys state) state,
-            _            => reply (Result.error :unknown) state,
+            _            => reply (err :unknown) state,
         };
 
         let handle_cast! message state = match message {
@@ -433,14 +433,14 @@ when test {
         // must not be spelled the same: this arrives as a perfectly good reply
         // whose value happens to say no.
         test.case "a request the server refuses is still a reply"
-            $( test.eq! (Result.ok (Result.error :unknown)) (with_store! (fn port -> {
+            $( test.eq! (Result.ok (err :unknown)) (with_store! (fn port -> {
                    let c = here! port;
                    let r = try_call! c :nonsense;
                    close! c
                    r
                })) ),
         test.case "and reaches call! as the value it is"
-            $( test.eq! (Result.error :unknown) (with_store! (fn port -> {
+            $( test.eq! (err :unknown) (with_store! (fn port -> {
                    let c = here! port;
                    let r = call! c :nonsense;
                    close! c
@@ -474,7 +474,7 @@ when test {
             $( test.true! (with_store! (fn port -> {
                    let c = here! port;
                    close! c
-                   Result.is_error (try! { try_call! c :keys } catch e { Result.error e })
+                   Result.is_error (try! { try_call! c :keys } catch e { err e })
                })) ),
 
         // --- a server that is replaced underneath the listener ------------------

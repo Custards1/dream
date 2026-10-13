@@ -17,13 +17,14 @@ import std.list;
 ///
 /// Strict in each step, as `list.fold_strict` is: `std.seq` builds `sum`,
 /// `count` and the rest on this, and a lazy accumulator over a large array is
-/// a chain of suspensions as long as the array. The seed is handed to `f`
-/// unforced, and only what `f` answers is forced.
+/// a chain of suspensions as long as the array. The seed is forced before the
+/// first element is taken, as `list.fold` forces it; `fold_lazy` keeps it
+/// unforced.
 let fold : (b -> a -> b) -> b -> #[a] -> b;
 let fold f init xs = {
     let n = len xs;
     let rec go i !acc = if i >= n { acc } else { go (i + 1) (f acc (xs.[i])) };
-    if n == 0 { init } else { go 1 (f init (xs.[0])) }
+    if n == 0 { init } else { go 0 init }
 };
 
 /// A left fold whose accumulator steps remain suspended until needed.

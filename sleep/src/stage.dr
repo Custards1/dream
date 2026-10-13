@@ -41,7 +41,7 @@ let name s = match s { Stage.wake => "Wake", Stage.n1 => "N1", Stage.n2 => "N2",
 
 /// The stage named `text`, in any case (`"rem"`, `"N3"`), or `()`.
 let parse : :string -> (Stage | :unit);
-let parse text = list.first_or () (list.filter (fn s -> str.lower (name s) == str.lower text) all);
+let parse text = list.first_or () (filter (fn s -> str.lower (name s) == str.lower text) all);
 
 /// Every epoch is thirty seconds.
 let epoch_seconds : :integer;

@@ -293,7 +293,7 @@ let finalize! l mi en low2 r2 funcs2 globals2 source image = {
             |> ir.Program.set_entry (lower.find_entry l r2)
             |> ir.Program.set_module_name (list.nth 1 named)
             |> ir.Program.set_source_name (list.nth 1 sourced);
-    if write_file! image (emit.to_binary (ir.finish p)) { Result.ok image }
+    if write_file! image (emit.to_binary (ir.finish p)) { ok image }
     else { Result.error ("dreams: cannot write " + image) }
 };
 
@@ -304,7 +304,7 @@ let boot! roots cfg source image text base_text engine base = {
     let l = expansion.expand! (modules.load! source roots cfg false);
     let mi = modules.module_count l - 1;
     let state_deps =
-        list.fold (fn acc i -> scope.declare_module l i acc)
+        fold (fn acc i -> scope.declare_module l i acc)
                   scope.state (list.range 0 mi);
     let part = entry_partition (modules.module_items (modules.module_at l mi)) 0;
     let slice = list.head part;
@@ -324,11 +324,11 @@ let boot! roots cfg source image text base_text engine base = {
     let pre_ = pre scope.state r0 low0 (scope.next_global state_deps) [] [] [] [] true;
     match compile_slice! l mi state1 pre_ (list.length slice)
                          base_text source {
-        Result.error(msg) => [Result.error msg, engine, base],
+        Result.error(msg) => [err msg, engine, base],
         Result.ok(en) =>
             match main_step! l mi main_item en source image {
-                Result.error(msg) => [Result.error msg, engine, base],
-                Result.ok(img) => [Result.ok img, en, engine_base en],
+                Result.error(msg) => [err msg, engine, base],
+                Result.ok(img) => [ok img, en, engine_base en],
             },
     }
 };
@@ -347,11 +347,11 @@ let proceed! source image items engine base_text base = {
                     (engine_imports engine) (engine_modules engine) false;
     match compile_slice! l mi state1 pre_
                          (base + list.length slice) base_text source {
-        Result.error(msg) => [Result.error msg, engine, base],
+        Result.error(msg) => [err msg, engine, base],
         Result.ok(en) =>
             match main_step! l mi main_item en source image {
-                Result.error(msg) => [Result.error msg, engine, base],
-                Result.ok(img) => [Result.ok img, en, engine_base en],
+                Result.error(msg) => [err msg, engine, base],
+                Result.ok(img) => [ok img, en, engine_base en],
             },
     }
 };
@@ -363,7 +363,7 @@ let fresh_build! roots cfg source image text engine base = {
     let b = compile.build! (expansion.expand! (modules.load! source roots cfg false))
                            compile.scratch;
     if not (compile.ok b) { [Result.error (as_session source (compile.rendered b)), engine, base] }
-    else if write_file! image (compile.bytes b) { [Result.ok image, (), 0] }
+    else if write_file! image (compile.bytes b) { [ok image, (), 0] }
     else { [Result.error ("dreams: cannot write " + image), engine, base] }
 };
 

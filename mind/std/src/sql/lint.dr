@@ -215,10 +215,10 @@ let lint tokens several positional = lint_as true tokens several positional;
 /// that the statement around it closes.
 let lint_as : :bool -> [:any] -> :bool -> :bool -> :any;
 let lint_as whole tokens several positional = {
-    let errors = list.filter (fn t -> t.[0] == :error) tokens;
+    let errors = filter (fn t -> t.[0] == :error) tokens;
     let splices = list.any (fn t -> t.[0] == :placeholder && str.starts_with ".." t.[1]) tokens;
-    let positionals = list.filter (fn t -> t.[0] == :positional) tokens;
-    let code = list.filter (fn t -> not (t.[0] == :code && str.trim t.[1] == "") && not (is_comment t)) tokens;
+    let positionals = filter (fn t -> t.[0] == :positional) tokens;
+    let code = filter (fn t -> not (t.[0] == :code && str.trim t.[1] == "") && not (is_comment t)) tokens;
     match [errors, code] {
         [[[:error, message], .._], _] => message,
         [_, []] if whole => "the statement is empty",
@@ -253,13 +253,13 @@ priv let rec balance tokens !depth = match tokens {
 /// unless `several` there must be only one, though it may end with `;`.
 priv let statements : [:any] -> :bool -> :any;
 priv let statements code several = {
-    let pieces = list.filter (fn p -> not (list.is_empty p)) (split_statements code [] []);
+    let pieces = filter (fn p -> not (list.is_empty p)) (split_statements code [] []);
     match pieces {
         [] => "the statement is empty",
         [_, _, .._] if not several =>
             "this is " + to_string (len pieces) + " statements, and a query is one;"
             + " several in one string are a script",
-        _ => match list.filter_map first_word_problem pieces {
+        _ => match filter_map first_word_problem pieces {
             [] => (),
             [message, .._] => message,
         },

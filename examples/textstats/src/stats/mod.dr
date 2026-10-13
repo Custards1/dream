@@ -26,7 +26,7 @@ let median xs = {
 /// starts with `(` does not continue the previous one.
 let longest words = {
     let better best w = if best == () || str.length w > str.length best { w } else { best };
-    list.fold better () words
+    fold better () words
 };
 
 /// A one-line summary of a list of word lengths.

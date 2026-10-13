@@ -39,7 +39,7 @@ let main! = {
     let scores = ml.evaluate fitted test;
     console.print! ("test accuracy " + ml.fixed 2 scores.["accuracy"])
     console.print! (list.take 8 (ml.classify fitted (data.x test)))
-    console.print! (list.take 8 (list.map num.to_int (tensor.to_list (data.y test))))
+    console.print! (list.take 8 (map num.to_int (tensor.to_list (data.y test))))
     console.print! (metrics.confusion 3 (ml.predict fitted (data.x test)) (data.y test))
 
     // A regression: the best fit of noisy linear data, scored by r2.
@@ -57,6 +57,6 @@ let main! = {
 
     // Parameters are a tree of tensors, read and changed as data.
     let p = ml.params fitted;
-    console.print! (list.map (fn [path, t] -> [path, tensor.shape t]) (tree.paths p))
+    console.print! (map (fn [path, t] -> [path, tensor.shape t]) (tree.paths p))
     console.print! (tree.size p)
 };

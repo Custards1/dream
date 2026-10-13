@@ -648,7 +648,7 @@ let show_node img i n = {
                             + to_string (node_c n) + "]",
             :set_many    => to_string (node_a n) + "[kids@" + to_string (node_b n)
                             + "x" + to_string (node_c n) + "]",
-            _ => str.join_str " " (list.filter (fn x -> x != "")
+            _ => str.join_str " " (filter (fn x -> x != "")
                      (list.map (fn e -> if is_node e { to_string e } else { "" })
                                [node_a n, node_b n, node_c n])),
         };

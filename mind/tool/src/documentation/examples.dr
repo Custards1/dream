@@ -51,6 +51,7 @@ let runs : :string -> :bool;
 let runs language = language == "dream" || language == "dr";
 
 /// Every runnable example in Markdown `text`, as `[code, expected to fail]`.
+let found : [:string] -> [[:string, :bool]];
 let rec found lines = match lines {
     [] => [],
     [line, ..rest] => {
@@ -69,7 +70,7 @@ let rec found lines = match lines {
 /// The example's page and its first line of substance, to find it by.
 let describe : :string -> :string -> :string;
 let describe page code = {
-    let line = list.first_or "" (list.filter (fn l -> not (str.is_blank l) && not (str.starts_with "import " (str.trim l))) (str.lines code));
+    let line = list.first_or "" (filter (fn l -> not (str.is_blank l) && not (str.starts_with "import " (str.trim l))) (str.lines code));
     page + ": " + str.truncate 70 (str.trim line)
 };
 
@@ -109,16 +110,16 @@ let run! ctx code = try! {
 /// distinct example's `[html, clean]` by its code, and a line for each example
 /// whose outcome is not the one its fence promises.
 let run_all! ctx jobs sources = {
-    let wanted = list.flat_map (fn [page, text, m] ->
-        list.map (fn [code, fails] -> [page, code, fails, m]) (found (str.split "\n" text))) sources;
+    let wanted = flat_map (fn [page, text, m] ->
+        map (fn [code, fails] -> [page, code, fails, m]) (found (str.split "\n" text))) sources;
     let distinct = list.unique_on (fn w -> list.nth 1 w) wanted;
     let bar = progress.start! "examples" (list.length distinct);
     progress.show! bar 0 ""
     let answers = proc.map_reporting! jobs (fn k -> progress.show! bar k "")
                                       (fn [_, code, _, m] -> run! ctx.[:manifest => m] code) distinct;
     progress.finish! bar
-    let results = map.from_pairs (list.zip (list.map (fn w -> list.nth 1 w) distinct) answers);
-    let unexpected = list.flat_map (fn [page, code, fails, _] -> match [list.nth 1 results.[code], fails] {
+    let results = map.from_pairs (list.zip (map (fn w -> list.nth 1 w) distinct) answers);
+    let unexpected = flat_map (fn [page, code, fails, _] -> match [list.nth 1 results.[code], fails] {
         [false, false] => [describe page code + " (failed)"],
         [true, true] => [describe page code + " (marked `fails` but ran cleanly)"],
         _ => [],

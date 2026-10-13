@@ -1346,10 +1346,11 @@ an explicit spelling such as `Result.map` or `array.map`. There is no runtime
 type dispatch. Local definitions, enclosing definitions, and explicit selective
 imports take precedence over shorthand. Qualified calls keep their meaning.
 
-`list.fold`, `array.fold`, and `map.fold` force each accumulator step to its
-outer value by default, keeping accumulator contents lazy and passing the
-initial seed unforced to the first callback. Use `fold_lazy` when later steps
-must be able to discard earlier computations. `list.fold_strict` remains a
+`list.fold`, `array.fold`, and `map.fold` force each accumulator to its outer
+value before taking the next element -- the seed too, when there is an element
+to take -- keeping accumulator contents lazy. Use `fold_lazy` when the seed or
+a later step must be able to be discarded without being computed. A fold the
+compiler writes as a loop (deforestation) keeps exactly this order. `list.fold_strict` remains a
 compatible spelling for `list.fold`.
 
 `and other self` continues with `other` when `self` succeeded or is present,

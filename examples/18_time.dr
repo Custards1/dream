@@ -19,11 +19,11 @@ let main! = {
     let later = launch + 90 * time.minute + time.seconds 1.5;
     console.print! (time.rfc3339 later)
     console.print! (time.format_duration (later - launch))
-    console.print! (time.parse_duration "2h45m" |> Result.map time.to_hours)
+    console.print! (time.parse_duration "2h45m" |> map time.to_hours)
 
     // Central Europe, from its rule. The clocks go forward at 02:00 on the
     // last Sunday of March -- which, in 2026, falls between those two instants.
-    let berlin = Result.unwrap_or time.utc (time.posix_zone "CET-1CEST,M3.5.0,M10.5.0/3");
+    let berlin = unwrap_or time.utc (time.posix_zone "CET-1CEST,M3.5.0,M10.5.0/3");
     console.print! (time.format "%a %d %b %Y %H:%M %Z" (time.in_zone berlin launch))
     console.print! (time.format "%a %d %b %Y %H:%M %Z" (time.in_zone berlin later))
 
@@ -36,12 +36,12 @@ let main! = {
     console.print! (time.format_duration (time.between breakfast (time.localize berlin (time.add_days 1 breakfast))))
 
     // A month after January 31st is the last day of February.
-    console.print! (list.map (fn n -> time.date_text (time.add_months n (time.date 2028 1 31))) [1, 2, 3])
+    console.print! (map (fn n -> time.date_text (time.add_months n (time.date 2028 1 31))) [1, 2, 3])
 
     // Reading times back: RFC 3339, HTTP's format, and a pattern of your own.
-    console.print! (time.parse_rfc3339 "2026-03-29T01:00:00+01:00" |> Result.map time.rfc3339)
+    console.print! (time.parse_rfc3339 "2026-03-29T01:00:00+01:00" |> map time.rfc3339)
     console.print! (time.http_date launch)
-    console.print! (time.parse "%d/%m/%Y %H:%M" "28/03/2026 23:30" |> Result.map time.datetime_text)
+    console.print! (time.parse "%d/%m/%Y %H:%M" "28/03/2026 23:30" |> map time.datetime_text)
     console.print! (time.parse "%d/%m/%Y" "31/02/2026")
 
     // For people.

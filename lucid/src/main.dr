@@ -132,13 +132,14 @@ let character_of p = ((position_of p)).["character" else 0];
 /// problems, because that is how a diagnostic is *withdrawn*: a server that
 /// sends only what is broken leaves the last set of squiggles on screen after
 /// the code is fixed.
+let publish! : :any -> [[:string, [:map]]] -> :string -> :any;
 let publish! out groups path = {
-    let mentioned = list.map (fn g -> list.head g) groups;
+    let mentioned = map (fn g -> list.head g) groups;
     let send! p ds =
         rpc.write_message! out
             (rpc.notification "textDocument/publishDiagnostics"
                  %{ "uri" => analysis.path_to_uri p, "diagnostics" => ds });
-    list.map (fn g -> send! (list.head g) (list.nth 1 g)) groups |> strict!
+    map (fn g -> send! (list.head g) (list.nth 1 g)) groups |> strict!
     if list.contains path mentioned { () } else { send! path [] }
 };
 
@@ -149,7 +150,7 @@ let refresh! : :any -> :map -> :string -> :map;
 let refresh! out s path = {
     if path == "" { () }
     else {
-        list.map (fn p -> send! s.[:worker] [:check, snapshot s p]) (map.keys (docs s)) |> strict!
+        map (fn p -> send! s.[:worker] [:check, snapshot s p]) (map.keys (docs s)) |> strict!
     }
     s
 };
@@ -187,11 +188,11 @@ let capabilities =
 /// The workspace root, as a package search path. An editor opens a directory,
 /// and that directory is where this project's packages are.
 let roots_from p = {
-    let folders = p.["workspaceFolders" else ()];
+    let folders : [:map] | :unit = p.["workspaceFolders" else ()];
     let from_folders =
         match folders {
             () => [],
-            fs => list.map (fn f -> analysis.uri_to_path (f.["uri" else ""])) fs,
+            fs => map (fn f -> analysis.uri_to_path (f.["uri" else ""])) fs,
         };
     match p.["rootUri" else ()] {
         () => from_folders,
@@ -365,7 +366,7 @@ let rec events! out !s = match recv! () {
         let why = match outcome { Result.error(e) => error.describe e, other => to_string other };
         rpc.write_message! out (rpc.notification "window/logMessage"
             %{ "type" => 1, "message" => "Lucid background worker stopped: " + why })
-        list.map (fn id -> rpc.write_message! out
+        map (fn id -> rpc.write_message! out
             (rpc.error_response id (0 - 32803) why)) (map.keys (s.[:pending else (%{})])) |> strict!
         let owner = self! ();
         strict! owner

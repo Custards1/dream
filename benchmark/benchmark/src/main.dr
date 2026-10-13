@@ -32,9 +32,9 @@ import std.str;
 // --- the workloads ----------------------------------------------------------
 //
 // `fib` and `collatz_steps` are classic recursion. `sum`, `pi` and `mapfilter`
-// fold over a `range`: `list.fold_strict`, not `list.fold`, because a plain
-// fold sits on a chain of suspended accumulators and forces it all at the end
-// (see the note above `fold_strict` in mind/std/src/list.dr). `strbuild` builds a
+// fold over a `range`: `list.fold` forces each accumulator step, avoiding a
+// chain of suspended accumulators (see `fold_lazy` in mind/std/src/list.dr).
+// `strbuild` builds a
 // string the linear way (`_str_concat` copies each piece once) and reports
 // its length, so the result is a small integer and the 2.4 MB string is not
 // printed.
@@ -46,7 +46,7 @@ let rec collatz_steps n =
         1 + collatz_steps (if n % 2 == 0 { n / 2 } else { 3 * n + 1 })
     };
 
-let fold = list.fold_strict;
+let fold = list.fold;
 
 let collatz_total n = fold
     (fn acc x -> acc + collatz_steps x)
@@ -101,9 +101,9 @@ let rec scan_bytes s i n acc =
 let bytescan n = scan_bytes scan_text 0 n 0;
 
 let mapfilter n = {
-    let squares = list.map (fn x -> x * x) (list.range 1 (n + 1));
-    let odds = list.filter (fn x -> x % 2 == 1) squares;
-    list.fold_strict (fn acc x -> acc + x) 0 odds
+    let squares = map (fn x -> x * x) (list.range 1 (n + 1));
+    let odds = filter (fn x -> x % 2 == 1) squares;
+    list.fold (fn acc x -> acc + x) 0 odds
 };
 
 let fib_n = 32;

@@ -70,10 +70,10 @@ group Entry { tag : :integer, kind : :integer, count : :integer, data : :string,
 
 let entry : :integer -> Value -> Entry;
 let entry tag v = match v {
-    Value.int16s(xs) => Entry.make tag 3 (list.length xs) (str.concat_all (list.map (fn n -> str.of_int_be 2 n) xs)) 2,
-    Value.int32s(xs) => Entry.make tag 4 (list.length xs) (str.concat_all (list.map (fn n -> str.of_int_be 4 n) xs)) 4,
+    Value.int16s(xs) => Entry.make tag 3 (list.length xs) (str.concat_all (map (fn n -> str.of_int_be 2 n) xs)) 2,
+    Value.int32s(xs) => Entry.make tag 4 (list.length xs) (str.concat_all (map (fn n -> str.of_int_be 4 n) xs)) 4,
     Value.string(s) => Entry.make tag 6 1 (s + "\0") 1,
-    Value.strings(xs) => Entry.make tag 8 (list.length xs) (str.concat_all (list.map (fn s -> s + "\0") xs)) 1,
+    Value.strings(xs) => Entry.make tag 8 (list.length xs) (str.concat_all (map (fn s -> s + "\0") xs)) 1,
     Value.i18n(s) => Entry.make tag 9 1 (s + "\0") 1,
     Value.bin(b) => Entry.make tag 7 (str.byte_length b) b 1,
 };
@@ -93,14 +93,14 @@ let header region entries = {
         let at = offset + bytes.padding (Entry.align e) offset;
         [at + str.byte_length (Entry.data e), [at - offset, at, e] :: placed]
     };
-    let [store_size, placements] = list.fold place [0, []] sorted;
+    let [store_size, placements] = fold place [0, []] sorted;
     let laid = list.reverse placements;
     let count = list.length sorted + 1;
     let index_entry = fn tag kind offset n -> str.of_int_be 4 tag + str.of_int_be 4 kind + str.of_int_be 4 offset + str.of_int_be 4 n;
     let trailer = index_entry region 7 (0 - count * 16) 16;
-    let store = str.concat_all (list.map (fn [gap, _, e] -> bytes.zeros gap + Entry.data e) laid) + trailer;
+    let store = str.concat_all (map (fn [gap, _, e] -> bytes.zeros gap + Entry.data e) laid) + trailer;
     let index = index_entry region 7 store_size 16
-                + str.concat_all (list.map (fn [_, at, e] -> index_entry (Entry.tag e) (Entry.kind e) at (Entry.count e)) laid);
+                + str.concat_all (map (fn [_, at, e] -> index_entry (Entry.tag e) (Entry.kind e) at (Entry.count e)) laid);
     str.of_bytes [142, 173, 232, 1] + bytes.zeros 4 + str.of_int_be 4 count + str.of_int_be 4 (str.byte_length store) + index + store
 };
 
@@ -122,8 +122,8 @@ let lead sp = {
 let entries_of : Layout -> [[:integer, Item]];
 let entries_of lay = {
     let items = Layout.items lay;
-    let dirs = list.map (fn d -> item.Item.dir d item.executable) (layout.owned items);
-    list.enumerate (list.sort_on item.path (items + dirs)) |> list.map (fn [n, i] -> [n + 1, i])
+    let dirs = map (fn d -> item.Item.dir d item.executable) (layout.owned items);
+    list.enumerate (list.sort_on item.path (items + dirs)) |> map (fn [n, i] -> [n + 1, i])
 };
 
 /// `usr/bin/x` as rpm stores it: the directory `/usr/bin/` and the name `x`.
@@ -137,29 +137,29 @@ let split_path path = {
 /// The file tags, from the files in the order the payload holds them.
 let file_tags! : Layout -> [[:integer, Item]] -> [Entry];
 let file_tags! lay listed = {
-    let items = list.map (fn m -> m.[1]) listed;
+    let items = map (fn m -> m.[1]) listed;
     let config = map.set_of (Layout.config lay);
-    let split = list.map (fn i -> split_path (item.path i)) items;
-    let dirnames = list.unique (list.map (fn s -> list.head s) split);
-    let dir_index = map.from_pairs (list.map (fn [n, d] -> [d, n]) (list.enumerate dirnames));
+    let split = map (fn i -> split_path (item.path i)) items;
+    let dirnames = list.unique (map (fn s -> list.head s) split);
+    let dir_index = map.from_pairs (map (fn [n, d] -> [d, n]) (list.enumerate dirnames));
     let n = list.length items;
-    let digests = list.map (fn i -> match i { item.Item.file(_, _, source, _) => io.digest! source, _ => "" }) items;
+    let digests = map (fn i -> match i { item.Item.file(_, _, source, _) => io.digest! source, _ => "" }) items;
     strict! digests
-    [entry 1028 (Value.int32s (list.map (fn i -> match i { item.Item.dir(_, _) => 4096, _ => item.size i }) items)),
-     entry 1030 (Value.int16s (list.map (fn i -> cpio.type_bits i + item.mode i % 4096) items)),
+    [entry 1028 (Value.int32s (map (fn i -> match i { item.Item.dir(_, _) => 4096, _ => item.size i }) items)),
+     entry 1030 (Value.int16s (map (fn i -> cpio.type_bits i + item.mode i % 4096) items)),
      entry 1033 (Value.int16s (list.replicate n 0)),
      entry 1034 (Value.int32s (list.replicate n (Layout.epoch lay))),
      entry 1035 (Value.strings digests),
-     entry 1036 (Value.strings (list.map (fn i -> match i { item.Item.link(_, t) => t, _ => "" }) items)),
-     entry 1037 (Value.int32s (list.map (fn i -> if map.member (item.path i) config { 17 } else { 0 }) items)),
+     entry 1036 (Value.strings (map (fn i -> match i { item.Item.link(_, t) => t, _ => "" }) items)),
+     entry 1037 (Value.int32s (map (fn i -> if map.member (item.path i) config { 17 } else { 0 }) items)),
      entry 1039 (Value.strings (list.replicate n "root")),
      entry 1040 (Value.strings (list.replicate n "root")),
      entry 1045 (Value.int32s (list.replicate n (0 - 1))),
      entry 1095 (Value.int32s (list.replicate n 1)),
-     entry 1096 (Value.int32s (list.map (fn m -> list.head m) listed)),
+     entry 1096 (Value.int32s (map (fn m -> list.head m) listed)),
      entry 1097 (Value.strings (list.replicate n "")),
-     entry 1116 (Value.int32s (list.map (fn s -> dir_index.[list.head s]) split)),
-     entry 1117 (Value.strings (list.map (fn s -> s.[1]) split)),
+     entry 1116 (Value.int32s (map (fn s -> dir_index.[list.head s]) split)),
+     entry 1117 (Value.strings (map (fn s -> s.[1]) split)),
      entry 1118 (Value.strings dirnames),
      int32 5011 8]
 };
@@ -195,9 +195,9 @@ let as_triple d = [deps.Dep.name d, deps.rpm_flags (deps.Dep.op d), deps.Dep.ver
 let relation : :integer -> :integer -> :integer -> [[:string, :integer, :string]] -> [Entry];
 let relation names flags versions ds = match ds {
     [] => [],
-    _ => [entry names (Value.strings (list.map (fn d -> d.[0]) ds)),
-          entry flags (Value.int32s (list.map (fn d -> d.[1]) ds)),
-          entry versions (Value.strings (list.map (fn d -> d.[2]) ds))],
+    _ => [entry names (Value.strings (map (fn d -> d.[0]) ds)),
+          entry flags (Value.int32s (map (fn d -> d.[1]) ds)),
+          entry versions (Value.strings (map (fn d -> d.[2]) ds))],
 };
 
 let relations : Spec -> compress.Compression -> Result [Entry] :string;
@@ -206,14 +206,14 @@ let relations sp c = {
     let? provides = deps.parse_all (spec.strings sp "rpm" "provides");
     let? conflicts = deps.parse_all (spec.strings sp "rpm" "conflicts");
     let? obsoletes = deps.parse_all (spec.strings sp "rpm" "replaces");
-    let shells = list.flat_map (fn [hook, _, _, flag] -> match (Spec.scripts sp).[hook else ()] {
+    let shells = flat_map (fn [hook, _, _, flag] -> match (Spec.scripts sp).[hook else ()] {
         () => [],
         _ => [["/bin/sh", interp + flag, ""]],
     }) script_tags;
-    Result.ok (relation 1049 1048 1050 (list.map as_triple needs + shells + rpmlib_needs c)
-          + relation 1047 1112 1113 ([Spec.name sp, 8, spec.full_version sp] :: list.map as_triple provides)
-          + relation 1054 1053 1055 (list.map as_triple conflicts)
-          + relation 1090 1114 1115 (list.map as_triple obsoletes))
+    Result.ok (relation 1049 1048 1050 (map as_triple needs + shells + rpmlib_needs c)
+          + relation 1047 1112 1113 ([Spec.name sp, 8, spec.full_version sp] :: map as_triple provides)
+          + relation 1054 1053 1055 (map as_triple conflicts)
+          + relation 1090 1114 1115 (map as_triple obsoletes))
 };
 
 // --- the package --------------------------------------------------------------------
@@ -224,7 +224,7 @@ let file_name sp = Spec.name sp + "-" + spec.full_version sp + "." + platform.rp
 /// Everything about the package but its files.
 let package_tags : Spec -> Layout -> compress.Compression -> :string -> [Entry];
 let package_tags sp lay c payload_digest = {
-    let scripts = list.flat_map (fn [hook, body_tag, prog_tag, _] -> match (Spec.scripts sp).[hook else ()] {
+    let scripts = flat_map (fn [hook, body_tag, prog_tag, _] -> match (Spec.scripts sp).[hook else ()] {
         () => [],
         body => [string body_tag body, entry prog_tag (Value.strings ["/bin/sh"])],
     }) script_tags;
@@ -262,7 +262,7 @@ let build! sp lay c deps_tags dir dest = {
     let listed = entries_of lay;
     let payload = dir + "/payload.cpio";
     let h = io.open! payload :write;
-    cpio.write! h (Layout.epoch lay) (list.map (fn [n, i] -> [n, item.renamed (fn p -> "./" + p) i]) listed)
+    cpio.write! h (Layout.epoch lay) (map (fn [n, i] -> [n, item.renamed (fn p -> "./" + p) i]) listed)
     io.close! h
     let cpio_size = out.size_of! payload;
     let? packed = compress.file! c payload;
@@ -279,7 +279,7 @@ let build! sp lay c deps_tags dir dest = {
     io.close! w
     let target = dest + "/" + file_name sp;
     scratch.place! made target
-    Result.ok target
+    ok target
 };
 
 /// Make the package in `out`, answering its path.

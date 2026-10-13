@@ -62,9 +62,9 @@ priv let build_tree codes = {
             };
         walk 0 (bits - 1) nodes count
     };
-    let numbered = list.map (fn [i, [code, bits]] -> [i, code, bits]) (list.enumerate codes);
-    let [nodes, count] = list.fold insert [%{ 0 => [-1, -1, -1] }, 1] numbered;
-    array.of_list (list.map (fn i -> array.of_list (nodes.[i])) (list.range 0 count))
+    let numbered = map (fn [i, [code, bits]] -> [i, code, bits]) (list.enumerate codes);
+    let [nodes, count] = fold insert [%{ 0 => [-1, -1, -1] }, 1] numbered;
+    array.of_list (map (fn i -> array.of_list (nodes.[i])) (list.range 0 count))
 };
 
 /// Compute two raised to a nonnegative exponent.
@@ -73,9 +73,9 @@ priv let rec pow2 k = if k <= 0 { 1 } else { 2 * pow2 (k - 1) };
 
 /// "name\0value" to the static index, and name to the first index with it.
 priv let static_pairs : :map;
-priv let static_pairs = comp map.from_pairs (list.reverse (list.map (fn i -> [static_entries.[i].[0] + "\u{0}" + static_entries.[i].[1], i + 1]) (list.range 0 61)));
+priv let static_pairs = comp map.from_pairs (list.reverse (map (fn i -> [static_entries.[i].[0] + "\u{0}" + static_entries.[i].[1], i + 1]) (list.range 0 61)));
 priv let static_names : :map;
-priv let static_names = comp map.from_pairs (list.reverse (list.map (fn i -> [static_entries.[i].[0], i + 1]) (list.range 0 61)));
+priv let static_names = comp map.from_pairs (list.reverse (map (fn i -> [static_entries.[i].[0], i + 1]) (list.range 0 61)));
 
 // --- integers and strings ----------------------------------------------------------------
 
@@ -189,29 +189,29 @@ let decode d block = decode_from d block 0 [];
 /// Decode header representations from an offset, updating the dynamic table.
 priv let decode_from : Decoder -> :string -> :integer -> [[:string]] -> Result :any :string;
 priv let rec decode_from d s at acc =
-    if at >= len s { Result.ok [list.reverse acc, d] }
+    if at >= len s { ok [list.reverse acc, d] }
     else {
         let b = str.byte at s;
         if b >= 128 {
             match read_int s at 7 {
-                () => Result.error "a header block cut short",
-                [0, _] => Result.error "index 0 is not a header",
+                () => err "a header block cut short",
+                [0, _] => err "index 0 is not a header",
                 [i, next] => match entry d i { () => Result.error ("no header at index " + to_string i), h => decode_from d s next (h :: acc) },
             }
         } else if b >= 64 {
             match literal_field d s at 6 {
-                () => Result.error "a malformed literal",
+                () => err "a malformed literal",
                 [[name, value], next] => decode_from (add d name value) s next ([name, value] :: acc),
             }
         } else if b >= 32 {
             match read_int s at 5 {
-                () => Result.error "a header block cut short",
-                [n, next] => if n > Decoder.max d { Result.error "a table size larger than this end allowed" }
+                () => err "a header block cut short",
+                [n, next] => if n > Decoder.max d { err "a table size larger than this end allowed" }
                              else { decode_from (resize d n) s next acc },
             }
         } else {
             match literal_field d s at 4 {
-                () => Result.error "a malformed literal",
+                () => err "a malformed literal",
                 [h, next] => decode_from d s next (h :: acc),
             }
         }
@@ -267,7 +267,7 @@ priv let evict d =
 
 /// Headers as a block. Names must already be lower case, as HTTP/2 requires.
 let encode : [[:string]] -> :string;
-let encode headers = str.concat_all (list.map encode_one headers);
+let encode headers = str.concat_all (map encode_one headers);
 
 /// Encode one name/value header pair as HPACK bytes.
 priv let encode_one : [:string] -> :string;
@@ -311,7 +311,7 @@ when test {
             (decode_all (decoder 4096) vectors) ),
         test.case "what this encodes decodes" $( {
             let hs = [[":status", "200"], ["content-type", "text/html"], ["x-thing", "caf\u{e9}"], [":path", "/"]];
-            test.eq! (Result.ok hs) (Result.map (fn [got, _] -> got) (decode (decoder 4096) (encode hs)))
+            test.eq! (ok hs) (Result.map (fn [got, _] -> got) (decode (decoder 4096) (encode hs)))
         } ),
         test.case "static hits are one byte" $( test.eq! [1, 1] [len (encode [[":method", "GET"]]), len (encode [[":status", "404"]])] ),
         test.case "the table evicts its oldest" $( {

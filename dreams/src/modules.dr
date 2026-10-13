@@ -73,8 +73,8 @@ mapping Module {
 
 let loaded : :string -> :string -> :integer -> [ast.Decl] -> Module;
 let loaded name path source items =
-    Module.make name path source (list.filter (fn item -> ast.kind item != :private) items)
-                (list.map ast.span (list.filter (fn item -> ast.kind item == :private) items)) ();
+    Module.make name path source (filter (fn item -> ast.kind item != :private) items)
+                (map ast.span (filter (fn item -> ast.kind item == :private) items)) ();
 
 let with_new_items : Module -> [ast.Decl] -> Module;
 let with_new_items m items = Module.set_items items m;
@@ -171,7 +171,7 @@ let loader packages cfg search_paths host_modules = {
 /// names none of them.
 let scoped_config : package.Packages -> config.Configuration -> [:any];
 let scoped_config ps cfg = {
-    let aliases = list.fold (fn m [n, i] -> m.[n => package.name (package.at ps i)])
+    let aliases = fold (fn m [n, i] -> m.[n => package.name (package.at ps i)])
                             (%{}) (map.pairs (package.by_name ps));
     config.with_aliases aliases (fn k -> package.find ps k != ()) cfg
 };
@@ -204,7 +204,7 @@ let host_modules l = Loader.host_modules l;
 /// comes from is keyed by index -- so ask `module_count` when the count is all
 /// that is wanted, which is what nearly every caller wanted.
 let modules : Loader -> [Module];
-let modules l      = list.map (fn i -> module_at l i) (list.range 0 (module_count l));
+let modules l      = map (fn i -> module_at l i) (list.range 0 (module_count l));
 let module_map : Loader -> %{:integer => Module};
 let module_map l   = Loader.modules l;
 let module_count : Loader -> :integer;
@@ -219,7 +219,7 @@ let by_path l      = Loader.by_path l;
 /// say. Every other reader knows the index it wants -- a diagnostic carries
 /// one -- and asks `file_at`.
 let files : Loader -> [:any];
-let files l        = list.map (fn i -> file_at l i) (list.range 0 (file_count l));
+let files l        = map (fn i -> file_at l i) (list.range 0 (file_count l));
 let file_map : Loader -> %{:integer => diag.Source};
 let file_map l     = Loader.files l;
 let file_count : Loader -> :integer;
@@ -286,7 +286,7 @@ let records l      = Loader.records l;
 /// Every setting a `when` condition read while loading, taken or not, as a
 /// set. What pins an image to the platform it was compiled for.
 let reads : Loader -> [:string];
-let reads l        = map.pairs (Loader.reads l) |> list.map (fn [k, _] -> k) |> list.sort;
+let reads l        = map.pairs (Loader.reads l) |> map (fn [k, _] -> k) |> list.sort;
 
 /// `[owner, name, library, entries, span]` for each `foreign` declaration,
 /// as the parser left it (`ast.foreign_d`). `note_foreigns` adds to this, for
@@ -373,7 +373,7 @@ let set_module mi m l = Loader.set_modules ((module_map l).[mi => m]) l;
 /// to rebuild the whole list.
 let map_modules : (Module -> Module) -> Loader -> Loader;
 let map_modules f l =
-    Loader.set_modules (list.fold (fn acc i -> acc.[i => f (module_at l i)])
+    Loader.set_modules (fold (fn acc i -> acc.[i => f (module_at l i)])
                             (module_map l) (list.range 0 (module_count l))) l;
 
 /// Is this path provided by the runtime rather than by Dream source?
@@ -415,7 +415,7 @@ let is_loading l name = list.contains name (in_progress l);
 // --- resolving a name to a file ----------------------------------------------
 
 let dotted_segments : :string -> [:string];
-let dotted_segments p = list.filter (fn s -> not (str.is_empty s)) (str.split "." p);
+let dotted_segments p = filter (fn s -> not (str.is_empty s)) (str.split "." p);
 
 let rec search_for! bases rel =
     match bases {
@@ -518,7 +518,7 @@ let rec local_module l scope dep = {
 let canonical_name! : Loader -> :string -> :string -> :string;
 let canonical_name! l file fallback = {
     let real = path.segments (path.drop_extension (path.absolute! file));
-    let best = list.fold (fn found root -> {
+    let best = fold (fn found root -> {
         let [src, name] = root;
         match package.module_name_in src real {
             () => found,
@@ -539,7 +539,7 @@ let canonical_name! l file fallback = {
 /// the root's load works them out once and the loader carries them; a loader
 /// that does not carry them works them out where it is asked.
 let package_roots! l = match Loader.package_roots l {
-    () => list.map (fn pkg -> [path.segments (path.absolute! (package.src pkg)), package.name pkg])
+    () => map (fn pkg -> [path.segments (path.absolute! (package.src pkg)), package.name pkg])
                    (package.packages (packages l)),
     roots => roots,
 };
@@ -609,7 +609,7 @@ let expand_items owner cfg items = {
     let flat = (if config.is_defined "strict_everything" cfg { strict_everything } else { fn x -> x })
                    (flatten_items cfg items);
     let inherited = list.filter whole_import flat;
-    list.concat (list.map (fn item ->
+    list.concat (map (fn item ->
         match item {
             // A record is a module and, in the parent, a global of the same
             // name holding its description -- see `syntax.record_parts`.
@@ -671,7 +671,7 @@ priv let strict_params ps =
 
 /// `when` resolved and `priv` unwrapped, with every other item as written.
 let rec flatten_items cfg items =
-    list.concat (list.map (fn item ->
+    list.concat (map (fn item ->
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { flatten_items cfg inner } else { [] },
@@ -689,8 +689,9 @@ let whole_import item =
 /// Every record declaration `expand_items` is about to rewrite, in the same
 /// order and under the same `when` conditions -- an item the configuration
 /// switches off becomes no module, so it is no record either.
+let record_items : :any -> [ast.Decl] -> [[:atom, :string, [[:any]], [[:any]], ast.Span]];
 let rec record_items cfg items =
-    list.concat (list.map (fn item ->
+    list.concat (map (fn item ->
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { record_items cfg inner } else { [] },
@@ -710,14 +711,14 @@ let rec record_items cfg items =
 /// answered `x ` and the end of the file. This is that, kept, and nothing in
 /// the compiler reads it: `owner + "." + name` is the module the rewrite made.
 let note_records owner items l =
-    Loader.set_records (records l + list.map (fn r -> list.cons owner r)
+    Loader.set_records (records l + map (fn r -> list.cons owner r)
                                        (record_items (config_in l owner) items)) l;
 
 /// The settings the `when` conditions among these items read: each condition
 /// that is evaluated, and inside a branch only when the branch is taken --
 /// exactly the conditions `expand_items` evaluates.
 let rec when_reads cfg items =
-    list.concat (list.map (fn item ->
+    list.concat (map (fn item ->
         match item {
             [:when, cond, inner, _] =>
                 list.append (config.reads cond)
@@ -730,7 +731,7 @@ let rec when_reads cfg items =
 let note_reads name items l =
     match when_reads (config_in l name) items {
         [] => l,
-        rs => put_reads (list.fold (fn m r -> m.[r => true]) (Loader.reads l) rs) l,
+        rs => put_reads (fold (fn m r -> m.[r => true]) (Loader.reads l) rs) l,
     };
 
 /// Forced as it is stored, so the table does not hold a suspension that pins
@@ -739,8 +740,9 @@ let put_reads (strict m) l = Loader.set_reads m l;
 
 /// Every `foreign` block `expand_items` is about to rewrite, as `record_items`
 /// finds records.
+let foreign_items : :any -> [ast.Decl] -> [[:string, :any, [[:any]], ast.Span]];
 let rec foreign_items cfg items =
-    list.concat (list.map (fn item ->
+    list.concat (map (fn item ->
         match item {
             [:when, cond, inner, _] =>
                 if config.eval cfg cond { foreign_items cfg inner } else { [] },
@@ -754,7 +756,7 @@ let rec foreign_items cfg items =
 /// survives only as the Dream type it was translated into. Nothing in the
 /// compiler reads this either.
 let note_foreigns owner items l =
-    Loader.set_foreigns (foreigns l + list.map (fn f -> list.cons owner f)
+    Loader.set_foreigns (foreigns l + map (fn f -> list.cons owner f)
                                          (foreign_items (config_in l owner) items)) l;
 
 // --- loading -----------------------------------------------------------------
@@ -762,7 +764,7 @@ let note_foreigns owner items l =
 /// The dotted paths a module depends on, with the span to blame: its imports
 /// and its `derive`s, which resolve the same way.
 let dependencies items =
-    list.concat (list.map (fn item ->
+    list.concat (map (fn item ->
         match item {
             [:import, segs, _, _, span] => [[str.join_str "." segs, span]],
             [:derive, segs, span]       => [[str.join_str "." segs, span]],
@@ -908,7 +910,7 @@ let rec load_package! l dotted at from_source =
             else {
                 let seen = mark_visited dotted
                     (Loader.set_namespaces (list.append (namespaces l) [dotted]) l);
-                [list.fold (fn acc m -> {
+                [fold (fn acc m -> {
                     let full = dotted + "." + m;
                     // A module of the package that is already being loaded is
                     // the one doing the importing: `mind/std/src/all.dr` says
@@ -955,7 +957,7 @@ let rec hoist_mod! l parent source m =
                 // are: by the time this is recorded it is an ordinary module.
                 let kept = expand_items full (config_in l full) items;
                 // Consed and reversed once, as `load_items!` does its own.
-                let nested = list.fold (fn acc item ->
+                let nested = fold (fn acc item ->
                     match item {
                         [:mod, _, _, _] => {
                             let done = hoist_mod! (list.head acc) full source item;
@@ -966,7 +968,7 @@ let rec hoist_mod! l parent source m =
                 let inner_items = list.reverse (list.nth 1 nested);
 
                 // A submodule may import, so follow those before it is recorded.
-                let followed = list.fold (fn acc d -> {
+                let followed = fold (fn acc d -> {
                     let dep = list.head d;
                     // Its own submodule, put there by the hoist above, or a
                     // sibling reached by walking outwards: either way already
@@ -1159,7 +1161,7 @@ let load_items! l source parsed display name file text = {
             // declarations allocated 493 MB here, four times what half as many
             // did -- see "The item list was appended to" in
             // docs/notes/compiler-scaling.md.
-            let hoisted = list.fold (fn acc item ->
+            let hoisted = fold (fn acc item ->
                 match item {
                     [:mod, _, _, _] => {
                         let done = hoist_mod! (list.head acc) name source item;
@@ -1207,7 +1209,7 @@ let exports_tests m =
 /// Generating the runner from what was actually loaded means there is no
 /// registry to keep in step, and no test that is silently never run.
 let add_test_runner! l = {
-    let suites = list.flat_map (fn i ->
+    let suites = flat_map (fn i ->
             if exports_tests (module_at l i) { [[module_name (module_at l i), i]] } else { [] })
         (list.range 0 (module_count l));
     let src =

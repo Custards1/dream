@@ -32,6 +32,7 @@
 
 import std.char;
 import std.io;
+import std.file;
 import std.list;
 import std.map;
 import std.num;
@@ -75,11 +76,11 @@ let parse_mode v = {
         t => t,
     };
     let rec go cs !acc = match cs {
-        [] => Result.ok acc,
+        [] => ok acc,
         [c, ..rest] if c >= '0' && c <= '7' => go rest (acc * 8 + char.code c - 48),
         _ => Result.error ("mode `" + spec.text_of v + "`: write it in octal, as \"755\""),
     };
-    match str.chars digits { [] => Result.error "mode: empty", cs => go cs 0 }
+    match str.chars digits { [] => err "mode: empty", cs => go cs 0 }
 };
 
 let source_of : [:string, :any] -> Result Source :string;
@@ -94,7 +95,7 @@ let source_of [dest, value] = match type_of value {
             };
             Result.ok (Source.new dest src
                   |> Source.set_mode mode
-                  |> Source.set_exclude (list.map spec.text_of (spec.as_list value.["exclude" else ()]))
+                  |> Source.set_exclude (map spec.text_of (spec.as_list value.["exclude" else ()]))
                   |> Source.set_config (value.["config" else false] == true))
         },
     },
@@ -137,7 +138,7 @@ let is_library name =
 let is_native : :string -> :bool;
 let is_native bytes =
     bytes == "\u{7f}ELF"
-    || list.contains (list.map (fn i -> str.byte i bytes) [0, 1, 2, 3])
+    || list.contains (map (fn i -> str.byte i bytes) [0, 1, 2, 3])
                      [[207, 250, 237, 254], [254, 237, 250, 207], [206, 250, 237, 254], [202, 254, 186, 190]];
 
 let in_program_dir : :string -> :bool;
@@ -169,7 +170,7 @@ let file_at! : Source -> :string -> :string -> Result [Item, :integer] :string;
 let file_at! s path source = match io.stat! source {
     [size, modified, :file] => {
         let mode = mode_of! s path source;
-        Result.ok [item.Item.file path mode source size, modified]
+        ok [item.Item.file path mode source size, modified]
     },
     _ => Result.error (source + " is not a file it can read"),
 };
@@ -183,12 +184,12 @@ let expand! sp s = {
         () => Result.error ("[ship.files] \"" + Source.dest s + "\": " + from + " is not there"),
         [_, _, :dir] => {
             let patterns = glob.always + Source.exclude s;
-            let wanted = list.filter (fn rel -> not (glob.excluded patterns rel)) (io.walk! from);
-            all! (list.map (fn rel -> file_at! s (dest + "/" + rel) (from + "/" + rel)) wanted)
+            let wanted = filter (fn rel -> not (glob.excluded patterns rel)) (file.walk! from);
+            all! (map (fn rel -> file_at! s (dest + "/" + rel) (from + "/" + rel)) wanted)
         },
         [_, _, :file] => {
             let? one = file_at! s dest from;
-            Result.ok [one]
+            ok [one]
         },
         _ => Result.error ("[ship.files] \"" + Source.dest s + "\": " + from + " is neither a file nor a directory"),
     }
@@ -199,8 +200,8 @@ let expand! sp s = {
 let all! : [:any] -> Result [:any] :string;
 let all! results = {
     strict! results
-    match list.filter (fn r -> match r { Result.error(_) => true, _ => false }) results {
-        [] => Result.ok (list.map (fn r -> match r { Result.ok(v) => v, _ => () }) results),
+    match filter (fn r -> match r { Result.error(_) => true, _ => false }) results {
+        [] => Result.ok (map (fn r -> match r { Result.ok(v) => v, _ => () }) results),
         [first, ..] => first,
     }
 };
@@ -208,11 +209,11 @@ let all! results = {
 /// Every path two entries both install, and every file another sits inside.
 let clashes : [Item] -> [:string];
 let clashes items = {
-    let counts = list.fold (fn acc i -> map.update 0 (fn n -> n + 1) (item.path i) acc) (%{}) items;
-    let twice = list.filter (fn [_, n] -> n > 1) (map.pairs counts);
-    let inside = list.filter (fn i -> list.any (fn p -> map.has p counts) (parents (item.path i))) items;
-    list.map (fn [p, _] -> "/" + p + " is installed by more than one entry") (list.sort_on (fn e -> list.head e) twice)
-    + list.map (fn i -> "/" + item.path i + " is inside a file") inside
+    let counts = fold (fn acc i -> map.update 0 (fn n -> n + 1) (item.path i) acc) (%{}) items;
+    let twice = filter (fn [_, n] -> n > 1) (map.pairs counts);
+    let inside = filter (fn i -> list.any (fn p -> map.has p counts) (parents (item.path i))) items;
+    map (fn [p, _] -> "/" + p + " is installed by more than one entry") (list.sort_on (fn e -> list.head e) twice)
+    + map (fn i -> "/" + item.path i + " is inside a file") inside
 };
 
 /// When every member is stamped: `SOURCE_DATE_EPOCH`, or the newest source.
@@ -229,7 +230,7 @@ let epoch! modified = match os.env! "SOURCE_DATE_EPOCH" {
 };
 
 let links_of : Spec -> Result [Item] :string;
-let links_of sp = Result.all (list.map (fn [dest, target] -> {
+let links_of sp = Result.all (map (fn [dest, target] -> {
     let? path = dest_path sp dest;
     match spec.text_of target {
         "" => Result.error ("[ship.links] \"" + dest + "\": say what it points to"),
@@ -246,21 +247,21 @@ let sections sp name = spec.entries sp name + spec.entries sp (name + "." + plat
 /// Everything the manifest installs, found on disk and checked.
 let collect! : Spec -> Result Layout :string;
 let collect! sp = {
-    let? sources = Result.all (list.map source_of (sections sp "ship.files"));
-    let? expanded = all! (list.map (fn s -> expand! sp s) sources);
+    let? sources = Result.all (map source_of (sections sp "ship.files"));
+    let? expanded = all! (map (fn s -> expand! sp s) sources);
     let? links = links_of sp;
     let found = list.concat expanded;
-    let items = list.sort_on item.path (list.map (fn f -> list.head f) found + links);
+    let items = list.sort_on item.path (map (fn f -> list.head f) found + links);
     match clashes items {
         [] => {
-            let configured = list.flat_map (fn s -> match [Source.config s, dest_path sp (Source.dest s)] {
+            let configured = flat_map (fn s -> match [Source.config s, dest_path sp (Source.dest s)] {
                 [true, Result.ok(d)] => [d],
                 _ => [],
             }) sources;
-            let config = list.filter (fn p -> str.starts_with "etc/" p
+            let config = filter (fn p -> str.starts_with "etc/" p
                                               || list.any (fn d -> p == d || str.starts_with (d + "/") p) configured)
-                                     (list.map item.path (list.filter (fn i -> list.head i == :file) items));
-            Result.ok (Layout.make items config (epoch! (list.map (fn f -> f.[1]) found)))
+                                     (map item.path (filter (fn i -> list.head i == :file) items));
+            Result.ok (Layout.make items config (epoch! (map (fn f -> f.[1]) found)))
         },
         problems => Result.error (str.join_str "\n" problems),
     }
@@ -272,16 +273,16 @@ let collect! sp = {
 let parents : :string -> [:string];
 let parents path = {
     let names = str.split "/" path;
-    list.map (fn n -> str.join_str "/" (list.take n names)) (list.range 1 (list.length names))
+    map (fn n -> str.join_str "/" (list.take n names)) (list.range 1 (list.length names))
 };
 
 /// Every directory something is installed in, sorted, each once.
 let dirs : [Item] -> [:string];
-let dirs items = list.sort (map.members (map.set_of (list.flat_map (fn i -> parents (item.path i)) items)));
+let dirs items = list.sort (map.members (map.set_of (flat_map (fn i -> parents (item.path i)) items)));
 
 /// The bytes a package takes once installed.
 let installed_size : [Item] -> :integer;
-let installed_size items = list.fold_strict (fn !acc i -> acc + item.size i) 0 items;
+let installed_size items = fold (fn !acc i -> acc + item.size i) 0 items;
 
 /// A path relative to the prefix, for the formats laid out from it -- a
 /// tarball, a formula. One outside the prefix keeps its path from the root.
@@ -312,7 +313,7 @@ let shared : %{:string => :bool} = map.set_of [
 
 /// The directories this package creates and should take away with it.
 let owned : [Item] -> [:string];
-let owned items = list.filter (fn d -> not (map.member d shared)) (dirs items);
+let owned items = filter (fn d -> not (map.member d shared)) (dirs items);
 
 when test {
     import std.test;
@@ -325,11 +326,11 @@ when test {
 
     let tests = [
         test.case "modes are octal however they are written"
-            $( test.eq! [Result.ok 493, Result.ok 493, Result.ok 493, Result.ok 420, :error]
+            $( test.eq! [ok 493, ok 493, ok 493, ok 420, :error]
                         [parse_mode "755", parse_mode "0o755", parse_mode 755, parse_mode "0644",
                          Result.tag (parse_mode "9")] ),
         test.case "an entry is a path or a table"
-            $( test.eq! [Result.ok ["bin/x", "x", (), [], false], Result.ok ["etc/y", "y", 384, ["*.o"], true], :error]
+            $( test.eq! [ok ["bin/x", "x", (), [], false], ok ["etc/y", "y", 384, ["*.o"], true], :error]
                         [Result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
                                     (source_of ["bin/x", "x"]),
                          Result.map (fn s -> [Source.dest s, Source.src s, Source.mode s, Source.exclude s, Source.config s])
@@ -338,7 +339,7 @@ when test {
         test.case "destinations are under the prefix unless absolute"
             $( {
                 let s = sp! ();
-                test.eq! [Result.ok "usr/bin/x", Result.ok "etc/x.conf", :error, :error]
+                test.eq! [ok "usr/bin/x", ok "etc/x.conf", :error, :error]
                          [dest_path s "bin/x", dest_path s "/etc/x.conf", Result.tag (dest_path s "../x"),
                           Result.tag (dest_path s "/")]
             } ),

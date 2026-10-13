@@ -45,24 +45,24 @@ priv let os_names : %{:string => Os} = %{
 let parse_arch : :string -> Result Arch :string;
 let parse_arch name = match str.lower name {
     "native" => match native () {
-        () => Result.error "this VM does not know what machine it runs on; set `arch` in [ship] or pass --arch",
-        a => Result.ok a,
+        () => err "this VM does not know what machine it runs on; set `arch` in [ship] or pass --arch",
+        a => ok a,
     },
     n => match arch_names.[n else ()] {
         () => Result.error ("unknown architecture `" + name + "`: say x86_64, aarch64, all or native"),
-        a => Result.ok a,
+        a => ok a,
     },
 };
 
 let parse_os : :string -> Result Os :string;
 let parse_os name = match str.lower name {
     "native" => match host_os () {
-        () => Result.error "this VM does not know what system it runs on; pass --os",
-        o => Result.ok o,
+        () => err "this VM does not know what system it runs on; pass --os",
+        o => ok o,
     },
     n => match os_names.[n else ()] {
         () => Result.error ("unknown system `" + name + "`: say linux, macos or windows"),
-        o => Result.ok o,
+        o => ok o,
     },
 };
 
@@ -87,7 +87,7 @@ when test {
 
     let tests = [
         test.case "every spelling of a machine"
-            $( test.eq! [Result.ok :x86_64, Result.ok :aarch64, Result.ok :all, Result.ok :x86_64]
+            $( test.eq! [ok :x86_64, ok :aarch64, ok :all, ok :x86_64]
                         [parse_arch "amd64", parse_arch "ARM64", parse_arch "noarch", parse_arch "x86_64"] ),
         test.case "an unknown machine is an error"
             $( test.eq! :error (Result.tag (parse_arch "sparc")) ),

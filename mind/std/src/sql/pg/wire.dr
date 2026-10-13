@@ -100,7 +100,7 @@ let decode kind body = match kind {
         Message.notification (bytes.i32_at body 0) channel (list.head (bytes.cstr_at body next))
     },
     116 => Message.parameter_description                                                    // t
-               (list.map (fn i -> bytes.u32_at body (2 + 4 * i)) (list.range 0 (bytes.u16_at body 0))),
+               (map (fn i -> bytes.u32_at body (2 + 4 * i)) (list.range 0 (bytes.u16_at body 0))),
     71 => Message.copy_in_response (str.byte 0 body) (copy_formats body),                   // G
     72 => Message.copy_out_response (str.byte 0 body) (copy_formats body),                  // H
     100 => Message.copy_data body,                                                          // d
@@ -160,7 +160,7 @@ priv let rec fields_from body !at n acc =
 /// Decode the column formats of a COPY response.
 priv let copy_formats : :string -> [:integer];
 priv let copy_formats body =
-    list.map (fn i -> bytes.i16_at body (3 + 2 * i)) (list.range 0 (bytes.u16_at body 1));
+    map (fn i -> bytes.i16_at body (3 + 2 * i)) (list.range 0 (bytes.u16_at body 1));
 
 /// The fields of an error or a notice, keyed by what they mean. The protocol
 /// names each by one byte; the atoms are the names its documentation uses.
@@ -221,7 +221,7 @@ let protocol_version = 196608;
 let startup : [[:string, :string]] -> :string;
 let startup params = {
     let body = bytes.be32 protocol_version
-               + str.concat_all (list.map (fn [k, v] -> bytes.cstr k + bytes.cstr v) params) + "\0";
+               + str.concat_all (map (fn [k, v] -> bytes.cstr k + bytes.cstr v) params) + "\0";
     bytes.be32 (len body + 4) + body
 };
 
@@ -253,7 +253,7 @@ let query sql = frame "Q" (bytes.cstr sql);
 let parse : :string -> :string -> [:integer] -> :string;
 let parse name sql oids =
     frame "P" (bytes.cstr name + bytes.cstr sql + bytes.be16 (len oids)
-               + str.concat_all (list.map bytes.be32 oids));
+               + str.concat_all (map bytes.be32 oids));
 
 /// Bind `values` to the statement `stmt`, making the portal `portal`. Every
 /// value goes as text -- a string, or `()` for NULL -- and every column comes
@@ -261,7 +261,7 @@ let parse name sql oids =
 let bind : :string -> :string -> [:any] -> :string;
 let bind portal stmt values =
     frame "B" (bytes.cstr portal + bytes.cstr stmt + bytes.be16 0 + bytes.be16 (len values)
-               + str.concat_all (list.map bound values) + bytes.be16 0);
+               + str.concat_all (map bound values) + bytes.be16 0);
 
 /// Encode a Bind message for a prepared statement and its parameters.
 priv let bound : :any -> :string;

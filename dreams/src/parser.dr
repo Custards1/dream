@@ -133,7 +133,7 @@ let non_starters = ["let", "let?", "priv", "rec", "else", "import", "as", "catch
 /// per candidate, and the parser asks it of every identifier in the program --
 /// it was a tenth of everything the compiler did. A map answers it in one
 /// hash; `comp` builds both sets into the compiler image.
-priv let set_of names = list.fold (fn m n -> m.[n => true]) %{} names;
+priv let set_of names = fold (fn m n -> m.[n => true]) %{} names;
 
 priv let keyword_set = comp set_of keywords;
 priv let non_starter_set = comp set_of non_starters;
@@ -981,7 +981,7 @@ let questions_body e = {
 /// of no parameters is a statement whose value is pulled from; one with
 /// parameters is a function, whose body owns its own.
 let questions_block stmts span = {
-    let stepped = list.concat (list.map (fn st -> {
+    let stepped = list.concat (map (fn st -> {
         let [st1, steps] = match st {
             [:let, n, [], body, is_rec, sp] => {
                 let [b1, s1] = hoist (questions body) [];
@@ -1085,7 +1085,7 @@ let rec parse_annotated c sp name params is_rec ts =
 /// `annotation`: one `:any ->` per parameter in front of it.
 let answering params annotation = {
     let sp = ast.span annotation;
-    list.fold (fn t p -> tagged "fn" [ast.atom_e "any" sp, t] sp) annotation params
+    fold (fn t p -> tagged "fn" [ast.atom_e "any" sp, t] sp) annotation params
 };
 
 /// Put one parsed item or statement onto a reversed list, splitting a `let`

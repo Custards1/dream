@@ -128,7 +128,7 @@ let rec classify src spans toks !inside acc =
             let mine = list.take_while (fn t -> lexer.span_start t <= stop) toks;
             let others = list.drop (list.length mine) toks;
             let lead = str.span " \t" start src - start;
-            let reach = list.fold_strict (fn m t -> if lexer.span_end t > m { lexer.span_end t } else { m })
+            let reach = fold (fn m t -> if lexer.span_end t > m { lexer.span_end t } else { m })
                                          inside mine;
             let kind = if start < inside { :verbatim }
                        else if start + lead >= stop { :blank }
@@ -377,7 +377,7 @@ let rec unplaced e =
 
 let meaning src = match parser.parse_module src {
     [:ok, items, _] => Result.ok (unplaced items),
-    [:error, message, span] => Result.error [message, ast.span_start span],
+    [:error, message, span] => err [message, ast.span_start span],
 };
 
 // --- the formatter ----------------------------------------------------------------
@@ -388,21 +388,21 @@ let meaning src = match parser.parse_module src {
 let format : :string -> Result :string [:string, :integer];
 let format src =
     match meaning src {
-        Result.error(why) => Result.error why,
+        Result.error(why) => err why,
         Result.ok(before) => match lexer.lex src {
-            Result.error(why) => Result.error why,
+            Result.error(why) => err why,
             Result.ok(toks) => {
                 let lines = classify src (line_spans src 0 []) toks 0 [];
                 let indents = settle_comments (list.reverse (walk lines [root] 0 []))
                                               (list.reverse lines) () [];
-                let rendered = list.map (fn [l, new] -> render src l new) (list.zip lines indents);
+                let rendered = map (fn [l, new] -> render src l new) (list.zip lines indents);
                 let out = str.join_str "\n" (squeeze rendered (list.map Line.kind lines) false []) + "\n";
                 match meaning out {
                     Result.ok(after) =>
-                        if after == before { Result.ok out }
-                        else { Result.error ["formatting would change what this file means, so it was left alone", 0] },
+                        if after == before { ok out }
+                        else { err ["formatting would change what this file means, so it was left alone", 0] },
                     Result.error([message, _]) =>
-                        Result.error ["formatting would break this file (" + message + "), so it was left alone", 0],
+                        err ["formatting would break this file (" + message + "), so it was left alone", 0],
                 }
             },
         },

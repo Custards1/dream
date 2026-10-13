@@ -59,7 +59,7 @@ let handle_call! request from state = match request {
         let pair = strict! (f state);
         reply (list.nth 0 pair) (list.nth 1 pair)
     },
-    _ => reply (Result.error :unknown_request) state,
+    _ => reply (err :unknown_request) state,
 };
 
 /// Apply an asynchronous agent update to its state.
@@ -157,7 +157,7 @@ when test {
                 let slow = server.call_within! a [:get, fn n -> list.sum (list.range 0 2000000) * 0 + n] 1;
                 let next = value! a;
                 stop! a
-                test.eq! [Result.error :timeout, 7] [slow, next]
+                test.eq! [err :timeout, 7] [slow, next]
             } ),
         test.case "get_and_update! answers the old and keeps the new"
             $( {
@@ -187,7 +187,7 @@ when test {
                 let a = start! 0;
                 let r = call! a :nonsense;
                 stop! a
-                test.eq! (Result.error :unknown_request) r
+                test.eq! (err :unknown_request) r
             } ),
         test.case "a cast it does not understand leaves it alone"
             $( {
@@ -293,6 +293,7 @@ import std.types;
 let value_as! : :any -> Handle -> :any;
 let value_as! description pid = types.check description (value! pid);
 
-/// Atomic validation: [:ok, ()] on replacement, [:error, error] on mismatch.
-let update_as! : :any -> Handle -> (:any -> :any) -> :any;
+/// Atomic validation: `Result.ok ()` when the new state was taken, or the
+/// `types.validate` error when it did not fit and the old state was kept.
+let update_as! : :any -> Handle -> (:any -> :any) -> Result :unit :error;
 let update_as! description pid f = call! pid [:update_as, description, f];

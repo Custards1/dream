@@ -32,7 +32,7 @@ let main! = {
 
     // Weighted choice, counted over many draws.
     let loot = list.take 1000 (random.values (random.weighted [[90, :common], [9, :rare], [1, :legendary]]) rng);
-    console.print! (list.map (fn kind -> [kind, list.count (fn x -> x == kind) loot]) [:common, :rare, :legendary])
+    console.print! (map (fn kind -> [kind, list.count (fn x -> x == kind) loot]) [:common, :rare, :legendary])
 
     // Two independent streams from one, for two processes.
     let [left, right] = random.split rng;

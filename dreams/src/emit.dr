@@ -167,7 +167,7 @@ let vm_nursery_max = 1;
 /// Every record of a section, joined once. The joining is what keeps this
 /// linear: a fold of `+` over fifty thousand records would copy the section so
 /// far on each one.
-let concat_map f xs = str.concat_all (list.map f xs);
+let concat_map f xs = str.concat_all (map f xs);
 
 let node_bytes n =
     str.concat_all [
@@ -225,7 +225,7 @@ let module_bytes m =
 /// Strings are an offset-and-length table into one contiguous blob, so that a
 /// loader can point at a string rather than copy it.
 let string_table strs = {
-    let offsets = list.reverse (list.nth 1 (list.fold_strict (fn acc s ->
+    let offsets = list.reverse (list.nth 1 (fold (fn acc s ->
         [list.head acc + str.byte_length s,
          list.cons [list.head acc, str.byte_length s] (list.nth 1 acc)])
         [0, []] strs));
@@ -257,7 +257,7 @@ let zeros n = str.repeat n (str.of_bytes [0]);
 /// and nothing about the next one depends on where this one ended up, so there
 /// is nothing for alignment to buy.
 let data_offsets lens =
-    list.reverse (list.nth 1 (list.fold_strict (fn acc n ->
+    list.reverse (list.nth 1 (fold (fn acc n ->
         [list.head acc + n, list.cons (list.head acc) (list.nth 1 acc)])
         [0, []] lens));
 
@@ -276,7 +276,7 @@ let data_sections lens names =
     if list.is_empty lens { [] }
     else {
         let offsets = data_offsets lens;
-        let total = list.fold (fn n len -> n + len) 0 lens;
+        let total = fold (fn n len -> n + len) 0 lens;
         // `PAYL`'s body is its eight-byte length header and no more. The bytes
         // follow it in the file but not in the section, because the section
         // table counts in 32 bits and the payload may not fit there. The real
@@ -354,7 +354,7 @@ let emit img = {
 
     // Offsets are absolute, so where each section lands is worked out before
     // the table that names them is written.
-    let laid_out = list.fold (fn acc s -> {
+    let laid_out = fold (fn acc s -> {
         let at = align8 (list.head acc);
         [at + sec_len s, list.append (list.nth 1 acc) [at]]
     }) [align8 table_end, []] secs;
@@ -381,7 +381,7 @@ let emit img = {
     // Each section, preceded by the padding that puts it exactly where the
     // table said it would be. The pieces are collected and concatenated once,
     // at the end.
-    let assembled = list.fold_strict (fn acc pair -> {
+    let assembled = fold (fn acc pair -> {
         let s = list.head pair;
         let at = list.nth 1 pair;
         [at + sec_len s,

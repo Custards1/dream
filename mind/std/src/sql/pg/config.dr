@@ -114,13 +114,13 @@ priv let parse_url text = {
     let [host, port] = split_hostport hostport;
     let pairs = [["host", host], ["port", port], ["user", user], ["dbname", database]]
                 + (if password == () { [] } else { [["password", password]] })
-                + list.map (fn kv -> match str.split "=" kv {
+                + map (fn kv -> match str.split "=" kv {
                                 [k] => [decode_percent k, ""],
                                 [k, ..vs] => [decode_percent k, decode_percent (str.join_str "=" vs)],
                                 _ => ["", ""],
                             })
-                           (list.filter (fn kv -> kv != "") (str.split "&" query));
-    from_pairs (list.map (fn [k, v] -> [k, decode_percent v]) (list.filter (fn [k, v] -> v != "") pairs))
+                           (filter (fn kv -> kv != "") (str.split "&" query));
+    from_pairs (map (fn [k, v] -> [k, decode_percent v]) (filter (fn [k, v] -> v != "") pairs))
 };
 
 /// `host:port`, `host`, or `[v6]:port`.
@@ -189,7 +189,7 @@ priv let rec quoted_value text at pieces = {
 /// Pairs in libpq's vocabulary, as a configuration. A key libpq knows and this
 /// does not use is ignored; any other is a run-time parameter.
 priv let from_pairs : [[:string, :string]] -> Result :map :string;
-priv let from_pairs pairs = list.fold (fn acc [k, v] -> match acc {
+priv let from_pairs pairs = fold (fn acc [k, v] -> match acc {
     Result.ok(c) => apply c k v,
     failed => failed,
 }) (Result.ok %{}) pairs;
@@ -226,7 +226,7 @@ priv let apply c k v = match k {
     "sslpassword" => Result.ok (Config.set_ssl_password v c),
     "sslcert" => Result.error ("a client certificate is `sslidentity`, a PKCS#12 file -- the format every platform's TLS can"
                           + " import -- rather than `sslcert` and `sslkey`; `openssl pkcs12 -export` makes one"),
-    "sslkey" => Result.error "a client key goes with its certificate in `sslidentity`, a PKCS#12 file",
+    "sslkey" => err "a client key goes with its certificate in `sslidentity`, a PKCS#12 file",
     "options" => Result.ok c,
     _ if map.has k ignored => Result.ok c,
     _ => Result.ok (Config.set_settings ((Config.settings c).[k => v]) c),
@@ -244,9 +244,9 @@ let from_env! u = {
     };
     let vars = [["PGHOST", "host"], ["PGPORT", "port"], ["PGUSER", "user"], ["PGPASSWORD", "password"],
                 ["PGDATABASE", "dbname"], ["PGAPPNAME", "application_name"]];
-    let pairs = strict! (list.filter (fn [k, v] -> v != ())
-                                     (list.map (fn [var, k] -> [k, os.env! var]) vars));
-    match list.fold (fn acc [k, v] -> match acc { Result.ok(c) => apply c k v, failed => failed }) (Result.ok base) pairs {
+    let pairs = strict! (filter (fn [k, v] -> v != ())
+                                     (map (fn [var, k] -> [k, os.env! var]) vars));
+    match fold (fn acc [k, v] -> match acc { Result.ok(c) => apply c k v, failed => failed }) (Result.ok base) pairs {
         Result.ok(c) => c,
         Result.error(why) => errors.fail! :bad_config why,
     }

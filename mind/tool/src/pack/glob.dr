@@ -40,7 +40,7 @@ let rec names_match ps ss = match [ps, ss] {
 /// that matches any of them matches the path, since leaving a directory out
 /// leaves out what is in it.
 let prefixes : [:string] -> [[:string]];
-let prefixes names = list.map (fn n -> list.take n names) (list.range 1 (list.length names + 1));
+let prefixes names = map (fn n -> list.take n names) (list.range 1 (list.length names + 1));
 
 /// Whether `path`, relative to the directory being shipped, is left out by
 /// `pattern`.
@@ -48,7 +48,7 @@ let matches : :string -> :string -> :bool;
 let matches pattern path = {
     let names = str.split "/" path;
     let anchored = str.contains_str "/" pattern;
-    let wanted = list.filter (fn n -> n != "") (str.split "/" pattern);
+    let wanted = filter (fn n -> n != "") (str.split "/" pattern);
     if anchored { list.any (fn pre -> names_match wanted pre) (prefixes names) }
     else { list.any (fn n -> name_matches (str.chars pattern) (str.chars n)) names }
 };

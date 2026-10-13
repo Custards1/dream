@@ -108,7 +108,7 @@ priv let dir_of setting s = path.join (Setting.target_dir setting) ("build/" + S
 /// environment variables its manifest lists.
 priv let context! : :map -> :map -> :map;
 priv let context! setting s = {
-    let env = list.fold (fn m name -> match os.env! name { () => m, v => m.[name => v] }) (%{}) (Scripted.env s);
+    let env = fold (fn m name -> match os.env! name { () => m, v => m.[name => v] }) (%{}) (Scripted.env s);
     let host = here! ();
     Context.make (Scripted.key s) (Scripted.version s) (Scripted.root s)
                  (match Setting.target setting { () => host, t => t }) host
@@ -127,7 +127,7 @@ priv let asking setting = Setting.testing setting || not (list.is_empty (Setting
 
 /// `[size, modified]` for each path, or `()` for one that is not there.
 priv let stamps! : [:string] -> :map;
-priv let stamps! paths = list.fold (fn m p -> m.[p => match io.stat! p { () => (), [size, modified, _] => [size, modified] }])
+priv let stamps! paths = fold (fn m p -> m.[p => match io.stat! p { () => (), [size, modified, _] => [size, modified] }])
                               (%{}) paths;
 
 /// Whether every path still has the stamp it had.
@@ -157,9 +157,10 @@ priv let unmoved! recorded = list.all (fn [p, was] -> match io.stat! p {
 /// Scripts that can share a driver, in the order they came.
 priv let groups : [:map] -> [[:map]];
 priv let groups scripted = {
-    let by = list.fold (fn acc s -> map.update [] (fn xs -> list.append xs [s]) (str.join_str "\n" (Scripted.paths s)) acc)
-                       (%{}) scripted;
-    list.map (fn k -> by.[k]) (list.unique (list.map (fn s -> str.join_str "\n" (Scripted.paths s)) scripted))
+    let seed : %{:string => [:map]} = %{};
+    let by = fold (fn acc s -> map.update [] (fn xs -> list.append xs [s]) (str.join_str "\n" (Scripted.paths s)) acc)
+                       seed scripted;
+    map (fn k -> by.[k]) (list.unique (map (fn s -> str.join_str "\n" (Scripted.paths s)) scripted))
 };
 
 /// The script as a module path inside its package: `build`, or `tools.build`
@@ -180,7 +181,7 @@ priv let group_dir setting group = {
     // and a build of it that runs its dependencies' scripts too -- must not
     // write one driver over the other while both are compiling it.
     let named = list.append (Scripted.paths (list.head group))
-                            (list.map (fn s -> Scripted.key s + "=" + Scripted.script s) group);
+                            (map (fn s -> Scripted.key s + "=" + Scripted.script s) group);
     path.join (Setting.target_dir setting) ("build/_drivers/" + str.slice 0 16 (io.digest (str.join_str "\n" named)))
 };
 
@@ -195,10 +196,10 @@ priv let write_driver! dir group = {
     replace! (path.join dir "main.dr")
                 (str.join_str "" (list.concat [
                     ["// Written by mind: runs these packages' build scripts.\nimport std.build.run;\n"],
-                    list.map (fn [i, s] -> "import mind_script_" + to_string i + "." + script_module s
+                    map (fn [i, s] -> "import mind_script_" + to_string i + "." + script_module s
                                            + " as script_" + to_string i + ";\n") numbered,
                     ["let main! = run.run_all! [\n"],
-                    list.map (fn [i, s] -> "    [\"" + Scripted.key s + "\", script_" + to_string i + ".plan],\n") numbered,
+                    map (fn [i, s] -> "    [\"" + Scripted.key s + "\", script_" + to_string i + ".plan],\n") numbered,
                     ["];\n"],
                 ]))
 };
@@ -212,17 +213,17 @@ priv let replace! path text = file.replace! path text;
 /// The `-L` roots a group's driver is compiled with.
 priv let driver_roots : [:map] -> [:string];
 priv let driver_roots group =
-    list.concat [list.flat_map (fn [i, s] -> ["-L", "mind_script_" + to_string i + "=" + Scripted.root s,
+    list.concat [flat_map (fn [i, s] -> ["-L", "mind_script_" + to_string i + "=" + Scripted.root s,
                                               "-L", "mind_script_" + to_string i + "+=" + Scripted.root s])
                                (list.enumerate group),
-                 list.flat_map (fn p -> ["-L", p]) (Scripted.paths (list.head group))];
+                 flat_map (fn p -> ["-L", p]) (Scripted.paths (list.head group))];
 
 /// The files one script is compiled from, from `dreams --modules`, which
 /// loads and does not compile: what a package's record keeps, so that editing
 /// one script runs that one again and no other.
 let sources_of : :string -> [:string];
 let sources_of listing =
-    list.flat_map (fn line -> match list.filter (fn w -> not (str.is_empty w)) (str.split " " line) {
+    flat_map (fn line -> match filter (fn w -> not (str.is_empty w)) (str.split " " line) {
         [_, f] if str.ends_with ".dr" f => [f],
         _ => [],
     }) (str.split "\n" listing);
@@ -236,7 +237,7 @@ priv let compiler_args setting args = match Setting.compiler setting {
 priv let script_sources! : :map -> :map -> :map;
 priv let script_sources! setting s = {
     let [lp, largs] = compiler_args setting (list.concat [["--modules", Scripted.script s],
-                                                          list.flat_map (fn p -> ["-L", p]) (Scripted.paths s)]);
+                                                          flat_map (fn p -> ["-L", p]) (Scripted.paths s)]);
     stamps! (sources_of (os.exec! lp largs).[:out])
 };
 
@@ -252,7 +253,7 @@ priv let compile_driver! setting dir group = {
     let r = os.exec_with! (os.cwd! ()) (progress.child_env! ()) program args 0;
     match r.[:code] {
         0 => { io.rename! scratch (path.join dir "script.dream"); Result.ok () },
-        _ => Result.error ("the build scripts of " + str.join_str ", " (list.map (fn s -> "`" + Scripted.key s + "`") group)
+        _ => Result.error ("the build scripts of " + str.join_str ", " (map (fn s -> "`" + Scripted.key s + "`") group)
                       + " do not compile:\n" + str.trim (r.[:err] + r.[:out])),
     }
 };
@@ -276,7 +277,7 @@ priv let fresh! record ctx_digest = match record {
 
 /// Run the group's stale scripts, or none, and answer `[:ok, [[key, outcome]]]`
 /// for all of them, or `[:error, why]`.
-priv let run_group! : [:any] -> :any;
+priv let run_group! : [:map, [:map]] -> Result [[:string, :map]] :string;
 priv let run_group! job = {
     let [setting, group] = job;
     let dir = group_dir setting group;
@@ -284,25 +285,25 @@ priv let run_group! job = {
     // What the driver was compiled from besides the scripts: the compiler,
     // stamped, since a driver made by another compiler is another image --
     // or, if the compiler was being rewritten when it ran, not an image.
-    let listed = [list.map (fn s -> [Scripted.key s, Scripted.script s]) group,
-                  stamps! (list.filter (fn w -> str.contains_str "/" w) (Setting.compiler setting))];
-    let each = list.map (fn s -> {
+    let listed = [map (fn s -> [Scripted.key s, Scripted.script s]) group,
+                  stamps! (filter (fn w -> str.contains_str "/" w) (Setting.compiler setting))];
+    let each = map (fn s -> {
         let ctx = context! setting s;
         let record_file = path.join (dir_of setting s) "record";
         [s, ctx, io.digest (wire.encode ctx), record_file, read_record! record_file]
     }) group;
     strict! each
-    let stale = list.filter (fn [_, _, digest, _, record] ->
+    let stale = filter (fn [_, _, digest, _, record] ->
         asking setting || not (io.exists! image && fresh! record digest)) each;
     match stale {
-        [] => Result.ok (list.map (fn [s, _, _, _, record] -> [Scripted.key s, record.[:outcome]]) each),
+        [] => Result.ok (map (fn [s, _, _, _, record] -> [Scripted.key s, record.[:outcome]]) each),
         _ => {
             file.mkdir_all! dir
             let driver = read_record! (path.join dir "record");
             // A stale script whose sources moved (or were never listed) is why
             // the driver is compiled again; one whose context or reads moved
             // only has to be run.
-            let moved = list.filter (fn [_, _, _, _, record] -> match record.[:sources else ()] {
+            let moved = filter (fn [_, _, _, _, record] -> match record.[:sources else ()] {
                 () => true,
                 sources => not (unmoved! sources),
             }) stale;
@@ -311,10 +312,10 @@ priv let run_group! job = {
                 _ => compile_driver! setting dir group,
             };
             match compiled {
-                Result.error(why) => Result.error why,
+                Result.error(why) => err why,
                 Result.ok(_) => {
                     replace! (path.join dir "record") (wire.encode (%{ :scripts => listed }))
-                    let contexts = list.fold (fn m [s, ctx, _, _, _] -> m.[Scripted.key s => ctx]) (%{}) stale;
+                    let contexts = fold (fn m [s, ctx, _, _, _] -> m.[Scripted.key s => ctx]) (%{}) stale;
                     // This run's own: another run of the same group may be
                     // asking for other packages at the same moment.
                     let run_id = file.scratch_suffix! ();
@@ -332,7 +333,7 @@ priv let run_group! job = {
                         [true, _] => Result.error ("the build scripts ran for longer than " + to_string (deadline_ms / 60000) + " minutes"),
                         [_, 0] => match wire.decode (match answer { () => "", t => t }) {
                             Result.ok(outcomes) if list.all (fn [_, o] -> types.accepts Outcome.type o) (map.pairs outcomes) => {
-                                strict! (list.map (fn [s, _, digest, record_file, record] -> {
+                                strict! (map (fn [s, _, digest, record_file, record] -> {
                                     let sources = match list.any (fn [m, .._] -> Scripted.key m == Scripted.key s) moved {
                                         true => script_sources! setting s,
                                         false => record.[:sources],
@@ -344,10 +345,10 @@ priv let run_group! job = {
                                                                                 :reads => Outcome.reads o, :outcome => o }))
                                     }
                                 }) stale)
-                                Result.ok (list.map (fn [s, _, _, _, record] -> [Scripted.key s, outcomes.[Scripted.key s else record.[:outcome]]])
+                                Result.ok (map (fn [s, _, _, _, record] -> [Scripted.key s, outcomes.[Scripted.key s else record.[:outcome]]])
                                                each)
                             },
-                            _ => Result.error "the build scripts wrote outcomes that do not read",
+                            _ => err "the build scripts wrote outcomes that do not read",
                         },
                         _ => Result.error (str.trim (r.[:err] + r.[:out])),
                     }
@@ -363,18 +364,19 @@ priv let run_group! job = {
 /// `[:ok, [[key, outcome]]]` in the order the scripts came, or the first failure.
 let run_all! : :map -> [:map] -> :any;
 let run_all! setting scripted = {
-    let results = proc.try_map! run_group! (list.map (fn g -> [setting, g]) (groups scripted));
+    let results = proc.try_map! run_group! (map (fn g -> [setting, g]) (groups scripted));
     strict! results
-    let found = list.fold (fn acc r -> match [acc, r] {
+    let seed : Result [[:string, :map]] :string = ok [];
+    let found = fold (fn acc r -> match [acc, r] {
         [Result.error(_), _] => acc,
         [Result.ok(done), Result.ok(Result.ok(more))] => Result.ok (list.append done more),
-        [_, Result.ok(Result.error(why))] => Result.error why,
+        [_, Result.ok(Result.error(why))] => err why,
         [_, Result.error(e)] => Result.error ("the build scripts failed: " + to_string e),
-    }) (Result.ok []) results;
+    }) seed results;
     match found {
         Result.ok(pairs) => {
             let by = map.from_pairs pairs;
-            Result.ok (list.map (fn s -> [Scripted.key s, by.[Scripted.key s]]) scripted)
+            Result.ok (map (fn s -> [Scripted.key s, by.[Scripted.key s]]) scripted)
         },
         failed => failed,
     }
@@ -397,28 +399,28 @@ let target_arg t = {
 /// together: two packages embedding a payload under one name.
 let compile_args : [[:any]] -> :any;
 let compile_args outcomes = {
-    let payloads = list.flat_map (fn [key, o] -> list.map (fn [n, p] -> [n, p, key]) (map.pairs (Outcome.payloads o)))
+    let payloads = flat_map (fn [key, o] -> map (fn [n, p] -> [n, p, key]) (map.pairs (Outcome.payloads o)))
                                  outcomes;
-    let clash = list.filter (fn [n, _, k] -> list.any (fn [n2, _, k2] -> n2 == n && k2 != k) payloads) payloads;
+    let clash = filter (fn [n, _, k] -> list.any (fn [n2, _, k2] -> n2 == n && k2 != k) payloads) payloads;
     match clash {
         [[n, _, k], .._] => Result.error ("two build scripts embed a payload called `" + n + "`, `" + k + "`'s and another's"),
         [] => {
-            let targets = list.filter_map (fn [_, o] -> Outcome.target o) outcomes;
+            let targets : [[:map]] = filter_map (fn [_, o] -> Outcome.target o) outcomes;
             Result.ok (list.concat [
-                list.flat_map (fn [n, p, _] -> ["--payload", n + "=" + p]) payloads,
-                list.flat_map (fn [key, o] -> match Outcome.modules o {
+                flat_map (fn [n, p, _] -> ["--payload", n + "=" + p]) payloads,
+                flat_map (fn [key, o] -> match Outcome.modules o {
                     () => [],
                     dir => ["-L", key + "+=" + dir],
                 }) outcomes,
-                list.flat_map (fn [key, o] -> list.flat_map (fn [n, v] -> match v {
+                flat_map (fn [key, o] -> flat_map (fn [n, v] -> match v {
                     true => ["-D", key + ":" + n],
                     _ => ["-D", key + ":" + n + "=" + shown v],
                 }) (map.pairs (Outcome.defines o))) outcomes,
-                list.flat_map (fn [_, o] -> list.flat_map (fn h -> ["--host-module", h]) (Outcome.hosts o)) outcomes,
+                flat_map (fn [_, o] -> flat_map (fn h -> ["--host-module", h]) (Outcome.hosts o)) outcomes,
                 match targets {
                     [] => [],
-                    [first, ..rest] => list.flat_map (fn t -> ["--target", target_arg t])
-                                                     (list.fold (fn acc ts -> list.filter (fn t -> list.contains t ts) acc) first rest),
+                    [first, ..rest] => flat_map (fn t -> ["--target", target_arg t])
+                                                     (fold (fn acc ts -> filter (fn t -> list.contains t ts) acc) first rest),
                 },
             ])
         },
@@ -433,13 +435,13 @@ when test {
             $( test.eq! ["/s/std/list.dr", "/p/build.dr"]
                         (sources_of "std.list  /s/std/list.dr\nstd.build.Step  std.build.Step\nbuild   /p/build.dr\n") ),
         test.case "outcomes become compiler arguments"
-            $( test.eq! (Result.ok ["--payload", "lib=/c/lib.so", "-L", "sq+=/c/mods", "-D", "sq:fast",
+            $( test.eq! (ok ["--payload", "lib=/c/lib.so", "-L", "sq+=/c/mods", "-D", "sq:fast",
                                "--host-module", "host.gpu"])
                         (compile_args [["sq", %{ :payloads => %{ "lib" => "/c/lib.so" }, :modules => "/c/mods",
                                                  :defines => %{ "fast" => true }, :hosts => ["host.gpu"] }],
                                        ["other", %{ :defines => %{}, :payloads => %{} }]]) ),
         test.case "a define with a value is scoped with it"
-            $( test.eq! (Result.ok ["-D", "sq:n=3"]) (compile_args [["sq", %{ :defines => %{ "n" => 3 } }]]) ),
+            $( test.eq! (ok ["-D", "sq:n=3"]) (compile_args [["sq", %{ :defines => %{ "n" => 3 } }]]) ),
         test.case "two packages cannot embed one name"
             $( test.eq! :error (Result.tag (compile_args [["a", %{ :payloads => %{ "x" => "/1" } }],
                                                          ["b", %{ :payloads => %{ "x" => "/2" } }]])) ),

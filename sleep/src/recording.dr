@@ -93,7 +93,7 @@ let layout = binary.record [
 
 /// The bytes of a recording in the `.slp` format.
 let encode : Recording -> :string;
-let encode r = Result.unwrap_or "" (binary.encode layout (to_fields r));
+let encode r = unwrap_or "" (binary.encode layout (to_fields r));
 
 priv let to_fields : Recording -> %{:atom => :any};
 priv let to_fields r = %{
@@ -107,7 +107,7 @@ priv let to_fields r = %{
     :signals => tensor.to_bytes (Recording.signals r),
     :stages => match Recording.stages r {
         () => [0, ""],
-        stages => [1, str.of_bytes (list.map stage.index stages)],
+        stages => [1, str.of_bytes (map stage.index stages)],
     },
 };
 
@@ -132,15 +132,15 @@ priv let of_fields f = {
         _ if tag == 1 && len stage_text != e =>
             Result.error ("there are " + to_string (len stage_text) + " stages for " + to_string e + " epochs"),
         _ if tag == 1 && list.any (fn b -> b >= stage.count) (str_bytes stage_text) =>
-            Result.error "a stage byte names no stage",
+            err "a stage byte names no stage",
         _ => Result.ok (Recording.make f.[:subject] f.[:start] f.[:zone]
                 (tensor.of_bytes [e, stage.epoch_seconds, c] f.[:signals])
-                (if tag == 1 { list.map stage.of_index (str_bytes stage_text) } else { () })),
+                (if tag == 1 { map stage.of_index (str_bytes stage_text) } else { () })),
     }
 };
 
 priv let str_bytes : :string -> [:integer];
-priv let str_bytes s = list.map (fn i -> str.byte i s) (list.range 0 (len s));
+priv let str_bytes s = map (fn i -> str.byte i s) (list.range 0 (len s));
 
 // --- CSV --------------------------------------------------------------------------------
 
@@ -154,14 +154,14 @@ let to_csv r = {
     let rows = tensor.to_list (tensor.reshape [e * stage.epoch_seconds, c] (Recording.signals r));
     let labels = match Recording.stages r {
         () => list.repeat (),
-        stages => list.flat_map (fn s -> list.replicate stage.epoch_seconds (stage.index s)) stages,
+        stages => flat_map (fn s -> list.replicate stage.epoch_seconds (stage.index s)) stages,
     };
     let header = "second," + str.join_str "," (list.take c columns) + (if is_scored r { ",stage" } else { "" });
-    let line [i, [row, label]] = str.join_str "," (to_string i :: list.map to_string row
+    let line [i, [row, label]] = str.join_str "," (to_string i :: map to_string row
         + (if label == () { [] } else { [to_string label] }));
     str.join_str "\n" (["# subject: " + Recording.subject r, "# start: " + to_string (Recording.start r),
                         "# zone: " + Recording.zone r, header]
-                       + list.map line (list.enumerate (list.zip rows labels))) + "\n"
+                       + map line (list.enumerate (list.zip rows labels))) + "\n"
 };
 
 /// The channels' names, in order.
@@ -177,11 +177,11 @@ priv let meta = regex.compile "^#\\s*(?<key>[a-z_]+)\\s*:\\s*(?<value>.*?)\\s*$"
 let of_csv : :string -> Result Recording :string;
 let of_csv text = {
     let lines = str.split "\n" text;
-    let found = list.filter (fn m -> m != ()) (list.map (fn l -> regex.find meta l) lines);
-    let fields = map.from_pairs (list.map (fn m -> [regex.named "key" m, regex.named "value" m]) found);
-    let body = str.join_str "\n" (list.filter (fn l -> not (str.starts_with "#" l)) lines);
+    let found = filter (fn m -> m != ()) (map (fn l -> regex.find meta l) lines);
+    let fields = map.from_pairs (map (fn m -> [regex.named "key" m, regex.named "value" m]) found);
+    let body = str.join_str "\n" (filter (fn l -> not (str.starts_with "#" l)) lines);
     match data.parse_csv body {
-        Result.error(why) => Result.error why,
+        Result.error(why) => err why,
         Result.ok(table) => of_table fields table,
     }
 };
@@ -192,9 +192,9 @@ priv let of_table fields table = {
     let scored = width == 6;
     let e = len table / stage.epoch_seconds;
     let kept = list.take (e * stage.epoch_seconds) table;
-    let readings = list.map (fn row -> list.take 4 (list.drop 1 row)) kept;
+    let readings = map (fn row -> list.take 4 (list.drop 1 row)) kept;
     match e {
-        0 => Result.error "a recording needs at least thirty seconds of readings",
+        0 => err "a recording needs at least thirty seconds of readings",
         _ if width != 5 && width != 6 =>
             Result.error ("expected second, four readings and perhaps a stage; a row has " + to_string width + " columns"),
         _ => Result.ok (Recording.make fields.["subject" else "unknown"]
@@ -210,8 +210,8 @@ priv let or_zero n = match n { () => 0, _ => n };
 
 /// A stage per epoch from per-second labels: the first second's.
 priv let epoch_stages : [[:float]] -> [Stage];
-priv let epoch_stages rows = list.map (fn i -> stage.of_index (num.to_int (list.nth i rows).[5]))
-    (list.map (fn k -> k * stage.epoch_seconds) (list.range 0 (len rows / stage.epoch_seconds)));
+priv let epoch_stages rows = map (fn i -> stage.of_index (num.to_int (list.nth i rows).[5]))
+    (map (fn k -> k * stage.epoch_seconds) (list.range 0 (len rows / stage.epoch_seconds)));
 
 when test {
     import std.property;
@@ -223,8 +223,8 @@ when test {
     let unscored = Recording.set_stages () r;
 
     let tests = [
-        test.case "a recording reads back exactly" $( test.eq! (Result.ok r) (decode (encode r)) ),
-        test.case "so does an unscored one" $( test.eq! (Result.ok unscored) (decode (encode unscored)) ),
+        test.case "a recording reads back exactly" $( test.eq! (ok r) (decode (encode r)) ),
+        test.case "so does an unscored one" $( test.eq! (ok unscored) (decode (encode unscored)) ),
         test.case "it starts with its magic and version" $( test.eq! [83, 76, 80, 1] (str_bytes (str.slice 0 4 (encode r))) ),
         test.case "a truncated file is refused"
             $( test.true! (Result.is_error (decode (str.slice 0 (len (encode r) - 7) (encode r)))) ),
@@ -232,13 +232,13 @@ when test {
             $( test.true! (Result.is_error (decode (str.slice 0 30 (encode r) + str.of_bytes [255, 255, 255, 255]))) ),
         test.case "another format is refused" $( test.true! (Result.is_error (decode "PNG")) ),
         test.case "CSV reads back"
-            $( test.eq! (Result.ok [Recording.subject r, Recording.zone r, Recording.stages r, tensor.shape signals])
+            $( test.eq! (ok [Recording.subject r, Recording.zone r, Recording.stages r, tensor.shape signals])
                         (Result.map (fn x -> [Recording.subject x, Recording.zone x, Recording.stages x, tensor.shape (Recording.signals x)]) (of_csv (to_csv r))) ),
         test.case "CSV keeps the readings"
             $( test.true! (tensor.maximum (tensor.abs (Recording.signals (Result.unwrap_or unscored (of_csv (to_csv r))) - signals)) < 1.0e-9) ),
         property.check "the encoding round-trips any scoring" (random.list_n 4 (random.int 0 4)) (fn ix -> {
             let x = Recording.set_stages (list.map stage.of_index ix) r;
-            decode (encode x) == (Result.ok x)
+            decode (encode x) == (ok x)
         }),
     ];
 }

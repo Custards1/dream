@@ -41,8 +41,8 @@ let find! sp format dir = match url_template sp format {
             :all => [["any", "any"]],
             _ => platforms,
         };
-        let found = list.filter (fn [os, machine] -> io.exists! (dir + "/" + tarball.file_for sp os machine :gzip)) wanted;
-        let assets = list.map (fn [os, machine] -> {
+        let found = filter (fn [os, machine] -> io.exists! (dir + "/" + tarball.file_for sp os machine :gzip)) wanted;
+        let assets = map (fn [os, machine] -> {
             let name = tarball.file_for sp os machine :gzip;
             Asset.make os machine name (spec.fill template (spec.vars sp).["file" => name].["os" => os].["arch" => machine])
                        (io.digest! (dir + "/" + name))
@@ -51,11 +51,11 @@ let find! sp format dir = match url_template sp format {
         match assets {
             [] => Result.error (format + ": no tarballs of " + Spec.name sp + " " + Spec.version sp + " in " + dir
                            + "; run `mind pack tarball` on each machine it is for, and gather them there"),
-            _ => Result.ok assets,
+            _ => ok assets,
         }
     },
 };
 
 /// Only the ones for one system.
 let on : :string -> [:any] -> [:any];
-let on os assets = list.filter (fn a -> Asset.os a == os || Asset.os a == "any") assets;
+let on os assets = filter (fn a -> Asset.os a == os || Asset.os a == "any") assets;

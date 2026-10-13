@@ -137,7 +137,7 @@ let run! port app = { let s = serve! port app; join! (Server.acceptor s) };
 /// Accept incoming connections and dispatch their handlers.
 priv let accept_loop! : :any -> :any -> Options -> :atom;
 priv let rec accept_loop! listener handle options =
-    match try! { let sock = net.accept! listener; Result.ok sock } catch e { Result.error e } {
+    match try! { let sock = net.accept! listener; Result.ok sock } catch e { err e } {
         Result.ok(sock) => {
             spawn! $( connection! sock handle options )
             accept_loop! listener handle options
@@ -166,7 +166,7 @@ priv let connection! sock handle options = {
     };
     if agreed_h2 {
         // HTTP/2 by ALPN: the client's preface comes first.
-        match try! { let got = http.read_exact! (http.reader sock) 24; strict! got; Result.ok got } catch e { Result.error e } {
+        match try! { let got = http.read_exact! (http.reader sock) 24; strict! got; Result.ok got } catch e { err e } {
             Result.ok([p, r]) => if p == h2.preface { serve_h2! sock r handle options peer watchdog },
             _ => (),
         }
@@ -198,7 +198,7 @@ priv let rec requests! sock r handle options peer watchdog =
     // Forced inside the `try!`: a request is built lazily, and a malformed
     // one must fail here, where it can be answered with a 400, rather than
     // in the handler, where it would be a 500.
-    match try! { let got = read_request! sock r options peer; strict! got; Result.ok got } catch e { Result.error e } {
+    match try! { let got = read_request! sock r options peer; strict! got; Result.ok got } catch e { err e } {
         Result.ok(()) => (),
         Result.ok([:h2, r2]) => serve_h2! sock r2 handle options peer watchdog,
         Result.ok([req, r2, body_proc]) => {
@@ -320,7 +320,7 @@ priv let read_request! sock r options peer = match http.read_head! r (Options.ma
 /// not, so the connection is ready for the next request.
 priv let body_server! : :any -> :any -> :integer -> :process -> :unit;
 priv let rec body_server! r state left owner = receive! {
-    [:next, from] => match try! { let got = http.next_piece! r state; strict! got; Result.ok got } catch e { Result.error e } {
+    [:next, from] => match try! { let got = http.next_piece! r state; strict! got; Result.ok got } catch e { err e } {
         Result.ok([(), st2, r2]) => { send! from [:body_piece, ()]; body_server! r2 st2 left owner },
         Result.ok([piece, st2, r2]) => if len piece > left {
             send! from [:body_error, error.new :too_large "a body larger than the limit"]
@@ -328,7 +328,7 @@ priv let rec body_server! r state left owner = receive! {
         } else { send! from [:body_piece, piece]; body_server! r2 st2 (left - len piece) owner },
         Result.error(e) => { send! from [:body_error, e]; body_server! r [:done] 0 owner },
     },
-    [:finish, from] => match try! { let got = http.fold_body! r state left () (fn acc piece -> acc); strict! got; Result.ok got } catch e { Result.error e } {
+    [:finish, from] => match try! { let got = http.fold_body! r state left () (fn acc piece -> acc); strict! got; Result.ok got } catch e { err e } {
         Result.ok([_, r2]) => { send! from [:body_reader, r2]; () },
         Result.error(_) => { send! from [:body_failed]; () },
     },
@@ -444,12 +444,12 @@ let fallback handle r = Router.set_fallback handle r;
 let mount : :string -> :map -> :map -> :map;
 let mount prefix inner r = {
     let pre = segments prefix;
-    Router.set_routes (Router.routes r + list.map (fn [m, segs, h] -> [m, pre + segs, h]) (Router.routes inner)) r
+    Router.set_routes (Router.routes r + map (fn [m, segs, h] -> [m, pre + segs, h]) (Router.routes inner)) r
 };
 
 /// Split a request path into its routing segments.
 priv let segments : :string -> [:string];
-priv let segments path = list.filter (fn s -> s != "") (str.split "/" path);
+priv let segments path = filter (fn s -> s != "") (str.split "/" path);
 
 /// A router as a handler; a handler as itself.
 let handler : :any -> :any;
@@ -461,9 +461,9 @@ let handler app = if type_of app == :map && map.has :routes app { dispatch app }
 let dispatch : :map -> :map -> :any;
 let dispatch r req = {
     let method = http.Request.method req;
-    let path_segs = list.map url.decode (segments (http.Request.path req));
-    let matching = list.filter (fn route -> match_path (route.[1]) path_segs %{} != ()) (Router.routes r);
-    let for_method m = list.filter (fn route -> route.[0] == m || route.[0] == "*") matching;
+    let path_segs = map url.decode (segments (http.Request.path req));
+    let matching = filter (fn route -> match_path (route.[1]) path_segs %{} != ()) (Router.routes r);
+    let for_method m = filter (fn route -> route.[0] == m || route.[0] == "*") matching;
     let chosen = match for_method method {
         [] => if method == "HEAD" { for_method "GET" } else { [] },
         found => found,
@@ -471,7 +471,7 @@ let dispatch r req = {
     match chosen {
         [[_, pattern, handle], .._] => handle (http.Request.set_params (match_path pattern path_segs %{}) req),
         [] => if matching != [] {
-            http.status_only 405 |> http.with_header "allow" (str.join_str ", " (list.unique (list.map (fn route -> route.[0]) matching)))
+            http.status_only 405 |> http.with_header "allow" (str.join_str ", " (list.unique (map (fn route -> route.[0]) matching)))
         } else {
             match Router.fallback r { () => http.not_found, handle => handle req }
         },
@@ -499,7 +499,7 @@ priv let rec match_path pattern path params = match [pattern, path] {
 /// a `..` segment is a 404 -- and the content type comes from the extension.
 let files! : :string -> :map -> :map;
 let files! dir req = {
-    let rel = match http.param "path" req { () => list.map url.decode (segments (http.Request.path req)), p => segments p };
+    let rel = match http.param "path" req { () => map url.decode (segments (http.Request.path req)), p => segments p };
     if list.any (fn s -> s == ".." || s == "." || str.contains '\\' s || str.contains '\u{0}' s) rel { http.not_found }
     else {
         let base = dir + "/" + str.join_str "/" rel;
@@ -572,8 +572,8 @@ let cors origins app req = {
 let with_headers : :any -> :any -> :map -> :map;
 let with_headers pairs app req = {
     let resp = (handler app) req;
-    let ps = if type_of pairs == :map { map.pairs pairs } else { pairs };
-    list.fold (fn r [k, v] -> if http.header k r == () { http.with_header k v r } else { r }) resp ps
+    let ps : [[:string, :any]] = if type_of pairs == :map { map.pairs pairs } else { pairs };
+    fold (fn r [k, v] -> if http.header k r == () { http.with_header k v r } else { r }) resp ps
 };
 
 /// HTTP Basic authentication: `check user password` decides, and anyone it
@@ -799,6 +799,7 @@ when test {
             // The bodies, not the responses: each carries a `Date`, and two
             // either side of a second's boundary are different responses
             // from the same connection.
+            let who : Result :map :error -> Result :string :error;
             let who r = Result.map http.body r;
             test.eq! [true, true] [Result.is_ok first && who first == who second, who plain != who first]
         } ),

@@ -11,7 +11,7 @@ import std.num;
 
 /// Concatenate rendered values. Strings are used as-is, including Unicode.
 let text : [:any] -> :string;
-let text values = str.concat_all (list.map to_string values);
+let text values = str.concat_all (map to_string values);
 
 /// Write a value's string representation to a handle, retrying partial writes.
 let write_to! : :any -> :any -> :unit;
@@ -60,7 +60,7 @@ let format template values = {
     let size = str.byte_length template;
     let rec walk !at !start remaining !pieces =
         if at >= size {
-            if not (list.is_empty remaining) { Result.error "too many format values" }
+            if not (list.is_empty remaining) { err "too many format values" }
             else { Result.ok (str.concat_all (list.reverse (list.cons (str.slice start (at - start) template) pieces))) }
         } else {
             let c = str.byte at template;
@@ -70,7 +70,7 @@ let format template values = {
                 if next == c { walk (at + 2) (at + 2) remaining (list.cons (str.slice at 1 template) before) }
                 else if c == 123 && next == 125 {
                     match remaining {
-                        [] => Result.error "not enough format values",
+                        [] => err "not enough format values",
                         [value, ..rest] => walk (at + 2) (at + 2) rest (list.cons (to_string value) before),
                     }
                 } else { Result.error ("unmatched format brace at byte " + to_string at) }
@@ -160,10 +160,10 @@ let ask! question parse = ask_with! (session! ()) question parse;
 /// Parse a yes/no answer, using `default` for an empty response.
 let confirmation : :bool -> :string -> Result :bool :string;
 let confirmation default line = match str.lower (str.trim line) {
-    "" => Result.ok default,
-    "y" => Result.ok true, "yes" => Result.ok true,
-    "n" => Result.ok false, "no" => Result.ok false,
-    _ => Result.error "Please answer yes or no.",
+    "" => ok default,
+    "y" => ok true, "yes" => ok true,
+    "n" => ok false, "no" => ok false,
+    _ => err "Please answer yes or no.",
 };
 /// Ask a yes/no question through the supplied session, with an explicit default.
 let confirm_with! : Session -> :any -> :bool -> :bool | :unit;
@@ -176,8 +176,8 @@ let confirm! question default = confirm_with! (session! ()) question default;
 /// Parse a trimmed integer response, returning a validation error for invalid input.
 let integer : :string -> Result :integer :string;
 let integer line = match num.parse_int (str.trim line) {
-    () => Result.error "Please enter an integer.",
-    n => Result.ok n,
+    () => err "Please enter an integer.",
+    n => ok n,
 };
 /// Prompt repeatedly until the user supplies an integer or input ends.
 let prompt_int! : :any -> :integer | :unit;
@@ -203,7 +203,7 @@ let style styles value = {
     let plain = to_string value;
     if list.is_empty styles || str.is_empty plain { plain }
     else {
-        let start = "\u{1b}[" + str.join_str ";" (list.map style_code styles) + "m";
+        let start = "\u{1b}[" + str.join_str ";" (map style_code styles) + "m";
         start + str.join_str ("\u{1b}[0m" + start) (str.split "\u{1b}[0m" plain) + "\u{1b}[0m"
     }
 };
@@ -262,7 +262,7 @@ let log_with! logger level value = {
         let out = Logger.output logger;
         let label = paint! (Logger.color logger) out (level_style level) ("[" + level_name level + "]");
         let prefix = if str.is_empty (Logger.prefix logger) { "" } else { Logger.prefix logger + ": " };
-        let lines = list.map (fn line -> label + " " + prefix + line) (str.split "\n" (to_string value));
+        let lines = map (fn line -> label + " " + prefix + line) (str.split "\n" (to_string value));
         print_to! out (str.join_str "\n" lines)
     }
 };
@@ -283,14 +283,14 @@ when test {
     import std.test;
     let tests = [
         test.case "format values, escapes, Unicode, and empty templates"
-            $( test.eq! [Result.ok "{雪}: 42", Result.ok "", Result.ok "[] () true"]
+            $( test.eq! [ok "{雪}: 42", ok "", ok "[] () true"]
                         [format "{{{}}}: {}" ["雪", 42], format "" [], format "{} {} {}" [[], (), true]] ),
         test.case "format errors keep missing and extra values visible"
-            $( test.eq! [Result.error "not enough format values", Result.error "too many format values",
-                         Result.error "unmatched format brace at byte 0"]
+            $( test.eq! [err "not enough format values", err "too many format values",
+                         err "unmatched format brace at byte 0"]
                         [format "{}" [], format "" [1], format "{" []] ),
         test.case "confirmation normalizes text and honors the empty-line default"
-            $( test.eq! [Result.ok true, Result.ok false, Result.ok true, Result.error "Please answer yes or no."]
+            $( test.eq! [ok true, ok false, ok true, err "Please answer yes or no."]
                         [confirmation false " YES ", confirmation true "n", confirmation true "", confirmation false "maybe"] ),
         test.case "nested styles restore their outer style"
             $( test.eq! "\u{1b}[31ma\u{1b}[1mb\u{1b}[0m\u{1b}[31mc\u{1b}[0m"

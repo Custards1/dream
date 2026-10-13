@@ -147,7 +147,7 @@ let parse_with flags source = match p.run regex_syntax source {
                 Result.ok (Regex.make source groups (group_names ast %{}) prefix starts
                                       (encode program groups prefix starts backwards) (encode whole groups "" () ""))
             },
-            why => Result.error why,
+            why => err why,
         }
     },
 };
@@ -155,7 +155,7 @@ let parse_with flags source = match p.run regex_syntax source {
 /// `text` with every character that means something in a pattern escaped,
 /// so `compile (escape s)` matches `s` exactly.
 let escape : :string -> :string;
-let escape text = str.concat_all (list.map (fn c -> if str.contains c "\\.+*?()|[]{}^$#&-~" { "\\" + str.of_chars [c] }
+let escape text = str.concat_all (map (fn c -> if str.contains c "\\.+*?()|[]{}^$#&-~" { "\\" + str.of_chars [c] }
                                                     else { str.of_chars [c] }) (str.chars text));
 
 // --- syntax --------------------------------------------------------------------------
@@ -394,7 +394,7 @@ priv let rec first_problem nodes = match nodes {
 
 /// The literal characters every match must begin with, when there are any.
 priv let literal_prefix : :any -> :string;
-priv let literal_prefix node = str.of_chars (list.map char.of_code (prefix_codes node));
+priv let literal_prefix node = str.of_chars (map char.of_code (prefix_codes node));
 
 /// Extract the literal code-point prefix that every match must begin with.
 priv let prefix_codes : :any -> [:integer];
@@ -435,7 +435,7 @@ priv let rec firsts node flags = match node {
     [:any] => [:any, false],
     [:class, false, items] => match item_codes items {
         :any => [:any, false],
-        codes => [if flags.[:i] { list.flat_map (fn c -> if is_letter_code c { [fold c, fold c - 32] } else { [c] }) codes } else { codes }, false],
+        codes => [if flags.[:i] { flat_map (fn c -> if is_letter_code c { [fold c, fold c - 32] } else { [c] }) codes } else { codes }, false],
     },
     [:class, true, _] => [:any, false],
     [:assert, _] => [[], true],
@@ -463,9 +463,9 @@ priv let union_firsts [a, na] [b, nb] = [if a == :any || b == :any { :any } else
 /// The codes of a class's ranges, when they are few and all ASCII.
 priv let item_codes : [:any] -> :any;
 priv let item_codes items = {
-    let ranges = list.map (fn item -> match item { [:range, lo, hi] => [lo, hi], _ => () }) items;
+    let ranges = map (fn item -> match item { [:range, lo, hi] => [lo, hi], _ => () }) items;
     if list.any (fn r -> r == () || r.[1] >= 128) ranges { :any }
-    else { list.flat_map (fn [lo, hi] -> list.range lo (hi + 1)) ranges }
+    else { flat_map (fn [lo, hi] -> list.range lo (hi + 1)) ranges }
 };
 
 // --- compiling to a program ------------------------------------------------------------
@@ -575,8 +575,8 @@ priv let encode program groups prefix starts backwards = {
         #[:match] => [inst 8 0 0 :: pieces, classes, n],
     };
     let [pieces, classes, n] = list.fold step [[], [], 0] program;
-    let class_bytes = list.map (fn [neg, ranges] -> str.concat_all ([str.of_bytes [if neg { 1 } else { 0 }], u32 (list.length ranges)]
-                                                                    + list.flat_map (fn [lo, hi] -> [u32 lo, u32 hi]) ranges))
+    let class_bytes = map (fn [neg, ranges] -> str.concat_all ([str.of_bytes [if neg { 1 } else { 0 }], u32 (list.length ranges)]
+                                                                    + flat_map (fn [lo, hi] -> [u32 lo, u32 hi]) ranges))
                                (list.reverse classes);
     str.concat_all (["DRX1", u32 groups, u32 (list.length program)] + list.reverse pieces
                     + [u32 n] + class_bytes + [u32 (len prefix), prefix]
@@ -589,7 +589,7 @@ priv let encode program groups prefix starts backwards = {
 /// pattern matches is wanted of it.
 priv let reversed : :any -> :any;
 priv let rec reversed node = match node {
-    [:seq, nodes] => [:seq, list.reverse (list.map reversed nodes)],
+    [:seq, nodes] => [:seq, list.reverse (map reversed nodes)],
     [:alt, nodes] => [:alt, list.map reversed nodes],
     [:cap, _, _, inner] => reversed inner,
     [:repeat, inner, lo, hi, greedy] => [:repeat, reversed inner, lo, hi, greedy],
@@ -614,8 +614,8 @@ priv let assert_code kind = match kind {
 /// A set of bytes as 32 bytes of bits, bit `b % 8` of byte `b / 8`.
 priv let bitmap : :string -> :string;
 priv let bitmap set = {
-    let bytes = list.unique (list.map (fn i -> str.byte i set) (list.range 0 (len set)));
-    str.of_bytes (list.map (fn k -> list.fold_strict (fn acc b -> acc + pow2 (b % 8)) 0 (list.filter (fn b -> b / 8 == k) bytes))
+    let bytes = list.unique (map (fn i -> str.byte i set) (list.range 0 (len set)));
+    str.of_bytes (map (fn k -> list.fold (fn acc b -> acc + pow2 (b % 8)) 0 (filter (fn b -> b / 8 == k) bytes))
                            (list.range 0 32))
 };
 
@@ -625,7 +625,7 @@ priv let rec pow2 n = if n <= 0 { 1 } else { 2 * pow2 (n - 1) };
 
 /// A class's items as sorted, disjoint ranges of code points.
 priv let item_ranges : [:any] -> [[:integer]];
-priv let item_ranges items = normalize (list.flat_map (fn item -> match item {
+priv let item_ranges items = normalize (flat_map (fn item -> match item {
     [:range, lo, hi] => [[lo, hi]],
     [:any_of, inner] => item_ranges inner,
     [:not, inner] => complement (item_ranges inner),
@@ -656,7 +656,7 @@ priv let complement ranges = {
 
 /// The other ASCII case of whatever letters the ranges cover.
 priv let fold_ranges : [[:integer]] -> [[:integer]];
-priv let fold_ranges ranges = list.flat_map (fn [lo, hi] -> {
+priv let fold_ranges ranges = flat_map (fn [lo, hi] -> {
     let upper = [num.max lo 65, num.min hi 90];
     let lower = [num.max lo 97, num.min hi 122];
     (if upper.[0] <= upper.[1] { [[upper.[0] + 32, upper.[1] + 32]] } else { [] })
@@ -670,7 +670,7 @@ priv let run code s from mode = vm.regex_run code s from mode;
 /// Convert runtime capture offsets into a match object for the original string.
 priv let match_of : Regex -> :string -> :array -> Match;
 priv let match_of re s caps = {
-    let spans = array.of_list (list.map (fn g -> { let a = caps.[2 * g]; let b = caps.[2 * g + 1];
+    let spans = array.of_list (map (fn g -> { let a = caps.[2 * g]; let b = caps.[2 * g + 1];
                                                    if a < 0 || b < 0 { () } else { #[a, b] } })
                                          (list.range 0 (Regex.groups re)));
     let start = caps.[0];
@@ -701,11 +701,11 @@ let find_from from re s = match run (Regex.code re) s from 1 { () => (), caps =>
 /// "". The machine finds them all in one call; each becomes a `Match` only
 /// when the list is read that far.
 let find_all : Regex -> :string -> [Match];
-let find_all re s = list.map (fn caps -> match_of re s caps) (run (Regex.code re) s 0 2);
+let find_all re s = map (fn caps -> match_of re s caps) (run (Regex.code re) s 0 2);
 
 /// The text of every match.
 let find_all_text : Regex -> :string -> [:string];
-let find_all_text re s = list.map Match.text (find_all re s);
+let find_all_text re s = map Match.text (find_all re s);
 
 /// How many matches there are, counted by the machine without building any.
 let count : Regex -> :string -> :integer;
@@ -736,12 +736,12 @@ let named name m = match m {
 let groups : (Match | :unit) -> ([(:string | :unit)] | :unit);
 let groups m = match m {
     () => (),
-    _ => list.map (fn n -> group n m) (list.range 1 (array.length (Match.spans m))),
+    _ => map (fn n -> group n m) (list.range 1 (array.length (Match.spans m))),
 };
 
 /// Every named group's text, by name.
 let named_groups : Match -> :map;
-let named_groups m = map.from_pairs (list.map (fn [k, n] -> [k, group n m]) (map.pairs (Match.names m)));
+let named_groups m = map.from_pairs (map (fn [k, n] -> [k, group n m]) (map.pairs (Match.names m)));
 
 /// The groups of the first match, from group 1, or `()` when there is none:
 /// the one-call way to take text apart.
@@ -897,7 +897,7 @@ when test {
         test.case "a backwards range is refused" $( test.true! (problem "[z-a]" != ()) ),
         test.case "parse is a result"        $( test.eq! [true, true] [Result.is_ok (parse "a+"), Result.is_error (parse "a{2,1}")] ),
         test.case "compile-time compiling"   $( test.eq! "abc" (group 0 (find compiled_at_build "xxabcxx")) ),
-        test.case "inside a parser"          $( test.eq! (Result.ok ["key", "42"])
+        test.case "inside a parser"          $( test.eq! (ok ["key", "42"])
                                                    (p.run (p.seq [token (r "[a-z]+"), p.then (token (r "\\d+")) (p.text "=")]) "key=42") ),
         test.case "the literal prefix"       $( test.eq! ["abc", "ab"] [Regex.prefix (r "abc(d|e)"), Regex.prefix (r "(ab)+")] ),
         test.case "the bytes a match starts with" $( test.eq! ["0123456789", "xXyY", (), (), ()]

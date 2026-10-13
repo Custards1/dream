@@ -64,7 +64,7 @@ let size_of members = {
         let size = match i { item.Item.dir(_, _) => 0, _ => item.size i };
         str.byte_length (header ino 0 1 0 size (item.path i)) + size + bytes.padding 4 size
     };
-    list.fold_strict (fn !acc m -> acc + one m) 0 members + str.byte_length (header 0 0 1 0 0 "TRAILER!!!")
+    fold (fn !acc m -> acc + one m) 0 members + str.byte_length (header 0 0 1 0 0 "TRAILER!!!")
 };
 
 when test {

@@ -61,12 +61,12 @@ let pacman d = Dep.name d + Dep.op d + Dep.version d;
 /// A whole list for Debian, where an alternative passes through untouched.
 let deb_list : [:string] -> Result :string :string;
 let deb_list ds = {
-    let one = fn d -> if str.contains_str "|" d { Result.ok (str.trim d) } else { Result.map deb (parse d) };
-    Result.map (fn xs -> str.join_str ", " xs) (Result.all (list.map one ds))
+    let one = fn d -> if str.contains_str "|" d { Result.ok (str.trim d) } else { map deb (parse d) };
+    map (fn xs -> str.join_str ", " xs) (Result.all (map one ds))
 };
 
 let parse_all : [:string] -> Result [:any] :string;
-let parse_all ds = Result.all (list.map parse ds);
+let parse_all ds = Result.all (map parse ds);
 
 when test {
     import std.test;
@@ -83,7 +83,7 @@ when test {
             $( test.eq! ["a (>= 1)", "a (>> 1)", "a", "a>=1"]
                         [deb (Dep.make "a" ">=" "1"), deb (Dep.make "a" ">" "1"), deb (Dep.new "a"), pacman (Dep.make "a" ">=" "1")] ),
         test.case "a Debian list, alternatives as written"
-            $( test.eq! (Result.ok "libc6 (>= 2.31), libssl3 | libssl1.1") (deb_list ["libc6 >= 2.31", "libssl3 | libssl1.1"]) ),
+            $( test.eq! (ok "libc6 (>= 2.31), libssl3 | libssl1.1") (deb_list ["libc6 >= 2.31", "libssl3 | libssl1.1"]) ),
         test.case "RPM's flags"
             $( test.eq! [0, 12, 8, 2] (list.map rpm_flags ["", ">=", "=", "<"]) ),
     ];

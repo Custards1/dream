@@ -38,6 +38,10 @@ with tempfile.TemporaryDirectory(prefix='dream-shorthand-') as directory:
             result = run(vm, *jit, str(image))
             assert result.returncode == 0 and result.stdout == expected, result.stdout + result.stderr
 
+    for mode in ('--check', '--no-emit', '--ir', '--stats'):
+        checked = compile_source(fixture, mode)
+        assert checked.returncode == 0, checked.stdout + checked.stderr
+
     cases = [
         ('import std.list as seq; import std.array as vec; '
          'let main! = console.print! (map (fn x -> x + 1) #[2]);', '#[3]\n'),
@@ -65,6 +69,26 @@ with tempfile.TemporaryDirectory(prefix='dream-shorthand-') as directory:
          'let main! = console.print! (choose (err "bad"));', 'Result.ok(3)\n'),
         ('let fallback : (:unit -> Option :integer) -> Option :integer -> Option :integer; '
          'let fallback = or_else; let main! = console.print! (fallback (fn _ -> some 3) none);', 'Option.some(3)\n'),
+        # A seed that is a literal decides the accumulator before the lambda
+        # can (`[]` is `[:never]`); what the lambda answers must still choose.
+        ('import std.list; import std.map; import std.str; '
+         'let backwards : :string -> [:char]; '
+         'let backwards s = fold (fn acc c -> list.cons c acc) [] (str.chars s); '
+         'let main! = console.print! (str.of_chars (backwards "abc"));', 'cba\n'),
+        ('import std.list; import std.map; '
+         'let split : [:integer] -> [[:integer]]; '
+         'let split xs = { let [odd, even] = fold (fn [o, e] x -> '
+         'if x % 2 == 1 { [list.cons x o, e] } else { [o, list.cons x e] }) [[], []] xs; [odd, even] }; '
+         'let main! = console.print! (split [1, 2, 3]);', '[[3, 1], [2]]\n'),
+        ('import std.list; macro bump e = { '
+         'let values : [:integer] = [e.[1]]; '
+         'let changed = map (fn x -> x + 1) values; '
+         '[:int, list.head changed, [0, 0]] }; '
+         'let main! = console.print! (expand bump 2);', '3\n'),
+        ('macro bump e = { let value : Result :integer :string = ok e.[1]; '
+         'let changed = map (fn x -> x + 1) value |> unwrap_or 0; '
+         '[:int, changed, [0, 0]] }; '
+         'let main! = console.print! (expand bump 2);', '3\n'),
     ]
     for body, wanted in cases:
         compiled = compile_source('import std.console; ' + body)
@@ -83,6 +107,10 @@ with tempfile.TemporaryDirectory(prefix='dream-shorthand-') as directory:
         message = compiled.stdout + compiled.stderr
         assert compiled.returncode != 0 and f'overload of `{name}`' in message, message
         assert 'write the member explicitly:' in message, message
+
+    for mode in ('--check', '--no-emit', '--ir'):
+        rejected = compile_source('let ambiguous = map;', mode)
+        assert rejected.returncode != 0 and 'overload of `map`' in rejected.stdout + rejected.stderr
 
     # A cached walk must not reuse a list choice after an argument becomes an
     # array, nor reuse a success after a signature stops disambiguating it.

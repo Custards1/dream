@@ -55,7 +55,7 @@ let main! = {
 
     // The same generic `describe` produced all three lines above, specialized
     // three ways.
-    console.print! ("all:         " + to_string (list.map (fn f -> f 2) [square.area, blob.area]))
+    console.print! ("all:         " + to_string (map (fn f -> f 2) [square.area, blob.area]))
 
     // std.seq, through its two instances in the standard library.
     console.print! ("array.sum:   " + to_string (array.sum #[1, 2, 3, 4]))

@@ -237,7 +237,7 @@ priv let train! model ds opts = {
     let batch = num.min n (Fit.batch opts);
     let seed = Fit.seed opts;
     let wanted = Fit.metrics opts;
-    let measures = list.map (fn m -> [metric_name m, metric_fn loss_name m]) wanted;
+    let measures = map (fn m -> [metric_name m, metric_fn loss_name m]) wanted;
     let verbose = Fit.verbose opts;
     let shuffle = Fit.shuffle opts;
     let patience = Fit.patience opts;
@@ -279,12 +279,12 @@ priv let train! model ds opts = {
                 strict! p2
                 strict! s2
                 strict! m2
-                let scored = list.map (fn [[_, f], acc] -> acc + k * f out yb) (list.zip measures sums);
+                let scored = map (fn [[_, f], acc] -> acc + k * f out yb) (list.zip measures sums);
                 strict! scored
                 go! (list.drop batch idx) p2 s2 m2 (t + 1) (loss_sum + k * l) scored
             },
         };
-        go! order p s m t0 0.0 (list.map (fn _ -> 0.0) measures)
+        go! order p s m t0 0.0 (map (fn _ -> 0.0) measures)
     };
 
     let rec epochs! e p s m t best stale log = {
@@ -296,15 +296,15 @@ priv let train! model ds opts = {
             strict! measured_loss
             let seconds = (time.monotonic! () - began) / 1.0e9;
             let row0 = %{"epoch" => e + 1, "loss" => measured_loss / n, "seconds" => seconds};
-            let row1 = list.fold (fn r [[name, _], total] -> r.[name => total / n]) row0 (list.zip measures sums);
+            let row1 = fold (fn r [[name, _], total] -> r.[name => total / n]) row0 (list.zip measures sums);
             let row = match validation {
                 () => row1,
                 v => {
                     let scores = evaluate_with model p2 m2 loss_fn measures batch v;
-                    list.fold (fn r [k, x] -> r.["val_" + k => x]) row1 (map.pairs scores)
+                    fold (fn r [k, x] -> r.["val_" + k => x]) row1 (map.pairs scores)
                 },
             };
-            if verbose { console.print! (describe_epoch (e + 1) epochs row (list.map (fn [name, _] -> name) measures)) }
+            if verbose { console.print! (describe_epoch (e + 1) epochs row (map (fn [name, _] -> name) measures)) }
             let watched = row.["val_loss" else row.["loss"]];
             let improved = best == () || watched < best.[0];
             let best2 = if improved { [watched, p2, m2] } else { best };
@@ -327,10 +327,10 @@ priv let describe_epoch : :integer -> :integer -> %{:string => :any} -> [:string
 priv let describe_epoch e epochs row names = {
     let width = str.length (to_string epochs);
     let num_text x = fixed 4 x;
-    let shown = ["loss"] + names + (if row.["val_loss" else ()] == () { [] } else { ["val_loss"] + list.map (fn name -> "val_" + name) names });
-    let pairs = list.map (fn k -> [k, row.[k]]) shown;
+    let shown = ["loss"] + names + (if row.["val_loss" else ()] == () { [] } else { ["val_loss"] + map (fn name -> "val_" + name) names });
+    let pairs = map (fn k -> [k, row.[k]]) shown;
     "epoch " + str.repeat (width - str.length (to_string e)) " " + to_string e + "/" + to_string epochs
-        + str.concat_all (list.map (fn [k, v] -> "  " + k + " " + num_text v) pairs)
+        + str.concat_all (map (fn [k, v] -> "  " + k + " " + num_text v) pairs)
         + "  " + fixed 2 row.["seconds"] + "s"
 };
 
@@ -342,7 +342,7 @@ let fixed digits x = {
     let f = 1.0 * x;
     if f != f || math.abs f > 1.0e15 { to_string f }
     else {
-        let scale = list.fold_strict (fn !acc _ -> acc * 10) 1 (list.range 0 digits);
+        let scale = fold (fn !acc _ -> acc * 10) 1 (list.range 0 digits);
         let whole = math.floor (math.abs f * scale + 0.5);
         let int_part = whole / scale;
         let frac = to_string (whole % scale);
@@ -384,7 +384,7 @@ let classify f x = {
         let cut = if Fitted.loss f == :binary_cross_entropy { 0.0 } else { 0.5 };
         tensor.gt (tensor.reshape [tensor.size out] out) cut
     } else { metrics.classes_of out };
-    list.map num.to_int (tensor.to_list classes)
+    map num.to_int (tensor.to_list classes)
 };
 
 /// Each row's output as probabilities: the softmax of a classifier's logits,
@@ -400,7 +400,7 @@ let probabilities f x = {
 let evaluate : Fitted -> data.Dataset -> %{:string => :float};
 let evaluate f ds = {
     let loss_name = Fitted.loss f;
-    let measures = list.map (fn m -> [metric_name m, metric_fn loss_name m]) (Fitted.metrics f);
+    let measures = map (fn m -> [metric_name m, metric_fn loss_name m]) (Fitted.metrics f);
     let first = list.head (tree.leaves (Fitted.params f));
     let placed = if type_of first == :tensor && tensor.device first == :gpu { data.to_gpu ds } else { ds };
     evaluate_with (Fitted.model f) (Fitted.params f) (Fitted.state f) (loss.of loss_name) measures 256 placed
@@ -411,14 +411,14 @@ let evaluate f ds = {
 priv let evaluate_with : nn.Layer -> :any -> :any -> :any -> [:any] -> :integer -> data.Dataset -> %{:string => :float};
 priv let evaluate_with model p state loss_fn measures batch ds = {
     let n = data.size ds;
-    let totals = list.fold (fn acc b -> {
+    let totals = fold (fn acc b -> {
         let k = data.size b;
         let out = nn.apply_state model p state (data.x b);
         let l = loss_fn out (data.y b);
-        list.map (fn [a, v] -> a + k * v) (list.zip acc (l :: list.map (fn [_, f] -> f out (data.y b)) measures))
-    }) (list.map (fn _ -> 0.0) (0 :: measures)) (data.batches batch ds);
-    let names = "loss" :: list.map (fn [name, _] -> name) measures;
-    map.from_pairs (list.map (fn [k, v] -> [k, (if type_of v == :tensor { tensor.sum v } else { v }) / n]) (list.zip names totals))
+        map (fn [a, v] -> a + k * v) (list.zip acc (l :: map (fn [_, f] -> f out (data.y b)) measures))
+    }) (map (fn _ -> 0.0) (0 :: measures)) (data.batches batch ds);
+    let names = "loss" :: map (fn [name, _] -> name) measures;
+    map.from_pairs (map (fn [k, v] -> [k, (if type_of v == :tensor { tensor.sum v } else { v }) / n]) (list.zip names totals))
 };
 
 /// `model`'s parameters, as a table to print: each layer, what it outputs
@@ -439,10 +439,10 @@ let save! path t = {
     let piece [p, x] = {
         let v = if type_of x == :tensor { tensor.host x } else { tensor.of_list [1.0 * x] };
         let kind = if type_of x == :tensor { "t" } else { "n" };
-        kind + " " + str.join_str "\u{1f}" (list.map key_text p) + "\t"
-            + str.join_str "," (list.map to_string (tensor.shape v)) + "\n" + tensor.to_bytes v
+        kind + " " + str.join_str "\u{1f}" (map key_text p) + "\t"
+            + str.join_str "," (map to_string (tensor.shape v)) + "\n" + tensor.to_bytes v
     };
-    file.write! path ("dream-ml 1\n" + str.concat_all (list.map piece (tree.paths t)))
+    file.write! path ("dream-ml 1\n" + str.concat_all (map piece (tree.paths t)))
 };
 
 /// Convert a serialization key to text.
@@ -482,7 +482,7 @@ let load! path = match file.read! path {
 /// The tree in text `save!` wrote: `[:ok, tree]` or `[:error, why]`.
 let parse_saved : :string -> Result :any :string;
 let parse_saved text =
-    if not (str.starts_with "dream-ml 1\n" text) { Result.error "not a file save! wrote" }
+    if not (str.starts_with "dream-ml 1\n" text) { err "not a file save! wrote" }
     else {
         let total = str.byte_length text;
         let rec read at acc = if at >= total { Result.ok (build (list.reverse acc)) } else {
@@ -491,12 +491,12 @@ let parse_saved text =
             let tab = str.find "\t" header;
             let kind = str.slice 0 1 header;
             let keys = str.slice 2 (tab - 2) header;
-            let shape = list.map int_of (str.split "," (str.slice (tab + 1) (str.length header - tab - 1) header));
-            let count = list.fold_strict (fn !a b -> a * b) 1 shape;
+            let shape = map int_of (str.split "," (str.slice (tab + 1) (str.length header - tab - 1) header));
+            let count = fold (fn !a b -> a * b) 1 shape;
             let bytes = str.slice (eol + 1) (count * 8) text;
             let t = tensor.of_bytes shape bytes;
             let leaf = if kind == "n" { tensor.sum t } else { t };
-            let path = if str.is_empty keys { [] } else { list.map key_of (str.split "\u{1f}" keys) };
+            let path = if str.is_empty keys { [] } else { map key_of (str.split "\u{1f}" keys) };
             read (eol + 1 + count * 8) ([path, leaf] :: acc)
         };
         read 11 []
@@ -508,12 +508,12 @@ priv let build : [[[:any], :any]] -> :any;
 priv let build pairs = match pairs {
     [[[], leaf]] => leaf,
     _ => {
-        let firsts = list.unique (list.map (fn [p, _] -> list.head p) pairs);
-        let child k = build (list.map (fn [p, x] -> [list.tail p, x]) (list.filter (fn [p, _] -> list.head p == k) pairs));
+        let firsts = list.unique (map (fn [p, _] -> list.head p) pairs);
+        let child k = build (map (fn [p, x] -> [list.tail p, x]) (filter (fn [p, _] -> list.head p == k) pairs));
         if list.all (fn k -> type_of k == :integer) firsts {
-            list.map child (list.sort firsts)
+            map child (list.sort firsts)
         } else {
-            map.from_pairs (list.map (fn k -> [k, child k]) firsts)
+            map.from_pairs (map (fn k -> [k, child k]) firsts)
         }
     },
 };
@@ -531,7 +531,7 @@ when test {
                     (if type_of x == :tensor { "t " } else { "n " }) + str.join_str "\u{1f}" (list.map key_text p) + "\t"
                         + str.join_str "," (list.map to_string (tensor.shape v)) + "\n" + tensor.to_bytes v
                 }) (tree.paths t)));
-                back == (Result.ok t)
+                back == (ok t)
             }) ),
         test.case "fit retains batch norm state for prediction and resuming"
             $( {

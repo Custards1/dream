@@ -36,12 +36,49 @@ becomes "is this the global index `std.list` gave `range`?", which has one
 answer. [dreams/src/lower.dr](../../dreams/src/lower.dr) builds the loop, beside the wrapper
 rewriting it resembles.
 
-**What it covers.** Sources `range` and `replicate`; steps `map` and `filter`;
-sinks `fold`, `fold_strict`, `sum` and `product`. Everything the original plan
-listed beyond that -- `from`, `repeat`, `take`, `zip`, `length`, `any` -- is
-*not* implemented, and a member whose loop is not written simply does not fuse:
-the call it always compiled to still works. Adding one means writing its loop by
-hand in `lower`, which is the price of not having a `build`/`foldr` mechanism.
+**What it covers.** Sources `range` and `replicate`, and -- since 2026-10-12 --
+any list or array the program already has; steps `map` and `filter`, of
+`std.list` or of `std.array`; sinks `fold`, `fold_strict`, `fold_lazy`, `sum`
+and `product` of either, and `std.map`'s `from_pairs`. A chain is one pipeline
+only while its pieces are one module's: `array.fold` over `array.map` over an
+array, never `array.fold` over `list.map`. Everything else -- `take`, `zip`,
+`length`, `any` -- is *not* implemented, and a member whose loop is not written
+simply does not fuse: the call it always compiled to still works. Adding one
+means writing its loop by hand in `lower`, which is the price of not having a
+`build`/`foldr` mechanism.
+
+**A container as the source** (2026-10-12). A pipeline need not start with a
+producer: `fold f acc (map g xs)` over a list someone already has built the list
+`map` makes and threw it away, and `fold f acc xs` alone called `f` through a
+closure for every element. Neither has a list to remove, but both have a loop to
+write, and the loop is the point. Over a list the cursor is what is left of it;
+over an array the cursor counts from zero and the array is carried. Nothing is
+produced twice, so a named list is as good a source as one written in place. On
+two million elements: a `fold` over a list 90 ms to 20, a `fold` over a `map`
+and a `filter` of one 470 ms to 30, a `fold` over an array 355 ms to 38.
+`from_pairs` did not move -- inserting into the map is its cost, not the list.
+
+The element of a list or an array is not a slot: it is read where it is used,
+by the substitution a `map`'s output already used. Making that common found two
+bugs the `map` stage had had all along, both in what "where it is used" means:
+
+- **A closure or a suspension made in the loop** copies its captures out of the
+  frame when it is made, and the frame's copy of a substituted slot was never
+  written. `fold (fn acc x -> list.cons ((fn k -> k + x) 0) acc) [] (map ..
+  (range ..))` answered garbage. Such a loop is not fused now
+  (`scope.captures_substituted`).
+- **A nested function's body was lowered with the loop's substitution still in
+  force**, and its own frame numbers slots from zero too: a lambda in a fold's
+  step had its first parameter read as the loop's element. `lower_function`
+  and a `comp` now lower their bodies with none.
+
+**The seed of a strict fold is forced** (2026-10-12). It was handed to the first
+callback unforced, so `fold (fn _ x -> x) (boom 0) [1]` was `1`; a fused loop
+forces its accumulator at the top of every turn, the first included. The rule
+moved rather than the loop -- a flag for the first turn costs a branch in every
+strict loop to protect a seed nobody drops -- and `list.fold` and `array.fold`
+force it too, so a fold means the same fused or not. `fold_lazy` is the fold for
+a seed that must stay unforced.
 
 Shortcut fusion (`foldr`/`build`, as Haskell does it) remains the general
 answer if this ever needs to fuse arbitrary producers with arbitrary consumers.

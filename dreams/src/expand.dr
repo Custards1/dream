@@ -12,6 +12,7 @@ import dreams.lower;
 import dreams.modules;
 import dreams.scope;
 import dreams.syntax;
+import dreams.typecheck;
 import std.map;
 
 let has_expansion : :any -> :bool;
@@ -96,7 +97,7 @@ let reading! u = {
 };
 /// `a - b`, elementwise and never below zero -- used twice, first to turn two
 /// readings into an interval and then to take the walk back off the work.
-let minus a b = list.map (fn [x, y] -> if x > y { x - y } else { 0 }) (list.zip a b);
+let minus a b = map (fn [x, y] -> if x > y { x - y } else { 0 }) (list.zip a b);
 
 /// Force `value` and answer `[value, [ns, reductions, bytes]]`.
 ///
@@ -147,11 +148,11 @@ let vm_starts s = tally s :vm_starts;
 /// failed spent its phases before the path that answered spent its own, and a
 /// reader wants the compile rather than the half of it that worked.
 let merge_meter a b = {
-    let join key combine = list.fold (fn m [k, v] -> m.[k => (combine (m.[k else ()]) v)])
+    let join key combine = fold (fn m [k, v] -> m.[k => (combine (m.[k else ()]) v)])
                                      (a.[key else %{}]) (map.pairs (b.[key else %{}]));
     %{ :phases => join :phases (fn old v -> match old {
            () => v,
-           _ => list.map (fn [x, y] -> x + y) (list.zip old v),
+           _ => map (fn [x, y] -> x + y) (list.zip old v),
        }),
        :counts => join :counts (fn old v -> match old { () => v, n => n + v }) }
 };
@@ -215,7 +216,7 @@ let macro_definition l reference = {
 /// every expansion. Its isolated function already has the right environment.
 let staged_lowering : lower.Lowering -> lower.Lowering;
 let staged_lowering low = {
-    let ready = list.fold (fn acc [placeholder, function, .._] -> {
+    let ready = fold (fn acc [placeholder, function, .._] -> {
         let [lowered, closure] = lower.emit (ir.node :make_closure function ir.no_node ir.no_node) acc;
         lower.set_prog (ir.set_node placeholder (ir.node :apply closure 0 0)
                                    (lower.prog lowered)) lowered
@@ -260,10 +261,10 @@ let prepare! l = prepare_work! l (work_of l);
 /// was written rather than by what it is called -- and a name would not do
 /// anyway, since two modules may each declare `twice`.
 let transformer_roots l =
-    list.fold (fn acc mi -> {
+    fold (fn acc mi -> {
         let m = modules.module_at l mi;
         let source = modules.module_source m;
-        list.fold (fn a item -> match item {
+        fold (fn a item -> match item {
             [:macro, _, _, _, sp] => a.[scope.root_key source (ast.span_start sp) => true],
             _ => a,
         }) acc (modules.module_items m)
@@ -282,11 +283,16 @@ let transformer_roots l =
 /// -- and so where a lazy parse is finally paid -- and declaring is the walk
 /// for names that `scope.resolve!` makes again afterwards.
 let stage_program l work = {
-    let replaced = apply_items l (list.map (fn [mi, i, tree] ->
+    let replaced = apply_items l (map (fn [mi, i, tree] ->
         [mi, i, stage tree]) work);
     modules.map_modules (fn m ->
-        with_items m (list.map macro_let (modules.module_items m))) replaced
+        with_items m (map macro_let (modules.module_items m))) replaced
 };
+
+/// Staged programs use the same type-directed members as runtime programs.
+let resolve_reachable! : modules.Loader -> scope.State -> (:map | :unit) -> scope.Resolution;
+let resolve_reachable! l declared roots =
+    typecheck.select_overloads l (scope.resolve_reachable! l declared roots);
 
 let prepare_work! : modules.Loader -> [:any] -> :map;
 let prepare_work! l work = {
@@ -298,7 +304,7 @@ let prepare_work! l work = {
     // the program afresh for each of them was a compile per failing `expand`
     // -- for a program that does not resolve, every one of them. Lazy, so a
     // snapshot nobody asks of whole never pays for it.
-    let whole = scope.resolve_reachable! staged declared ();
+    let whole = resolve_reachable! staged declared ();
     %{ :loader => staged, :declared => declared,
        :roots => transformer_roots l, :resolved_whole => whole }
 };
@@ -415,7 +421,7 @@ let evaluate_round! base s session0 jobs = {
     let plans = list.reverse (list.head prepared);
     let s1 = counts (s.[:next => (list.nth 1 prepared)])
         [[:rounds, 1], [:wrappers, list.length plans],
-         [:calls, list.fold (fn n plan -> n + list.length (list.nth 1 plan)) 0 plans]];
+         [:calls, fold (fn n plan -> n + list.length (list.nth 1 plan)) 0 plans]];
 
     // What every call's name means, and nothing else. The wrappers used to be
     // declared as globals and resolved along with the transformers, which put
@@ -423,7 +429,7 @@ let evaluate_round! base s session0 jobs = {
     // they are resolved on their own now and the resolution is read for its
     // `refs` and thrown away.
     let siting = phase! s1 :sites (scope.resolve_names! staged base.[:declared]
-        (list.map (fn plan -> [list.head plan,
+        (map (fn plan -> [list.head plan,
                                modules.module_source (modules.module_at staged (list.head plan)),
                                list.nth 3 plan, ()]) plans));
     let s2 = list.head siting;
@@ -441,10 +447,10 @@ let evaluate_round! base s session0 jobs = {
     // is opened rather than here -- charging a phase forces it.
     let resolved = if base.[:whole else false] {
                        match base.[:resolved_whole else ()] {
-                           () => scope.resolve_reachable! staged base.[:declared] (),
+                           () => resolve_reachable! staged base.[:declared] (),
                            r => r,
                        }
-                   } else { scope.resolve_reachable! staged base.[:declared] (base.[:roots else ()]) };
+                   } else { resolve_reachable! staged base.[:declared] (base.[:roots else ()]) };
     let arena = invocation_image staged resolved;
     let bytes = emit.to_binary arena;
 
@@ -508,10 +514,10 @@ let evaluate_round! base s session0 jobs = {
         // check, the diagnostic, the note an editor reads and the global the
         // session is entered at are all the same lookup.
         let sites = list.range 0 (list.length calls);
-        let references = list.map (fn i ->
+        let references = map (fn i ->
             scope.resolution sited mi (modules.module_source m)
                              (ast.span (list.nth i targets))) sites;
-        let definitions = list.map (fn i -> macro_definition l (list.nth i references)) sites;
+        let definitions = map (fn i -> macro_definition l (list.nth i references)) sites;
 
         /// What is wrong with call `i`, or `()`. A resolution error anywhere in
         /// the round is everyone's objection: the round resolved the wrappers
@@ -534,17 +540,17 @@ let evaluate_round! base s session0 jobs = {
         /// takes: that is a compile of the program per call, and for a file
         /// with dozens of `expand`s it ran out of memory long before it
         /// reported anything.
-        let sited_errors = list.filter (fn d -> diag.is_error d) (scope.r_diags sited);
+        let sited_errors = filter (fn d -> diag.is_error d) (scope.r_diags sited);
         let objection i =
             match list.nth i definitions {
                 () => if list.is_empty sited_errors {
                           "`expand` needs the name of a declared macro"
                       } else {
                           "cannot compile macro: "
-                          + str.join_str "; " (list.map (fn d -> diag.message d) sited_errors)
+                          + str.join_str "; " (map (fn d -> diag.message d) sited_errors)
                       },
                 _ if diag.error_count (scope.r_diags resolved) > 0 => {
-                    let broken = list.filter (fn d -> diag.is_error d) (scope.r_diags resolved);
+                    let broken = filter (fn d -> diag.is_error d) (scope.r_diags resolved);
                     "cannot run macro: what it runs does not compile (" + diag.message (list.head broken)
                     + (if list.length broken > 1 { ", and " + to_string (list.length broken - 1) + " more" }
                        else { "" }) + ")"
@@ -560,14 +566,14 @@ let evaluate_round! base s session0 jobs = {
 
         /// The state with every call that named a macro written down, for an
         /// editor.
-        let noted = list.fold (fn acc i -> match list.nth i definitions {
+        let noted = fold (fn acc i -> match list.nth i definitions {
             () => acc,
             _ => note_macro acc mi
                      (ast.span_start (ast.span (call_callee (list.head (list.nth i calls)))))
                      (list.nth i references),
         }) st0 sites;
 
-        list.fold (fn [st, session, answers] i -> {
+        fold (fn [st, session, answers] i -> {
             let at = list.nth 1 (list.nth i calls);
             match objection i {
                 why if why != () =>
@@ -583,7 +589,7 @@ let evaluate_round! base s session0 jobs = {
                             (modules.module_name (modules.module_at staged target_mi))
                             target_name (call_args (list.head (list.nth i calls)));
                         strict! value
-                        Result.ok value
+                        ok value
                     } catch e { Result.error (to_string e) };
                     let ran = counted (charged st1 :vm (minus (reading! ()) started))
                                       :vm_starts 1;
@@ -653,7 +659,7 @@ let rec punch tree !acc = match tree {
     },
     _ => if type_of tree != :list { [tree, acc] }
          else {
-             let done = list.fold (fn [parts, a] part -> {
+             let done = fold (fn [parts, a] part -> {
                  let got = punch part a;
                  [list.cons (list.head got) parts, list.nth 1 got]
              }) [[], acc] tree;
@@ -682,10 +688,10 @@ let rec rounds! base s session mi tree depth = {
     let refused sp = ast.unit_e sp;
     if list.is_empty calls { [s, session, tree] }
     else if depth >= 64 {
-        [list.fold (fn st call ->
+        [fold (fn st call ->
              fail st mi (list.nth 1 call) "macro expansion exceeded 64 nested calls") s calls,
          session,
-         fill (list.head punched) (list.map (fn call -> refused (list.nth 1 call)) calls)]
+         fill (list.head punched) (map (fn call -> refused (list.nth 1 call)) calls)]
     } else {
         let result = evaluate! base s session mi calls;
         // Both the syntax and the updated loader contain lazy fields whose
@@ -694,7 +700,7 @@ let rec rounds! base s session mi tree depth = {
         // keep every temporary compilation alive at once.
         strict! result
         let [state, opened, values] = result;
-        let answers = list.map (fn pair -> match list.head pair {
+        let answers = map (fn pair -> match list.head pair {
             () => refused (list.nth 1 (list.nth 1 pair)),
             answer => answer,
         }) (list.zip values calls);
@@ -734,9 +740,9 @@ let rec rounds_all! base s session items depth = {
         // One job per module, its declarations' calls in the order they were
         // punched, so the answers come back in an order the walk below can
         // hand out again without keying anything.
-        let mods = list.unique (list.map (fn j -> list.head j) active);
-        let jobs = list.map (fn mi -> [mi, list.concat (list.map (fn j -> list.nth 3 j)
-            (list.filter (fn j -> list.head j == mi) active))]) mods;
+        let mods = list.unique (map (fn j -> list.head j) active);
+        let jobs = map (fn mi -> [mi, list.concat (map (fn j -> list.nth 3 j)
+            (filter (fn j -> list.head j == mi) active))]) mods;
         let result = evaluate_round! base s session jobs;
         // Both the syntax and the updated loader contain lazy fields whose
         // frames retain this round's resolver and lowered program. Finish them
@@ -744,7 +750,7 @@ let rec rounds_all! base s session items depth = {
         // every temporary compilation alive at once.
         strict! result
         let [state, opened, per_module] = result;
-        let pool = list.fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
+        let pool = fold (fn m pair -> m.[list.head pair => list.nth 1 pair])
                              %{} (list.zip mods per_module);
         let filled = list.fold (fn [acc, remaining] j -> {
             let calls = list.nth 3 j;
@@ -753,7 +759,7 @@ let rec rounds_all! base s session items depth = {
             } else {
                 let mi = list.head j;
                 let mine = remaining.[mi else []];
-                let answers = list.map (fn pair -> match list.head pair {
+                let answers = map (fn pair -> match list.head pair {
                     () => ast.unit_e (list.nth 1 (list.nth 1 pair)),
                     answer => answer,
                 }) (list.zip (list.take (list.length calls) mine) calls);
@@ -815,7 +821,7 @@ let picks_of l mi = {
         let numbered = list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
             [i + 1, list.cons [i, item] acc]) [0, []] (modules.module_items m)));
         [mi, source, sites, numbered,
-         list.filter (fn [_, item] -> in_item sites item) numbered]
+         filter (fn [_, item] -> in_item sites item) numbered]
     }
 };
 
@@ -859,17 +865,17 @@ let picks_of l mi = {
 /// declaration, which is a module's declarations squared.
 let work_of : modules.Loader -> [:any];
 let work_of l = {
-    let picks = list.map (fn mi -> picks_of l mi) (list.range 0 (modules.module_count l));
-    let seen = list.fold (fn acc [_, source, _, _, picked] ->
+    let picks = map (fn mi -> picks_of l mi) (list.range 0 (modules.module_count l));
+    let seen = fold (fn acc [_, source, _, _, picked] ->
         if list.is_empty picked { acc }
         else { acc.[source => picked + acc.[source else []]] }) %{} picks;
-    list.concat (list.map (fn [mi, source, sites, numbered, picked] ->
+    list.concat (map (fn [mi, source, sites, numbered, picked] ->
         if list.is_empty sites { [] }
         else {
             let accounted = list.all (fn at ->
                 list.any (fn [_, item] -> holds item at) (seen.[source else []])) sites;
-            list.map (fn [i, item] -> [mi, i, item])
-                (list.filter (fn [_, item] -> has_expansion (macro_let item))
+            map (fn [i, item] -> [mi, i, item])
+                (filter (fn [_, item] -> has_expansion (macro_let item))
                              (if accounted { picked } else { numbered }))
         }) picks)
 };
@@ -883,7 +889,7 @@ let work_of l = {
 /// rather than the program, and is the reason the rest of them can keep the
 /// loader's answer across the copy expansion stages against.
 let apply_items : modules.Loader -> [[:any]] -> modules.Loader;
-let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
+let apply_items l items = fold (fn acc [mi, i, tree] -> {
     let current = modules.module_at acc mi;
     replace_module acc mi
         (modules.with_new_items current ((modules.module_items current).[i => tree]))
@@ -899,7 +905,7 @@ let apply_items l items = list.fold (fn acc [mi, i, tree] -> {
 /// fails the same way, having spent the time only because it was failing.
 let sequential! : modules.Loader -> modules.Loader;
 let sequential! l =
-    list.fold (fn s mi -> {
+    fold (fn s mi -> {
         let m = modules.module_at (loader s) mi;
         // The same filter `work_of` uses, at its coarsest: a file with no
         // `expand` written in it has nothing here. This is the fallback path
@@ -909,7 +915,7 @@ let sequential! l =
         let items = if list.is_empty (modules.expand_sites (loader s) (modules.module_source m)) {
                         []
                     } else { modules.module_items m };
-        list.fold_strict (fn acc i -> {
+        fold (fn acc i -> {
             let item = list.nth i items;
             if not (has_expansion (macro_let item)) { acc }
             else {
@@ -1018,6 +1024,6 @@ let expand_work! l work = {
              loader seq]
         };
         publish_meter (list.head outcome) (modules.map_modules (fn m -> with_items m
-            (list.map macro_let (modules.module_items m))) (list.nth 1 outcome))
+            (map macro_let (modules.module_items m))) (list.nth 1 outcome))
     }
 };

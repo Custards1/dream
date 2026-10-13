@@ -211,9 +211,9 @@ let describe e =
     if not (is_postgres e) { to_string e }
     else {
         let p = error.payload e;
-        let head = str.join_str " " (list.filter (fn s -> s != "")
+        let head = str.join_str " " (filter (fn s -> s != "")
             [p.[:severity else ""], p.[:code else ""], name_of p.[:condition else :unknown] + ":"]);
-        let tail = list.filter (fn s -> s != "")
+        let tail = filter (fn s -> s != "")
             [labelled "detail" p.[:detail else ()], labelled "hint" p.[:hint else ()],
              labelled "cause" (match p.[:cause else ()] { () => (), c => to_string c })];
         str.join_str "\n  " (list.cons (head + " " + p.[:message else ""]) tail)

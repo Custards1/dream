@@ -335,7 +335,7 @@ let transpose x = node (tensor.transpose (value x)) [[x, tensor.transpose]];
 /// The axes reordered, as `tensor.permute`.
 let permute : [:integer] -> :any -> :any;
 let permute axes x = {
-    let inverse = list.map (fn k -> list.index_of k axes) (list.range 0 (len axes));
+    let inverse = map (fn k -> list.index_of k axes) (list.range 0 (len axes));
     node (tensor.permute axes (value x)) [[x, tensor.permute inverse]]
 };
 
@@ -383,9 +383,9 @@ let slice start count x = {
 /// Tensors joined along their first axis.
 let concat : [:any] -> :any;
 let concat xs = {
-    let vs = list.map value xs;
-    let starts = list.reverse (list.fold (fn acc v -> (acc.[0] + ops.rows v) :: acc) [0] vs);
-    let links = list.map (fn [x, [at, v]] -> [x, fn g -> tensor.slice at (ops.rows v) g])
+    let vs = map value xs;
+    let starts = list.reverse (fold (fn acc v -> (acc.[0] + ops.rows v) :: acc) [0] vs);
+    let links = map (fn [x, [at, v]] -> [x, fn g -> tensor.slice at (ops.rows v) g])
         (list.zip xs (list.zip starts vs));
     node (tensor.concat vs) links
 };
@@ -454,7 +454,7 @@ let spread axis v g = {
             // to the transpose, whose rows are the columns of `g`:
             // `[inner, outer]` repeated is `[inner, outer * n]`, and its
             // transpose is the `[outer * n, inner]` that is wanted.
-            let inner = list.fold_strict (fn !a b -> a * b) 1 (list.drop (axis + 1) shape);
+            let inner = fold (fn !a b -> a * b) 1 (list.drop (axis + 1) shape);
             let outer = tensor.size g / inner;
             let turned = tensor.transpose (tensor.reshape [outer, inner] g);
             let tiled = tensor.reshape [inner, outer * n] (tensor.repeat n turned);
@@ -656,12 +656,12 @@ let numeric_grad f params h = {
     let one path x = match type_of x {
         :tensor => {
             let n = tensor.size x;
-            let diffs = list.map (fn i -> (value (f (at path i h)) - value (f (at path i (-h)))) / (2.0 * h)) (list.range 0 n);
+            let diffs = map (fn i -> (value (f (at path i h)) - value (f (at path i (-h)))) / (2.0 * h)) (list.range 0 n);
             tensor.reshape (tensor.shape x) (tensor.of_list diffs)
         },
         _ => (value (f (at path 0 h)) - value (f (at path 0 (-h)))) / (2.0 * h),
     };
-    rebuild params (list.map (fn [path, x] -> [path, one path x]) (tree.paths params))
+    rebuild params (map (fn [path, x] -> [path, one path x]) (tree.paths params))
 };
 
 /// `t` with number `i` of the leaf at `path` moved by `delta`.
@@ -670,26 +670,26 @@ priv let bump path i delta t = match path {
     [] => match type_of t {
         :tensor => {
             let flat = tensor.to_list (tensor.reshape [tensor.size t] t);
-            tensor.reshape (tensor.shape t) (tensor.of_list (list.map (fn [j, x] -> if j == i { x + delta } else { x }) (list.enumerate flat)))
+            tensor.reshape (tensor.shape t) (tensor.of_list (map (fn [j, x] -> if j == i { x + delta } else { x }) (list.enumerate flat)))
         },
         _ => t + delta,
     },
     [k, ..rest] => match type_of t {
-        :list => list.map (fn [j, x] -> if j == k { bump rest i delta x } else { x }) (list.enumerate t),
+        :list => map (fn [j, x] -> if j == k { bump rest i delta x } else { x }) (list.enumerate t),
         _ => t.[k => bump rest i delta t.[k]],
     },
 };
 
 /// A tree shaped like `t` with the leaves at the given paths replaced.
 priv let rebuild : :any -> [[[:any], :any]] -> :any;
-priv let rebuild t pairs = list.fold (fn acc [path, x] -> replace path x acc) t pairs;
+priv let rebuild t pairs = fold (fn acc [path, x] -> replace path x acc) t pairs;
 
 /// Replace a value at the specified path in a parameter tree.
 priv let replace : [:any] -> :any -> :any -> :any;
 priv let replace path x t = match path {
     [] => x,
     [k, ..rest] => match type_of t {
-        :list => list.map (fn [j, y] -> if j == k { replace rest x y } else { y }) (list.enumerate t),
+        :list => map (fn [j, y] -> if j == k { replace rest x y } else { y }) (list.enumerate t),
         _ => t.[k => replace rest x t.[k]],
     },
 };

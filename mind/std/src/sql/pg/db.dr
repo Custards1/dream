@@ -257,7 +257,7 @@ let server_version conn = match parameter "server_version" conn {
 let version_number : :string -> :integer;
 let version_number text = {
     let numeric = str.slice 0 (str.span "0123456789." 0 text) text;
-    let parts = list.map (fn p -> match num.parse_int p { n if type_of n == :integer => n, _ => 0 })
+    let parts = map (fn p -> match num.parse_int p { n if type_of n == :integer => n, _ => 0 })
                          (str.split "." numeric);
     match parts {
         [major, minor, .._] if major >= 10 => major * 10000 + minor,
@@ -289,7 +289,7 @@ priv let rec authenticate! conn = match receive! conn {
         authenticate! conn
     },
     wire.Message.authentication(10, data) => {
-        let mechanisms = list.filter (fn m -> m != "") (str.split "\0" data);
+        let mechanisms = filter (fn m -> m != "") (str.split "\0" data);
         if list.contains "SCRAM-SHA-256" mechanisms { scram! conn }
         else {
             errors.fail! :unsupported_authentication
@@ -491,11 +491,11 @@ priv let closed : Conn -> Pending -> :string -> Pending;
 priv let closed conn p tag = {
     let columns = Pending.columns p;
     let decoders = config.Config.decoders (Conn.config conn);
-    let tuples = list.map (decode_tuple decoders columns) (list.reverse (Pending.raw p));
+    let tuples = map (decode_tuple decoders columns) (list.reverse (Pending.raw p));
     let r = %{
         :columns => columns,
         :tuples => tuples,
-        :rows => list.map (row_of columns) tuples,
+        :rows => map (row_of columns) tuples,
         :command => tag,
         :count => count_of tag,
         :copy => list.reverse (Pending.copy p),
@@ -510,7 +510,7 @@ priv let finish! conn p status = match Pending.failure p {
     () => {
         let notices = list.reverse (Pending.notices p);
         let notes = list.reverse (Pending.notifications p);
-        list.map (fn r -> r.[:status => status].[:notices => notices].[:notifications => notes])
+        map (fn r -> r.[:status => status].[:notices => notices].[:notifications => notes])
                  (list.reverse (Pending.done p))
     },
     e => raise! e,
@@ -519,12 +519,12 @@ priv let finish! conn p status = match Pending.failure p {
 /// Decode wire fields using their column type information.
 priv let decode_tuple : :map -> [:any] -> [:any] -> [:any];
 priv let decode_tuple decoders columns fields =
-    list.map (fn [c, f] -> value.decode decoders (wire.Column.oid c) f) (list.zip columns fields);
+    map (fn [c, f] -> value.decode decoders (wire.Column.oid c) f) (list.zip columns fields);
 
 /// Associate decoded row values with their column names.
 priv let row_of : [:any] -> [:any] -> :map;
 priv let row_of columns tuple =
-    list.fold_strict (fn m [c, v] -> m.[wire.Column.key c => v]) %{} (list.zip columns tuple);
+    fold (fn m [c, v] -> m.[wire.Column.key c => v]) %{} (list.zip columns tuple);
 
 /// The count at the end of a command tag: `INSERT 0 5` is 5, `UPDATE 2` is 2,
 /// `CREATE TABLE` is `()`.
@@ -550,8 +550,8 @@ let query! conn q = {
 /// Execute already rendered SQL and its parameters, for database adapters.
 let query_text! : Conn -> :string -> [:any] -> :map;
 let query_text! conn text vs = {
-    only (exchange! conn (wire.parse "" text (list.map value.oid_of vs)
-                          + wire.bind "" "" (list.map value.encode vs)
+    only (exchange! conn (wire.parse "" text (map value.oid_of vs)
+                          + wire.bind "" "" (map value.encode vs)
                           + wire.describe "P" "" + wire.execute "" 0 + wire.sync)
                     (pending []))
 };
@@ -595,7 +595,7 @@ let scalar! conn q = match Reply.tuples (query! conn q) {
 
 /// The first column of every row.
 let column! : Conn -> sql.Query -> [:any];
-let column! conn q = list.map (fn t -> list.head t) (Reply.tuples (query! conn q));
+let column! conn q = map (fn t -> list.head t) (Reply.tuples (query! conn q));
 
 /// Run a statement for what it does, and answer how many rows it did it to.
 let exec! : Conn -> sql.Query -> :integer;
@@ -640,7 +640,7 @@ let each! conn q batch handle! = stream! conn q batch (each_step! handle!) 0;
 
 /// Consume a result row through the caller's fold function.
 priv let fold_step! : (a -> :map -> a) -> a -> [:map] -> a;
-priv let fold_step! f acc rows = list.fold_strict f acc rows;
+priv let fold_step! f acc rows = fold f acc rows;
 
 /// Deliver one result row to the caller's row handler.
 priv let each_step! : (:map -> :any) -> :integer -> [:map] -> :integer;
@@ -658,7 +658,7 @@ priv let stream! : Conn -> sql.Query -> :integer -> (a -> [:map] -> a) -> a -> a
 priv let stream! conn q batch step! init = {
     let [text, vs] = sql.render q;
     fold_text! conn text vs batch
-        (fn acc columns tuples -> step! acc (list.map (row_of columns) tuples)) init
+        (fn acc columns tuples -> step! acc (map (row_of columns) tuples)) init
 };
 
 /// Stream rendered SQL through a portal. The callback receives column metadata
@@ -668,8 +668,8 @@ let fold_text! : Conn -> :string -> [:any] -> :integer -> (a -> [:any] -> [[:any
 let fold_text! conn text vs batch step! init = {
     let size = if batch < 1 { 1 } else { batch };
     try! {
-        write! conn (wire.parse "" text (list.map value.oid_of vs)
-                     + wire.bind "" "" (list.map value.encode vs)
+        write! conn (wire.parse "" text (map value.oid_of vs)
+                     + wire.bind "" "" (map value.encode vs)
                      + wire.describe "P" "" + wire.execute "" size + wire.flush)
     } catch e { raise! (lost e) }
     portal! conn size step! init [] [] ()
@@ -707,7 +707,7 @@ priv let rec portal! conn batch step! !acc columns raw failure = {
 priv let portal_step! : Conn -> (a -> [:any] -> [[:any]] -> a) -> a -> [:any] -> [:any] -> a;
 priv let portal_step! conn step! acc columns raw = try! {
     let decoders = config.Config.decoders (Conn.config conn);
-    let tuples = list.map (decode_tuple decoders columns) (list.reverse raw);
+    let tuples = map (decode_tuple decoders columns) (list.reverse raw);
     strict! (step! acc columns tuples)
 } catch e {
     try! { exchange! conn (wire.close "P" "" + wire.sync) (pending []) } catch ignored { () }
@@ -728,8 +728,8 @@ let attempt! : (a -> b) -> a -> Result b :any;
 let attempt! body! arg = try! {
     let v = body! arg;
     strict! v
-    Result.ok v
-} catch e { Result.error e };
+    ok v
+} catch e { err e };
 //
 // `body!` is what runs inside, given the connection: a lambda written in an
 // impure function -- `db.transaction! conn (fn c -> db.exec! c ..)` -- or,
@@ -772,7 +772,7 @@ priv let rollback! conn = try! { exec! conn "ROLLBACK"; () } catch e { () };
 
 /// Construct the BEGIN statement for transaction options.
 let begin_statement : Transaction -> :string;
-let begin_statement options = str.join_str " " (list.filter (fn s -> s != "") [
+let begin_statement options = str.join_str " " (filter (fn s -> s != "") [
     "BEGIN",
     match Transaction.isolation options {
         () => "",
@@ -847,7 +847,7 @@ priv let rec described! conn p failure = match receive! conn {
 /// Run a prepared statement with `vs` for its parameters, in order.
 let execute! : Conn -> Prepared -> [:any] -> :map;
 let execute! conn p vs = {
-    only (exchange! conn (wire.bind "" (Prepared.name p) (list.map value.encode vs) + wire.execute "" 0 + wire.sync)
+    only (exchange! conn (wire.bind "" (Prepared.name p) (map value.encode vs) + wire.execute "" 0 + wire.sync)
                     (pending (Prepared.columns p)))
 };
 
@@ -870,7 +870,7 @@ let deallocate! conn p = {
 let copy_in! : Conn -> :any -> [:any] -> [[:any]] -> :integer;
 let copy_in! conn table columns rows = {
     let target = sql.text (sql.concat [sql.qualified (str.split "." (to_string_name table)), sql.raw " ("
-                                       , sql.join ", " (list.map sql.ident columns), sql.raw ")"]);
+                                       , sql.join ", " (map sql.ident columns), sql.raw ")"]);
     let outcome = try! {
         write! conn (wire.query ("COPY " + target + " FROM STDIN"))
         match copy_ready! conn () {
@@ -878,9 +878,9 @@ let copy_in! conn table columns rows = {
                 send_rows! conn rows
                 write! conn wire.copy_done
                 let n = counted (only (collect! conn (pending [])));
-                Result.ok n
+                ok n
             },
-            e => Result.error e,
+            e => err e,
         }
     } catch e { raise! (lost e) };
     match outcome {
@@ -916,14 +916,14 @@ priv let send_rows! : Conn -> [[:any]] -> :unit;
 priv let rec send_rows! conn rows = match rows {
     [] => (),
     _ => {
-        write! conn (wire.copy_data (str.concat_all (list.map copy_line (list.take 1000 rows))))
+        write! conn (wire.copy_data (str.concat_all (map copy_line (list.take 1000 rows))))
         send_rows! conn (list.drop 1000 rows)
     },
 };
 
 /// A row as one line of COPY text.
 let copy_line : [:any] -> :string;
-let copy_line row = str.join_str "\t" (list.map copy_field row) + "\n";
+let copy_line row = str.join_str "\t" (map copy_field row) + "\n";
 
 /// Encode a value as a field of text-format COPY data.
 priv let copy_field : :any -> :string;
@@ -945,13 +945,13 @@ priv let copy_escape text = str.escape_bytes "\\\t\n\r" (fn b -> match b {
 /// Copy out what `statement` -- a `COPY .. TO STDOUT` -- writes, each row as a
 /// list of its fields' text, `()` for NULL.
 let copy_out! : Conn -> sql.Statement -> [[:any]];
-let copy_out! conn statement = list.map copy_fields (Reply.copy (only (script! conn statement)));
+let copy_out! conn statement = map copy_fields (Reply.copy (only (script! conn statement)));
 
 /// One line of COPY text as its fields.
 let copy_fields : :string -> [:any];
 let copy_fields line = {
     let body = if str.ends_with "\n" line { str.slice 0 (len line - 1) line } else { line };
-    list.map (fn f -> if f == "\\N" { () } else { copy_unescape f }) (str.split "\t" body)
+    map (fn f -> if f == "\\N" { () } else { copy_unescape f }) (str.split "\t" body)
 };
 
 /// Decode PostgreSQL text COPY backslash escapes.
@@ -1003,7 +1003,7 @@ let rec next_notification! conn = match receive! conn {
 let subscribe! : :any -> [:string] -> :process -> :map;
 let subscribe! target channels !to = {
     let conn = connect! target;
-    strict! (list.map (fn ch -> listen! conn ch) channels)
+    strict! (map (fn ch -> listen! conn ch) channels)
     // Bound before the map is built: a map's values are lazy, and a spawn
     // left in one would not happen until something read it.
     let process = forwarder! conn to;

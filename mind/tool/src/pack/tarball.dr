@@ -46,8 +46,8 @@ let top sp = Spec.name sp + "-" + Spec.version sp;
 
 let items : Spec -> Layout -> [Item];
 let items sp lay = {
-    let moved = list.map (fn i -> item.renamed (fn p -> top sp + "/" + layout.relative sp p) i) (Layout.items lay);
-    let dirs = list.map (fn d -> item.Item.dir (d + "/") item.executable) (layout.dirs moved);
+    let moved = map (fn i -> item.renamed (fn p -> top sp + "/" + layout.relative sp p) i) (Layout.items lay);
+    let dirs = map (fn d -> item.Item.dir (d + "/") item.executable) (layout.dirs moved);
     list.sort_on item.path (dirs + moved)
 };
 
@@ -58,7 +58,7 @@ let build! sp lay c dir dest = {
     let? packed = compress.file! c tar_path;
     let target = dest + "/" + file_name sp c;
     scratch.place! packed target
-    Result.ok target
+    ok target
 };
 
 /// Make the tarball in `dest`, answering its path. gzip unless asked, since

@@ -76,24 +76,25 @@ let render entries = {
 /// broken lock is rewritten rather than trusted.
 let parse text =
     match toml.parse text {
-        Result.ok(doc) => list.concat (list.map (fn pair -> {
+        Result.ok(doc) => list.concat (map (fn pair -> {
             let [section, table] = pair;
-            list.map (fn kv -> {
+            map (fn kv -> {
                 let [key, v] = kv;
                 let get k = if type_of v == :map { v.[k else ()] } else { () };
                 entry section key (get "source") (get "commit") (get "version")
             }) (map.pairs table)
-        }) (list.filter (fn pair -> list.head pair != "") (map.pairs doc))),
+        }) (filter (fn pair -> list.head pair != "") (map.pairs doc))),
         _ => [],
     };
 
 /// Every package that resolved to a different commit from the same source as
 /// the lock says: the one change a lock exists to catch. A changed source is
 /// the manifest being edited, which is somebody's decision, so it is not one.
+let drift : [[:any]] -> [[:any]] -> [[:any]];
 let drift old new = {
     let at e = section_of e + "\n" + key_of e;
-    let before = list.fold (fn m e -> m.[at e => e]) (%{}) old;
-    list.filter (fn e -> match before.[at e else ()] {
+    let before = fold (fn m e -> m.[at e => e]) (%{}) old;
+    filter (fn e -> match before.[at e else ()] {
         () => false,
         o => source_of o == source_of e && commit_of o != () && commit_of e != ()
              && commit_of o != commit_of e,
@@ -102,17 +103,18 @@ let drift old new = {
 
 /// What the lock says about one package, for the message about it.
 let locked old e =
-    list.head (list.filter (fn o -> section_of o == section_of e && key_of o == key_of e) old);
+    list.head (filter (fn o -> section_of o == section_of e && key_of o == key_of e) old);
 
 /// A walk that did not see everything -- a build without dev dependencies --
 /// keeps the entries it did not see, so building and testing do not rewrite
 /// the lock back and forth. A full walk (`complete`) replaces it.
+let merge : [[:any]] -> [[:any]] -> :bool -> [[:any]];
 let merge old new complete =
     if complete { new }
     else {
         let at e = section_of e + "\n" + key_of e;
-        let seen = list.fold (fn m e -> m.[at e => true]) (%{}) new;
-        list.append new (list.filter (fn o -> not (seen.[at o else false])) old)
+        let seen = fold (fn m e -> m.[at e => true]) (%{}) new;
+        list.append new (filter (fn o -> not (seen.[at o else false])) old)
     };
 
 let load! root = match file.read! (path.join root file_name) { () => [], text => parse text };
