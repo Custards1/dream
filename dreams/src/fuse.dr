@@ -111,6 +111,11 @@ let roles = %{
     // `reverse` is a fold whose step nobody wrote down: the element consed
     // onto what came before it.
     "reverse" => Role.sink :reverse 1 true,
+    // `concat` over a chain is the chain's producer appending each element
+    // to the rest, as `concat` itself appends: one list, not two.
+    "concat" => Role.sink :concat 1 false,
+    // `last` is a lazy fold keeping the latest element, from `()`.
+    "last" => Role.sink :last 1 false,
 };
 
 /// `std.array`'s: the same steps and sinks over an array, and no source of

@@ -1309,6 +1309,7 @@ let fused_body p l = {
     let sink = fuse.Plan.sink p;
     let answer = match sink {
         :collect => lower_seq :make_list [] (list.head done),
+        :concat => lower_seq :make_list [] (list.head done),
         :any => const_bool false (list.head done),
         :all => const_bool true (list.head done),
         :none => const_bool true (list.head done),
@@ -1319,7 +1320,7 @@ let fused_body p l = {
     // The turn that takes this element, and -- when a `filter` says it might
     // not be taken -- the turn that leaves the accumulator alone.
     let taken = if fuse.decides_early sink { deciding_turn p stag sink (list.head answer) }
-                else if sink == fuse.collect { collecting_turn p stag (list.head answer) }
+                else if sink == fuse.collect || sink == :concat { collecting_turn p stag sink (list.head answer) }
                 else { self_turn p stag (fn l0 -> fused_step p l0) (list.head answer) };
     let advanced =
         match fuse.Plan.guards p {
@@ -1424,10 +1425,13 @@ let deciding_turn p stag sink l = {
 /// for the rest, built as `list.map` builds its cells -- `_list_cons` of the
 /// element and the recursive call -- so the element and the rest are as lazy
 /// as they were there.
-let collecting_turn p stag l = {
+let collecting_turn p stag sink l = {
     let x = emit_local (fuse.Plan.elem p) l;
     let rest = self_turn p stag (fn l0 -> local_node fuse.acc_slot l0) (list.head x);
-    call_builtin "_list_cons" [list.nth 1 x, list.nth 1 rest] (list.head rest)
+    // `concat`'s element is a list of its own, appended as `list.append`
+    // appends it.
+    if sink == :concat { binary :add (list.nth 1 x) (list.nth 1 rest) (list.head rest) }
+    else { call_builtin "_list_cons" [list.nth 1 x, list.nth 1 rest] (list.head rest) }
 };
 
 /// The `filter`s, as one condition. `and` is short-circuiting, which is what
@@ -1466,6 +1470,8 @@ let fused_step p l =
             let one = const_int 1 (list.head a);
             binary :add (list.nth 1 a) (list.nth 1 one) (list.head one)
         },
+        // `last`: the element, in place of the one before it.
+        fuse.Step.op(:last) => emit_local (fuse.Plan.elem p) l,
         // `reverse`: the element, as lazy as it was, consed onto the rest.
         fuse.Step.op(:reverse) => {
             let a = local_node fuse.acc_slot l;

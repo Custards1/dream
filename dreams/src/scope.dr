@@ -3907,7 +3907,7 @@ let with_source c r over tag strict args =
             // `length` alone is the machine's own walk, which no loop beats,
             // and `reverse` alone is already the loop it would be; over a
             // `filter` or a `map` either is a loop with no list between.
-            else if (tag == :length || tag == :reverse) && list.is_empty steps { () }
+            else if list.contains tag [:length, :reverse, :concat, :last] && list.is_empty steps { () }
             else {
                 match sink_step tag strict (list.nth 0 src) (list.nth 1 src) args (ast.span (list.last args)) {
                     () => (),
@@ -3999,6 +3999,9 @@ let sink_step tag strict stag src_args args span =
         // `from_pairs` starts from the empty map, written as the literal.
         :pairs => Fusion.new stag src_args (fuse.Seed.written [:map, [], span]) (fuse.Step.op :pairs) strict,
         :length => Fusion.new stag src_args (fuse.Seed.number 0) (fuse.Step.op :length) strict,
+        :concat => Fusion.new stag src_args (fuse.Seed.number 0) (fuse.Step.op :concat) false
+                       |> Fusion.set_sink :concat,
+        :last => Fusion.new stag src_args (fuse.Seed.written [:unit, span]) (fuse.Step.op :last) strict,
         :reverse => Fusion.new stag src_args (fuse.Seed.written [:list, [], span]) (fuse.Step.op :reverse) strict,
         // A predicate of one element, held to what a fold's function is held
         // to and for the same reasons; the loop starts from nothing it reads,
