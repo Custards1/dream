@@ -5663,6 +5663,22 @@ unsigned default_jit_threads() {
     return 2;
 }
 
+/// How `take_hottest` ranks the queue. `DREAM_JIT_RANK` selects one, for
+/// measuring the three against each other; the default is what the benchmark
+/// says is fastest. `calls` is the raw count, `calls_per_size` divides by the
+/// body size so a fixed CPU budget buys the most functions, and
+/// `calls_times_size` is the work a compile is expected to save -- calls times
+/// the body they complete, the knapsack's benefit rather than its density.
+enum class JitRank { Calls, CallsPerSize, CallsTimesSize };
+
+JitRank default_jit_rank() {
+    if (const char* v = std::getenv("DREAM_JIT_RANK")) {
+        if (std::strcmp(v, "calls") == 0) return JitRank::Calls;
+        if (std::strcmp(v, "calls_times_size") == 0) return JitRank::CallsTimesSize;
+    }
+    return JitRank::CallsPerSize;
+}
+
 // The rough body size the queue is ranked by.
 //
 // What a compile costs LLVM is proportional to the module it is handed, which
@@ -5786,6 +5802,7 @@ struct Jit::Impl {
     /// see `take_hottest`.
     std::vector<uint32_t> sizes;
     SizeScratch scratch;
+    const JitRank rank = default_jit_rank();
 
     bool ensure_jit(std::string* error);
     bool create_jit();
@@ -6011,9 +6028,14 @@ uint32_t Jit::take_hottest() {
     for (auto it = impl_->queue.begin(); it != impl_->queue.end(); ++it) {
         const uint32_t fi = *it;
         const uint32_t n = counts_[fi].load(std::memory_order_relaxed);
-        uint32_t& size = impl_->sizes[fi];
-        if (size == 0) size = body_size(img, img.func(fi).body, impl_->scratch) + 1;
-        const double value = double(n) / double(size);
+        double value = double(n);
+        if (impl_->rank != JitRank::Calls) {
+            uint32_t& size = impl_->sizes[fi];
+            if (size == 0) size = body_size(img, img.func(fi).body, impl_->scratch) + 1;
+            value = impl_->rank == JitRank::CallsTimesSize
+                        ? double(n) * double(size)
+                        : double(n) / double(size);
+        }
         if (value > best_value) {
             best_value = value;
             best = it;

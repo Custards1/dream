@@ -84,7 +84,8 @@ let opts = [
 let command_spec = [
     cli.command "new"   "create a project in ./<name>" [],
     cli.command "init"  "make this directory a project, named after it or [name]" [],
-    cli.command "build" "compile the project; GOAL.. makes what its build script names instead" [],
+    cli.command "build" "compile the project; GOAL.. makes what its build script names instead"
+        [cli.flag "" "precompile" "hand `--precompile` to the VM that runs the compiler"],
     cli.command "run"   "compile, then run it with the arguments given" [],
     cli.command "test"  "run every test at once: units and checks; NAME narrows" [],
     cli.command "check" "compile without writing an image" [],
@@ -836,6 +837,7 @@ let options_of! c =
                [:sets,     sets_of c],
                [:profile,  profile_of! c],
                [:targets,  cli.all c "target"],
+               [:vm,       if cli.flag_set c "precompile" { ["--precompile"] } else { [] }],
                [:verbose,  cli.flag_set c "verbose"],
                [:jobs,     jobs_of! c]];
 

@@ -97,6 +97,10 @@ Given twice, the second is relative to the first.
 (`-L`, `-D`, `--target`, `--release`), plus `--profile`, `--compiler`,
 `-j` and `-f ARG` to pass anything else through as written.
 
+`mind build --precompile` is the one option that is the VM's rather than the
+compiler's: it hands `--precompile` to the VM that runs `dreams`, so every
+function the JIT can take is compiled before the build starts.
+
 ## Dependencies
 
 **Listing a dependency is the whole of using it.** Nothing else goes in the

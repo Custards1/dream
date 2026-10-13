@@ -836,6 +836,9 @@ let target_dir m = path.join (manifest.root m) "target";
 let options = %{ :compiler => (), :defines => [], :includes => [], :hosts => [],
                  :paths => [], :flags => [], :output => (), :extra => [],
                  :verbose => false, :dev => false,
+                 // Flags for the VM that runs the compiler (`--precompile`).
+                 // They go before the image, where the VM reads its own options.
+                 :vm => [],
                  // `-D KEY:name=value`, as `[key, name, value]`; `--profile`;
                  // and `--target`, as many as were given.
                  :sets => [], :profile => "debug", :targets => [] };
@@ -955,8 +958,13 @@ let choose_compiler! m explicit =
 /// runs `mind`. That is the whole difference between the two compilers from
 /// here, and it is a prefix rather than a mode -- anything named `.dream` is
 /// run this way, and everything else is executed directly.
-let compiler_command! chosen =
-    if str.ends_with ".dream" chosen { [vm_command! (), [chosen]] }
+///
+/// The VM's own options (`:vm`, `--precompile`) come before the image,
+/// because that is where the VM reads them; the compiler's arguments follow it.
+let compiler_command! o chosen =
+    if str.ends_with ".dream" chosen {
+        [vm_command! (), list.append (option o :vm []) [chosen]]
+    }
     else { [chosen, []] };
 
 /// `[flag, a, flag, b, ..]` -- how a repeated option is written out.
@@ -1015,7 +1023,7 @@ let script_setting! m o g = {
     // Absolute, since a check runs them from a directory of its own.
     let placed! p = if str.contains_str "/" p { path.absolute! p } else { p };
     script.Setting.make (target_dir m)
-        (match compiler_command! (choose_compiler! m (option o :compiler ())) {
+        (match compiler_command! o (choose_compiler! m (option o :compiler ())) {
              [program, lead] => map placed! (list.cons program lead),
          })
         (placed! (vm_command! ())) (profile_of o) (script_target o m) (option o :jobs 1)
@@ -1183,7 +1191,7 @@ let command_line! m o =
     match compile_args! m o {
         Result.error(why) => Result.error why,
         Result.ok(args) =>
-            match compiler_command! (choose_compiler! m (option o :compiler ())) {
+            match compiler_command! o (choose_compiler! m (option o :compiler ())) {
                 [program, lead] => Result.ok (str.join_str " " (list.cons program (list.append lead args))),
             },
     };
@@ -1195,7 +1203,7 @@ let compile! m o = {
         Result.error(why) => Result.error why,
         Result.ok(args) => {
             file.mkdir_all! (path.dirname (output_of m o))
-            match compiler_command! (choose_compiler! m (option o :compiler ())) {
+            match compiler_command! o (choose_compiler! m (option o :compiler ())) {
                 [program, lead] => {
                     if option o :verbose false {
                         console.error! (str.join_str " " (list.cons program (list.append lead args)))
@@ -1258,7 +1266,7 @@ let become_repl! m o args = {
         console.error! (str.join_str " " (list.cons (choose_compiler! m (option o :compiler ()))
                                                     args))
     }
-    match compiler_command! (choose_compiler! m (option o :compiler ())) {
+    match compiler_command! o (choose_compiler! m (option o :compiler ())) {
         [program, lead] => {
             match try! { os.replace! program (list.append lead args) }
                   catch e { Result.error ("cannot start " + to_string program + ": " + to_string e) } {
