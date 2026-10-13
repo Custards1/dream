@@ -1289,6 +1289,7 @@ let fused_body p l = {
         :any => const_bool false (list.head done),
         :all => const_bool true (list.head done),
         :none => const_bool true (list.head done),
+        :find => emit_leaf :unit (list.head done),
         _ => local_node fuse.acc_slot (list.head done),
     };
 
@@ -1367,7 +1368,7 @@ let self_turn p stag acc_at l = {
 
 /// One turn of a loop that stops at the first element that decides it: the
 /// predicate asked, and either the answer -- `true` for `any`, `false` for
-/// `all` and `none` -- or the next turn. Nothing after the deciding element
+/// `all` and `none`, the element for `find` -- or the next turn. Nothing after the deciding element
 /// is asked, as `list.any` asks nothing after it.
 let deciding_turn p stag sink l = {
     // A sink that decides early always has its predicate written down.
@@ -1375,7 +1376,10 @@ let deciding_turn p stag sink l = {
         fuse.Step.written(body, ps) => fused_written p body ps l,
         fuse.Step.op(_) => const_bool false l,
     };
-    let on = const_bool (sink == :any) (list.head asked);
+    // `find` answers the element itself, read again where it is answered:
+    // a `map`'s output is computed a second time, for the one element found.
+    let on = if sink == :find { emit_local (fuse.Plan.elem p) (list.head asked) }
+             else { const_bool (sink == :any) (list.head asked) };
     let next = self_turn p stag (fn l0 -> local_node fuse.acc_slot l0) (list.head on);
     let [yes, no] = if sink == :all { [list.nth 1 next, list.nth 1 on] } else { [list.nth 1 on, list.nth 1 next] };
     let made = emit (ir.node :if (list.nth 1 asked) yes no) (list.head next);

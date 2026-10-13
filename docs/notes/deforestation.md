@@ -40,7 +40,7 @@ rewriting it resembles.
 2026-10-12 -- any list or array the program already has; steps `map` and
 `filter`, of `std.list` or of `std.array`; sinks `fold`, `fold_strict`,
 `fold_lazy`, `sum`, `product`, `count`, `length` (over a chain with a step),
-and the deciding `any`, `all` and `none`, of either, and `std.map`'s
+and the deciding `any`, `all`, `none` and `find`, of either, and `std.map`'s
 `from_pairs`. A chain of `std.list` stages that ends in a list is one lazy
 producer (`:collect`). A chain is one pipeline only while its pieces are one
 module's: `array.fold` over `array.map` over an array, never `array.fold` over
