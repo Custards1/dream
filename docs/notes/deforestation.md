@@ -36,7 +36,7 @@ becomes "is this the global index `std.list` gave `range`?", which has one
 answer. [dreams/src/lower.dr](../../dreams/src/lower.dr) builds the loop, beside the wrapper
 rewriting it resembles.
 
-**What it covers.** Sources `range`, `replicate` and `enumerate`, and -- since
+**What it covers.** Sources `range`, `replicate`, `enumerate` and `zip`, and -- since
 2026-10-12 -- any list or array the program already has; steps `map` and
 `filter`, of `std.list` or of `std.array`; sinks `fold`, `fold_strict`,
 `fold_lazy`, `sum`, `product`, `count`, `length` and `reverse` (over a chain with a step),
@@ -44,7 +44,7 @@ and the deciding `any`, `all`, `none` and `find`, of either, and `std.map`'s
 `from_pairs`. A chain of `std.list` stages that ends in a list is one lazy
 producer (`:collect`). A chain is one pipeline only while its pieces are one
 module's: `array.fold` over `array.map` over an array, never `array.fold` over
-`list.map`. Everything else -- `take`, `zip`, `flat_map` -- is *not*
+`list.map`. Everything else -- `take`, `flat_map` -- is *not*
 implemented, and a member whose loop is not written simply does not fuse: the
 call it always compiled to still works. Adding one means writing its loop by
 hand in `lower`, which is the price of not having a `build`/`foldr` mechanism.

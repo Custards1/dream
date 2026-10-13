@@ -1238,6 +1238,14 @@ let fused_element tag l = {
             let made = emit (ir.node :make_list (list.nth 1 placed) 2 ir.no_node) (list.head placed);
             [inherit (list.nth 1 made) [list.nth 1 held, list.nth 1 head] (list.head made), list.nth 1 made]
         },
+        // The pair `zip` would have made: the two heads.
+        :zip => {
+            let first = fused_element :list l;
+            let second = carried_head (list.head first);
+            let placed = kids [list.nth 1 first, list.nth 1 second] (list.head second);
+            let made = emit (ir.node :make_list (list.nth 1 placed) 2 ir.no_node) (list.head placed);
+            [inherit (list.nth 1 made) [list.nth 1 first, list.nth 1 second] (list.head made), list.nth 1 made]
+        },
         :list => {
             let zero = const_int 0 (list.head cur);
             let made = emit (ir.node :get (list.nth 1 cur) (list.nth 1 zero) ir.no_node) (list.head zero);
@@ -1249,6 +1257,14 @@ let fused_element tag l = {
             [inherit (list.nth 1 made) [list.nth 1 held, list.nth 1 cur] (list.head made), list.nth 1 made]
         },
     }
+};
+
+/// The head of the second list `zip` walks, which it carries.
+let carried_head l = {
+    let held = local_node fuse.carried_slot l;
+    let zero = const_int 0 (list.head held);
+    let made = emit (ir.node :get (list.nth 1 held) (list.nth 1 zero) ir.no_node) (list.head zero);
+    [inherit (list.nth 1 made) [list.nth 1 held, list.nth 1 zero] (list.head made), list.nth 1 made]
 };
 
 /// The loop itself, emitted into the same arena as everything else -- a
@@ -1270,6 +1286,13 @@ let fused_body p l = {
             },
             :list => call_builtin "_list_is_empty" [list.nth 1 cur0] (list.head cur0),
             :enumerate => call_builtin "_list_is_empty" [list.nth 1 cur0] (list.head cur0),
+            // Either list running out ends it, the first asked first.
+            :zip => {
+                let one = call_builtin "_list_is_empty" [list.nth 1 cur0] (list.head cur0);
+                let held = local_node fuse.carried_slot (list.head one);
+                let other = call_builtin "_list_is_empty" [list.nth 1 held] (list.head held);
+                binary :or (list.nth 1 one) (list.nth 1 other) (list.head other)
+            },
             :array => {
                 let held = local_node fuse.carried_slot (list.head cur0);
                 let size = call_builtin "len" [list.nth 1 held] (list.head held);
@@ -1341,18 +1364,27 @@ let self_turn p stag acc_at l = {
     let advanced = match stag {
         :list => call_builtin "_list_tail" [list.nth 1 cur] (list.head cur),
         :enumerate => call_builtin "_list_tail" [list.nth 1 cur] (list.head cur),
+        :zip => call_builtin "_list_tail" [list.nth 1 cur] (list.head cur),
         _ => {
             let one = const_int 1 (list.head cur);
             binary (if stag == :replicate { :sub } else { :add })
                    (list.nth 1 cur) (list.nth 1 one) (list.head one)
         },
     };
-    // Carried unchanged, but for `enumerate`'s count, which goes up by one.
-    let carried = if stag == :enumerate {
-        let held = local_node fuse.carried_slot (list.head advanced);
-        let one = const_int 1 (list.head held);
-        binary :add (list.nth 1 held) (list.nth 1 one) (list.head one)
-    } else { local_node fuse.carried_slot (list.head advanced) };
+    // Carried unchanged, but for `enumerate`'s count, which goes up by one,
+    // and `zip`'s second list, which moves on with the first.
+    let carried = match stag {
+        :enumerate => {
+            let held = local_node fuse.carried_slot (list.head advanced);
+            let one = const_int 1 (list.head held);
+            binary :add (list.nth 1 held) (list.nth 1 one) (list.head one)
+        },
+        :zip => {
+            let held = local_node fuse.carried_slot (list.head advanced);
+            call_builtin "_list_tail" [list.nth 1 held] (list.head held)
+        },
+        _ => local_node fuse.carried_slot (list.head advanced),
+    };
     let acc = acc_at (list.head carried);
     // The names from the frame around it, handed straight back.
     let free = list.fold (fn got i -> {
@@ -1488,6 +1520,18 @@ let element_written p body ps l =
             let i = bound_to first (list.nth 1 count) (list.head count);
             let x = fused_element :list (list.head i);
             let j = bound_to second (list.nth 1 x) (list.head x);
+            let inner = lower_expr body (list.head j);
+            let stmts = list.append (list.append (list.nth 1 i) (list.nth 1 j)) [list.nth 1 inner];
+            let placed = kids stmts (list.head inner);
+            let made = emit (ir.node :block (list.nth 1 placed) (list.length stmts) ir.no_node) (list.head placed);
+            [inherit (list.nth 1 made) stmts (list.head made), list.nth 1 made]
+        },
+        // `fn acc [x, y]` over `zip`: each name bound straight from a head.
+        [:zip, [:list_p, [first, second], (), _]] if plain_binder first && plain_binder second => {
+            let x = fused_element :list l;
+            let i = bound_to first (list.nth 1 x) (list.head x);
+            let y = carried_head (list.head i);
+            let j = bound_to second (list.nth 1 y) (list.head y);
             let inner = lower_expr body (list.head j);
             let stmts = list.append (list.append (list.nth 1 i) (list.nth 1 j)) [list.nth 1 inner];
             let placed = kids stmts (list.head inner);

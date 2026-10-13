@@ -90,6 +90,9 @@ let roles = %{
     "replicate" => Role.source :replicate 2,
     // `enumerate xs` walks `xs` and counts: its element is `[index, element]`.
     "enumerate" => Role.source :enumerate 1,
+    // `zip xs ys` walks both and stops at the shorter: its element is
+    // `[x, y]`, the heads of the two.
+    "zip" => Role.source :zip 2,
     "map" => Role.step :map 2,
     "filter" => Role.step :filter 2,
     "fold" => Role.sink :fold 3 true,
@@ -355,7 +358,7 @@ let elements tag = [:fused_element, tag];
 
 /// Does this source tag stand for a container the program already has?
 let walks_container : :atom -> :bool;
-let walks_container tag = tag == :list || tag == :array || tag == :enumerate;
+let walks_container tag = tag == :list || tag == :array || tag == :enumerate || tag == :zip;
 
 // --- a stage that has no slot -----------------------------------------------
 //
