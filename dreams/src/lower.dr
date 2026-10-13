@@ -1450,6 +1450,24 @@ let fused_step p l =
 /// written as a pattern, `fn acc [k, v]` -- the element taken apart in front of
 /// it, checked as the lambda's own parameter would have been (`lower_body`).
 let fused_written p body ps l =
+    match if list.length ps == 2 { ast.param_pattern (list.head ps) } else { () } {
+        () => element_written p body ps l,
+        // The accumulator taken apart first, from its slot, as the lambda's
+        // own first parameter would have been.
+        pattern => {
+            let arg = local_node fuse.acc_slot l;
+            let parts = destructure pattern (list.nth 1 arg) (list.head arg);
+            let inner = element_written p body ps (list.head parts);
+            let stmts = list.append (list.nth 1 parts) [list.nth 1 inner];
+            let placed = kids stmts (list.head inner);
+            let made = emit (ir.node :block (list.nth 1 placed) (list.length stmts) ir.no_node) (list.head placed);
+            [inherit (list.nth 1 made) stmts (list.head made), list.nth 1 made]
+        },
+    };
+
+/// The step's body with its element taken apart in front of it, when the
+/// element was written as a pattern.
+let element_written p body ps l =
     match [list.head (fuse.Plan.source p), ast.param_pattern (list.last ps)] {
         [_, ()] => lower_expr body l,
         // `fn acc [i, x]` over `enumerate`: each name bound straight from the

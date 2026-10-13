@@ -227,15 +227,50 @@ let max_free = 8;
 /// file -- of any under 64 MB, which is every file -- and distinct for every
 /// pipeline and every name.
 let free_span : :integer -> :integer -> [:integer, :integer];
-let free_span start i = {
-    let at = 2147483648 + start * 2 * max_free + i;
-    [at, at + 1]
-};
+let free_span start i = synthetic_span start i;
 
 /// Where the loop's own binding of that name is recorded: as distinct, and
 /// distinct from the read.
 let free_binder_span : :integer -> :integer -> [:integer, :integer];
-let free_binder_span start i = free_span start (max_free + i);
+let free_binder_span start i = synthetic_span start (max_free + i);
+
+/// An offset for syntax this pass writes and nobody did: past the end of any
+/// file under 32 MB, and one of 32 for every offset in the text -- the names
+/// a loop takes from its frame (0 to 15) and the lambda a function passed by
+/// name stands for (16 to 19, `as_lambda`).
+let synthetic_span : :integer -> :integer -> [:integer, :integer];
+let synthetic_span start i = {
+    let at = 2147483648 + start * 32 + i;
+    [at, at + 1]
+};
+
+// --- a function passed by name ----------------------------------------------
+//
+// `fold step acc xs`, `any is_big xs`, `map describe xs`: the function is a
+// name rather than a lambda written there. It is the lambda that calls it --
+// `fn acc x -> step acc x` -- written with names nobody can write and offsets
+// nobody wrote (`synthetic_span`), so the loop calls it once a turn rather
+// than through `strict_steps`. Only a name or a module's member: anything else
+// would be computed again at every turn, where it was computed once.
+
+/// The lambda `e` stands for as a function of `arity` arguments: `e` itself
+/// when it is one, the call of it when it is a name or a member, or `()`.
+let as_lambda : :integer -> ast.Expr -> :any;
+let as_lambda arity e = match e {
+    [:lambda, _, _, _] => e,
+    [:name, _, sp] => calling arity e sp,
+    [:field, _, _, sp] => calling arity e sp,
+    _ => (),
+};
+
+/// `fn <0> <1> .. -> e <0> <1> ..`.
+let calling arity e sp = {
+    let start = ast.span_start sp;
+    let names = map (fn i -> "<arg " + to_string i + ">") (list.range 0 arity);
+    let ps = map (fn i -> ast.param names.[i] (synthetic_span start (16 + i))) (list.range 0 arity);
+    let args = map (fn i -> [:name, names.[i], synthetic_span start (16 + arity + i)]) (list.range 0 arity);
+    [:lambda, ps, [:apply, e, args, sp], sp]
+};
 
 // --- a chain that ends in a list ---------------------------------------------
 //

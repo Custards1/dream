@@ -77,8 +77,9 @@ always ambiguous.
 **A pattern for the element.** `fn acc [k, v] -> ..` is how a fold over pairs is
 written, and a pattern parameter was refused. The element may be one now --
 taken apart in front of the step, checked as the lambda would check it, so a
-pair of the wrong length still raises `:match_error` -- and the accumulator may
-not. Over `enumerate` a two-name pattern is bound straight from the count and
+pair of the wrong length still raises `:match_error` -- and so may the
+accumulator, `fn [lo, hi] x -> ..`, taken apart at the top of each turn after
+it is forced. Over `enumerate` a two-name pattern is bound straight from the count and
 the head, and the pair is never built.
 
 **Names from the frame around it.** A step that read a local of the function it
@@ -90,6 +91,12 @@ enters the loop (at an offset past the end of any file, so that its resolution
 has a key of its own) and handed straight back at every turn, which is the
 parameter the JIT keeps in place. Up to eight; past that the pipeline stays as
 written. The compiler's own image went from 152 fused loops to 392 with it.
+
+**A step passed by name.** `fold add 0 xs` and `map f xs`, `f` a global or a
+local, fuse too: the name is wrapped in a lambda that calls it
+(`fuse.as_lambda`), and the lambda is inlined like a written one, so a global
+step is a direct call the JIT can take and a local one is a free name of the
+loop. That took the compiler from 392 loops to 419.
 
 Its own compile did not get faster, and that is the honest boundary of all of
 the above: the compiler's loops are maps and lists built a turn at a time, and
@@ -182,10 +189,10 @@ and `zip`.
 - **The loop has to reach the JIT**, which is the point. It is emitted as a
   global -- the only callee the JIT recognises as a self call -- with three
   parameters and no captures, so that a `range`'s limit is an argument rather
-  than a frame the JIT would have to keep. A fold's function must be a lambda
-  written at the call site, because it is inlined; passed by name it would be a
-  closure call in the loop body, and a loop that calls a closure is a loop the
-  JIT declines. What the loop body *may* now name, which it could not when this
+  than a frame the JIT would have to keep. A fold's function is inlined; one
+  passed by name is wrapped in a lambda first, which makes a global a direct
+  call and a local a closure call -- and a loop that calls a closure is a loop
+  the JIT declines, though it still saves the list. What the loop body *may* now name, which it could not when this
   was written, is another global function: `collatz`'s fused loop is
   `acc + collatz_steps x`, and the tier compiles that call rather than refusing
   the loop over it. A closure is still out -- it is the name that has to be

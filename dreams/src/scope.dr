@@ -3946,7 +3946,7 @@ let rec peel c r over e !acc fuel =
                         if list.length cargs != n { () }
                         else {
                             peel c r over (list.nth 1 cargs)
-                                 (list.cons (fuse.Stage.make stag (list.nth 0 cargs)) acc) (fuel - 1)
+                                 (list.cons (fuse.Stage.make stag (fuse.as_lambda 1 (list.nth 0 cargs))) acc) (fuel - 1)
                         },
                     _ => [[over, [e]], acc],
                 },
@@ -4002,7 +4002,7 @@ let sink_step tag strict stag src_args args span =
         // to and for the same reasons; the loop starts from nothing it reads,
         // or from a count of zero.
         t if fuse.takes_predicate t =>
-            match list.nth 0 args {
+            match fuse.as_lambda 1 (list.nth 0 args) {
                 [:lambda, ps, body, _] =>
                     if list.length ps != 1 { () }
                     else if list.any (fn p -> ast.param_strict p) ps { () }
@@ -4014,16 +4014,14 @@ let sink_step tag strict stag src_args args span =
                 _ => (),
             },
         :fold =>
-            match list.nth 0 args {
+            match fuse.as_lambda 2 (list.nth 0 args) {
                 [:lambda, ps, body, _] =>
                     if list.length ps != 2 { () }
-                    // The element may be written as a pattern -- `fn acc [k, v]`
-                    // is how a fold over pairs is written -- and the loop takes
-                    // it apart in front of the body, checked as the lambda
-                    // would check it. The accumulator may not: it is a slot
-                    // the loop writes every turn, and a pattern over it would
-                    // be a check and a binding of the loop's own state.
-                    else if ast.param_pattern (list.nth 0 ps) != () { () }
+                    // Either parameter may be written as a pattern --
+                    // `fn acc [k, v]` is how a fold over pairs is written,
+                    // `fn [l, out] x` how one threads two things -- and the
+                    // loop takes each apart in front of the body, checked as
+                    // the lambda would check it.
                     // Nor does it have anywhere to put a strict parameter's
                     // force: the lambda's body is written into the loop, and
                     // the force is the body's first statement.
@@ -4154,8 +4152,9 @@ let check_fused c e shape r = {
                 let bound = bind_pattern_param c elem_p
                     (bind_at (ctx_mi c) (ctx_source c) (ast.param_name elem_p) elem
                             (list.nth 1 elem_p)
-                        (bind_at (ctx_mi c) (ctx_source c) (ast.param_name acc_p)
-                                 fuse.acc_slot (list.nth 1 acc_p) scoped));
+                        (bind_pattern_param c acc_p
+                            (bind_at (ctx_mi c) (ctx_source c) (ast.param_name acc_p)
+                                     fuse.acc_slot (list.nth 1 acc_p) scoped)));
                 pop_scope (check_expr c body bound)
             },
             fuse.Step.op(_) => list.nth 0 staged,
