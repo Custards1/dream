@@ -39,7 +39,7 @@ rewriting it resembles.
 **What it covers.** Sources `range`, `replicate` and `enumerate`, and -- since
 2026-10-12 -- any list or array the program already has; steps `map` and
 `filter`, of `std.list` or of `std.array`; sinks `fold`, `fold_strict`,
-`fold_lazy`, `sum`, `product`, `count`, `length` (over a chain with a step),
+`fold_lazy`, `sum`, `product`, `count`, `length` and `reverse` (over a chain with a step),
 and the deciding `any`, `all`, `none` and `find`, of either, and `std.map`'s
 `from_pairs`. A chain of `std.list` stages that ends in a list is one lazy
 producer (`:collect`). A chain is one pipeline only while its pieces are one

@@ -1434,6 +1434,12 @@ let fused_step p l =
             let one = const_int 1 (list.head a);
             binary :add (list.nth 1 a) (list.nth 1 one) (list.head one)
         },
+        // `reverse`: the element, as lazy as it was, consed onto the rest.
+        fuse.Step.op(:reverse) => {
+            let a = local_node fuse.acc_slot l;
+            let x = emit_local (fuse.Plan.elem p) (list.head a);
+            call_builtin "_list_cons" [list.nth 1 x, list.nth 1 a] (list.head x)
+        },
         // `from_pairs`: the pair's first element keyed to its second, read as
         // `list.nth` reads them -- `()` for a pair that is short.
         fuse.Step.op(:pairs) => {

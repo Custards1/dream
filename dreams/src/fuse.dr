@@ -105,6 +105,9 @@ let roles = %{
     "find" => Role.sink :find 2 false,
     "count" => Role.sink :count 2 true,
     "length" => Role.sink :length 1 true,
+    // `reverse` is a fold whose step nobody wrote down: the element consed
+    // onto what came before it.
+    "reverse" => Role.sink :reverse 1 true,
 };
 
 /// `std.array`'s: the same steps and sinks over an array, and no source of
