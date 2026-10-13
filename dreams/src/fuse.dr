@@ -75,7 +75,9 @@ union Role {
     // A call that folds a list down to one value. The tag says which
     // accumulator shape the loop gets: `:fold` takes the step from a lambda
     // written at the call site; `:add` and `:mul` are the step, because `sum`
-    // and `product` are folds whose function nobody wrote down.
+    // and `product` are folds whose function nobody wrote down. `:any`,
+    // `:all` and `:none` stop at the first element that decides them, and
+    // `:count` and `:length` count.
     sink(tag, arity, strict)
 }
 
@@ -93,6 +95,11 @@ let roles = %{
     "fold_strict" => Role.sink :fold 3 true,
     "sum" => Role.sink :add 1 false,
     "product" => Role.sink :mul 1 false,
+    "any" => Role.sink :any 2 false,
+    "all" => Role.sink :all 2 false,
+    "none" => Role.sink :none 2 false,
+    "count" => Role.sink :count 2 true,
+    "length" => Role.sink :length 1 true,
 };
 
 /// `std.array`'s: the same steps and sinks over an array, and no source of
@@ -106,6 +113,10 @@ let array_roles = %{
     "fold" => Role.sink :fold 3 true,
     "sum" => Role.sink :add 1 false,
     "product" => Role.sink :mul 1 false,
+    "any" => Role.sink :any 2 false,
+    "all" => Role.sink :all 2 false,
+    "count" => Role.sink :count 2 true,
+    "length" => Role.sink :length 1 true,
 };
 
 /// `std.map`'s: building a map from a list of pairs is a fold whose step
@@ -182,7 +193,20 @@ struct Plan {
     // The slot the element the sink sees is read from -- the source's own,
     // when no `map` came between them.
     elem
+    // The sink's tag (`Role.sink`), which says how the loop stops: `:any`,
+    // `:all` and `:none` at the first element that decides them, everything
+    // else when the source runs out.
+    sink = :fold
 }
+
+/// Does a sink of this tag stop at the first element that decides it?
+let decides_early : :atom -> :bool;
+let decides_early tag = tag == :any || tag == :all || tag == :none;
+
+/// Does a sink of this tag take a predicate of one element, rather than a
+/// step of the accumulator and an element?
+let takes_predicate : :atom -> :bool;
+let takes_predicate tag = decides_early tag || tag == :count;
 
 /// Where the loop keeps things. Every fused loop has the same three
 /// parameters, whichever source it came from: a cursor the source advances, a
@@ -627,8 +651,16 @@ when test {
             $( test.eq! (Role.sink :fold 3 true) (role_of "fold_strict") ),
         test.case "a member with no role is not invented"
             $( test.eq! () (role_of "sort") ),
-        test.case "every name has a role"
-            $( test.true! (list.all (fn n -> role_of n != ()) member_names) ),
+        test.case "every name has a role in one of the modules"
+            $( test.true! (list.all (fn n -> list.any (fn k -> member_of k n != ()) [:list, :array, :map])
+                                    member_names) ),
+        test.case "a member says which module it is"
+            $( test.eq! [Member.make :array (Role.sink :fold 3 true), (), Member.make :map (Role.sink :pairs 1 false)]
+                        [member_of :array "fold", member_of :array "range", member_of :map "from_pairs"] ),
+        test.case "a map is built from a list"
+            $( test.eq! [:list, :array, :list] [runs_over :list, runs_over :array, runs_over :map] ),
+        test.case "a list or an array is walked, a range is counted"
+            $( test.eq! [true, true, false] [walks_container :list, walks_container :array, walks_container :range] ),
         test.case "a range hands its cursor to the consumer"
             $( test.eq! cursor_slot (element_slot :range) ),
         test.case "a replicate hands the value it carries"

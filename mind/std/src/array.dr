@@ -10,6 +10,37 @@
 derive std.seq;
 import std.list;
 
+// --- what std.seq gives, said of arrays -------------------------------------
+//
+// `std.seq` is written once for every sequence, so its signatures say `:any`
+// for the sequence -- and an `:any` takes a list as readily as an array. These
+// say what each one takes here, which is what lets `any (fn x -> ..) xs` mean
+// `list.any` for a list and this for an array: a member that would take either
+// could never be told from `std.list`'s by its argument.
+
+/// Add every element; 0 for an empty one.
+let sum : #[:integer | :float] -> (:integer | :float);
+/// Multiply every element; 1 for an empty one.
+let product : #[:integer | :float] -> (:integer | :float);
+/// How many elements satisfy `keep`.
+let count : (a -> :bool) -> #[a] -> :integer;
+/// Does any element satisfy `keep`? `keep` is asked of nothing after the first that does.
+let any : (a -> :bool) -> #[a] -> :bool;
+/// Does every element satisfy `keep`? `keep` is asked of nothing after the first that does not.
+let all : (a -> :bool) -> #[a] -> :bool;
+/// Is an element equal to `wanted`?
+let contains : a -> #[a] -> :bool;
+/// The least element, or `()` for an empty one.
+let minimum : #[a] -> :any;
+/// The greatest element, or `()` for an empty one.
+let maximum : #[a] -> :any;
+/// The element `key` makes least, or `()` for an empty one.
+let minimum_by : (a -> :any) -> #[a] -> :any;
+/// The element `key` makes greatest, or `()` for an empty one.
+let maximum_by : (a -> :any) -> #[a] -> :any;
+/// Every element's text, `sep` between them.
+let join : :string -> #[a] -> :string;
+
 // --- the hole std.seq declares ----------------------------------------------
 
 /// Left to right over the elements. Indexing is constant time, so this is a

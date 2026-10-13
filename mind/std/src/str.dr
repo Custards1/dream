@@ -12,6 +12,28 @@
 // the one thing a text library must not do, so nothing here does it implicitly.
 
 derive std.seq;
+
+// What std.seq gives, said of strings: its own signatures say `:any` for the
+// sequence, and a member that takes a list as readily as a string can never be
+// told from `std.list`'s by its argument (see the same in `std.array`).
+/// How many elements satisfy `keep`.
+let count : (:char -> :bool) -> :string -> :integer;
+/// Does any element satisfy `keep`? `keep` is asked of nothing after the first that does.
+let any : (:char -> :bool) -> :string -> :bool;
+/// Does every element satisfy `keep`? `keep` is asked of nothing after the first that does not.
+let all : (:char -> :bool) -> :string -> :bool;
+/// Is an element equal to `wanted`?
+let contains : :any -> :string -> :bool;
+/// The least element, or `()` for an empty one.
+let minimum : :string -> :any;
+/// The greatest element, or `()` for an empty one.
+let maximum : :string -> :any;
+/// The element `key` makes least, or `()` for an empty one.
+let minimum_by : (:char -> :any) -> :string -> :any;
+/// The element `key` makes greatest, or `()` for an empty one.
+let maximum_by : (:char -> :any) -> :string -> :any;
+/// Every element's text, `sep` between them.
+let join : :string -> :string -> :string;
 import std.list;
 import std.char;
 

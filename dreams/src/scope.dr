@@ -3781,6 +3781,8 @@ struct Fusion {
     step
     strict : :bool
     steps = []
+    // The sink's tag, which `lower` reads for how the loop stops (`fuse.Plan`).
+    sink = :fold
 }
 
 /// The pipeline written as this call, as a `Fusion`, or `()`.
@@ -3866,6 +3868,9 @@ let with_source c r over tag strict args =
             let src = list.nth 0 peeled;
             let steps = list.nth 1 peeled;
             if not (list.all (fn st -> step_ok r st) steps) { () }
+            // `length` alone is the machine's own walk, which no loop beats;
+            // over a `filter` or a `map` it is a loop with no list to build.
+            else if tag == :length && list.is_empty steps { () }
             else {
                 match sink_step tag strict (list.nth 0 src) (list.nth 1 src) args (ast.span (list.last args)) {
                     () => (),
@@ -3940,7 +3945,7 @@ let step_ok r st =
 /// the stage in front of it has to be written out.
 let sink_uses shape =
     match Fusion.step shape {
-        fuse.Step.written(body, ps) => fuse.uses (ast.param_name (list.nth 1 ps)) body,
+        fuse.Step.written(body, ps) => fuse.uses (ast.param_name (list.last ps)) body,
         // A pair is read for its key and again for its value.
         fuse.Step.op(:pairs) => 2,
         fuse.Step.op(_) => 1,
@@ -3953,6 +3958,22 @@ let sink_step tag strict stag src_args args span =
     match tag {
         // `from_pairs` starts from the empty map, written as the literal.
         :pairs => Fusion.new stag src_args (fuse.Seed.written [:map, [], span]) (fuse.Step.op :pairs) strict,
+        :length => Fusion.new stag src_args (fuse.Seed.number 0) (fuse.Step.op :length) strict,
+        // A predicate of one element, held to what a fold's function is held
+        // to and for the same reasons; the loop starts from nothing it reads,
+        // or from a count of zero.
+        t if fuse.takes_predicate t =>
+            match list.nth 0 args {
+                [:lambda, ps, body, _] =>
+                    if list.length ps != 1 { () }
+                    else if list.any (fn p -> ast.param_pattern p != () || ast.param_strict p) ps { () }
+                    else if list.any (fn n -> builtins.is_impure_name n) (fuse.mentioned body) { () }
+                    else {
+                        Fusion.new stag src_args (fuse.Seed.number 0) (fuse.Step.written body ps) strict
+                            |> Fusion.set_sink t
+                    },
+                _ => (),
+            },
         :fold =>
             match list.nth 0 args {
                 [:lambda, ps, body, _] =>
@@ -4048,6 +4069,14 @@ let check_fused c e shape r = {
     let elem = list.nth 1 staged;
     let inner =
         match Fusion.step shape {
+            // A predicate has the element and no accumulator; a fold's
+            // function has both.
+            fuse.Step.written(body, [elem_p]) => {
+                let scoped = push_scope (list.nth 0 staged);
+                let bound = bind_at (ctx_mi c) (ctx_source c) (ast.param_name elem_p) elem
+                                    (list.nth 1 elem_p) scoped;
+                pop_scope (check_expr c body bound)
+            },
             fuse.Step.written(body, ps) => {
                 let acc_p = list.nth 0 ps;
                 let elem_p = list.nth 1 ps;
@@ -4067,7 +4096,8 @@ let check_fused c e shape r = {
     let taken = take_fused_global (fuse.loop_name stag) fi walked;
     record_fusion (ctx_mi c) (ctx_source c) span
         (fuse.Plan.make span fi (list.nth 1 taken) [stag, Fusion.source_args shape] seed
-                        (Fusion.step shape) (Fusion.strict shape) (list.nth 2 staged) (list.nth 3 staged) elem)
+                        (Fusion.step shape) (Fusion.strict shape) (list.nth 2 staged) (list.nth 3 staged) elem
+                        (Fusion.sink shape))
         (list.head taken)
     }
 };

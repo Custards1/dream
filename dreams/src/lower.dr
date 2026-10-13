@@ -1262,11 +1262,20 @@ let fused_body p l = {
             },
         };
 
-    let answer = local_node fuse.acc_slot (list.head done);
+    // What the loop answers when the source runs out: the accumulator, or --
+    // for a sink that stops early -- what it answers when nothing decided it.
+    let sink = fuse.Plan.sink p;
+    let answer = match sink {
+        :any => const_bool false (list.head done),
+        :all => const_bool true (list.head done),
+        :none => const_bool true (list.head done),
+        _ => local_node fuse.acc_slot (list.head done),
+    };
 
     // The turn that takes this element, and -- when a `filter` says it might
     // not be taken -- the turn that leaves the accumulator alone.
-    let taken = self_turn p stag (fn l0 -> fused_step p l0) (list.head answer);
+    let taken = if fuse.decides_early sink { deciding_turn p stag sink (list.head answer) }
+                else { self_turn p stag (fn l0 -> fused_step p l0) (list.head answer) };
     let advanced =
         match fuse.Plan.guards p {
             [] => taken,
@@ -1324,6 +1333,25 @@ let self_turn p stag acc_at l = {
                (list.head callee)
 };
 
+/// One turn of a loop that stops at the first element that decides it: the
+/// predicate asked, and either the answer -- `true` for `any`, `false` for
+/// `all` and `none` -- or the next turn. Nothing after the deciding element
+/// is asked, as `list.any` asks nothing after it.
+let deciding_turn p stag sink l = {
+    // A sink that decides early always has its predicate written down.
+    let asked = match fuse.Plan.step p {
+        fuse.Step.written(body, _) => lower_expr body l,
+        fuse.Step.op(_) => const_bool false l,
+    };
+    let on = const_bool (sink == :any) (list.head asked);
+    let next = self_turn p stag (fn l0 -> local_node fuse.acc_slot l0) (list.head on);
+    let [yes, no] = if sink == :all { [list.nth 1 next, list.nth 1 on] } else { [list.nth 1 on, list.nth 1 next] };
+    let made = emit (ir.node :if (list.nth 1 asked) yes no) (list.head next);
+    [set_flag (list.nth 1 asked) ir.f_strict
+        (inherit (list.nth 1 made) [list.nth 1 asked, yes, no] (list.head made)),
+     list.nth 1 made]
+};
+
 /// The `filter`s, as one condition. `and` is short-circuiting, which is what
 /// keeps the order right: an element the first filter rejects never reaches
 /// the second, exactly as it never reached the second `filter`'s call.
@@ -1341,7 +1369,25 @@ let lower_guards gs l =
 /// stand for.
 let fused_step p l =
     match fuse.Plan.step p {
+        // `count`: one more when the predicate holds.
+        fuse.Step.written(body, _) if fuse.Plan.sink p == :count => {
+            let a = local_node fuse.acc_slot l;
+            let asked = lower_expr body (list.head a);
+            let one = const_int 1 (list.head asked);
+            let more = binary :add (list.nth 1 a) (list.nth 1 one) (list.head one);
+            let same = local_node fuse.acc_slot (list.head more);
+            let made = emit (ir.node :if (list.nth 1 asked) (list.nth 1 more) (list.nth 1 same)) (list.head same);
+            [set_flag (list.nth 1 asked) ir.f_strict
+                (inherit (list.nth 1 made) [list.nth 1 asked, list.nth 1 more, list.nth 1 same] (list.head made)),
+             list.nth 1 made]
+        },
         fuse.Step.written(body, _) => lower_expr body l,
+        // `length`: one more for every element that got this far.
+        fuse.Step.op(:length) => {
+            let a = local_node fuse.acc_slot l;
+            let one = const_int 1 (list.head a);
+            binary :add (list.nth 1 a) (list.nth 1 one) (list.head one)
+        },
         // `from_pairs`: the pair's first element keyed to its second, read as
         // `list.nth` reads them -- `()` for a pair that is short.
         fuse.Step.op(:pairs) => {

@@ -198,17 +198,29 @@ let kept l o initial =
         if len keep >= list.length (scope.bodies initial) { () } else { keep }
     };
 
-/// The modules compiled whole: every one not inside another package -- the
-/// package being built, or a program's own files when there is none.
+/// The modules compiled whole: every one whose package is the one being
+/// built, and every one in no package -- a program's own files.
+///
+/// A file's package is the *nearest* one around it. Packages nest: `mind`
+/// writes a build script's driver, a package of its own, under the target
+/// directory of the package whose script it runs, and taking the driver for
+/// part of the outer package pruned its `main!` away.
 let root_modules : modules.Loader -> %{:integer => :bool};
 let root_modules l = {
     let ps = modules.packages l;
     let here = package.current_index ps;
-    let elsewhere = list.concat (map (fn [i, p] -> if i == here { [] } else { [package.src p] })
-                                     (list.enumerate (package.packages ps)));
+    let dirs = list.enumerate (map package.src (package.packages ps));
     fold (fn acc mi -> {
         let file = modules.module_path (modules.module_at l mi);
-        if list.any (fn dir -> path.relative_to dir file != ()) elsewhere { acc } else { acc.[mi => true] }
+        // `[depth inside, package]` for each package around the file.
+        let around = list.concat (map (fn [i, dir] -> match path.relative_to dir file {
+            () => [],
+            inside => [[list.length inside, i]],
+        }) dirs);
+        match list.sort_on list.head around {
+            [] => acc.[mi => true],
+            [[_, i], .._] => if i == here { acc.[mi => true] } else { acc },
+        }
     }) %{} (list.range 0 (modules.module_count l))
 };
 
