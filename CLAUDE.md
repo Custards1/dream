@@ -57,11 +57,11 @@ just bootstrap-check   # the seed still reproduces itself from this source
 ```
 
 The guarantee is byte equality: compiling this source with the seed produces an
-identical image, and so does the stage after that. When you change the compiler,
-run `just bootstrap` and copy `build/dreams.dream` over the seed -- or, when the
-change adds atoms to the compiler, build again with each new image until one
-compiles the source into itself, and copy that one: it can take two rounds
-(see "`mind/std/src/all.dr --test` is not byte-stable" in
+identical image, and so does the stage after that. When you change the compiler
+or `std` -- a comment included, since it moves spans -- run `just reseed`: it
+builds with each new image until one compiles the source into itself, and
+copies that one over the seed. It can take two rounds when the change adds
+atoms (see "`mind/std/src/all.dr --test` is not byte-stable" in
 docs/notes/macro-expansion.md).
 
 A parallel build resolves and lowers in **parts, one per module**, each in a

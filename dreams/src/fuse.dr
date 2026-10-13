@@ -88,6 +88,8 @@ let roles = %{
     // same value every time -- the *same* value, not a copy, which is what the
     // fused loop has to preserve as well.
     "replicate" => Role.source :replicate 2,
+    // `enumerate xs` walks `xs` and counts: its element is `[index, element]`.
+    "enumerate" => Role.source :enumerate 1,
     "map" => Role.step :map 2,
     "filter" => Role.step :filter 2,
     "fold" => Role.sink :fold 3 true,
@@ -199,6 +201,24 @@ struct Plan {
     sink = :fold
 }
 
+// --- a chain that ends in a list ---------------------------------------------
+//
+// `map f (filter g xs)` builds the list `filter` makes and walks it once more
+// to make the answer. The answer is a list, and a list in this language is
+// lazy in its spine -- `list.map` conses `f x` onto a suspended call for the
+// rest -- so the chain cannot become a strict loop: an endless list would never
+// end. It becomes one *lazy* producer instead, a function over the source that
+// at each cell asks the `filter`s and either conses the mapped element onto a
+// suspended call for the rest or moves on, exactly as the two calls would
+// between them, and builds one list rather than two.
+//
+// Its sink is `:collect`. It is only worth one with two stages or more: a lone
+// `map` has no list between it and anything to remove.
+
+/// The sink a chain of steps that ends in a list has.
+let collect : :atom;
+let collect = :collect;
+
 /// Does a sink of this tag stop at the first element that decides it?
 let decides_early : :atom -> :bool;
 let decides_early tag = tag == :any || tag == :all || tag == :none;
@@ -257,7 +277,7 @@ let elements tag = [:fused_element, tag];
 
 /// Does this source tag stand for a container the program already has?
 let walks_container : :atom -> :bool;
-let walks_container tag = tag == :list || tag == :array;
+let walks_container tag = tag == :list || tag == :array || tag == :enumerate;
 
 // --- a stage that has no slot -----------------------------------------------
 //

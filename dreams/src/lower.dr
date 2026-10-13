@@ -1201,6 +1201,12 @@ let subst_of p =
 /// nothing carried; an array carried, with the cursor at zero. The container
 /// is lowered once, here, where it was always going to be evaluated.
 let fused_inits source l = match source {
+    // The list as the cursor, and the count from zero.
+    [:enumerate, [xs]] => {
+        let got = lower_expr xs l;
+        let zero = const_int 0 (list.head got);
+        [list.head zero, [list.nth 1 got, list.nth 1 zero]]
+    },
     [:list, [xs]] => {
         let got = lower_expr xs l;
         let none = emit_leaf :unit (list.head got);
@@ -1220,6 +1226,16 @@ let fused_inits source l = match source {
 let fused_element tag l = {
     let cur = local_node fuse.cursor_slot l;
     match tag {
+        // The pair `enumerate` would have made: the count and the head.
+        :enumerate => {
+            let held = local_node fuse.carried_slot (list.head cur);
+            let zero = const_int 0 (list.head held);
+            let head = emit (ir.node :get (list.nth 1 cur) (list.nth 1 zero) ir.no_node) (list.head zero);
+            let headed = inherit (list.nth 1 head) [list.nth 1 cur, list.nth 1 zero] (list.head head);
+            let placed = kids [list.nth 1 held, list.nth 1 head] headed;
+            let made = emit (ir.node :make_list (list.nth 1 placed) 2 ir.no_node) (list.head placed);
+            [inherit (list.nth 1 made) [list.nth 1 held, list.nth 1 head] (list.head made), list.nth 1 made]
+        },
         :list => {
             let zero = const_int 0 (list.head cur);
             let made = emit (ir.node :get (list.nth 1 cur) (list.nth 1 zero) ir.no_node) (list.head zero);
@@ -1251,6 +1267,7 @@ let fused_body p l = {
                 binary :le (list.nth 1 cur0) (list.nth 1 zero) (list.head zero)
             },
             :list => call_builtin "_list_is_empty" [list.nth 1 cur0] (list.head cur0),
+            :enumerate => call_builtin "_list_is_empty" [list.nth 1 cur0] (list.head cur0),
             :array => {
                 let held = local_node fuse.carried_slot (list.head cur0);
                 let size = call_builtin "len" [list.nth 1 held] (list.head held);
@@ -1266,6 +1283,7 @@ let fused_body p l = {
     // for a sink that stops early -- what it answers when nothing decided it.
     let sink = fuse.Plan.sink p;
     let answer = match sink {
+        :collect => lower_seq :make_list [] (list.head done),
         :any => const_bool false (list.head done),
         :all => const_bool true (list.head done),
         :none => const_bool true (list.head done),
@@ -1275,6 +1293,7 @@ let fused_body p l = {
     // The turn that takes this element, and -- when a `filter` says it might
     // not be taken -- the turn that leaves the accumulator alone.
     let taken = if fuse.decides_early sink { deciding_turn p stag sink (list.head answer) }
+                else if sink == fuse.collect { collecting_turn p stag (list.head answer) }
                 else { self_turn p stag (fn l0 -> fused_step p l0) (list.head answer) };
     let advanced =
         match fuse.Plan.guards p {
@@ -1318,13 +1337,19 @@ let self_turn p stag acc_at l = {
     let cur = local_node fuse.cursor_slot l;
     let advanced = match stag {
         :list => call_builtin "_list_tail" [list.nth 1 cur] (list.head cur),
+        :enumerate => call_builtin "_list_tail" [list.nth 1 cur] (list.head cur),
         _ => {
             let one = const_int 1 (list.head cur);
             binary (if stag == :replicate { :sub } else { :add })
                    (list.nth 1 cur) (list.nth 1 one) (list.head one)
         },
     };
-    let carried = local_node fuse.carried_slot (list.head advanced);
+    // Carried unchanged, but for `enumerate`'s count, which goes up by one.
+    let carried = if stag == :enumerate {
+        let held = local_node fuse.carried_slot (list.head advanced);
+        let one = const_int 1 (list.head held);
+        binary :add (list.nth 1 held) (list.nth 1 one) (list.head one)
+    } else { local_node fuse.carried_slot (list.head advanced) };
     let acc = acc_at (list.head carried);
     let callee = emit (ir.node :global (fuse.Plan.gi p) ir.no_node ir.no_node)
                       (list.head acc);
@@ -1340,7 +1365,7 @@ let self_turn p stag acc_at l = {
 let deciding_turn p stag sink l = {
     // A sink that decides early always has its predicate written down.
     let asked = match fuse.Plan.step p {
-        fuse.Step.written(body, _) => lower_expr body l,
+        fuse.Step.written(body, ps) => fused_written p body ps l,
         fuse.Step.op(_) => const_bool false l,
     };
     let on = const_bool (sink == :any) (list.head asked);
@@ -1350,6 +1375,16 @@ let deciding_turn p stag sink l = {
     [set_flag (list.nth 1 asked) ir.f_strict
         (inherit (list.nth 1 made) [list.nth 1 asked, yes, no] (list.head made)),
      list.nth 1 made]
+};
+
+/// One cell of a chain that ends in a list: the element consed onto the call
+/// for the rest, built as `list.map` builds its cells -- `_list_cons` of the
+/// element and the recursive call -- so the element and the rest are as lazy
+/// as they were there.
+let collecting_turn p stag l = {
+    let x = emit_local (fuse.Plan.elem p) l;
+    let rest = self_turn p stag (fn l0 -> local_node fuse.acc_slot l0) (list.head x);
+    call_builtin "_list_cons" [list.nth 1 x, list.nth 1 rest] (list.head rest)
 };
 
 /// The `filter`s, as one condition. `and` is short-circuiting, which is what
@@ -1370,9 +1405,9 @@ let lower_guards gs l =
 let fused_step p l =
     match fuse.Plan.step p {
         // `count`: one more when the predicate holds.
-        fuse.Step.written(body, _) if fuse.Plan.sink p == :count => {
+        fuse.Step.written(body, ps) if fuse.Plan.sink p == :count => {
             let a = local_node fuse.acc_slot l;
-            let asked = lower_expr body (list.head a);
+            let asked = fused_written p body ps (list.head a);
             let one = const_int 1 (list.head asked);
             let more = binary :add (list.nth 1 a) (list.nth 1 one) (list.head one);
             let same = local_node fuse.acc_slot (list.head more);
@@ -1381,7 +1416,7 @@ let fused_step p l =
                 (inherit (list.nth 1 made) [list.nth 1 asked, list.nth 1 more, list.nth 1 same] (list.head made)),
              list.nth 1 made]
         },
-        fuse.Step.written(body, _) => lower_expr body l,
+        fuse.Step.written(body, ps) => fused_written p body ps l,
         // `length`: one more for every element that got this far.
         fuse.Step.op(:length) => {
             let a = local_node fuse.acc_slot l;
@@ -1403,6 +1438,50 @@ let fused_step p l =
                    (list.nth 1 a) (list.nth 1 x) (list.head x)
         },
     };
+
+/// A step written at the call site: its body, and -- when the element was
+/// written as a pattern, `fn acc [k, v]` -- the element taken apart in front of
+/// it, checked as the lambda's own parameter would have been (`lower_body`).
+let fused_written p body ps l =
+    match [list.head (fuse.Plan.source p), ast.param_pattern (list.last ps)] {
+        [_, ()] => lower_expr body l,
+        // `fn acc [i, x]` over `enumerate`: each name bound straight from the
+        // count and the head. The pair always has two elements, so there is
+        // nothing to check and no reason to build it.
+        [:enumerate, [:list_p, [first, second], (), _]] if plain_binder first && plain_binder second => {
+            let count = local_node fuse.carried_slot l;
+            let i = bound_to first (list.nth 1 count) (list.head count);
+            let x = fused_element :list (list.head i);
+            let j = bound_to second (list.nth 1 x) (list.head x);
+            let inner = lower_expr body (list.head j);
+            let stmts = list.append (list.append (list.nth 1 i) (list.nth 1 j)) [list.nth 1 inner];
+            let placed = kids stmts (list.head inner);
+            let made = emit (ir.node :block (list.nth 1 placed) (list.length stmts) ir.no_node) (list.head placed);
+            [inherit (list.nth 1 made) stmts (list.head made), list.nth 1 made]
+        },
+        [_, pattern] => {
+            let arg = emit_local (fuse.Plan.elem p) l;
+            let parts = destructure pattern (list.nth 1 arg) (list.head arg);
+            let inner = lower_expr body (list.head parts);
+            let stmts = list.append (list.nth 1 parts) [list.nth 1 inner];
+            let placed = kids stmts (list.head inner);
+            let made = emit (ir.node :block (list.nth 1 placed) (list.length stmts) ir.no_node) (list.head placed);
+            [inherit (list.nth 1 made) stmts (list.head made), list.nth 1 made]
+        },
+    };
+
+/// A name or `_`: a part of a pattern that needs no check of its own.
+let plain_binder pat = match pat { [:bind, _, _] => true, [:wildcard, _] => true, _ => false };
+
+/// `[lowering, statements]`: `value` bound to the name `pat` gives, or nothing
+/// for `_`.
+let bound_to pat value l = match pat {
+    [:bind, _, span] => {
+        let made = emit (ir.node :bind (expand macros.coalesce (slot_at span l) 0) value ir.no_node) l;
+        [list.head made, [list.nth 1 made]]
+    },
+    _ => [l, []],
+};
 
 /// Part `i` of the pair in slot `slot`, or `()`.
 let pair_part slot i l = {

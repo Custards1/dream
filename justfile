@@ -134,6 +134,36 @@ bootstrap-check: vm
     @cmp -s {{seed}} /tmp/dreams-stage2.dream || { echo "the seed is stale: it builds a different compiler from this source -- copy /tmp/dreams-stage2.dream over {{seed}}"; exit 1; }
     @echo "the bootstrap image reproduces itself"
 
+# Move the seed to this source: build the compiler with the seed, then with
+# each new image in turn, until one compiles the source into itself byte for
+# byte, and copy that one over the seed. One round when nothing changed the
+# compiler's own atoms; two when something did (see "`mind/std/src/all.dr
+# --test` is not byte-stable" in docs/notes/macro-expansion.md). The stages are
+# built in a directory of their own, never over an image something may have
+# mapped, and a compiler that is still changing after five is an error.
+reseed: vm
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=$(mktemp -d)
+    trap 'rm -rf "$dir"' EXIT
+    prev={{seed}}
+    for round in 1 2 3 4 5; do
+        next="$dir/stage$round.dream"
+        timeout 900 ./{{dream}} "$prev" -L mind -L . -o "$next" dreams/src/main.dr
+        if cmp -s "$prev" "$next"; then
+            if [ "$prev" = "{{seed}}" ]; then
+                echo "the seed already reproduces itself"
+            else
+                cp "$prev" {{seed}}
+                echo "reseeded after $((round - 1)) round(s): the seed reproduces itself"
+            fi
+            exit 0
+        fi
+        prev="$next"
+    done
+    echo "the compiler did not settle in five rounds; the seed is unchanged" >&2
+    exit 1
+
 # `mind`'s own tests: path handling, manifest reading, dependency specs.
 test-mind: build
     ./{{dreams}} -L mind/std mind/tool/src/main.dr --test -o /tmp/dream-mind-tests.dream

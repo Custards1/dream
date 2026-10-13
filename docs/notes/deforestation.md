@@ -36,16 +36,58 @@ becomes "is this the global index `std.list` gave `range`?", which has one
 answer. [dreams/src/lower.dr](../../dreams/src/lower.dr) builds the loop, beside the wrapper
 rewriting it resembles.
 
-**What it covers.** Sources `range` and `replicate`, and -- since 2026-10-12 --
-any list or array the program already has; steps `map` and `filter`, of
-`std.list` or of `std.array`; sinks `fold`, `fold_strict`, `fold_lazy`, `sum`
-and `product` of either, and `std.map`'s `from_pairs`. A chain is one pipeline
-only while its pieces are one module's: `array.fold` over `array.map` over an
-array, never `array.fold` over `list.map`. Everything else -- `take`, `zip`,
-`length`, `any` -- is *not* implemented, and a member whose loop is not written
-simply does not fuse: the call it always compiled to still works. Adding one
-means writing its loop by hand in `lower`, which is the price of not having a
-`build`/`foldr` mechanism.
+**What it covers.** Sources `range`, `replicate` and `enumerate`, and -- since
+2026-10-12 -- any list or array the program already has; steps `map` and
+`filter`, of `std.list` or of `std.array`; sinks `fold`, `fold_strict`,
+`fold_lazy`, `sum`, `product`, `count`, `length` (over a chain with a step),
+and the deciding `any`, `all` and `none`, of either, and `std.map`'s
+`from_pairs`. A chain of `std.list` stages that ends in a list is one lazy
+producer (`:collect`). A chain is one pipeline only while its pieces are one
+module's: `array.fold` over `array.map` over an array, never `array.fold` over
+`list.map`. Everything else -- `take`, `zip`, `flat_map` -- is *not*
+implemented, and a member whose loop is not written simply does not fuse: the
+call it always compiled to still works. Adding one means writing its loop by
+hand in `lower`, which is the price of not having a `build`/`foldr` mechanism.
+
+What each of 2026-10-12's additions bought, on a million or two elements (the
+same answers before and after, under both tiers):
+
+| shape | before | fused |
+|---|---|---|
+| `fold` over a list | 90 ms | 20 ms |
+| `fold` over `map`/`filter` of a list | 470 ms | 30 ms |
+| `fold` over an array | 355 ms | 38 ms |
+| `any` | 92 ms | 21 ms |
+| `all` over `map` | 320 ms | 21 ms |
+| `count` | 178 ms | 24 ms |
+| `length` over `filter` | 250 ms | 27 ms |
+| `fold (fn acc [a, b] -> ..)` over pairs | 210 ms | 70 ms |
+| `fold (fn acc [i, x] -> ..)` over `enumerate` | 365 ms | 38 ms |
+| `map` over `filter`, answered as a list | 230 ms | 36 ms |
+
+**Deciding sinks.** `any`, `all` and `none` stop at the first element that
+decides them, and ask nothing after it -- which is what `list.any` does, and
+what `std.seq`'s fold-built `any` does too, since its `||` asks `keep` of
+nothing once something matched. `std.array` and `std.str` sign what they derive
+from `std.seq` with their own container, because `std.seq` says `:any` for the
+sequence and a member that takes a list as readily as an array could never be
+told from `std.list`'s by its argument: shorthand `any` over an array was
+always ambiguous.
+
+**A pattern for the element.** `fn acc [k, v] -> ..` is how a fold over pairs is
+written, and a pattern parameter was refused. The element may be one now --
+taken apart in front of the step, checked as the lambda would check it, so a
+pair of the wrong length still raises `:match_error` -- and the accumulator may
+not. Over `enumerate` a two-name pattern is bound straight from the count and
+the head, and the pair is never built.
+
+**A chain that ends in a list** cannot be a strict loop: a list is lazy in its
+spine, and an endless one would never end. It is one lazy producer instead --
+a function over the source that at each cell asks the `filter`s and conses the
+mapped element onto a suspended call for the rest, built as `list.map` builds
+its cells -- so the elements and the rest are exactly as lazy as before, and
+one list is built rather than one per stage. Two stages or more: a lone `map`
+has no list to remove.
 
 **A container as the source** (2026-10-12). A pipeline need not start with a
 producer: `fold f acc (map g xs)` over a list someone already has built the list
