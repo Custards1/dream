@@ -517,7 +517,7 @@ void enter_function(Process& p, uint32_t func_index, const FuncRec& f, Value fra
         // a process whose functions never grow hot -- most of a compile --
         // pays a load and a branch for the JIT being present.
         CompiledFn fn = jit->tier(func_index);
-        if (fn) {
+        if (fn && p.compiled_stack_has_room(DREAM_FRAME_ADDRESS())) {
             int status = 0;
             // Compiled code spends the same budget the interpreter does, so
             // fold what it used into the process's total -- but only what *it*
@@ -3322,6 +3322,8 @@ void run_process(Process& p, int64_t budget) {
     // loop rather than a load per step. That matters most for the Return run
     // below, which is more than half of all the steps a program takes.
     const bool prof = p.runtime().profiling();
+    Jit* const work_jit = p.runtime().jit();
+    const bool sample_work = work_jit && work_jit->samples_work();
     // `slice_spent` is how a nested force says the budget ran out while it was
     // running: it re-armed the counter so that what reads it keeps working,
     // and this is where the slice it could not end actually ends.
@@ -3337,6 +3339,9 @@ void run_process(Process& p, int64_t budget) {
             case Mode::Eval:
                 --p.reductions;
                 ++p.total_reductions;
+                if (sample_work && (p.total_reductions & 63) == 0) {
+                    work_jit->note_work(current_func(p));
+                }
                 // Attributed to whichever function's frame is current, which
                 // is what makes a profile read like the source: a reduction
                 // belongs to the code that asked for it.
@@ -3439,6 +3444,8 @@ bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* o
     const size_t max_heap = lim.heap_bytes;
     const WellKnownAtoms& wk = well_known(p.runtime());
     const bool prof = p.runtime().profiling();
+    Jit* const work_jit = p.runtime().jit();
+    const bool sample_work = work_jit && work_jit->samples_work();
     const size_t floor = p.conts.size();
     const Mode saved_mode = p.mode;
     const uint32_t saved_node = p.node;
@@ -3469,6 +3476,9 @@ bool nested_whnf(Process& p, Value v, const Value* args, uint32_t argc, Value* o
         if (p.mode == Mode::Eval) {
             --p.reductions;
             ++p.total_reductions;
+            if (sample_work && (p.total_reductions & 63) == 0) {
+                work_jit->note_work(current_func(p));
+            }
             // Attributed like any other reduction. Leaving this out made the
             // profiler blind to most of a compile: `dreams` forces at every
             // stage boundary, so the machine spends the bulk of its life in

@@ -45,9 +45,8 @@
 // interpreter would have allocated per call disappears entirely, which on `fib`
 // is the whole program -- 100% of what it allocates is frames.
 //
-// What that costs is written down in `kStackBudget`: a machine call uses
-// machine stack, and machine stack is a fixed resource where a heap
-// continuation is not. Compiled recursion therefore carries its depth and
+// A machine call uses machine stack, a fixed resource where a heap
+// continuation is not. Compiled recursion therefore carries its stack floor and
 // gives up -- `JIT_DEEP` -- rather than overflow, and the interpreter, whose
 // recursion is on the heap and bounded by `DREAM_MAX_DEPTH`, takes the call
 // over. That is a fallback, not an error: the program sees what it would have
@@ -62,7 +61,9 @@
 #include "jit.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
@@ -77,9 +78,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "llvm/Config/llvm-config.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/MDBuilder.h"
@@ -118,30 +121,6 @@ constexpr int JIT_DEEP = 3;
 /// but unlike it, the function is not given up on, because this is a fact
 /// about one call rather than about the function.
 constexpr int JIT_BAIL = 4;
-
-/// How much machine stack one chain of compiled self calls may use.
-///
-/// The interpreter's recursion is heap continuations and its limit is
-/// `DREAM_MAX_DEPTH` -- four million of them. A compiled non-tail call is a
-/// machine call, and a machine stack is typically eight megabytes for the
-/// whole thread, shared with every interpreter loop and native above and below
-/// this one. So compiled recursion gets a budget rather than the limit, and
-/// hands the call back when it is spent. A megabyte is deep enough that no
-/// ordinary program reaches it -- `fib 32` goes 32 deep -- and shallow enough
-/// that several nested chains still fit.
-constexpr uint32_t kStackBudget = 1u << 20;
-/// What one compiled frame is assumed to cost, on top of eight bytes per slot,
-/// for turning that budget into a count of calls.
-///
-/// It is a guess, because how much stack LLVM gives a function is decided after
-/// this code is written and there is no cheap way to ask. So it is a guess made
-/// in the direction where being wrong is harmless: too high and the recursion
-/// hands itself back to the interpreter earlier than it had to, which costs a
-/// little speed on a recursion nobody writes; too low and it overflows the
-/// machine stack, which is a crash. `fib` recurses 32 deep and an ordinary
-/// tree walk tens; a function that needs thousands is one the interpreter
-/// should have anyway.
-constexpr uint32_t kFrameOverhead = 128;
 
 /// How many *other* functions one compilation may pull into its module.
 ///
@@ -2103,7 +2082,7 @@ bool PeerSet::admit(uint32_t gi, int depth) {
     // interpreter, and a peer has no frame to write to -- so a peer that looped
     // would hold its worker for as long as the loop ran, which for a loop that
     // does not terminate is for ever. Recursion is allowed, because the machine
-    // stack bounds it: past `kStackBudget` the body answers `JIT_DEEP` and the
+    // stack bounds it: past the stack floor the body answers `JIT_DEEP` and the
     // interpreter takes the call over. A loop has no such bound, and that is the
     // whole of the difference. A function refused here is still compiled in its
     // own right when something enters it directly; it is only refused as
@@ -2156,14 +2135,14 @@ Ty peer_call_ty(const PeerSet& peers, uint32_t gi, SlotSet float_args) {
 // ---------------------------------------------------------------------------
 
 /// The signature of a body emitted as a function of its arguments:
-/// `(proc, depth, frame, a0..an, status)`. A peer's is always all-tagged, which
+/// `(proc, depth, frame, stack_floor, a0..an, status)`. A peer's is always all-tagged, which
 /// is what lets one declaration serve every caller of it.
 llvm::FunctionType* body_signature(llvm::LLVMContext& ctx, uint32_t arity, SlotSet float_slots) {
     auto* i64t = llvm::Type::getInt64Ty(ctx);
     auto* i32t = llvm::Type::getInt32Ty(ctx);
     auto* ptrt = llvm::PointerType::getUnqual(ctx);
     auto* dblt = llvm::Type::getDoubleTy(ctx);
-    std::vector<llvm::Type*> params{ptrt, i32t, i64t};
+    std::vector<llvm::Type*> params{ptrt, i32t, i64t, i64t};
     for (uint32_t i = 0; i < arity; ++i) {
         params.push_back(float_slots.test(i) ? dblt : i64t);
     }
@@ -2233,7 +2212,7 @@ private:
     bool loop_slot_is_dbl(uint32_t i) const { return float_slots_.test(i); }
 
     void declare_helpers();
-    /// The body, as a function of `(proc, depth, frame, a0..an, status)`. Only
+    /// The body, as a function of `(proc, depth, frame, stack_floor, a0..an, status)`. Only
     /// emitted for a body that calls itself outside tail position; the frame
     /// comes along for the yield at depth zero and is untouched otherwise.
     llvm::Function* emit_body(const std::string& name);
@@ -2471,6 +2450,9 @@ private:
     /// Per slot, the alloca a remembered `let` keeps its value in once it is
     /// computed this iteration -- zero until then -- or null.
     std::vector<llvm::Value*> memo_;
+    /// Snapshot helpers copy their input before returning. All snapshot sites
+    /// in one invocation can share this scratch array, even across iterations.
+    llvm::Value* snapshot_vals_ = nullptr;
     /// How each call is made, as the analysis decided it.
     const std::unordered_map<uint32_t, CallKind> kinds_;
     /// See "What the interpreter evaluates".
@@ -2524,6 +2506,7 @@ private:
     /// the way out: a deopt unwinds through every frame at once, and a counter
     /// would have to be put back by each of them.
     llvm::Argument* depth_ = nullptr;
+    llvm::Value* stack_floor_ = nullptr;
 
     llvm::BasicBlock* loop_header_ = nullptr;
     /// Emitting the loop shape, which only a root compile is: its answer goes
@@ -2541,7 +2524,7 @@ private:
         rt_get_, rt_set_, rt_set_many_, rt_cons_, rt_make_list_, rt_make_array_, rt_make_record_, rt_make_map_,
         rt_literal_str_,
         rt_global_, rt_snapshot_, rt_thunk_, rt_apply_, rt_peek_, rt_adopt_, rt_yield_frame_,
-        rt_cons_after_, rt_set_tail_, rt_type_error_got_, rt_settle_;
+        rt_cons_after_, rt_set_tail_, rt_type_error_got_, rt_settle_, rt_stack_floor_;
     /// The adopt arm of the `snapshot` being written, joined at its end.
     llvm::BasicBlock* pending_adopt_ = nullptr;
 };
@@ -2574,6 +2557,8 @@ void Emitter::declare_helpers() {
         "dream_rt_switch_head", llvm::FunctionType::get(i32_, {ptr_, i64_, ptr_}, false));
     rt_force_ = mod_.getOrInsertFunction(
         "dream_rt_force", llvm::FunctionType::get(i32_, {ptr_, i64_, ptr_}, false));
+    rt_stack_floor_ = mod_.getOrInsertFunction(
+        "dream_rt_stack_floor", llvm::FunctionType::get(i64_, {ptr_}, false));
     rt_arith_ = mod_.getOrInsertFunction(
         "dream_rt_arith", llvm::FunctionType::get(i32_, {ptr_, i32_, i64_, i64_, ptr_}, false));
     rt_compare_ = mod_.getOrInsertFunction(
@@ -2685,6 +2670,7 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
 
     auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
     b_.SetInsertPoint(entry);
+    stack_floor_ = b_.CreateCall(rt_stack_floor_, {proc_}, "stack.floor");
 
     // Frame slots become allocas so the loop can carry them in registers;
     // they are written back only when yielding. Every one of them is created
@@ -2811,7 +2797,7 @@ llvm::Function* Emitter::emit_loop(const std::string& name) {
 }
 
 llvm::Function* Emitter::emit_body(const std::string& name) {
-    // `(proc, depth, frame, a0..an, status)`. The parameters arrive as values
+    // `(proc, depth, frame, stack_floor, a0..an, status)`. The parameters arrive as values
     // rather than through the frame, which is the whole point: a self call
     // allocates nothing, and the only frame in the picture is the one the
     // interpreter already made for the outermost call. A parameter the
@@ -2827,6 +2813,7 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
     proc_ = fn_->getArg(0);
     depth_ = fn_->getArg(1);
     frame_ = fn_->getArg(2);
+    stack_floor_ = fn_->getArg(3);
     status_ = fn_->getArg(fn_->arg_size() - 1);
     proc_->setName("proc");
     depth_->setName("depth");
@@ -2844,7 +2831,7 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
                                     "slot" + std::to_string(i));
     }
     for (uint32_t i = 0; i < f_.arity; ++i) {
-        b_.CreateStore(fn_->getArg(3 + i), slots_[i]);
+        b_.CreateStore(fn_->getArg(4 + i), slots_[i]);
     }
     // Slots past the parameters belong to `let` bindings, and a bound slot is
     // never read here: its value is written where its name is. So they are
@@ -2862,13 +2849,23 @@ llvm::Function* Emitter::emit_body(const std::string& name) {
     }
     reduction_slot_ = b_.CreateCall(rt_reduction_slot_, {proc_}, "reductions");
 
-    // Out of machine stack: hand the call back. See `kStackBudget`.
-    const uint32_t limit =
-        std::max(64u, kStackBudget / (kFrameOverhead + 8 * std::max(1u, uint32_t(f_.slots))));
+    // Out of machine stack: hand the call back. The floor accounts for the
+    // worker's guard page and the whole compiled/nested-force chain, rather
+    // than guessing a frame size from the number of local slots.
     auto* deep = llvm::BasicBlock::Create(ctx_, "deep", fn_);
     loop_header_ = llvm::BasicBlock::Create(ctx_, "loop", fn_);
-    b_.CreateCondBr(b_.CreateICmpUGE(depth_, llvm::ConstantInt::get(i32_, limit)), deep,
-                    loop_header_);
+    // Read the actual stack pointer inline. The floor travels with compiled
+    // calls, so recursive kernels need no runtime call for each stack check.
+    std::vector<llvm::Type*> stack_types;
+    if (llvm::Intrinsic::isOverloaded(llvm::Intrinsic::stacksave)) stack_types.push_back(ptr_);
+#if LLVM_VERSION_MAJOR >= 21
+    auto* stack_read = llvm::Intrinsic::getOrInsertDeclaration(&mod_, llvm::Intrinsic::stacksave, stack_types);
+#else
+    auto* stack_read = llvm::Intrinsic::getDeclaration(&mod_, llvm::Intrinsic::stacksave, stack_types);
+#endif
+    llvm::Value* stack_at = b_.CreatePtrToInt(b_.CreateCall(stack_read), i64_);
+    llvm::Value* stack_ok = b_.CreateICmpUGE(stack_at, stack_floor_);
+    b_.CreateCondBr(stack_ok, loop_header_, deep);
 
     b_.SetInsertPoint(deep);
     b_.CreateStore(i32c(JIT_DEEP), status_);
@@ -2916,6 +2913,7 @@ llvm::Function* Emitter::emit_entry(const std::string& name, llvm::Function* bod
     status_->setName("status");
 
     b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
+    stack_floor_ = b_.CreateCall(rt_stack_floor_, {proc_}, "stack.floor");
     llvm::BasicBlock* bail = float_slots_ ? llvm::BasicBlock::Create(ctx_, "bail", fn) : nullptr;
     llvm::Value* slot_base = b_.CreateCall(rt_frame_slots_, {frame_}, "slots");
     std::vector<llvm::Value*> raw(f_.arity);
@@ -2931,7 +2929,7 @@ llvm::Function* Emitter::emit_entry(const std::string& name, llvm::Function* bod
     for (uint32_t slot : force_first_) {
         if (slot < f_.arity) raw[slot] = force(raw[slot]);
     }
-    std::vector<llvm::Value*> args{proc_, i32c(0), frame_};
+    std::vector<llvm::Value*> args{proc_, i32c(0), frame_, stack_floor_};
     for (uint32_t i = 0; i < f_.arity; ++i) {
         args.push_back(slot_is_dbl(i) ? guard_float(raw[i], bail) : raw[i]);
     }
@@ -3055,7 +3053,8 @@ llvm::Value* Emitter::entry_alloca(llvm::Type* t, const char* name, uint32_t n) 
 // ---------------------------------------------------------------------------
 
 llvm::Value* Emitter::snapshot_vals() {
-    llvm::Value* vals = entry_alloca(i64_, "snap.vals", f_.slots);
+    if (!snapshot_vals_) snapshot_vals_ = entry_alloca(i64_, "snap.vals", f_.slots);
+    llvm::Value* vals = snapshot_vals_;
     for (uint32_t i = 0; i < f_.slots; ++i) {
         llvm::Value* v = nullptr;
         if (i < f_.arity) {
@@ -4869,7 +4868,7 @@ Emitter::JV Emitter::peer_call(uint32_t gi, const Node& n) {
 
 Emitter::JV Emitter::call_peer_variant(llvm::Function* fn, SlotSet dbl_slots, bool ret_dbl,
                                        const std::vector<JV>& args) {
-    std::vector<llvm::Value*> call{proc_, callee_depth(), frame_};
+    std::vector<llvm::Value*> call{proc_, callee_depth(), frame_, stack_floor_};
     // A tagged parameter is handed a box -- a float in a register is boxed
     // here, the fourth crossing under "Representation" -- and a double one a
     // double. Every double one was either a double already or has just been
@@ -5058,7 +5057,7 @@ bool Emitter::self_args(const Node& n, std::vector<JV>* out) {
 //
 // `len xs = if is_empty xs { 0 } else { 1 + len (tail xs) }` is recursion, and
 // until this it was compiled as recursion: a machine call per level, and past
-// `kStackBudget` -- a few thousand levels -- `JIT_DEEP`, which gives the
+// the machine stack floor -- `JIT_DEEP`, which gives the
 // function to the interpreter for good. Over a long list that is every list
 // function written the natural way, and the interpreter then spends a heap
 // continuation per element to hold the pending additions.
@@ -5492,7 +5491,7 @@ Emitter::JV Emitter::enter_loop(const Node& n, const std::vector<JV>& args) {
 Emitter::JV Emitter::recursive_call(const std::vector<JV>& args) {
     spend_reduction();
 
-    std::vector<llvm::Value*> call{proc_, callee_depth(), frame_};
+    std::vector<llvm::Value*> call{proc_, callee_depth(), frame_, stack_floor_};
     for (uint32_t i = 0; i < args.size(); ++i) {
         call.push_back(slot_is_dbl(i)
                            ? as_double(args[i], "a call carrying a float was given something else")
@@ -5663,20 +5662,17 @@ unsigned default_jit_threads() {
     return 2;
 }
 
-/// How `take_hottest` ranks the queue. `DREAM_JIT_RANK` selects one, for
-/// measuring the three against each other; the default is what the benchmark
-/// says is fastest. `calls` is the raw count, `calls_per_size` divides by the
-/// body size so a fixed CPU budget buys the most functions, and
-/// `calls_times_size` is the work a compile is expected to save -- calls times
-/// the body they complete, the knapsack's benefit rather than its density.
-enum class JitRank { Calls, CallsPerSize, CallsTimesSize };
+/// Queue policy from the environment, overridden by `--jit-policy`. Density
+/// won the self-build comparison; the sampled and learned policies remain
+/// available for workloads where their profiling cost repays itself.
+using JitRank = JitPolicy;
 
 JitRank default_jit_rank() {
+    JitRank policy = JitRank::CallsPerSize;
     if (const char* v = std::getenv("DREAM_JIT_RANK")) {
-        if (std::strcmp(v, "calls") == 0) return JitRank::Calls;
-        if (std::strcmp(v, "calls_times_size") == 0) return JitRank::CallsTimesSize;
+        parse_jit_policy(v, policy);
     }
-    return JitRank::CallsPerSize;
+    return policy;
 }
 
 // The rough body size the queue is ranked by.
@@ -5695,6 +5691,55 @@ struct SizeScratch {
     /// needs no clearing between calls.
     std::vector<uint32_t> stamp;
     uint32_t gen = 0;
+};
+
+// The advanced policy learns CPU milliseconds from completed compilations.
+// Features are body size and its interaction with local-slot width: wide
+// functions emit more snapshot stores and spill more values. Fit only when a
+// compile finishes; ranking a queued candidate is three multiplies and adds.
+struct CompileCostModel {
+    double normal[3][3] = {{4, 0, 0}, {0, 4, 0}, {0, 0, 4}};
+    double rhs[3] = {8, 4, 4};
+    double coeff[3] = {2, 1, 1};
+
+    static std::array<double, 3> features(uint32_t nodes, uint32_t slots) {
+        const double n = double(nodes) / 64.0;
+        return {1.0, n, n * double(slots > 16 ? slots - 16 : 0) / 64.0};
+    }
+    double predict(uint32_t nodes, uint32_t slots) const {
+        auto x = features(nodes, slots);
+        return std::max(0.25, coeff[0] + coeff[1] * x[1] + coeff[2] * x[2]);
+    }
+    void observe(uint32_t nodes, uint32_t slots, double ms) {
+        auto x = features(nodes, slots);
+        // Forget older observations gradually as the program changes phase.
+        for (unsigned i = 0; i < 3; ++i) {
+            rhs[i] = 0.98 * rhs[i] + x[i] * ms;
+            for (unsigned j = 0; j < 3; ++j)
+                normal[i][j] = 0.98 * normal[i][j] + x[i] * x[j];
+        }
+        double a[3][4];
+        for (unsigned i = 0; i < 3; ++i) {
+            for (unsigned j = 0; j < 3; ++j) a[i][j] = normal[i][j];
+            a[i][3] = rhs[i];
+        }
+        for (unsigned col = 0; col < 3; ++col) {
+            unsigned pivot = col;
+            for (unsigned row = col + 1; row < 3; ++row)
+                if (std::abs(a[row][col]) > std::abs(a[pivot][col])) pivot = row;
+            if (std::abs(a[pivot][col]) < 1e-9) return;
+            for (unsigned j = col; j < 4; ++j) std::swap(a[col][j], a[pivot][j]);
+            const double scale = a[col][col];
+            for (unsigned j = col; j < 4; ++j) a[col][j] /= scale;
+            for (unsigned row = 0; row < 3; ++row) {
+                if (row == col) continue;
+                const double scale = a[row][col];
+                for (unsigned j = col; j < 4; ++j) a[row][j] -= scale * a[col][j];
+            }
+        }
+        // Compilation cost cannot decrease just because a body gets wider.
+        for (unsigned i = 0; i < 3; ++i) coeff[i] = std::max(0.0, a[i][3]);
+    }
 };
 
 uint32_t body_size(const Image& img, uint32_t root, SizeScratch& s) {
@@ -5802,7 +5847,8 @@ struct Jit::Impl {
     /// see `take_hottest`.
     std::vector<uint32_t> sizes;
     SizeScratch scratch;
-    const JitRank rank = default_jit_rank();
+    JitRank rank = default_jit_rank();
+    CompileCostModel cost_model;  // guarded by queue_mutex
 
     bool ensure_jit(std::string* error);
     bool create_jit();
@@ -5858,6 +5904,7 @@ bool Jit::Impl::create_jit() {
     add("dream_rt_type_error", reinterpret_cast<void*>(&dream_rt_type_error));
     add("dream_rt_type_error_got", reinterpret_cast<void*>(&dream_rt_type_error_got));
     add("dream_rt_reduction_slot", reinterpret_cast<void*>(&dream_rt_reduction_slot));
+    add("dream_rt_stack_floor", reinterpret_cast<void*>(&dream_rt_stack_floor));
     add("dream_rt_frame_slots", reinterpret_cast<void*>(&dream_rt_frame_slots));
     add("dream_rt_native", reinterpret_cast<void*>(&dream_rt_native));
     add("dream_rt_builtin", reinterpret_cast<void*>(&dream_rt_builtin));
@@ -5893,6 +5940,8 @@ bool Jit::available() { return true; }
 Jit::Jit(Runtime& rt) : impl_(std::make_unique<Impl>(rt)) {
     const size_t funcs = impl_->rt.image().func_count();
     counts_ = std::vector<std::atomic<uint32_t>>(funcs);
+    work_ = std::vector<std::atomic<uint32_t>>(funcs);
+    work_ranking_ = impl_->rank == JitRank::WorkPerSize || impl_->rank == JitRank::Adaptive;
     cached_ = std::vector<std::atomic<CompiledFn>>(funcs);
     bails_ = std::vector<std::atomic<uint8_t>>(funcs);
     threshold_.store(impl_->threshold, std::memory_order_relaxed);
@@ -6029,12 +6078,19 @@ uint32_t Jit::take_hottest() {
         const uint32_t fi = *it;
         const uint32_t n = counts_[fi].load(std::memory_order_relaxed);
         double value = double(n);
+        if (work_ranking_) {
+            value = std::max(value, 64.0 * work_[fi].load(std::memory_order_relaxed));
+        }
         if (impl_->rank != JitRank::Calls) {
             uint32_t& size = impl_->sizes[fi];
             if (size == 0) size = body_size(img, img.func(fi).body, impl_->scratch) + 1;
-            value = impl_->rank == JitRank::CallsTimesSize
-                        ? double(n) * double(size)
-                        : double(n) / double(size);
+            if (impl_->rank == JitRank::Adaptive) {
+                value /= impl_->cost_model.predict(size, img.func(fi).slots);
+            } else {
+                value = impl_->rank == JitRank::CallsTimesSize
+                            ? value * double(size) : value / double(size);
+            }
+            if (impl_->rank == JitRank::CallsPerSizeSquared) value /= double(size);
         }
         if (value > best_value) {
             best_value = value;
@@ -6042,6 +6098,18 @@ uint32_t Jit::take_hottest() {
         }
     }
     const uint32_t func_index = *best;
+    static const bool trace = std::getenv("DREAM_JIT_TRACE") != nullptr;
+    if (trace) {
+        uint32_t& size = impl_->sizes[func_index];
+        if (!size) size = body_size(img, img.func(func_index).body, impl_->scratch) + 1;
+        StringRef name = img.str(img.func(func_index).name);
+        std::fprintf(stderr, "; jit pick fn#%u %.*s policy=%s calls=%u work=%llu nodes=%u "
+                             "estimated_cost=%.3f ms score=%.3f\n",
+                     func_index, int(name.len), name.data, jit_policy_name(impl_->rank),
+                     counts_[func_index].load(std::memory_order_relaxed),
+                     static_cast<unsigned long long>(work_[func_index].load(std::memory_order_relaxed)) * 64,
+                     size, impl_->cost_model.predict(size, img.func(func_index).slots), best_value);
+    }
     impl_->queue.erase(best);
     return func_index;
 }
@@ -6173,6 +6241,15 @@ void Jit::set_threads(unsigned n) {
     if (impl_->workers.empty() && n > 0) impl_->threads = n;
 }
 
+void Jit::set_policy(JitPolicy policy) {
+    std::lock_guard<std::mutex> g(impl_->queue_mutex);
+    if (!impl_->workers.empty()) return;
+    impl_->rank = policy;
+    work_ranking_ = policy == JitPolicy::WorkPerSize || policy == JitPolicy::Adaptive;
+}
+
+JitPolicy Jit::policy() const { return impl_->rank; }
+
 CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
     {
         std::lock_guard<std::mutex> g(impl_->mutex);
@@ -6192,6 +6269,10 @@ CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
         uint32_t fi;
         CompiledFn* result;
         const Image* img;
+        Impl* impl;
+#if defined(__linux__)
+        int64_t cpu_start = impl->rank == JitRank::Adaptive ? cpu_nanos(CLOCK_THREAD_CPUTIME_ID) : 0;
+#endif
         Clock::time_point t0 = Clock::now();
         Clock::time_point emitted{}, optimized{};
         size_t insts_in = 0, insts_out = 0;
@@ -6199,9 +6280,21 @@ CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
             return std::chrono::duration<double, std::milli>(b - a).count();
         }
         ~Trace() {
+            const Clock::time_point t3 = Clock::now();
+            if (*result && impl->rank == JitRank::Adaptive) {
+#if defined(__linux__)
+                const double spent = double(cpu_nanos(CLOCK_THREAD_CPUTIME_ID) - cpu_start) / 1e6;
+#else
+                const double spent = ms(t0, t3);
+#endif
+                std::lock_guard<std::mutex> g(impl->queue_mutex);
+                if (impl->sizes.size() < img->func_count()) impl->sizes.assign(img->func_count(), 0);
+                uint32_t& size = impl->sizes[fi];
+                if (!size) size = body_size(*img, img->func(fi).body, impl->scratch) + 1;
+                impl->cost_model.observe(size, img->func(fi).slots, spent);
+            }
             static const bool on = std::getenv("DREAM_JIT_TRACE") != nullptr;
             if (!on) return;
-            const Clock::time_point t3 = Clock::now();
             StringRef name = img->str(img->func(fi).name);
             if (!*result) {
                 std::fprintf(stderr, "; jit fn#%u %.*s refused %.2f ms\n", fi, int(name.len),
@@ -6217,7 +6310,7 @@ CompiledFn Jit::compile_one(uint32_t func_index, std::string* error) {
         }
     };
     CompiledFn traced = nullptr;
-    Trace trace{func_index, &traced, &impl_->rt.image()};
+    Trace trace{func_index, &traced, &impl_->rt.image(), impl_.get()};
 
     const Image& img = impl_->rt.image();
     if (!impl_->ensure_jit(error)) return nullptr;

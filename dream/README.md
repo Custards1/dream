@@ -63,6 +63,7 @@ VM options go **before** the image; everything after it belongs to the program.
 | `--dump` | disassemble the image and exit |
 | `--no-jit` | stay in the interpreter |
 | `--jit-threshold N` | calls before a function is compiled (default 32) |
+| `--jit-policy NAME` | choose `density` (default), `calls`, `calls_times_size`, `work`, `calls_per_size_squared`, or `adaptive` |
 | `--dump-jit FN` | print the LLVM IR generated for one function |
 | `--any-target` | run an image built for another platform anyway |
 | `--mindv2-path` | print the effective `$MINDV2_PATH` and exit |
@@ -81,6 +82,7 @@ VM options go **before** the image; everything after it belongs to the program.
 | `DREAM_VERIFY_HEAP` | walk and check the heap after every collection |
 | `DREAM_STUCK_SECONDS` | report what every process is doing if nothing has progressed for this long |
 | `DREAM_JIT_SYNC` | compile on the calling thread rather than in the background |
+| `DREAM_JIT_RANK` | default selection policy; `--jit-policy` overrides it; `calls_per_size` and `work_per_size` are aliases for `density` and `work` |
 | `DREAM_JIT_TRACE` | print every compile, whether it was taken, and what it cost |
 | `DREAM_JIT_DENY` | keep these functions out of the JIT: names, or `#` and an index from the trace, comma-separated -- bisect a fault the interpreter does not have |
 | `DREAM_JIT_CHECK_EFFECTS` | abort, naming the function and the native, when a retried compiled call performs an effect an earlier attempt already performed -- a gap in the rule that compiled bodies are pure |
@@ -217,6 +219,30 @@ dispatch, self tail calls, calls to other compiled functions and to
 natives, and the list, array and map operations a loop makes -- the empty
 test, head and tail, cons, `.[k]` reads and writes. With deforestation in the
 compiler, a pipeline of `std.list` combinators becomes one compiled loop.
+
+The default `density` policy ranks waiting functions by calls divided by body
+size; it keeps counting while LLVM works and caches each size. This was the
+best general choice in interleaved self-build and kernel measurements. `work`
+samples one interpreted reduction in 64 and ranks sampled work per body size.
+`adaptive` uses the same samples but learns a compilation-cost model from
+completed compiles, including local-slot width, and ranks work per predicted
+CPU millisecond. These two policies can also make an expensive, rarely called
+function hot. They are opt-in because their sampling and extra compilations
+can cost more than they save on short programs.
+
+```
+dream --jit-policy adaptive program.dream
+DREAM_JIT_TRACE=1 dream --jit-policy adaptive program.dream
+python3 dream/tests/jit_selection_bench.py --policies density adaptive
+```
+
+`--stats` reports the chosen policy; the trace reports each queue choice,
+its score and estimated cost. `--jit-policy` takes precedence over
+`DREAM_JIT_RANK`. Tail recursion, additive accumulator forms and tail calls
+through bindings compile to loops. Branching recursion retains its evaluation
+order and falls back to the interpreter's heap continuations when the actual
+machine-stack budget is spent. The budget covers nested interpreter forces
+and follows the current scheduler worker's stack, including after migration.
 
 **What it will not compile, and why.** Compiled code evaluates a self tail
 call's arguments eagerly. Doing that to an argument the callee would never

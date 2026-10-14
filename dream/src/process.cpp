@@ -1,7 +1,11 @@
 #include "process.hpp"
 
+#include <algorithm>
+
 #ifdef _WIN32
 #include "windows.hpp"
+#elif defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
 #endif
 
 #include "interp.hpp"
@@ -150,6 +154,45 @@ Process::Process(Runtime& rt, uint64_t id) : rt_(rt), id_(id), heap_(64 * 1024) 
 }
 
 Process::~Process() { release_foreign(*this); }
+
+uintptr_t Process::compiled_stack_floor() const {
+    // Thread-local, not process-local: a green process can resume on another
+    // scheduler worker, whose stack may have a different address and size.
+    static thread_local const uintptr_t low = []() -> uintptr_t {
+#if defined(_WIN32)
+        // AllocationBase names the reserved stack, including its uncommitted
+        // part. VirtualQuery is available on the Windows 7 target as well.
+        int anchor;
+        MEMORY_BASIC_INFORMATION region{};
+        return VirtualQuery(&anchor, &region, sizeof region)
+                   ? reinterpret_cast<uintptr_t>(region.AllocationBase) : 0;
+#elif defined(__APPLE__)
+        const auto top = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(pthread_self()));
+        return top - pthread_get_stacksize_np(pthread_self());
+#elif defined(__linux__)
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) != 0) return 0;
+        void* bottom = nullptr;
+        size_t size = 0;
+        const int result = pthread_attr_getstack(&attr, &bottom, &size);
+        pthread_attr_destroy(&attr);
+        return result == 0 ? reinterpret_cast<uintptr_t>(bottom) : 0;
+#else
+        return 0;
+#endif
+    }();
+    // Leave space for the next generated frame, the interpreter and GC. The
+    // old slot-count estimate missed temporary arrays and spilled registers:
+    // a newly admitted wide dispatcher could use 140 KB for a single call.
+    constexpr uintptr_t reserve = 256 * 1024;
+    uintptr_t floor = low ? low + reserve : 0;
+    if (jit_stack_hi) {
+        const auto top = reinterpret_cast<uintptr_t>(jit_stack_hi);
+        constexpr uintptr_t budget = 512 * 1024;
+        floor = std::max(floor, top > budget ? top - budget : top);
+    }
+    return floor;
+}
 
 void Process::maybe_collect() {
     if (jit_stack_hi) {

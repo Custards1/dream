@@ -1733,3 +1733,63 @@ if the picture changes.
 The next measurement, then, is what sets a self-compile's wall clock -- the
 slowest module, and the stages that wait on it -- not precise roots, whose
 whole prize is the remaining 340 ms of scanning CPU.
+
+## JIT stack bounds and selection policies (2026-10-13)
+
+The widened slot masks admitted functions whose generated stack frames were
+much larger than their parameter and local-slot counts suggested. Saved crashes
+included generated code clearing a stack buffer and GC scanning across a
+worker's stack guard page. A nesting count could not bound the bytes consumed
+by those frames; nested interpreter forces also started a fresh compiled
+recursion count.
+
+The tier now checks actual stack addresses. Before entering compiled code it
+reserves 256 KiB above the current OS thread's stack bottom. Nested compiled
+calls share a 512 KiB budget from the outer machine loop, and recursive/peer
+bodies compare their stack pointer against that floor inline. The OS bounds
+are cached per thread, so a process resuming on another scheduler worker gets
+that worker's bounds. Snapshot sites also share one scratch array per generated
+invocation, instead of each reserving a full array of local slots.
+
+`jit_wide_stack` reproduces the old SIGSEGV on a 1 MiB worker stack; both the
+fixed JIT and interpreter produce the same result with heap verification and
+a small nursery. `jit_branch_stack` exercises fallback from branching machine
+recursion. `jit_recursion_loops` checks that tail recursion, additive
+accumulation and tail calls through bindings emit loops and run deep on the
+small stack. General branching recursion keeps its evaluation order and uses
+the interpreter's heap continuations once the byte budget is spent.
+
+Selection is available as `--jit-policy`, with the old `DREAM_JIT_RANK` as its
+environment default. `density` (calls/body size) remains the default. The
+`adaptive` option samples every 64th interpreted reduction and learns the CPU
+cost of successful compilations. Its regularized, exponentially weighted model
+uses body size and body size times local-slot width; queued candidates are
+ranked by `max(calls, 64 * samples) / predicted compilation milliseconds`.
+On systems without a thread CPU clock, the observations use elapsed time.
+The model is fitted after a compile, away from the interpreter's hot loop;
+the trace shows each selection's samples, score and estimated cost.
+
+Measured on a Ryzen 9 5900X, with serial, interleaved runs and identical output
+required for every policy. Self-builds must reproduce the compiler image byte
+for byte. The first comparison used five rounds for each policy:
+
+| policy | self-build median, seconds | one CPU, seconds |
+|---|---:|---:|
+| calls | 4.835 | 15.424 |
+| density | 4.590 | 15.247 |
+| calls times body size | 5.105 | 15.490 |
+| sampled work/body size | 4.787 | 16.048 |
+
+Dividing by body size squared also lost: 4.700 s against density's 4.616 s in
+another five interleaved rounds. After adding the learned cost model and CLI,
+five rounds of density/adaptive self-builds measured 4.663/4.764 s. Three rounds
+restricted to one CPU measured 15.406/19.038 s. Adaptive improved the sum and
+Collatz kernel medians by about 4% on the unrestricted machine, but compilation
+and sampling overhead made it a worse default for self-builds, especially when
+LLVM competed for one CPU. It remains an explicit option for workload-specific
+measurement rather than an automatic assumption that more profiling is faster.
+
+The reproducible comparison, including all seven kernels and optional CPU
+affinity, is `dream/tests/jit_selection_bench.py`. It accepts `--policies`,
+`--runs`, `--cpu`, and `--output` for a JSON record. Each policy is selected
+through the CLI, so the benchmark exercises the same override users do.

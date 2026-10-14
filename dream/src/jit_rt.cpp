@@ -196,6 +196,10 @@ Value dream_rt_type_error_got(Process* p, const char* message, Value v) {
 
 int64_t* dream_rt_reduction_slot(Process* p) { return &p->reductions; }
 
+uint64_t dream_rt_stack_floor(Process* p) {
+    return p->compiled_stack_floor();
+}
+
 Value* dream_rt_frame_slots(Value frame) {
     return static_cast<FrameObj*>(as_obj(frame))->slots();
 }

@@ -50,6 +50,9 @@ const char* USAGE =
     "                           core, before running anything\n"
     "      --jit-threads <n>    threads compiling in the background (default 2;\n"
     "                           also $DREAM_JIT_THREADS)\n"
+    "      --jit-policy <name>   density (default), calls, calls_times_size, work,\n"
+    "                           calls_per_size_squared, or adaptive; overrides\n"
+    "                           $DREAM_JIT_RANK\n"
     "      --max-heap <size>    heap one process may grow to before it fails with\n"
     "                           :out_of_memory: bytes, or 512M, 2G (default 1G;\n"
     "                           also $DREAM_MAX_HEAP)\n"
@@ -374,6 +377,8 @@ int dream_main(int argc, char** argv) {
     size_t profile_top = 0;
     uint32_t jit_threshold = 0;
     unsigned jit_threads = 0;
+    JitPolicy jit_policy = JitPolicy::CallsPerSize;
+    bool jit_policy_set = false;
     bool precompile = false;
     size_t max_heap = 0, max_depth = 0, max_stack = 0, nursery_max = 0;
 
@@ -443,6 +448,15 @@ int dream_main(int argc, char** argv) {
             // place the installed path is guaranteed to be right.
             std::printf("%s\n", MINDV2_PATH.c_str());
             return 0;
+        } else if (a == "--jit-policy") {
+            const std::string name = next("--jit-policy");
+            if (!parse_jit_policy(name, jit_policy)) {
+                std::fprintf(stderr, "dream: unknown JIT policy '%s'; choose density, calls, "
+                                     "calls_times_size, work, calls_per_size_squared, or adaptive\n",
+                             name.c_str());
+                return 2;
+            }
+            jit_policy_set = true;
         } else if (a == "--jit-threshold") {
             jit_threshold = uint32_t(std::stoul(next("--jit-threshold")));
         } else if (a == "--precompile") {
@@ -542,6 +556,7 @@ int dream_main(int argc, char** argv) {
     if (use_jit && Jit::available()) jit_owner = std::make_unique<Jit>(rt);
     if (jit_threshold && jit_owner) jit_owner->set_threshold(jit_threshold);
     if (jit_threads && jit_owner) jit_owner->set_threads(jit_threads);
+    if (jit_policy_set && jit_owner) jit_owner->set_policy(jit_policy);
 
     if (!dump_jit_fn.empty()) {
         if (!Jit::available()) {

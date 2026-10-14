@@ -291,6 +291,7 @@ void Runtime::print_stats() const {
     // printed for the runs worth measuring. Whether a change to the tier
     // *widened* it is exactly the question a self-compile is asked.
     if (jit_) {
+        std::fprintf(stderr, "; jit policy %s\n", jit_policy_name(jit_->policy()));
         std::fprintf(stderr, "; %llu functions compiled\n",
                      static_cast<unsigned long long>(jit_->compiled_count()));
     }

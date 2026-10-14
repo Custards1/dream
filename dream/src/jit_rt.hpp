@@ -78,6 +78,9 @@ dream::Value dream_rt_type_error_got(dream::Process* p, const char* message, dre
 /// the loop back-edge can decrement it without a call.
 int64_t* dream_rt_reduction_slot(dream::Process* p);
 
+/// Actual machine-stack budget, including nested interpreter forces.
+uint64_t dream_rt_stack_floor(dream::Process* p);
+
 /// The frame a yielding loop resumes in: `frame`'s closure and size, the first
 /// `n` slots from `vals`, the rest empty. See `Emitter::emit_yield`.
 dream::Value dream_rt_yield_frame(dream::Process* p, dream::Value frame, uint32_t n,

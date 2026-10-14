@@ -56,6 +56,32 @@ trap 'rm -rf "$WORK"' EXIT
 pass=0
 fail=0
 
+# A stack regression may ask for a smaller OS-thread stack, in KiB. Apply it
+# only to the VM running the image, not to the compiler or later test cases.
+# Shells without this resource limit still run the tier-agreement check.
+run_image() {
+  if [[ -f "$HERE/programs/$name.stack" ]]; then
+    local stack_kb
+    read -r stack_kb < "$HERE/programs/$name.stack"
+    ulimit -S -s "$stack_kb" 2>/dev/null || :
+  fi
+  exec "$@"
+}
+
+# Policy parsing is a VM option, including in an interpreter-only build.
+bad_policy="$("$dream" --jit-policy invalid 2>&1)"
+bad_policy_rc=$?
+if [[ "$bad_policy_rc" != 2 || "$bad_policy" != *'unknown JIT policy'* ]]; then
+  echo "FAIL jit_policy (unknown policy was not rejected)"
+  fail=$((fail + 1))
+fi
+missing_policy="$("$dream" --jit-policy 2>&1)"
+missing_policy_rc=$?
+if [[ "$missing_policy_rc" != 2 || "$missing_policy" != *'needs a value'* ]]; then
+  echo "FAIL jit_policy (missing policy was not rejected)"
+  fail=$((fail + 1))
+fi
+
 for src in "$HERE"/programs/*.dr; do
   name="$(basename "$src" .dr)"
   expected="$HERE/programs/$name.expected"
@@ -97,15 +123,19 @@ for src in "$HERE"/programs/*.dr; do
         echo "FAIL $name (integer hint missing from IR)"
         compiled_ok=false
       fi
+      if [[ "$name" == jit_recursion_loops && ( "$ir" == *'.rec('* || "$ir" != *'br label %loop'* ) ]]; then
+        echo "FAIL $name ($fn did not lower to a loop)"
+        compiled_ok=false
+      fi
     done < "$HERE/programs/$name.jit"
     if [[ "$compiled_ok" == false ]]; then
       fail=$((fail + 1))
       continue
     fi
   fi
-  jit_out="$(env "${env_args[@]}" "$dream" "${jit_args[@]}" "$image" 2>&1)"
+  jit_out="$(run_image env "${env_args[@]}" "$dream" "${jit_args[@]}" "$image" 2>&1)"
   jit_rc=$?
-  int_out="$(env "${env_args[@]}" "$dream" --no-jit "$image" 2>&1)"
+  int_out="$(run_image env "${env_args[@]}" "$dream" --no-jit "$image" 2>&1)"
   int_rc=$?
 
   if [[ "$jit_out" != "$int_out" || "$jit_rc" != "$int_rc" ]]; then
@@ -120,6 +150,16 @@ for src in "$HERE"/programs/*.dr; do
     diff "$expected" <(printf '%s\n' "$jit_out") | sed 's/^/    /'
     fail=$((fail + 1))
     continue
+  fi
+
+  if [[ "$name" == jit_recursion_loops ]]; then
+    policy_out="$(run_image env DREAM_JIT_RANK=adaptive "$dream" --jit-policy density \
+                  --stats --jit-threshold 1 "$image" 2>&1)"
+    if [[ "$policy_out" == *'jit on'* && "$policy_out" != *'; jit policy density'* ]]; then
+      echo "FAIL jit_policy (CLI did not override the environment)"
+      fail=$((fail + 1))
+      continue
+    fi
   fi
 
   echo "ok   $name"

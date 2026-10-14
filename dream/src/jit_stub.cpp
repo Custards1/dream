@@ -19,6 +19,8 @@ CompiledFn Jit::compile_one(uint32_t, std::string* error) {
 uint32_t Jit::take_hottest() { return 0; }
 Jit::Precompiled Jit::precompile(unsigned) { return {}; }
 void Jit::set_threads(unsigned) {}
+void Jit::set_policy(JitPolicy) {}
+JitPolicy Jit::policy() const { return JitPolicy::CallsPerSize; }
 CompiledFn Jit::compile(uint32_t, std::string* error) {
     if (error) *error = "this build has no JIT: LLVM was not found at configure time";
     return nullptr;

@@ -547,6 +547,14 @@ public:
     /// roots. See `jit_stack_hi`.
     void collect_under_compiled();
 
+    /// Room for another compiled call on this OS thread's machine stack.
+    /// A nested force resets the JIT's recursion counter, so count bytes from
+    /// the outer compiled entry as well as keeping space above the guard page.
+    uintptr_t compiled_stack_floor() const;
+    bool compiled_stack_has_room(void* here) const {
+        return reinterpret_cast<uintptr_t>(here) >= compiled_stack_floor();
+    }
+
     void visit_roots(Heap& heap) override;
 
     /// The error a kill ends this process with: kind `:killed`, the reason

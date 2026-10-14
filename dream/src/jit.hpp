@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "value.hpp"
@@ -19,6 +20,31 @@ namespace dream {
 
 class Runtime;
 class Process;
+
+enum class JitPolicy { Calls, CallsPerSize, CallsTimesSize, WorkPerSize, CallsPerSizeSquared, Adaptive };
+
+inline bool parse_jit_policy(std::string_view name, JitPolicy& policy) {
+    if (name == "calls") policy = JitPolicy::Calls;
+    else if (name == "density" || name == "calls_per_size") policy = JitPolicy::CallsPerSize;
+    else if (name == "calls_times_size") policy = JitPolicy::CallsTimesSize;
+    else if (name == "work" || name == "work_per_size") policy = JitPolicy::WorkPerSize;
+    else if (name == "calls_per_size_squared") policy = JitPolicy::CallsPerSizeSquared;
+    else if (name == "adaptive") policy = JitPolicy::Adaptive;
+    else return false;
+    return true;
+}
+
+inline const char* jit_policy_name(JitPolicy policy) {
+    switch (policy) {
+        case JitPolicy::Calls: return "calls";
+        case JitPolicy::CallsPerSize: return "density";
+        case JitPolicy::CallsTimesSize: return "calls_times_size";
+        case JitPolicy::WorkPerSize: return "work";
+        case JitPolicy::CallsPerSizeSquared: return "calls_per_size_squared";
+        case JitPolicy::Adaptive: return "adaptive";
+    }
+    return "density";
+}
 
 /// Signature of a JIT-compiled function body.
 ///
@@ -92,6 +118,18 @@ public:
     /// so `tier` never asks again. The slow path, and the only one that locks.
     CompiledFn on_enter(uint32_t func_index);
 
+    /// Cheap samples of interpreted work, so one expensive call can become
+    /// hot and a frequently entered wrapper does not crowd out a real loop.
+    bool samples_work() const { return work_ranking_; }
+    void note_work(uint32_t func_index) {
+        if (func_index >= work_.size()) return;
+        CompiledFn fn = cached_[func_index].load(std::memory_order_relaxed);
+        if (fn && fn != queued()) return;
+        const uint32_t n = work_[func_index].load(std::memory_order_relaxed) + 1;
+        work_[func_index].store(n, std::memory_order_relaxed);
+        if (!fn && n >= threshold_.load(std::memory_order_relaxed)) on_enter(func_index);
+    }
+
     /// Stop offering the compiled body for `func_index`. Called when compiled
     /// self recursion ran out of machine stack: the interpreter, whose
     /// recursion is on the heap, takes that function over for the rest of the
@@ -138,6 +176,9 @@ public:
     /// How many compile threads to start, before the first function gets
     /// hot. `--jit-threads`; otherwise `DREAM_JIT_THREADS`, or two.
     void set_threads(unsigned n);
+    /// Choose before executing the image; a CLI setting overrides the environment.
+    void set_policy(JitPolicy policy);
+    JitPolicy policy() const;
     uint32_t threshold() const;
     uint64_t compiled_count() const;
     /// Human-readable IR for one function, for `--dump-jit`.
@@ -164,6 +205,8 @@ private:
     /// cache with a single load and no PIMPL indirection. Both are sized once,
     /// in the constructor, after the image has loaded.
     std::vector<std::atomic<uint32_t>> counts_;
+    std::vector<std::atomic<uint32_t>> work_;
+    bool work_ranking_ = false;
     std::vector<std::atomic<CompiledFn>> cached_;
     /// Consecutive bails per function; see `note_bail`. Relaxed, like
     /// `counts_`, and for the same reason: a lost count moves a heuristic.
