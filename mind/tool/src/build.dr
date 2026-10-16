@@ -961,6 +961,7 @@ let choose_compiler! m explicit =
 ///
 /// The VM's own options (`:vm`, `--precompile`) come before the image,
 /// because that is where the VM reads them; the compiler's arguments follow it.
+let compiler_command! : :map -> :string -> [:string, [:string]];
 let compiler_command! o chosen =
     if str.ends_with ".dream" chosen {
         [vm_command! (), list.append (option o :vm []) [chosen]]

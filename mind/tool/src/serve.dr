@@ -1,0 +1,111 @@
+// `mind serve DIR` and `mind docs serve`: a directory over HTTP, for looking at
+// what a build made -- documentation, a site, a WebAssembly page -- the way a
+// browser will be given it, rather than through `file://`, where a browser
+// refuses half of what a page does.
+//
+// It is `std.http.server`'s `static!` and nothing else, and what makes it safe
+// to leave running is said there and here. It listens on 127.0.0.1 unless told
+// otherwise, so the files are this machine's to read and nobody else's; an
+// address that reaches further is a choice made with `--host`, and `mind`
+// says so when it is made. Whoever can reach it gets at most 32 connections
+// from one address and 256 in all, 15 seconds to send a request and to read
+// an answer, and nothing but `GET` and `HEAD`: no HTTP/2, whose flood attacks
+// a file server has no reason to answer, and no request bodies past a few
+// kilobytes. Dotfiles and symbolic links are never served, and a large file
+// is sent a piece at a time, so a slow or many-times-repeated download holds
+// a piece of it in memory rather than the whole of it.
+import std.cli;
+import std.console;
+import std.io;
+import std.list;
+import std.log;
+import std.num;
+import std.os;
+import std.path;
+import std.str;
+import std.time;
+import std.http.server;
+
+/// The options `serve` reads, shared by `mind serve` and `mind docs serve`.
+let opts : [cli.Option];
+let opts = [
+    cli.value "p" "port" "PORT" "port to listen on (default: 8000; 0 picks a free one)",
+    cli.value "" "host" "ADDR" "address to listen on (default: 127.0.0.1, this machine alone)",
+    cli.flag "" "list" "list the entries of a directory that has no index.html",
+    cli.flag "" "dotfiles" "serve names that start with a dot",
+    cli.flag "q" "quiet" "do not log each request",
+];
+
+let usage = "mind serve -- serve a directory over HTTP, on this machine\n\nusage: mind serve [options] [DIR]\n\n"
+    + cli.options_help (list.append opts [cli.flag "h" "help" "show serving options"]) + "\n\n"
+    + "DIR is the current directory when it is not given. Only GET and HEAD are\n"
+    + "answered; dotfiles and symbolic links are never served. Listening anywhere\n"
+    + "but 127.0.0.1 shares DIR with whoever can reach this machine.\n";
+
+let fail! why = {
+    console.error! ("mind serve: " + why)
+    os.exit! 1
+};
+
+/// Whether an address is this machine alone.
+let loopback : :string -> :bool;
+let loopback host = host == "localhost" || host == "127.0.0.1" || str.starts_with "127." host;
+
+/// The server's settings for what `c` asked: the bounds above, and the
+/// address and port.
+let options! : :any -> server.Options;
+let options! c = {
+    let port = match num.parse_int (cli.get "8000" c "port") {
+        p if p != () && p >= 0 && p <= 65535 => p,
+        _ => fail! ("--port wants a number from 0 to 65535, not `" + cli.get "" c "port" + "`"),
+    };
+    server.defaults
+        |> server.Options.set_port port
+        |> server.Options.set_host (cli.get "127.0.0.1" c "host")
+        |> server.Options.set_max_connections 256
+        |> server.Options.set_max_per_peer 32
+        |> server.Options.set_idle (time.seconds 15)
+        |> server.Options.set_max_header 16384
+        |> server.Options.set_max_body 16384
+        |> server.Options.set_http2 false
+        |> server.Options.set_name "mind"
+        |> server.Options.set_logger (log.named "serve" (log.default! ()))
+};
+
+/// Serve `dir` as `c` says, until the process is stopped. `what` names it in
+/// the line that says where it is.
+let serve! : :any -> :string -> :string -> :unit;
+let serve! c dir what = {
+    if not (io.is_dir! dir) { fail! (dir + " is not a directory") }
+    let o = options! c;
+    let files = server.Static.new ()
+        |> server.Static.set_listing (cli.flag_set c "list")
+        |> server.Static.set_dotfiles (cli.flag_set c "dotfiles");
+    let app = server.static! files (path.absolute! dir);
+    let logged = if cli.flag_set c "quiet" { app } else { server.logged! (log.named "serve" (log.default! ())) app };
+    let s = match try! { let s = server.serve_with! o logged; strict! s; Result.ok s } catch e { Result.error e } {
+        Result.ok(s) => s,
+        Result.error(e) => fail! ("cannot listen on " + server.Options.host o + ":" + to_string (server.Options.port o) + ": " + to_string e),
+    };
+    let host = server.Options.host o;
+    let shown = if loopback host { "127.0.0.1" } else { host };
+    console.print! ("serving " + what + " at http://" + shown + ":" + to_string (server.port s) + "/  (ctrl-c stops)")
+    if not (loopback host) {
+        console.error! ("mind serve: warning: listening on " + host + ", so anyone who can reach this machine can read " + dir)
+    }
+    join! (server.Server.acceptor s)
+    ()
+};
+
+/// `mind serve [options] [DIR]`.
+let run! : [:string] -> :unit;
+let run! args = match cli.parse (list.append opts [cli.flag "h" "help" "show serving options"]) args {
+    Result.error(why) => fail! (why + "\n" + usage),
+    Result.ok(c) => if cli.flag_set c "help" { console.print! usage } else {
+        match cli.rest c {
+            [] => serve! c "." "this directory",
+            [dir] => serve! c dir dir,
+            _ => fail! "one directory at a time; try `mind serve --help`",
+        }
+    },
+};

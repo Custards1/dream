@@ -96,6 +96,15 @@ mind: dreams
     mkdir -p build
     ./{{dreams}} -L mind/std mind/tool/src/main.dr --shebang -o build/mind
 
+# Learn Dream, the book in learn/, as a site in learn/target/docs. Every
+# example in it is compiled and run, and its output is put on the page;
+# `just learn-serve` builds it and serves it at http://127.0.0.1:8000/.
+learn: mind
+    cd learn && DREAM="$PWD/../{{dream}}" DREAMS="$PWD/../{{image}}" MIND_STDLIB="$PWD/../mind" ../{{dream}} ../build/mind docs
+
+learn-serve: mind
+    cd learn && DREAM="$PWD/../{{dream}}" DREAMS="$PWD/../{{image}}" MIND_STDLIB="$PWD/../mind" ../{{dream}} ../build/mind docs serve --watch
+
 # Dream itself, packaged every way `mind pack` supports, into dist/: the `[ship]`
 # sections of mind.toml say what goes in. The VM is staged by `cmake --install`
 # rather than copied from the build tree, since only the installed binary
@@ -173,6 +182,7 @@ test-mind: build
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/options.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/scripts.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/docs.sh
+    dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/learn.sh
 
 clean:
     rm -rf {{build_dir}} build-nojit build-tsan

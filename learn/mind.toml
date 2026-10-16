@@ -1,0 +1,14 @@
+# Learn Dream: a book, built by `mind docs`. It has no modules of its own;
+# every ```dream example in docs/ is a whole program that `mind docs` compiles
+# and runs, and the page shows what it printed. `just learn` builds it, and
+# `just test-learn` holds every example to what its fence promises.
+[package]
+name = "learn"
+version = "0.1.0"
+description = "Learn Dream: a lazily evaluated functional language, from a first program to processes and servers"
+
+[docs]
+title = "Learn Dream"
+api = false
+strict-examples = true
+example-timeout = 20000

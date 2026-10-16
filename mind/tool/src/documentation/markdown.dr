@@ -139,5 +139,6 @@ let title fallback text = match list.find (fn l -> str.starts_with "# " l) (str.
     () => fallback, line => str.trim (tail 2 line),
 };
 
-let code_html language code = "<pre><code class=\"language-" + escape (slug language) + "\">" + escape code + "</code></pre>";
+let code_html language code = "<div class=\"code\">" + (if language == "" { "" } else { "<span class=\"lang\">" + escape language + "</span>" })
+    + "<pre><code class=\"language-" + escape (slug language) + "\">" + escape code + "</code></pre></div>";
 let render text = render_with code_html text;

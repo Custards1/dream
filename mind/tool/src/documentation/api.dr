@@ -75,11 +75,12 @@ let rec scan lines number state comments entries = match lines {
 };
 let extract text = scan (str.split "\n" text) 1 [0, "", 0] [] [];
 let render ctx source entries = str.join_str "" (map (fn e ->
-    "<section class=\"symbol\"><h2 id=\"" + markdown.escape e.[:name] + "\"><a class=\"anchor\" href=\"#" + markdown.escape e.[:name] + "\">" + markdown.escape e.[:name] + "</a></h2>"
-    + "<pre><code>" + markdown.escape e.[:signature] + "</code></pre>"
-    + examples.render ctx e.[:doc] + "<a class=\"source\" href=\"" + markdown.escape source + "#L" + to_string e.[:line] + "\">View source · line " + to_string e.[:line] + "</a></section>") entries);
-let source_html text = "<pre class=\"source-code\"><code>" + str.join_str "\n" (map (fn [i, line] ->
-    "<span id=\"L" + to_string (i + 1) + "\"><a href=\"#L" + to_string (i + 1) + "\">" + to_string (i + 1) + "</a> " + markdown.escape line + "</span>") (list.enumerate (str.split "\n" text))) + "</code></pre>";
+    "<section class=\"symbol\"><div class=\"symbol-head\"><h2 id=\"" + markdown.escape e.[:name] + "\"><a class=\"anchor\" href=\"#" + markdown.escape e.[:name] + "\">"
+    + markdown.escape e.[:name] + "</a></h2><a class=\"source\" href=\"" + markdown.escape source + "#L" + to_string e.[:line] + "\">source · line " + to_string e.[:line] + "</a></div>"
+    + "<pre class=\"signature\"><code class=\"language-dream\">" + markdown.escape e.[:signature] + "</code></pre>"
+    + "<div class=\"symbol-doc\">" + examples.render ctx e.[:doc] + "</div></section>") entries);
+let source_html text = "<pre class=\"source-code\"><code>" + str.join_str "" (map (fn [i, line] ->
+    "<span class=\"line\" id=\"L" + to_string (i + 1) + "\"><a class=\"ln\" href=\"#L" + to_string (i + 1) + "\">" + to_string (i + 1) + "</a><span class=\"lc\">" + markdown.escape line + "</span>\n</span>") (list.enumerate (str.split "\n" text))) + "</code></pre>";
 
 let comment_text line = {
     let text = markdown.tail 3 line;

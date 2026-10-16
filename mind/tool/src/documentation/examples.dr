@@ -2,7 +2,9 @@
 //
 // An example either works or is written to fail -- a compile error or a raise
 // is documentation too -- and the fence says which: ```dream for one that
-// should run cleanly, ```dream fails for one that should not.
+// should run cleanly, ```dream fails for one that should not. ```dream no-run
+// is a fragment, shown and highlighted but not compiled: a few lines out of a
+// larger program, which could not run on their own.
 //
 // Every example is found and run before any page is drawn (`run_all!`): each
 // distinct one once, several at a time, with a progress bar on a terminal.
@@ -31,19 +33,20 @@ let report phase r = {
         else { phase + " · exit " + to_string r.[:code else (0 - 1)] };
     let text = output r;
     let shown = if len text > 32768 { str.slice 0 32768 text + "\n[output truncated]" } else if text == "" { "(no output)" } else { text };
-    "<div class=\"example-result\"><p><strong>" + markdown.escape label + "</strong></p><pre><code>" + markdown.escape shown + "</code></pre></div>"
+    "<div class=\"example-result " + (if clean r { "ok" } else { "fail" }) + "\"><div class=\"example-label\">" + markdown.escape label
+        + "</div><pre><code>" + markdown.escape shown + "</code></pre></div>"
 };
 
 /// Whether a phase's result is a clean finish: exit 0, in time.
 let clean : :map -> :bool;
 let clean r = r.[:code else 1] == 0 && not r.[:timed_out else false];
 
-/// A fence's info string as `[language, expected to fail]`: `dream fails` is
-/// `["dream", true]`.
-let fence_info : :string -> [:string, :bool];
+/// A fence's info string as `[language, expected to fail, not to be run]`:
+/// `dream fails` is `["dream", true, false]`.
+let fence_info : :string -> [:string, :bool, :bool];
 let fence_info info = {
     let ws = str.words info;
-    [list.first_or "" ws, list.contains "fails" (list.drop 1 ws)]
+    [list.first_or "" ws, list.contains "fails" (list.drop 1 ws), list.contains "no-run" (list.drop 1 ws)]
 };
 
 /// Whether a fence's language is one whose examples are run.
@@ -59,8 +62,8 @@ let rec found lines = match lines {
         if str.starts_with "```" s || str.starts_with "~~~" s {
             match markdown.fenced (str.slice 0 3 s) rest [] {
                 [code, more] => {
-                    let [language, fails] = fence_info (markdown.tail 3 s);
-                    if runs language { list.cons [code, fails] (found more) } else { found more }
+                    let [language, fails, shown_only] = fence_info (markdown.tail 3 s);
+                    if runs language && not shown_only { list.cons [code, fails] (found more) } else { found more }
                 },
             }
         } else { found rest }
@@ -86,7 +89,7 @@ let run! ctx code = try! {
     match build.compile_args! m opts {
         Result.error(why) => [report "Build setup" (%{ :code => 1, :err => why }), false],
         Result.ok(args) => {
-            let cmd = build.compiler_command! (build.choose_compiler! m ctx.[:compiler]);
+            let cmd = build.compiler_command! opts (build.choose_compiler! m ctx.[:compiler]);
             // The example's deadline bounds its compile as well as its run:
             // an example that cannot build in that time is as broken as one
             // that cannot finish, and the page says so either way.
@@ -96,9 +99,12 @@ let run! ctx code = try! {
                 let vm = build.vm_command! ();
                 let program = if str.contains_str "/" vm { path.absolute! vm } else { vm };
                 let ran = os.exec_in! dir program [image] ctx.[:timeout];
-                // Successful compiler chatter only repeats temporary paths.
-                // Warnings are kept when present; execution always has a result.
-                [(if compiled.[:err else ""] == "" { "" } else { report "Compile" compiled }) + report "Run" ran, clean ran]
+                // The compiler's `compiled -> PATH` line names a temporary
+                // file and says nothing a reader needs; anything else it says
+                // on a clean compile is a warning, and is shown.
+                let said = str.join_str "\n" (filter (fn l -> not (str.starts_with "compiled -> " l) && str.trim l != "")
+                                                      (str.lines compiled.[:err else ""]));
+                [(if said == "" { "" } else { report "Compile" compiled.[:err => said].[:out => ""] }) + report "Run" ran, clean ran]
             }
         },
     }

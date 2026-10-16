@@ -56,6 +56,8 @@ import std.list;
 import std.log;
 import std.map;
 import std.net;
+import std.num;
+import std.os;
 import std.path;
 import std.proc;
 import std.str;
@@ -80,8 +82,18 @@ import std.http.url;
 /// arrives, and `max_body` still bounds it. `http2` lets a client speak
 /// HTTP/2: over TLS when it asks for `h2`, and in clear text when it opens
 /// with HTTP/2's preface ("prior knowledge"). Bodies over HTTP/2 arrive whole.
+///
+/// `host` is the address to listen on: `()` for every interface, as
+/// `net.listen!` does, or `"127.0.0.1"` for this machine alone -- which is
+/// what a server for one person at one desk should say. `max_connections`
+/// bounds the connections served at once, and `max_per_peer` those from any
+/// one address (0 for no bound): past either, a new connection is answered
+/// 503 and closed.
 mapping Options {
     port : :integer = 8080
+    host : :any = ()
+    max_connections : :integer = 1024
+    max_per_peer : :integer = 0
     max_body : :integer = 10485760
     max_header : :integer = 65536
     idle : :integer = 30000000000
@@ -110,9 +122,12 @@ let serve! port app = serve_with! (Options.set_port port defaults) app;
 /// Start an HTTP server using explicit listener and connection options.
 let serve_with! : Options -> :any -> Server;
 let serve_with! options app = {
-    let listener = net.listen! (Options.port options);
+    let listener = match Options.host options {
+        () => net.listen! (Options.port options),
+        host => net.listen_on! host (Options.port options),
+    };
     let handle = handler app;
-    let acceptor = spawn! $( accept_loop! listener handle options );
+    let acceptor = spawn! $( accept_loop! listener handle options (Live.new ()) );
     Server.make listener (net.port! listener) acceptor
 };
 
@@ -134,18 +149,106 @@ let stop! s = { try! { io.close! (Server.listener s) } catch e { () }; () };
 let run! : :integer -> :any -> :any;
 let run! port app = { let s = serve! port app; join! (Server.acceptor s) };
 
-/// Accept incoming connections and dispatch their handlers.
-priv let accept_loop! : :any -> :any -> Options -> :atom;
-priv let rec accept_loop! listener handle options =
-    match try! { let sock = net.accept! listener; Result.ok sock } catch e { err e } {
-        Result.ok(sock) => {
-            spawn! $( connection! sock handle options )
-            accept_loop! listener handle options
-        },
-        // `stop!` closes the listener under the parked accept, which is how
-        // this loop learns it is over.
-        Result.error(_) => :stopped,
-    };
+/// The connections being served, as the acceptor counts them: each
+/// connection's process and the address it came from, how many there are,
+/// and how many from each address. The acceptor's own, and of no use outside it.
+mapping Live {
+    !conns : :map = %{}
+    !count : :integer = 0
+    !peers : :map = %{}
+}
+
+/// The address a peer connected from, without its port: what `max_per_peer`
+/// counts by.
+priv let address : :string -> :string;
+priv let address peer = match str.find_last ":" peer { i if i > 0 => str.slice 0 i peer, _ => peer };
+
+/// A connection is over: forget it.
+priv let ended : Live -> :any -> Live;
+priv let ended live c = match (Live.conns live).[c else ()] {
+    () => live,
+    addr => {
+        let left = (Live.peers live).[addr else 1] - 1;
+        Live.make (map.remove c (Live.conns live)) (Live.count live - 1)
+                  (if left > 0 { (Live.peers live).[addr => left] } else { map.remove addr (Live.peers live) })
+    },
+};
+
+/// Every connection that has ended since the acceptor last looked, without
+/// waiting for one.
+priv let reap! : Live -> Live;
+priv let rec reap! live = receive! {
+    [:down, c, _] => reap! (ended live c),
+    after 0 => live,
+};
+
+/// Accept connections and serve each in a process of its own, no more than
+/// `max_connections` at once. At the bound the acceptor stops accepting
+/// until one ends, and the kernel's backlog holds whoever is waiting: a flood
+/// of connections costs a queue, not a process and a socket each. Past
+/// `max_per_peer` one address is told 503 and closed, so one client cannot
+/// take every place.
+priv let accept_loop! : :any -> :any -> Options -> Live -> :atom;
+priv let rec accept_loop! listener handle options (strict live) = {
+    let bound = Options.max_connections options;
+    if bound > 0 && Live.count live >= bound {
+        match proc.recv_where! (fn m -> match m { [:down, _, _] => true, _ => false }) {
+            [:down, c, _] => accept_loop! listener handle options (ended live c),
+            _ => accept_loop! listener handle options live,
+        }
+    } else {
+        match try! { let sock = net.accept! listener; Result.ok sock } catch e { err e } {
+            Result.ok(sock) => {
+                let now = reap! live;
+                let addr = address (try! { net.peer! sock } catch e { "" });
+                let per = Options.max_per_peer options;
+                if per > 0 && (Live.peers now).[addr else 0] >= per {
+                    refuse! sock options
+                    accept_loop! listener handle options now
+                } else {
+                    let c = spawn! $( connection! sock handle options );
+                    proc.monitor! c
+                    accept_loop! listener handle options
+                        (Live.make ((Live.conns now).[c => addr]) (Live.count now + 1)
+                                   ((Live.peers now).[addr => (Live.peers now).[addr else 0] + 1]))
+                }
+            },
+            // `stop!` closes the listener under the parked accept, which is how
+            // this loop learns it is over.
+            Result.error(_) => :stopped,
+        }
+    }
+};
+
+/// Turn a connection away with a 503, in a process of its own so the
+/// acceptor goes straight back to accepting. Closing a socket whose request
+/// has not been read resets it, and a reset is all the client would see --
+/// not the 503 ahead of it -- so the answer is written, the sending side shut,
+/// and what the client sent read and dropped until it closes too, for a
+/// second at most: a client that keeps sending costs that second and no more.
+priv let refuse! : :any -> Options -> :unit;
+priv let refuse! sock options = {
+    spawn! $( turn_away! sock options )
+    ()
+};
+
+/// The work of `refuse!`.
+priv let turn_away! : :any -> Options -> :unit;
+priv let turn_away! sock options = {
+    let resp = finish! (http.status_only 503) (http.Request.new ()) options
+        |> http.with_header "connection" "close" |> http.with_header "retry-after" "1";
+    try! {
+        streams.write_all! sock (http.encode_response resp false)
+        net.shutdown! sock
+        time.within! time.second (drain! sock)
+    } catch e { () }
+    try! { io.close! sock } catch e { () }
+    ()
+};
+
+/// Read and drop what arrives on a socket until its end.
+priv let drain! : :any -> :atom;
+priv let rec drain! sock = if io.read! sock 4096 == "" { :drained } else { drain! sock };
 
 /// Serve one accepted connection using the configured protocol options.
 priv let connection! : :any -> :any -> Options -> :unit;
@@ -264,7 +367,9 @@ priv let send_response! sock req resp keep head watchdog = {
     match http.Response.stream resp2 {
         () => { streams.write_all! sock (http.encode_response resp2 head); () },
         s => {
-            let chunked = http.Request.version req != "HTTP/1.0";
+            // A stream whose length is known says so, and is sent as it is:
+            // a file, whose client can then show how far along it is.
+            let chunked = http.Request.version req != "HTTP/1.0" && http.header "content-length" resp2 == ();
             streams.write_all! sock (http.encode_stream_head resp2 chunked)
             if not head { http.write_stream! sock s chunked (still_going! watchdog) }
         },
@@ -492,24 +597,258 @@ priv let rec match_path pattern path params = match [pattern, path] {
 };
 
 // --- static files ---------------------------------------------------------------------------
+//
+// A directory served over HTTP is a directory handed to whoever can reach the
+// port, so what is refused matters as much as what is sent. A path is taken
+// apart into names and each is checked before the disk is touched: `..`, `.`,
+// an encoded slash, a backslash or a NUL is a 404, as is a dotfile (`.git`,
+// `.env`) unless `dotfiles` says otherwise -- `.well-known` excepted, which
+// exists to be served. A symbolic link anywhere below the directory is a 404
+// too: there is no `realpath` to say where one leads, and a server that never
+// follows one cannot be led out of its directory by one.
+//
+// A file is never read whole. One no larger than a piece is read and sent;
+// anything larger is a stream (`#[:unfold, ..]`) that opens the file, reads a
+// piece at its offset and closes it again, each time it is pulled, so a client
+// that goes away mid-download leaves no handle behind, and a thousand clients
+// fetching a large file hold a piece each rather than the file each.
+//
+// What a client may ask of a file is answered as RFC 9110 says: `GET` and
+// `HEAD` and nothing else (405, with `Allow`); `If-None-Match` against a strong
+// ETag of size and modification time, then `If-Modified-Since`, for a 304; and
+// one byte range, with `If-Range`, for a 206 -- several ranges are answered
+// whole, which the RFC allows, and an unsatisfiable one is a 416. A directory
+// asked for without its slash is redirected to it, since relative links in
+// its index are read against the URL.
+
+/// How `static!` serves a directory: the file a directory answers with, whether
+/// a directory without one lists its entries, whether names starting with a dot
+/// are served, the `Cache-Control` sent with every file, and the size of the
+/// pieces a large file is read and sent in.
+mapping Static {
+    index : :string = "index.html"
+    listing : :bool = false
+    dotfiles : :bool = false
+    cache : :string = "no-cache"
+    piece : :integer = 65536
+}
 
 /// A handler that serves the files under `dir`: the path is the route's
 /// `*path` parameter when there is one, otherwise the request's path. A
-/// directory serves its `index.html`. Nothing outside `dir` can be named --
-/// a `..` segment is a 404 -- and the content type comes from the extension.
+/// directory serves its `index.html`. `static!` with `Static`'s defaults.
 let files! : :string -> :map -> :map;
-let files! dir req = {
-    let rel = match http.param "path" req { () => map url.decode (segments (http.Request.path req)), p => segments p };
-    if list.any (fn s -> s == ".." || s == "." || str.contains '\\' s || str.contains '\u{0}' s) rel { http.not_found }
+let files! dir req = static! (Static.new ()) dir req;
+
+/// A handler that serves the files under `dir` as `o` says; the section
+/// above says what is refused and why.
+let static! : Static -> :string -> :map -> :map;
+let static! o dir req = {
+    let method = http.Request.method req;
+    if method != "GET" && method != "HEAD" { http.status_only 405 |> http.with_header "allow" "GET, HEAD" }
     else {
-        let base = dir + "/" + str.join_str "/" rel;
-        let path = if io.is_dir! base { base + "/index.html" } else { base };
-        match file.read! path {
+        match requested o req {
             () => http.not_found,
-            bytes => http.respond 200 bytes |> http.with_header "content-type" (mime_type path),
+            names => if below_link! dir names { http.not_found } else { serve_path! o dir names req },
         }
     }
 };
+
+/// The names a request asks for under the directory, or `()` when any of them
+/// is one that is never served.
+priv let requested : Static -> :map -> ([:string] | :unit);
+priv let requested o req = {
+    let names = match http.param "path" req {
+        () => map url.decode (segments (http.Request.path req)),
+        p => segments p,
+    };
+    if list.any (refused o) names { () } else { names }
+};
+
+/// Whether a name is one `static!` will not serve.
+priv let refused : Static -> :string -> :bool;
+priv let refused o name =
+    name == ".." || name == "." || str.contains '/' name || str.contains '\\' name || str.contains '\u{0}' name
+    // A name `std.path` reads as a root of its own (`C:` on Windows) would
+    // make the join below start somewhere else.
+    || path.anchor name != ""
+    || (not (Static.dotfiles o) && str.starts_with "." name && name != ".well-known");
+
+/// Whether any of the names below `dir` is a symbolic link.
+priv let below_link! : :string -> [:string] -> :bool;
+priv let below_link! dir names = {
+    let rec go! at rest = match rest {
+        [] => false,
+        [name, ..more] => {
+            let here = path.join at name;
+            match io.lstat! here { [_, _, :link] => true, () => false, _ => go! here more }
+        },
+    };
+    go! dir names
+};
+
+/// Answer for what `names` lead to: a file, a directory's index or listing, or
+/// a 404.
+priv let serve_path! : Static -> :string -> [:string] -> :map -> :map;
+priv let serve_path! o dir names req = {
+    let at = path.join_all dir names;
+    match io.stat! at {
+        [size, modified, :file] => send_file! o at size modified req,
+        [_, _, :dir] => {
+            let asked = http.Request.path req;
+            if not (str.ends_with "/" asked) {
+                // Collapsed to one leading slash: `//host` in a Location is
+                // another site, and this must never send anyone to one.
+                let target = http.Request.url req;
+                let query = match str.find "?" target { i if i >= 0 => str.slice i (len target - i) target, _ => "" };
+                http.status_only 301 |> http.with_header "location" ("/" + without_leading_slashes asked + "/" + query)
+            } else {
+                let index = path.join at (Static.index o);
+                match io.lstat! index {
+                    [size, modified, :file] => send_file! o index size modified req,
+                    _ => if Static.listing o { listing! o at asked } else { http.not_found },
+                }
+            }
+        },
+        _ => http.not_found,
+    }
+};
+
+/// A path with every slash it starts with taken off.
+priv let without_leading_slashes : :string -> :string;
+priv let rec without_leading_slashes p = if str.starts_with "/" p { without_leading_slashes (str.slice 1 (len p - 1) p) } else { p };
+
+/// A file's strong validator: its size and when it was last written. Two
+/// versions of a file the same length written in the same nanosecond are the
+/// same file as far as anyone can tell.
+priv let etag : :integer -> :integer -> :string;
+priv let etag size modified = "\"" + to_string size + "-" + to_string modified + "\"";
+
+/// Whether the client's copy is current: `If-None-Match` when it is sent, and
+/// `If-Modified-Since`, to the second, only when it is not.
+priv let fresh : :map -> :string -> :integer -> :bool;
+priv let fresh req tag modified = match http.header "if-none-match" req {
+    () => match http.header "if-modified-since" req {
+        () => false,
+        since => match time.parse_http_date since {
+            Result.ok(t) => modified / time.second <= t / time.second,
+            Result.error(_) => false,
+        },
+    },
+    tags => list.any (fn t -> t == "*" || t == tag || t == "W/" + tag) (map str.trim (str.split "," tags)),
+};
+
+/// The one byte range a request asks for in a file of `size` bytes, as
+/// `[first, last]`; `:unsatisfiable`; or `()` to send the whole file -- no
+/// range, several, a malformed one, or an `If-Range` the file no longer is.
+priv let byte_range : :map -> :string -> :string -> :integer -> ([:integer, :integer] | :atom | :unit);
+priv let byte_range req tag last_modified size = {
+    let current = match http.header "if-range" req { () => true, v => v == tag || v == last_modified };
+    match http.header "range" req {
+        spec if spec != () && current && str.starts_with "bytes=" spec && not (str.contains ',' spec) => {
+            let [from, to] = match str.split "-" (str.trim (str.slice 6 (len spec - 6) spec)) { [a, b] => [a, b], _ => ["x", "x"] };
+            let digits t = t != "" && str.span "0123456789" 0 t == len t;
+            // Only ever asked of digits, so never `()`.
+            let whole t = match num.parse_int t { () => 0, n => n };
+            if from == "" && digits to {
+                let n = whole to;
+                if n == 0 || size == 0 { :unsatisfiable } else { [num.max 0 (size - n), size - 1] }
+            } else if digits from && (to == "" || digits to) {
+                let first = whole from;
+                let last = if to == "" { size - 1 } else { num.min (whole to) (size - 1) };
+                if first >= size { :unsatisfiable } else if last < first { () } else { [first, last] }
+            } else { () }
+        },
+        _ => (),
+    }
+};
+
+/// A file, or the part of it asked for, with its validators.
+priv let send_file! : Static -> :string -> :integer -> :integer -> :map -> :map;
+priv let send_file! o file size modified req = {
+    let tag = etag size modified;
+    let last = time.http_date modified;
+    let described resp = resp
+        |> http.with_header "etag" tag |> http.with_header "last-modified" last
+        |> http.with_header "cache-control" (Static.cache o) |> http.with_header "accept-ranges" "bytes"
+        |> http.with_header "x-content-type-options" "nosniff";
+    if fresh req tag modified { described (http.status_only 304) }
+    else {
+        let typed resp = described resp |> http.with_header "content-type" (mime_type file);
+        let head = http.Request.method req == "HEAD";
+        match byte_range req tag last size {
+            :unsatisfiable => described (http.status_only 416) |> http.with_header "content-range" ("bytes */" + to_string size),
+            [first, last_byte] => typed (body_of! o file first (last_byte + 1) head 206)
+                |> http.with_header "content-range" ("bytes " + to_string first + "-" + to_string last_byte + "/" + to_string size),
+            _ => typed (body_of! o file 0 size head 200),
+        }
+    }
+};
+
+/// Bytes `from` to `upto` of a file as a response of `status`: read now when
+/// they fit in a piece, as a stream when they do not, and not at all for a
+/// `HEAD`, which is told the length and nothing more.
+priv let body_of! : Static -> :string -> :integer -> :integer -> :bool -> :integer -> :map;
+priv let body_of! o file from upto head status = {
+    let length = upto - from;
+    if head || length > Static.piece o {
+        let pieces = if head { [] } else { #[:unfold, file_piece!, [file, from, upto, Static.piece o]] };
+        http.stream pieces |> http.Response.set_status status |> http.with_header "content-length" (to_string length)
+    } else {
+        http.respond status (read_at! file from length)
+    }
+};
+
+/// The next piece of a file being sent, and where the one after starts; `()`
+/// at the end. A file cut short while it is sent raises, which ends the
+/// connection: its length has been promised and cannot be kept.
+priv let file_piece! : [:any] -> :any;
+priv let file_piece! [file, at, upto, piece] =
+    if at >= upto { () }
+    else {
+        let n = num.min piece (upto - at);
+        let got = read_at! file at n;
+        strict! got
+        [got, [file, at + n, upto, piece]]
+    };
+
+/// `n` bytes of a file from `at`, the file open only for the read.
+priv let read_at! : :string -> :integer -> :integer -> :string;
+priv let read_at! file at n = {
+    let h = io.open! file :read;
+    defer! io.close! h
+    io.seek! h at
+    let rec more! (strict left) acc =
+        if left == 0 { str.concat_all (list.reverse acc) }
+        else {
+            let got = io.read! h left;
+            if got == "" { raise! (error.new :io_changed (file + " grew shorter while it was being sent")) }
+            more! (left - len got) (got :: acc)
+        };
+    more! n []
+};
+
+/// A directory's entries as a page: each a link, a directory's ending in a
+/// slash; what `static!` would refuse is left out.
+priv let listing! : Static -> :string -> :string -> :map;
+priv let listing! o at asked = {
+    let names = list.sort (filter (fn n -> not (refused o n)) (try! { os.list_dir! at } catch e { [] }));
+    let entry! n = match io.lstat! (path.join at n) {
+        [_, _, :dir] => [n + "/"],
+        [_, _, :file] => [n],
+        _ => [],
+    };
+    let shown = flat_map entry! names;
+    let title = escape_html (url.decode asked);
+    http.html ("<!doctype html><meta charset=\"utf-8\"><title>" + title + "</title><h1>" + title + "</h1><ul>"
+        + (if asked == "/" { "" } else { "<li><a href=\"../\">../</a></li>" })
+        + str.concat_all (map (fn n -> "<li><a href=\"" + url.encode_path n + "\">" + escape_html n + "</a></li>") shown)
+        + "</ul>")
+        |> http.with_header "x-content-type-options" "nosniff"
+};
+
+/// Text as HTML that shows it, markup and all.
+priv let escape_html : :string -> :string;
+priv let escape_html t = t |> str.replace "&" "&amp;" |> str.replace "<" "&lt;" |> str.replace ">" "&gt;" |> str.replace "\"" "&quot;" |> str.replace "'" "&#39;";
 
 /// The content type of a file, by its extension.
 let mime_type : :string -> :string;
@@ -873,6 +1212,98 @@ when test {
             test.eq! [Result.ok ["body {}", "text/css; charset=utf-8"], Result.ok "<p>home</p>", 404, 404]
                      [Result.map (fn r -> [http.body r, http.header "content-type" r]) css, home,
                       Result.unwrap_or 0 (Result.map http.status escape), Result.unwrap_or 0 (Result.map http.status encoded)]
+        } ),
+        test.case "what a static directory refuses" $( {
+            let dir = "/tmp/dream-http-refuse-" + to_string (time.now! ());
+            io.mkdir_all! (path.join dir ".git")
+            io.mkdir_all! (path.join dir ".well-known")
+            file.write! (path.join dir ".env") "SECRET=1"
+            file.write! (path.join dir ".git/config") "[core]"
+            file.write! (path.join dir ".well-known/security.txt") "Contact: x"
+            file.write! (path.join dir "ok.txt") "fine"
+            io.symlink! "/etc" (path.join dir "out")
+            io.symlink! "ok.txt" (path.join dir "alias.txt")
+            let status! p = http.status (call! (files! dir) (http.Request.new () |> http.Request.set_path p));
+            let posted = http.status (call! (files! dir) (http.Request.new () |> http.Request.set_method "POST" |> http.Request.set_path "/ok.txt"));
+            let got = [status! "/.env", status! "/.git/config", status! "/.well-known/security.txt", status! "/ok.txt",
+                       status! "/out/passwd", status! "/alias.txt", status! "/ok.txt%2f..%2f..%2fetc", status! "/%00", posted];
+            strict! got
+            io.remove_all! dir
+            test.eq! [404, 404, 200, 200, 404, 404, 404, 404, 405] got
+        } ),
+        test.case "validators, ranges and HEAD" $( {
+            let dir = "/tmp/dream-http-ranges-" + to_string (time.now! ());
+            io.mkdir_all! dir
+            file.write! (path.join dir "digits.txt") "0123456789"
+            let get! headers = call! (files! dir) (fold (fn r [k, v] -> http.with_header k v r)
+                                                       (http.Request.new () |> http.Request.set_path "/digits.txt") headers);
+            let whole = get! [];
+            let tag = http.header "etag" whole;
+            let again = get! [["if-none-match", tag]];
+            let since = get! [["if-modified-since", http.header "last-modified" whole]];
+            let part = get! [["range", "bytes=2-4"]];
+            let tail = get! [["range", "bytes=-3"]];
+            let open = get! [["range", "bytes=7-"]];
+            let beyond = get! [["range", "bytes=10-"]];
+            let several = get! [["range", "bytes=0-1,4-5"]];
+            let stale = get! [["range", "bytes=2-4"], ["if-range", "\"other\""]];
+            let head = call! (files! dir) (http.Request.new () |> http.Request.set_method "HEAD" |> http.Request.set_path "/digits.txt");
+            io.remove_all! dir
+            test.eq! [[200, "0123456789", "bytes"], 304, 304, [206, "234", "bytes 2-4/10"], "789", "789",
+                      [416, "bytes */10"], [200, "0123456789"], 200, ["10", ""]]
+                     [[http.status whole, http.body whole, http.header "accept-ranges" whole], http.status again, http.status since,
+                      [http.status part, http.body part, http.header "content-range" part], http.body tail, http.body open,
+                      [http.status beyond, http.header "content-range" beyond], [http.status several, http.body several],
+                      http.status stale, [http.header "content-length" head, http.stream_text! (http.Response.stream head)]]
+        } ),
+        test.case "a directory: its slash, its index, its listing" $( {
+            let dir = "/tmp/dream-http-dirs-" + to_string (time.now! ());
+            io.mkdir_all! (path.join dir "docs")
+            io.mkdir_all! (path.join dir "bare/inner")
+            file.write! (path.join dir "docs/index.html") "<p>docs</p>"
+            file.write! (path.join dir "bare/a <b>.txt") "x"
+            file.write! (path.join dir "bare/.hidden") "x"
+            let ask! o p = call! (static! o dir) (http.Request.new () |> http.Request.set_path p |> http.Request.set_url p);
+            let moved = ask! (Static.new ()) "/docs";
+            let sneaky = ask! (Static.new ()) "//docs";
+            let index = ask! (Static.new ()) "/docs/";
+            let unlisted = ask! (Static.new ()) "/bare/";
+            let listed = ask! (Static.new () |> Static.set_listing true) "/bare/";
+            io.remove_all! dir
+            test.eq! [[301, "/docs/"], "/docs/", "<p>docs</p>", 404, [true, true, false, false]]
+                     [[http.status moved, http.header "location" moved], http.header "location" sneaky, http.body index,
+                      http.status unlisted,
+                      [str.contains_str "href=\"inner/\"" (http.body listed), str.contains_str "a &lt;b&gt;.txt" (http.body listed),
+                       str.contains_str ".hidden" (http.body listed), str.contains_str "<b>" (http.body listed)]]
+        } ),
+        test.case "a large file is streamed with its length" $( {
+            let dir = "/tmp/dream-http-large-" + to_string (time.now! ());
+            io.mkdir_all! dir
+            let big = str.repeat 20000 "abcdefghij";
+            file.write! (path.join dir "big.txt") big
+            let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_host "127.0.0.1")
+                                (static! (Static.new () |> Static.set_piece 4096) dir);
+            let resp = http.get! (local_url s + "/big.txt");
+            let ranged = raw! (port s) "GET /big.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=199990-\r\nConnection: close\r\n\r\n";
+            stop! s
+            io.remove_all! dir
+            test.eq! [Result.ok [true, "200000"], true, false]
+                     [Result.map (fn r -> [http.body r == big, http.header "content-length" r]) resp,
+                      str.ends_with "\r\n\r\nabcdefghij" ranged, str.contains_str "chunked" (str.lower ranged)]
+        } ),
+        test.case "one address cannot take every connection" $( {
+            let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_host "127.0.0.1" |> Options.set_max_per_peer 1)
+                                (fn req -> http.text "hi");
+            // The first connection is held open, idle; the second, from the
+            // same address, is turned away.
+            let held = net.connect! "127.0.0.1" (port s);
+            proc.sleep! 50
+            let second = raw! (port s) "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            io.close! held
+            proc.sleep! 50
+            let third = raw! (port s) "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            stop! s
+            test.eq! [true, true] [str.starts_with "HTTP/1.1 503" second, str.starts_with "HTTP/1.1 200" third]
         } ),
     ];
 }

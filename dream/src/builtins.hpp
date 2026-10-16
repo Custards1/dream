@@ -53,6 +53,10 @@ extern DREAM_DATA_API const BuiltinDef BUILTINS[];
 inline const BuiltinDef& builtin_def(uint32_t id) { return BUILTINS[id]; }
 uint32_t builtin_count();
 
+/// A float as the shortest decimal that reads back as it (as a float32 when
+/// `f32`), positional from 1e-4 to 1e16 and with an exponent outside.
+void append_shortest(double d, bool f32, std::string* out);
+
 /// Insert into an open-addressed map, growing it when it gets crowded.
 /// `map` with `key` set to `value`. The map handed in is unchanged and stays
 /// valid: what comes back shares all of it but the path to the new entry.

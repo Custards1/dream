@@ -1,6 +1,14 @@
 // Streams: a body made, or arriving, in pieces -- a lazy list of strings, a
-// function of unit answering the next piece or `()`, or `#[:mapped, f, s]`,
-// the pieces of another stream passed through a pure `f` as they are pulled.
+// function of unit answering the next piece or `()`, `#[:mapped, f, s]`,
+// the pieces of another stream passed through a pure `f` as they are pulled,
+// or `#[:unfold, step!, state]`, whose `step! state` answers `[piece, next
+// state]` or `()` at the end.
+//
+// An unfold is the form for a stream that has to remember where it is -- a
+// file read a piece at a time -- and is not a list for the reason a response
+// is forced all the way down before it is sent (`answer!` in
+// `std.http.server`): a lazy list of reads would be read whole there, where
+// an unfold is a function and a state, and stays as it is.
 // `std.http` describes them; this module is where they are taken apart, so
 // that `std.http.h2`, which `std.http` uses, can take them apart too.
 
@@ -16,6 +24,7 @@ let pull! s = match type_of s {
     :unit => [(), ()],
     :array => match s {
         #[:mapped, f, inner] => match pull! inner { [(), _] => [(), ()], [piece, rest] => [f piece, #[:mapped, f, rest]] },
+        #[:unfold, step, state] => match step state { [piece, next] => [piece, #[:unfold, step, next]], _ => [(), ()] },
         _ => [(), ()],
     },
     _ => { let piece = s (); strict! piece; [piece, s] },

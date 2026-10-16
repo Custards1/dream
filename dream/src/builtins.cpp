@@ -426,6 +426,32 @@ bool map_lookup(Process&, Value map, Value key, Value* out) {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// The shortest decimal that reads back as the same number, written the way
+/// Python's `repr` writes one: in positional notation from 1e-4 up to 1e16,
+/// and with an exponent only outside that. `%g` alone picks the digits well
+/// and the notation badly -- it uses an exponent whenever the digits are
+/// fewer than the integer part's, so 10.0, whose shortest form is one digit,
+/// came out as `1e+01` in the middle of `[6, 8, 1e+01, 12]`. `f32` asks for the
+/// shortest that reads back as the same float32, which is how a float32
+/// tensor's 0.1 prints as 0.1 and not as the double it widens to.
+void append_shortest(double d, bool f32, std::string* out) {
+    char buf[64];
+    int prec = 1;
+    for (; prec < 17; ++prec) {
+        std::snprintf(buf, sizeof buf, "%.*g", prec, d);
+        double back = std::strtod(buf, nullptr);
+        if (f32 ? float(back) == float(d) : back == d) break;
+    }
+    if (prec == 17) std::snprintf(buf, sizeof buf, "%.17g", d);
+    if (std::isfinite(d) && d != 0 && std::strchr(buf, 'e')) {
+        int exponent = int(std::floor(std::log10(std::fabs(d))));
+        if (exponent >= -4 && exponent < 16) {
+            std::snprintf(buf, sizeof buf, "%.*f", std::max(0, prec - 1 - exponent), d);
+        }
+    }
+    out->append(buf);
+}
+
 namespace {
 
 bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int depth);
@@ -527,14 +553,7 @@ bool stringify_into(Process& p, Value v, std::string* out, bool quoted, int dept
             bigint::append_decimal(w, out);
             return true;
         case ObjType::Float: {
-            double d = static_cast<FloatObj*>(as_obj(w))->value;
-            char buf[40];
-            // %.17g round-trips but is ugly; try shorter forms first.
-            for (int prec = 1; prec <= 17; ++prec) {
-                std::snprintf(buf, sizeof buf, "%.*g", prec, d);
-                if (std::strtod(buf, nullptr) == d) break;
-            }
-            out->append(buf);
+            append_shortest(static_cast<FloatObj*>(as_obj(w))->value, false, out);
             return true;
         }
         case ObjType::BigStr:

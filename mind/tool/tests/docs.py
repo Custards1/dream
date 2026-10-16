@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix='mind-doc-tests-') as scratch:
 let hello : :string -> :string;
 let hello name = "hello " + name;
 
-/// A compile error is useful documentation too.
+/// A compile error is useful documentation too, unlike `hello`.
 /// ```dream fails
 /// let main! = unknown_name;
 /// ```
@@ -76,6 +76,13 @@ import std.console;
 let main! = console.print! "guide output";
 ```
 
+Names in code are links: `list.map`, `std.http.server`, `lib.hello`, but
+not `nowhere.at_all`, and not inside a link: [`list.map`](nested/next.md).
+
+```dream no-run
+this is a fragment, never compiled
+```
+
 <script>alert("unsafe")</script>
 
 [Unsafe](javascript:alert)
@@ -108,6 +115,14 @@ let main! = console.print! "guide output";
     assert '<script>alert' not in guide and '&lt;script&gt;' in guide
     assert 'href="javascript:' not in guide
     assert '<table>' in guide
+    # Code names lead to the reference, the standard library's included.
+    assert 'href="../api/std/list.html#map"><code>list.map</code></a>' in guide, guide
+    assert 'href="../api/std/http/server.html"><code>std.http.server</code></a>' in guide
+    assert 'href="../api/demo/lib.html#hello"><code>lib.hello</code></a>' in guide
+    assert '<code>nowhere.at_all</code>' in guide and 'next.html"><code>list.map</code></a>' in guide
+    assert 'href="#hello"><code>hello</code></a>' in api
+    assert (target / 'api/std/index.html').exists() and (target / 'api/std/list.html').exists()
+    assert 'never compiled' in guide
     nested = (target / 'guides/nested/next.html').read_text()
     assert 'id="repeated-1"' in nested and 'id="repeated-2"' in nested
     assert '../../assets/docs.css' in nested

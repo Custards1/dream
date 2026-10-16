@@ -1396,12 +1396,8 @@ NativeResult io_mkdir(Process& p, Value, Value* args, uint32_t) {
 // accepting, and connecting.
 // ---------------------------------------------------------------------------
 
-/// Bind and listen on `port`, on every interface.
-NativeResult net_listen(Process& p, Value, Value* args, uint32_t) {
-    Value v = resolve(args[0]);
-    if (!is_fixnum(v) || fixnum_value(v) < 0 || fixnum_value(v) > 65535) {
-        return fail(p, "bad_argument", "listen! needs a port between 0 and 65535");
-    }
+/// Bind and listen on `port` at `addr`, whose port is filled in here.
+static NativeResult listen_at(Process& p, sockaddr_in addr, int64_t port) {
     int fd = sys::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return fail_errno(p, "socket", errno);
 
@@ -1410,10 +1406,8 @@ NativeResult net_listen(Process& p, Value, Value* args, uint32_t) {
     int on = 1;
     sys::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
 
-    sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(uint16_t(fixnum_value(v)));
+    addr.sin_port = htons(uint16_t(port));
     if (sys::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
         int e = errno;
         sys::close(fd);
@@ -1426,6 +1420,46 @@ NativeResult net_listen(Process& p, Value, Value* args, uint32_t) {
     }
     set_nonblocking(fd);
     return NativeResult::ok(make_fixnum(HandleTable::get().add(fd, HandleKind::Listener)));
+}
+
+/// Bind and listen on `port`, on every interface.
+NativeResult net_listen(Process& p, Value, Value* args, uint32_t) {
+    Value v = resolve(args[0]);
+    if (!is_fixnum(v) || fixnum_value(v) < 0 || fixnum_value(v) > 65535) {
+        return fail(p, "bad_argument", "listen! needs a port between 0 and 65535");
+    }
+    sockaddr_in addr{};
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    return listen_at(p, addr, fixnum_value(v));
+}
+
+/// Bind and listen on `port` at one address: `"127.0.0.1"` or `"localhost"`
+/// for this machine alone, `"0.0.0.0"` for every interface, or a name that
+/// resolves to one of this machine's addresses. A server that is only meant
+/// to be reached from here should say so, rather than be reachable by the
+/// whole network because `listen!` cannot say anything else.
+NativeResult net_listen_on(Process& p, Value, Value* args, uint32_t) {
+    if (!is_string(args[0])) return fail(p, "type_error", "listen_on! needs a host to bind to");
+    Value v = resolve(args[1]);
+    if (!is_fixnum(v) || fixnum_value(v) < 0 || fixnum_value(v) > 65535) {
+        return fail(p, "bad_argument", "listen_on! needs a port between 0 and 65535");
+    }
+    std::string host = string_arg(args[0]);
+    // IPv4, as `connect!` is. `getaddrinfo` blocks, but a listener is made
+    // once, and a numeric host never touches the resolver.
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    addrinfo* found = nullptr;
+    int gai = ::getaddrinfo(host.c_str(), nullptr, &hints, &found);
+    if (gai != 0 || !found) {
+        return fail(p, "not_found", "cannot resolve " + host + ": " + ::gai_strerror(gai));
+    }
+    sockaddr_in addr{};
+    std::memcpy(&addr, found->ai_addr, sizeof addr);
+    ::freeaddrinfo(found);
+    return listen_at(p, addr, fixnum_value(v));
 }
 
 /// Take the next incoming connection, parking this process until one arrives.
@@ -1863,6 +1897,7 @@ ModuleDef make_net_module() {
     return ModuleDef{"std.net",
                      {
                          {"listen!", 1, 0b1, net_listen},
+                         {"listen_on!", 2, 0b11, net_listen_on},
                          {"accept!", 1, 0b1, net_accept},
                          {"connect!", 2, 0b11, net_connect},
                          {"peer!", 1, 0b1, net_peer},

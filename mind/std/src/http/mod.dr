@@ -540,7 +540,10 @@ priv let hex_number t =
 // message waited for. Server-sent events are a stream with a format.
 
 /// A 200 response whose body is sent in pieces as `chunks` makes them: a
-/// list of strings, or a function answering the next one or `()`.
+/// list of strings, a function answering the next one or `()`, or
+/// `#[:unfold, step!, state]`, where `step! state` answers `[piece, next
+/// state]` or `()` -- a stream that remembers where it is, as `std.http.server`
+/// reads a file.
 let stream : :any -> :map;
 let stream chunks = Response.new () |> Response.set_stream chunks;
 
@@ -623,12 +626,14 @@ let encode_response resp head = {
 
 /// The head of a response whose body is a stream: chunked for HTTP/1.1, and
 /// for an HTTP/1.0 client neither chunked nor with a length, the end of the
-/// body being the end of the connection.
+/// body being the end of the connection -- unless the response gives its
+/// `content-length`, as a file does, when that is what ends it.
 let encode_stream_head : :map -> :bool -> :string;
 let encode_stream_head resp chunked = {
     let code = Response.status resp;
-    let framed = without_header "content-length" resp
-                 |> (fn r -> if chunked { with_header "transfer-encoding" "chunked" r } else { with_header "connection" "close" r });
+    let framed = if chunked { without_header "content-length" resp |> with_header "transfer-encoding" "chunked" }
+                 else if header "content-length" resp != () { resp }
+                 else { with_header "connection" "close" resp };
     str.concat_all (["HTTP/1.1 ", to_string code, " ", reason code, "\r\n"]
                     + flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers framed)
                     + ["\r\n"])

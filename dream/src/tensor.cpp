@@ -1770,18 +1770,9 @@ bool reshape(Process& p, TensorObj* t, const Shape& s, Value* out) {
 
 // --- rendering -----------------------------------------------------------------------
 
-/// The shortest decimal that reads back as the same number -- the same rule a
-/// float prints by, applied at the precision the tensor holds, so a float32 0.1
-/// prints as 0.1 and not as the double it widens to.
-void render_number(double d, bool f32, std::string* out) {
-    char buf[40];
-    for (int prec = 1; prec <= 17; ++prec) {
-        std::snprintf(buf, sizeof buf, "%.*g", prec, d);
-        double back = std::strtod(buf, nullptr);
-        if (f32 ? float(back) == float(d) : back == d) break;
-    }
-    out->append(buf);
-}
+/// A number as a float prints (`append_shortest`), at the precision the
+/// tensor holds.
+void render_number(double d, bool f32, std::string* out) { append_shortest(d, f32, out); }
 
 void render_axis(const double*& data, const Shape& s, uint32_t depth, bool f32, std::string* out) {
     out->push_back('[');

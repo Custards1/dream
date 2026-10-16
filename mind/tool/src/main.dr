@@ -36,6 +36,7 @@ import std.vm;
 
 import pack.commands;
 import docs;
+import serve;
 import build;
 import config;
 import fetch;
@@ -99,7 +100,8 @@ let command_spec = [
     cli.command "info"  "show what this build would run, without running it" [],
     cli.command "options" "every package's options, and what this build sets them to" [],
     cli.command "pack" "make release packages; mind pack help lists formats" [],
-    cli.command "docs" "compile Markdown guides and source API documentation" [],
+    cli.command "docs" "compile Markdown guides and source API documentation; `docs serve` serves them" [],
+    cli.command "serve" "serve a directory over HTTP on this machine (default: here)" [],
     cli.command "clean" "remove target/" [],
     cli.command "help"  "this message" [],
 ];
@@ -908,6 +910,10 @@ let normal_main! args =
 let rec dispatch! kept c args = match args {
     ["help", "pack"] => commands.run! ["help"],
     ["help", "docs"] => docs.run! ["--help"],
+    ["help", "serve"] => serve.run! ["--help"],
+    // Serving takes no build options, so what was read before it is dropped;
+    // a `-C DIR` among it has already been entered.
+    ["serve", ..rest] => serve.run! rest,
     [cmd, ..rest] if cmd == "pack" || cmd == "docs" => {
         let forwarded = list.append (list.reverse kept) rest;
         if cmd == "pack" { commands.run! forwarded } else { docs.run! forwarded }

@@ -471,7 +471,8 @@ import std.net;
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `listen!` | `port:integer → handle` | Binds a TCP listener on `port`. Use port `0` to let the OS pick a port, then read it back with `port!`. |
+| `listen!` | `port:integer → handle` | Binds a TCP listener on `port`, on every interface. Use port `0` to let the OS pick a port, then read it back with `port!`. |
+| `listen_on!` | `host:string → port:integer → handle` | `listen!` at one address: `"127.0.0.1"` or `"localhost"` for this machine alone, `"0.0.0.0"` for every interface. IPv4, as `connect!` is. A server meant only for this machine should bind this way. |
 | `accept!` | `listener → handle` | Waits for an incoming connection and returns a stream handle. Parks until a connection arrives. |
 | `connect!` | `host:string → port:integer → handle` | Connects to a TCP server. Parks during the connect. Raises `:connection_refused` if the server is not listening. |
 | `peer!` | `socket → string` | Returns the remote address as `"host:port"`. |
