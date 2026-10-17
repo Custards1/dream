@@ -14,7 +14,7 @@ Dont forget about strict parameters, use them when needed
 |---|---|---|
 | `dream/` | The VM: interpreter, green processes, LLVM JIT; its references and notes in `dream/docs/`. Submodule: dream-mindv2/dream. | C++ |
 | `mind/tool/` | `mind`, the build tool. Finds packages, shells out to a compiler. Submodule: dream-mindv2/mind. | Dream |
-| `mind/std/` | The standard library; its design docs and notes in `mind/std/docs/`. Submodule: dream-mindv2/std. | Dream |
+| `mind/std/` | The standard library; its design docs and notes in `mind/std/docs/`, its API published at dream-mindv2.github.io/std on every push. Submodule: dream-mindv2/std. | Dream |
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** The language spec and the compiler's notes in `dreams/docs/`. Submodule: dream-mindv2/dreams. | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. Submodule: dream-mindv2/lucid. | Dream |
 | `mind/std/src/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/src/sql/pg/README.md](mind/std/src/sql/pg/README.md). | Dream |
@@ -22,7 +22,7 @@ Dont forget about strict parameters, use them when needed
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. Submodule: dream-mindv2/vscode-dream. | JS |
 | `editors/nvim/` | The Neovim plugin: starts `lucid`, plus syntax, indent and a filetype. Submodule: dream-mindv2/dream.nvim. | Lua, Vim |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
-| `learn/` | Learn Dream, the book: a `mind docs` site whose every example is run. Submodule: dream-mindv2/learn. | Markdown |
+| `learn/` | Learn Dream, the book: a `mind docs` site whose every example is run, published at dream-mindv2.github.io/learn on every push and daily. Submodule: dream-mindv2/learn. | Markdown |
 | `docs/` | The index of every document. Each lives with its component, in that component's `docs/`. | — |
 | `docs/notes/` | The index of the design and performance log, by section title. Each note lives in its component's `docs/notes/`. | — |
 
