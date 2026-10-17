@@ -38,6 +38,8 @@ end.
 - Where it stands against CPython, and what the remaining gap is made of
 - List and map code in the JIT
 - Building ahead: a producer makes a run of cells a call
+- Frames freed on return: the most it could save
+- Strict bindings are loads
 - Reusing the frame of a self tail call: measured, and not built
 - A JIT that can allocate -- the plan, and how it was done instead
 - Spilling compiled frames: measured, and not kept
@@ -186,3 +188,13 @@ took to free device memory, and how a chain of operations runs as one pass.
 
 The payload: data past the 4 GiB line an image otherwise stops at, reached as
 views rather than copies.
+
+## [Inlining, measured](../../dreams/docs/notes/inlining.md)
+
+Writing small functions out where they are called: built, measured, and not
+enabled, and why.
+
+- Inlining, measured
+- What was built
+- What it did
+- Why it did not pay
