@@ -216,6 +216,7 @@ test-mind: build
     dream={{dream}} mind=/tmp/dream-mind-graph.dream mind/tool/tests/graph.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/options.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/scripts.sh
+    dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/reproduce.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/docs.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/learn.sh
 
