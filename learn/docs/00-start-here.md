@@ -48,11 +48,16 @@ A program is a file of declarations. `main!` is the one that runs. The `!` at
 the end of its name says it has effects. Printing is an effect, and only a
 `!` name may print.
 
-Save it as `hello.dr` and run it:
+Save it as `hello.dr`, compile it to an image, and run the image:
 
 ```sh
-mind run hello.dr
+dream -x dreams hello.dr -o hello.dream
+dream hello.dream
 ```
+
+`dream -x dreams` runs the installed compiler, and `-o` says where to write
+the image. An image is the whole program, compiled. It runs on any machine
+with a `dream`, whatever its system.
 
 ## A project
 
@@ -72,13 +77,9 @@ and serves it on your machine.
 
 ## Trying things out
 
-`mind repl` starts an interactive session. Type a declaration and it is
-kept. Type an expression and it is evaluated against everything kept so far.
-
-```dream no-run
-> let square x = x * x;
-> square 12
-144
-```
+The quickest loop is a project and `mind run`: change a file, run it, read
+what it prints. `mind check` compiles without writing an image, which is the
+fastest way to hear what the compiler thinks of a change, types and effects
+included. For a lone file, `dream -x dreams hello.dr` does the same.
 
 Next: [Values and functions](01-values-and-functions.md).

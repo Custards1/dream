@@ -39,15 +39,19 @@ let section url = match str.split "/" url {
     _ => "",
 };
 
-/// The first sentence or so of a guide, for its card: the first line that is
-/// prose rather than a heading, a list, a table or code, without its marks.
+/// The first sentence or so of a guide, for its card: from the first
+/// paragraph of prose -- not a heading, a list, a table or code -- up to the
+/// end of its first sentence, without its marks.
 let blurb : :string -> :string;
 let blurb text = {
-    let lines = map str.trim (str.split "\n" text);
     let marks = ["#", "```", "~~~", "|", "<", "- ", "* ", ">", "![", "["];
-    let prose = filter (fn l -> l != "" && not (list.any (fn m -> str.starts_with m l) marks)) lines;
-    let first = list.first_or "" prose |> str.replace "`" "" |> str.replace "**" "";
-    if len first > 160 { str.truncate 157 first + "…" } else { first }
+    let prose l = l != "" && not (list.any (fn m -> str.starts_with m l) marks);
+    let lines = map str.trim (str.split "\n" text);
+    let from = list.drop_while (fn l -> not (prose l)) lines;
+    let paragraph = str.join_str " " (list.take_while prose from) |> str.replace "`" "" |> str.replace "**" "";
+    let stop = str.find ". " paragraph;
+    let sentence = if stop > 0 { str.slice 0 (stop + 1) paragraph } else { paragraph };
+    if len sentence > 170 { str.truncate 167 sentence + "…" } else { sentence }
 };
 
 let icon_search = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" aria-hidden=\"true\"><circle cx=\"11\" cy=\"11\" r=\"7\"/><path d=\"m20 20-3.5-3.5\"/></svg>";
@@ -311,7 +315,8 @@ main { min-width: 0; padding: 40px 56px 64px; }
 .t-op { color: var(--t-op); }
 
 /* --- examples ----------------------------------------------------------- */
-.code + .example-result, .example-result + .example-result { margin-top: -1.1em; }
+.code:has(+ .example-result) { margin-bottom: 0; }
+.example-result + .example-result { margin-top: -1.4em; }
 .example-result { margin: 0 0 1.4em; border: 1px solid var(--line); border-top: 0; border-radius: 0 0 12px 12px; overflow: hidden; }
 .code:has(+ .example-result) pre { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
 .example-label { display: flex; align-items: center; gap: 8px; padding: 7px 14px; font: 600 12px/1.6 var(--sans); color: var(--ok); background: var(--ok-soft); }

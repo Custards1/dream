@@ -11,8 +11,8 @@ union Shape { circle(radius : :float), square(side : :float) }
 
 let area shape : :float =
     match shape {
-        [:circle, r] => 3.14159 * r * r,
-        [:square, s] => s * s,
+        Shape.circle(r) => 3.14159 * r * r,
+        Shape.square(s) => s * s,
     };
 
 let rec total !acc shapes =
