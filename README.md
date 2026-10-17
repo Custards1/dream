@@ -57,15 +57,24 @@ What is in that program:
 Beyond that, the language has syntax macros run at compile time, records,
 compile-time evaluation and contracts, unbounded integers, tensors with a GPU
 backend, a C FFI with owned handles, TLS, and a standard library with servers,
-supervisors, codecs and SQL. [docs/language-spec.md](docs/language-spec.md) is
+supervisors, codecs and SQL. [dreams/docs/language-spec.md](https://github.com/dream-mindv2/dreams/blob/main/docs/language-spec.md) is
 the whole language.
 
 ## Getting started
 
 You need a C++20 compiler, CMake 3.20, [`just`](https://github.com/casey/just),
 **libffi** and **OpenSSL 3** -- `std.ffi` and `std.tls` are part of every VM.
-LLVM is optional and gives the JIT. On Nix, `nix-shell` at the root provides
-all of it.
+LLVM is optional and gives the JIT.
+
+This repository is the **workspace**: each component lives in a repository of
+its own under [dream-mindv2](https://github.com/dream-mindv2) and is checked
+out here as a submodule, so clone it with them:
+
+```
+git clone --recursive https://github.com/Custards1/dream
+cd dream
+just subs            # (or after a plain clone) fetch every component, each on its branch
+```
 
 ```
 just                 # the VM, then the compiler, built from the checked-in seed
@@ -96,17 +105,25 @@ or `mind run` instead.
 
 ## What is here
 
+| | | |
+|---|---|---|
+| [dream](https://github.com/dream-mindv2/dream) | `dream/` | **The VM**, in C++: a lazy graph-reduction interpreter, green processes, a generational collector and an LLVM JIT. Its references and performance log are in its `docs/`. |
+| [dreams](https://github.com/dream-mindv2/dreams) | `dreams/` | **The compiler**, in Dream: `.dr` source to a `.dream` image. It builds itself from a checked-in seed. The language specification is in its `docs/`. |
+| [std](https://github.com/dream-mindv2/std) | `mind/std/` | **The standard library.** |
+| [mind](https://github.com/dream-mindv2/mind) | `mind/tool/` | **`mind`**, the build tool: packages, dependencies, build scripts, tests, documentation sites, serving and packaging. |
+| [lucid](https://github.com/dream-mindv2/lucid) | `lucid/` | **The language server**, which is the compiler, imported as a library. |
+| [vscode-dream](https://github.com/dream-mindv2/vscode-dream) | `editors/vscode/` | The VS Code extension. |
+| [dream.nvim](https://github.com/dream-mindv2/dream.nvim) | `editors/nvim/` | The Neovim plugin. |
+| [learn](https://github.com/dream-mindv2/learn) | `learn/` | **Learn Dream**, a book from a first program to a web server, every example run. Start here to learn the language. |
+
+And in this repository itself:
+
 | | |
 |---|---|
-| [`dream/`](dream/README.md) | **The VM**, in C++: a lazy graph-reduction interpreter, green processes, a generational collector and an LLVM JIT. |
-| [`dreams/`](dreams/README.md) | **The compiler**, in Dream: `.dr` source to a `.dream` image. It builds itself from a checked-in seed. |
-| [`mind/tool/`](mind/tool/README.md) | **`mind`**, the build tool: packages, dependencies, build scripts, tests. |
-| [`mind/std/`](mind/std/README.md) | **The standard library.** |
-| [`lucid/`](lucid/README.md) | **The language server**, which is the compiler, imported as a library. |
-| [`editors/vscode/`](editors/vscode/README.md) | The VS Code extension. |
 | [`examples/`](examples/README.md) | Example programs, each a test: its output is recorded beside it. |
 | [`benchmark/`](benchmark/README.md) | Dream against CPython, and the tensor benchmarks. |
-| [`docs/`](docs/README.md) | The language reference, the image format, the collector, the FFI -- and [`docs/notes/`](docs/notes/README.md), the log of what was measured and why things are the way they are. |
+| [`docs/`](docs/README.md) | The index of every document, each of which lives with its component -- and of [`docs/notes/`](docs/notes/README.md), the log of what was measured and why things are the way they are. |
+| `justfile`, `build.dr`, `mind.toml` | How the components are built and tested together. `just subs-status`, `subs-pull`, `subs-push` and `subs-bump` work across all of them. |
 
 The pieces depend on each other in one direction. The VM runs images and knows
 nothing about source. The compiler is an image the VM runs. `mind` is a Dream
@@ -124,7 +141,7 @@ one a clean build writes.
 
 **A portable image.** A `.dream` file is bytecode: fixed-width little-endian
 integers, indices rather than pointers. The same file runs on Linux, macOS, Windows and
-Android ([docs/platforms.md](docs/platforms.md)). The VM maps it and reads it
+Android ([dream/docs/platforms.md](https://github.com/dream-mindv2/dream/blob/main/docs/platforms.md)). The VM maps it and reads it
 where it lies. The JIT generates machine code locally, at run time.
 
 **A self-hosting compiler.** `dreams/bootstrap/dreams.dream` is an image of the
@@ -148,8 +165,8 @@ running server has mapped, and the server dies of `SIGBUS`.
 ## Platforms
 
 Linux, macOS, Windows and Android, 64-bit little-endian. Linux is where it is developed
-and where every suite runs; [docs/platforms.md](docs/platforms.md) says what is
+and where every suite runs; [dream/docs/platforms.md](https://github.com/dream-mindv2/dream/blob/main/docs/platforms.md) says what is
 portable, what is not, and how it is checked on each platform.
 
-Build release packages with `mind pack` ([formats and configuration](mind/tool/PACKAGING.md)).
-Build guides and source API documentation with `mind docs` ([authoring docs and runnable examples](mind/tool/DOCUMENTATION.md)).
+Build release packages with `mind pack` ([formats and configuration](https://github.com/dream-mindv2/mind/blob/main/PACKAGING.md)).
+Build guides and source API documentation with `mind docs` ([authoring docs and runnable examples](https://github.com/dream-mindv2/mind/blob/main/DOCUMENTATION.md)).

@@ -1,6 +1,0 @@
-# `mind`, the build tool. build.dr beside this declares the checks against
-# packages on disk that `mind test mind` runs after the units.
-[package]
-name = "mind"
-version = "0.1.0"
-description = "The Dream build tool"

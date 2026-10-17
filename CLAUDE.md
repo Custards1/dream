@@ -12,21 +12,31 @@ Dont forget about strict parameters, use them when needed
 
 | Directory | What it is | Written in |
 |---|---|---|
-| `dream/` | The VM: interpreter, green processes, LLVM JIT. | C++ |
-| `mind/tool/` | `mind`, the build tool. Finds packages, shells out to a compiler. | Dream |
-| `mind/std/` | The standard library. | Dream |
-| `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** | Dream |
-| `lucid/` | The language server. Imports `dreams` as a library. | Dream |
+| `dream/` | The VM: interpreter, green processes, LLVM JIT; its references and notes in `dream/docs/`. Submodule: dream-mindv2/dream. | C++ |
+| `mind/tool/` | `mind`, the build tool. Finds packages, shells out to a compiler. Submodule: dream-mindv2/mind. | Dream |
+| `mind/std/` | The standard library; its design docs and notes in `mind/std/docs/`. Submodule: dream-mindv2/std. | Dream |
+| `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** The language spec and the compiler's notes in `dreams/docs/`. Submodule: dream-mindv2/dreams. | Dream |
+| `lucid/` | The language server. Imports `dreams` as a library. Submodule: dream-mindv2/lucid. | Dream |
 | `mind/std/src/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/src/sql/pg/README.md](mind/std/src/sql/pg/README.md). | Dream |
 | `mind/tool/src/pack/` | `mind pack`, the packager: .deb, .rpm, Arch packages, tarballs, Homebrew formulas, PKGBUILDs and install scripts, every byte written in Dream. [mind/tool/PACKAGING.md](mind/tool/PACKAGING.md). | Dream |
-| `editors/vscode/` | The VS Code extension: an LSP client and a grammar. | JS |
-| `editors/nvim/` | The Neovim plugin: starts `lucid`, plus syntax, indent and a filetype. | Lua, Vim |
+| `editors/vscode/` | The VS Code extension: an LSP client and a grammar. Submodule: dream-mindv2/vscode-dream. | JS |
+| `editors/nvim/` | The Neovim plugin: starts `lucid`, plus syntax, indent and a filetype. Submodule: dream-mindv2/dream.nvim. | Lua, Vim |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
-| `docs/` | `language-spec.md`, `builtins.md`, `ffi.md`, `gc.md`, `bytecode-format.md`. | — |
-| `docs/notes/` | The design and performance log: what was measured, kept and thrown away. | — |
+| `learn/` | Learn Dream, the book: a `mind docs` site whose every example is run. Submodule: dream-mindv2/learn. | Markdown |
+| `docs/` | The index of every document. Each lives with its component, in that component's `docs/`. | — |
+| `docs/notes/` | The index of the design and performance log, by section title. Each note lives in its component's `docs/notes/`. | — |
 
-`docs/bytecode-format.md` is the container as it actually is; `docs/gc.md` and
-`docs/dynamic-linking.md` are a design plus a log of how far it has got, and are
+This repository is a **workspace**. Components that have repositories of their
+own under github.com/dream-mindv2 are checked out here as git submodules at
+the paths above, so every recipe, test and relative path works as it did. A
+document lives with the component it describes. `just subs` sets up the
+submodules after a clone and puts each on its branch. `just subs-status`,
+`subs-pull`, `subs-push`, `subs-each CMD` and `subs-bump` handle the rest. A
+change inside a submodule is committed and pushed there, then recorded here
+with `just subs-bump`.
+
+`dream/docs/bytecode-format.md` is the container as it actually is; `dream/docs/gc.md` and
+`dream/docs/dynamic-linking.md` are a design plus a log of how far it has got, and are
 the first thing to read before touching either. The same goes for
 [docs/notes/](docs/notes/README.md) and whatever part of the compiler or VM it
 describes: that is where the traps are written down, and where a comment's
@@ -62,7 +72,7 @@ or `std` -- a comment included, since it moves spans -- run `just reseed`: it
 builds with each new image until one compiles the source into itself, and
 copies that one over the seed. It can take two rounds when the change adds
 atoms (see "`mind/std/src/all.dr --test` is not byte-stable" in
-docs/notes/macro-expansion.md).
+dreams/docs/notes/macro-expansion.md).
 
 A parallel build resolves and lowers in **parts, one per module**, each in a
 process of its own, and `dreams --units DIR` keeps each part between builds --
@@ -73,7 +83,7 @@ program's signatures, and every file's parse, keyed on its text), and the
 image is byte for byte the one an
 uncached build writes (`dreams/tests/units.sh`). `mind` passes it on every
 build. [dreams/src/unit.dr](dreams/src/unit.dr) and "Compile units" in
-docs/notes/parallel-compile.md are the design.
+dreams/docs/notes/parallel-compile.md are the design.
 
 The pipeline a build runs -- resolve, lower and link, types, contracts, share,
 emit -- is written once, in [dreams/src/compile.dr](dreams/src/compile.dr):
@@ -255,7 +265,7 @@ standard library and compiler with nothing set; otherwise `~/.mindv2`
 
 ## Making it faster
 
-The full record is [docs/notes/vm-performance.md](docs/notes/vm-performance.md)
+The full record is [dream/docs/notes/vm-performance.md](dream/docs/notes/vm-performance.md)
 and its neighbours. What follows is what to know before measuring anything.
 
 The tools:
@@ -328,14 +338,14 @@ The lessons that keep coming back:
   `(strict acc)` is forced when the function is entered, which is the fix for
   an accumulator that would otherwise become a chain of suspensions and
   overflow. It is also how to get a loop past the JIT's strictness test. See
-  "Strict parameters" in docs/language-spec.md; the lowering is a strict
+  "Strict parameters" in dreams/docs/language-spec.md; the lowering is a strict
   `local` statement at the top of the body (`lower_body`).
   `std` uses it wherever an accumulator could grow (`list.fold_strict`,
   `list.sum`, the folds of `std.seq` and `std.map`).
 - Errors are values: a function that can fail answers `Result.ok v` or
   `Result.error r`, and one that may find nothing `Option.some v` or
   `Option.none` -- the unions in `std.prelude` that every module has
-  without an import ("The prelude" in docs/language-spec.md; `modules.with_prelude!`
+  without an import ("The prelude" in dreams/docs/language-spec.md; `modules.with_prelude!`
   loads it, `scope.lend_prelude` lends it, and a module's own name wins).
   What to do with one is a typed member: `Result.map f r`,
   `Option.unwrap_or d o`, `|>`-friendly; `std.result` has short wrappers
@@ -348,20 +358,20 @@ The lessons that keep coming back:
   result to it. Most of the library still says "nothing there" with `()`;
   `Option.of`/`Option.or_unit` cross over. A native answers a result as the record too
   (`make_result`). Changing what a native answers needs a staged reseed,
-  because the seed runs on the new VM (docs/notes/results.md). The compiler
+  because the seed runs on the new VM (dreams/docs/notes/results.md). The compiler
   also warns about an accumulator nothing forces (`dreams/src/lint.dr`).
 - `virtual dyn let f self` and a record's `derive dyn base` opt in to run-time
   dispatch: the record's values carry a table in slot 0, and `base.f x`
   called through the declaring module dispatches on its last argument.
   Everything else about `derive` is still compile-time specialization;
-  "Dispatch" in docs/language-spec.md and `dispatching` in dreams/src/scope.dr.
+  "Dispatch" in dreams/docs/language-spec.md and `dispatching` in dreams/src/scope.dr.
 - `when test { .. }` holds a module's tests, collected by compiling with
   `--test`. Tests are `test.case "name" $( test.eq! expected actual )`.
 - `macro name params = ..` declares a syntax transformer and `expand name args`
   calls one. A macro receives its arguments as **syntax** — ordinary Dream
   lists, with a span last — and returns syntax, which is checked and then
   substituted. It runs on the same embedded VM `comp!` does, before name
-  resolution; [dreams/src/expand.dr](dreams/src/expand.dr) and [docs/notes/macro-expansion.md](docs/notes/macro-expansion.md) says what
+  resolution; [dreams/src/expand.dr](dreams/src/expand.dr) and [dreams/docs/notes/macro-expansion.md](dreams/docs/notes/macro-expansion.md) says what
   that costs.
 - `group P { x, y }`, `struct P { x, y }` and `mapping P { x, y }` declare a
   record: a module of generated functions — `P.make`, `P.new`, `P.x`, `P.set_x`.
@@ -371,7 +381,7 @@ The lessons that keep coming back:
   apart; a `mapping` is a map. The *loader* rewrites them (`syntax.record`),
   so nothing downstream knows a record from a `mod`; "A record is a
   declaration before it is a module" is what that costs a tool, and "Records
-  are values of their own" in docs/notes/static-types.md is the design.
+  are values of their own" in dreams/docs/notes/static-types.md is the design.
   A field may be given a default (`x = 0`); `new` is the constructor that
   takes only the fields without one. An entry *with parameters* is a **member** — `say_hi self = ..`
   — an ordinary function compiled inside the generated module, where the
@@ -393,14 +403,14 @@ The lessons that keep coming back:
   `types.accepts` tests, `types.check` raises, `types.enforce` wraps a
   function against an arrow. Nothing is inferred or coerced, and a `type` is
   a `let`, so imports, `priv`, currying and local capture need no new rules.
-  "The type grammar" in [docs/language-spec.md](docs/language-spec.md)
+  "The type grammar" in [dreams/docs/language-spec.md](dreams/docs/language-spec.md)
   is the grammar.
 - `let name : type` is a **signature**, checked at compile time
   ([dreams/src/typecheck.dr](dreams/src/typecheck.dr)); `let x : t = e` and
   `let f x : answer = e` are the inline forms. A free lowercase name in one is
   a type variable. A signature changes no node -- the one thing it adds to an
   image is a hint for the JIT -- code no signature touches is
-  never rejected. [docs/notes/static-types.md](docs/notes/static-types.md)
+  never rejected. [dreams/docs/notes/static-types.md](dreams/docs/notes/static-types.md)
   is the design.
 - `union Shape { circle(radius : :float), empty }` declares a **discriminated
   union**: a module of constructors whose values are records --
@@ -424,7 +434,7 @@ The lessons that keep coming back:
   `GemmOperand` -- strides, or a chain computed as it packs. A GPU tensor holds device memory the heap counts as
   collection pressure and frees when it dies (`Heap::reap_external`). The CPU
   kernels are compiled twice, baseline and AVX2, and picked at start-up.
-  [docs/notes/tensors.md](docs/notes/tensors.md) is the design and the
+  [dream/docs/notes/tensors.md](dream/docs/notes/tensors.md) is the design and the
   measurements.
 - `foreign lib from "libx.so" { resource Db = db_close; open! : :cstr -> out Db -> :int = db_open }`
   declares a C library: each line a C signature in the type grammar, which the
@@ -433,7 +443,7 @@ The lessons that keep coming back:
   a handle owned by the calling process and destroyed when it is released or
   the process ends; `foreign.run! server (fn () -> ..)` does work in a library
   server that owns what is made through it. `foreign` is contextual -- still
-  the name of `std.foreign`. [docs/ffi.md](docs/ffi.md). `from system "sqlite3"
+  the name of `std.foreign`. [dream/docs/ffi.md](dream/docs/ffi.md). `from system "sqlite3"
   "0"` names a library installed on the system rather than a file: the VM
   searches `$DREAM_LIB_SQLITE3`, `$DREAM_LIBRARY_PATH`, the installation's
   `lib`, the loader, then the package managers' directories, and says all of
@@ -443,11 +453,11 @@ The lessons that keep coming back:
   typed as written, the image opened in a runtime of its own on first use
   (`from "x.dream"`, `installed`, `embedded`, or `(expr)`). Only data crosses,
   and a call runs to completion holding that image. It is built on
-  `vm.open_image!`'s sessions, not on docs/dynamic-linking.md, which is still
+  `vm.open_image!`'s sessions, not on dream/docs/dynamic-linking.md, which is still
   a plan. Where an installation is -- `$MINDV2_PATH` or `~/.mindv2` -- is
   answered once, by the VM (`os.install_dirs!`), and `std.install` is that
   answer in Dream; do not split `$MINDV2_PATH` again.
-  [docs/images.md](docs/images.md).
+  [dream/docs/images.md](dream/docs/images.md).
 - `import std.tls` gives **TLS** on a socket, upgraded in place:
   `tls.connect! sock %{ :host => h }` answers the same handle, and `io.read!`
   and `io.write!` on it then carry plaintext. The VM drives a TLS library
@@ -478,7 +488,7 @@ The lessons that keep coming back:
   `std.tensor` (`repeat`, `max_axis`, `take`, `im2col`, batched `@`,
   `permute`, ..), not into Dream. Its hot walks are shaped for the JIT;
   `DREAM_JIT_WHY=1` names what refuses a function (a `match` on anything
-  but a parameter is the usual one). [docs/notes/ml.md](docs/notes/ml.md),
+  but a parameter is the usual one). [mind/std/docs/notes/ml.md](mind/std/docs/notes/ml.md),
   and example 22.
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
@@ -514,7 +524,7 @@ use `ast.Expr`, `Pattern`, `Decl`, `Param` and `Span` without changing those
 representations. Optional lookups may remain unsigned where their truthful
 unit alternative would require unrelated caller changes. Force finite loop
 accumulators with `!acc`; forcing a list's spine does not force its elements.
-See [Static types](docs/notes/static-types.md) for the migration and measurements.
+See [Static types](dreams/docs/notes/static-types.md) for the migration and measurements.
 
 A function with several settings takes a `mapping` whose fields all have
 defaults (`ml.Fit`, `optim.Adam`, `sql.Transaction`, `sqlite.Options`), and

@@ -19,7 +19,7 @@
 // whichever compiler `$CXX` or the platform names, not with CMake, and the
 // compiler is compiled by the VM this build made, so `mind build dreams`
 // after an edit to one file of the VM recompiles that file, relinks, and
-// builds the compiler again with what it made. This is docs/build.md,
+// builds the compiler again with what it made. This is mind/std/docs/build.md,
 // "Building this repository".
 
 import std.build;

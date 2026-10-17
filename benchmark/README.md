@@ -2,7 +2,7 @@
 
 ## Dream against CPython: [`benchmark/`](benchmark)
 
-Seven small workloads, written twice: [`main.dr`](benchmark/main.dr) in Dream
+Seven small workloads, written twice: [`main.dr`](benchmark/src/main.dr) in Dream
 and [`bench.py`](benchmark/bench.py) as a line-for-line transliteration in
 Python, at the same sizes.
 
@@ -31,7 +31,7 @@ before in a worktree and run both.
 
 Where the numbers stand and what the gaps are made of is "Where it stands
 against CPython, and what the remaining gap is made of" in
-[docs/notes/vm-performance.md](../docs/notes/vm-performance.md). The short
+[dream/docs/notes/vm-performance.md](../dream/docs/notes/vm-performance.md). The short
 version: numeric and list loops the JIT takes run several times faster than
 CPython. `strbuild` is far slower, and is not a runtime comparison at all:
 Python's `"hello " * n` is a single `memcpy` loop, where the Dream program
@@ -52,7 +52,7 @@ dream build/dreams.dream -L mind benchmark/tensor/main.dr -o /tmp/tb.dream
 dream /tmp/tb.dream [N]
 ```
 
-[docs/notes/tensors.md](../docs/notes/tensors.md) is the record.
+[dream/docs/notes/tensors.md](../dream/docs/notes/tensors.md) is the record.
 
 ## The compiler
 

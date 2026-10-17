@@ -96,6 +96,41 @@ mind: dreams
     mkdir -p build
     ./{{dreams}} -L mind/std mind/tool/src/main.dr --shebang -o build/mind
 
+# --- the component repositories ------------------------------------------------------
+#
+# This repository is a workspace: the components live in repositories of their
+# own under github.com/dream-mindv2 and are checked out here as submodules, at
+# the paths every recipe already uses (`mind/tool` is dream-mindv2/mind). A
+# submodule is checked out at a commit, not on a branch, so `subs` puts each
+# one on the branch .gitmodules names; work there is then ordinary git, and
+# `subs-push` and `subs-bump` carry it out.
+
+# After a clone: fetch every component and put each on its branch.
+subs:
+    git submodule update --init --recursive
+    git submodule foreach --quiet 'git checkout -q "$(git config -f "$toplevel/.gitmodules" "submodule.$name.branch" || echo main)" && echo "$sm_path: on $(git branch --show-current)"'
+
+# Every component at a glance: its branch, what is changed, and what is not pushed.
+subs-status:
+    @git submodule foreach --quiet 'printf "%-14s %s\n" "$sm_path" "$(git status -sb | head -1)"; git status --short | sed "s/^/               /"'
+
+# Pull every component's branch from its repository.
+subs-pull:
+    git submodule foreach --quiet 'echo "$sm_path:"; git pull --ff-only'
+
+# Push every component that has commits its repository does not.
+subs-push:
+    git submodule foreach --quiet 'if [ -n "$(git log @{u}.. --oneline 2>/dev/null)" ]; then echo "$sm_path:"; git push; fi'
+
+# Run a command in every component: `just subs-each git log -1 --oneline`.
+subs-each +CMD:
+    git submodule foreach '{{CMD}}'
+
+# Record each component's current commit in this workspace, to commit here.
+subs-bump:
+    git add $(git config -f .gitmodules --get-regexp '\.path$' | awk '{print $2}')
+    @git submodule summary --cached
+
 # Learn Dream, the book in learn/, as a site in learn/target/docs. Every
 # example in it is compiled and run, and its output is put on the page;
 # `just learn-serve` builds it and serves it at http://127.0.0.1:8000/.
@@ -147,7 +182,7 @@ bootstrap-check: vm
 # each new image in turn, until one compiles the source into itself byte for
 # byte, and copy that one over the seed. One round when nothing changed the
 # compiler's own atoms; two when something did (see "`mind/std/src/all.dr
-# --test` is not byte-stable" in docs/notes/macro-expansion.md). The stages are
+# --test` is not byte-stable" in dreams/docs/notes/macro-expansion.md). The stages are
 # built in a directory of their own, never over an image something may have
 # mapped, and a compiler that is still changing after five is an error.
 reseed: vm
@@ -463,7 +498,7 @@ test-heap: build
 # is what puts every collection in every program through the parallel path, and
 # `DREAM_GC_CONCURRENT=1` makes a concurrent marking go on in the background of
 # every major too -- the two of them are what ThreadSanitizer gets to see;
-# see docs/gc.md.
+# see dream/docs/gc.md.
 test-races:
     cmake -S . -B build-tsan -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \

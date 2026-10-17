@@ -1,3 +1,0 @@
-#!/bin/sh
-# The program the fixture ships: a script, so that the package runs anywhere.
-echo "hello from the fixture"

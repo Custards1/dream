@@ -7,8 +7,13 @@ overturn an earlier one (it says so where it does). Read the file that
 describes a thing before changing it; that is where the traps are written
 down.
 
-Code comments and `dreams/TODO.md` point here by section title (`see "Some
-title"`). Every title is listed below, so searching this page finds the file.
+Each note lives with the component it describes: the VM's in
+[`dream/docs/notes/`](../../dream/docs/notes), the compiler's in
+[`dreams/docs/notes/`](../../dreams/docs/notes), the library's in
+[`mind/std/docs/notes/`](../../mind/std/docs/notes) and the language server's
+in [`lucid/docs/notes/`](../../lucid/docs/notes). This is their index. Code comments and `dreams/TODO.md` point into them by
+section title (`see "Some title"`). Every title is listed below, so searching
+this page finds the file.
 
 **Before believing a measurement**, read "Two things that will lie to you
 about a change to the interpreter" in vm-performance.md. The short version:
@@ -16,7 +21,7 @@ A/B against the commit before, in a worktree, with the same VM; 3% is noise
 for an edit to the interpreter loop; and never compare against a number
 written in a note, since the compiler it was measured on has since grown.
 
-## [Making the VM faster](vm-performance.md)
+## [Making the VM faster](../../dream/docs/notes/vm-performance.md)
 
 The interpreter, the collector, the scheduler and the JIT: what was measured,
 what was kept, and what the measurements taught. Newer findings are nearer the
@@ -40,9 +45,9 @@ end.
 - A pinned heap grew past its cap
 - Strict by default: the experiment
 
-The collector has a document of its own, [../gc.md](../gc.md), and "Collecting under compiled code" there is where the JIT and the collector meet.
+The collector has a document of its own, [../gc.md](../../dream/docs/gc.md), and "Collecting under compiled code" there is where the JIT and the collector meet.
 
-## [Results became a union](results.md)
+## [Results became a union](../../dreams/docs/notes/results.md)
 
 `[:ok, v]` to the prelude's `Result`: the prelude, why `let?` has no bridge, the
 image flag and the two-step reseed it forced, and what a span-exact rewrite
@@ -54,7 +59,7 @@ still got wrong.
 - The rewrite, and what it could not tell
 - What is still a tagged list, and why
 
-## [Bignums, and the cryptography beside them](bignums.md)
+## [Bignums, and the cryptography beside them](../../dream/docs/notes/bignums.md)
 
 Unbounded integers at no cost to fixnum code, why their limbs live outside the
 heap like a GPU tensor's numbers, and `std.crypto` as natives.
@@ -67,7 +72,7 @@ heap like a GPU tensor's numbers, and `std.crypto` as natives.
 - Semantics that changed
 - `std.crypto` (2026-10-03)
 
-## [Compiling in parallel](parallel-compile.md)
+## [Compiling in parallel](../../dreams/docs/notes/parallel-compile.md)
 
 Spreading a build across processes and cores, what it does on fewer of them,
 and the compile units that let a build redo only what changed.
@@ -84,7 +89,7 @@ and the compile units that let a build redo only what changed.
 - The key was quadratic in modules
 - The whole-program stages, taken down
 
-## [Compiling large programs](compiler-scaling.md)
+## [Compiling large programs](../../dreams/docs/notes/compiler-scaling.md)
 
 The quadratics, and the memory held by unforced values, that decided how large
 a program `dreams` can compile.
@@ -97,7 +102,7 @@ a program `dreams` can compile.
 - The arena was a chain of its own versions, and `push_node` never saw it
 - The item list was appended to
 
-## [What macro expansion costs](macro-expansion.md)
+## [What macro expansion costs](../../dreams/docs/notes/macro-expansion.md)
 
 Expansion is a compile: the rounds of work that took its cost from per call to
 per program, and the phase meter that guided them.
@@ -115,12 +120,12 @@ per program, and the phase meter that guided them.
 - `mind/std/src/all.dr --test` is not byte-stable across compiler changes
 - A program that does not resolve ran the machine out of memory
 
-## [Deforestation](deforestation.md)
+## [Deforestation](../../dreams/docs/notes/deforestation.md)
 
 How a pipeline of `std.list` combinators becomes one loop the JIT can take,
 and why `sum` went from four seconds to under fifty milliseconds.
 
-## [Static types](static-types.md)
+## [Static types](../../dreams/docs/notes/static-types.md)
 
 The checker, compile-time contracts, and what a signature buys the JIT.
 
@@ -129,7 +134,7 @@ The checker, compile-time contracts, and what a signature buys the JIT.
 - Records are values of their own
 - A pipeline of setters is one copy
 
-## [The language server](lucid.md)
+## [The language server](../../lucid/docs/notes/lucid.md)
 
 How `lucid` answers an editor, and which tree answers which question.
 
@@ -138,7 +143,7 @@ How `lucid` answers an editor, and which tree answers which question.
 - A record is a declaration before it is a module
 - A host module's members come from the host
 
-## [Machine learning](ml.md)
+## [Machine learning](../../mind/std/docs/notes/ml.md)
 
 `std.ml`: autodiff, layers, losses, optimizers and the training loop on
 `std.tensor`, and shaping its Dream code for the JIT.
@@ -153,7 +158,7 @@ How `lucid` answers an editor, and which tree answers which question.
 - Measured: a training run
 - What is not done
 
-## [Tensors](tensors.md)
+## [Tensors](../../dream/docs/notes/tensors.md)
 
 Packed numeric arrays, `@` and the GPU: what made the product fast, what it
 took to free device memory, and how a chain of operations runs as one pass.
@@ -177,7 +182,7 @@ took to free device memory, and how a chain of operations runs as one pass.
 - Considered: a server process that owns the tensors and mutates them
 - What is not done yet
 
-## [Large data in an image](large-data.md)
+## [Large data in an image](../../dream/docs/notes/large-data.md)
 
 The payload: data past the 4 GiB line an image otherwise stops at, reached as
 views rather than copies.

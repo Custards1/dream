@@ -1,9 +1,0 @@
-# The language server. It is the compiler used as a library: every answer it
-# gives is one `dreams` worked out.
-[package]
-name = "lucid"
-version = "0.1.0"
-description = "The Dream language server"
-
-[dependencies]
-dreams = "../dreams"

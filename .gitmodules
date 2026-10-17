@@ -1,0 +1,32 @@
+[submodule "mind/tool"]
+	path = mind/tool
+	url = https://github.com/dream-mindv2/mind.git
+	branch = main
+[submodule "dream"]
+	path = dream
+	url = https://github.com/dream-mindv2/dream.git
+	branch = main
+[submodule "dreams"]
+	path = dreams
+	url = https://github.com/dream-mindv2/dreams.git
+	branch = main
+[submodule "mind/std"]
+	path = mind/std
+	url = https://github.com/dream-mindv2/std.git
+	branch = main
+[submodule "lucid"]
+	path = lucid
+	url = https://github.com/dream-mindv2/lucid.git
+	branch = main
+[submodule "editors/vscode"]
+	path = editors/vscode
+	url = https://github.com/dream-mindv2/vscode-dream.git
+	branch = main
+[submodule "editors/nvim"]
+	path = editors/nvim
+	url = https://github.com/dream-mindv2/dream.nvim.git
+	branch = main
+[submodule "learn"]
+	path = learn
+	url = https://github.com/dream-mindv2/learn.git
+	branch = main
