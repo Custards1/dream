@@ -405,6 +405,7 @@ test-dreams-compile: build
     dream={{dream}} image={{image}} dreams/tests/parts.sh
     dream={{dream}} image={{image}} dreams/tests/target.sh
     dream={{dream}} image={{image}} dreams/tests/units.sh
+    dream={{dream}} image={{image}} dreams/tests/sc.sh
     python3 dreams/tests/macros.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/optional_types.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/bitwise.py --dream {{dream}} --compiler {{image}}
