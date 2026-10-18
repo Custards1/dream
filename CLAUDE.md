@@ -497,6 +497,14 @@ The lessons that keep coming back:
   `DREAM_JIT_WHY=1` names what refuses a function (a `match` on anything
   but a parameter is the usual one). [mind/std/docs/notes/ml.md](mind/std/docs/notes/ml.md),
   and example 22.
+- `import std.trunk` gives **trunks**: one container, a finite
+  sequence whose representation the VM chooses from what the program does --
+  push and prepend in place, constant-time `.[i]`, `contains` and an
+  association list's `lookup`/`put` answered by indexes that evaluate nothing
+  a scan would not. Values, as everything is: linear use is written in place
+  (Baker's version tree) and an old version still reads as it was. Reach for
+  it before choosing a list, array or map by hand.
+  [dream/docs/notes/trunks.md](dream/docs/notes/trunks.md).
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,

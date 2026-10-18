@@ -46,6 +46,7 @@ end.
 - Strict arguments are evaluated where they stand
 - A pinned heap grew past its cap
 - Strict by default: the experiment
+- The timeline, and what a parallel compile was waiting on
 
 The collector has a document of its own, [../gc.md](../../dream/docs/gc.md), and "Collecting under compiled code" there is where the JIT and the collector meet.
 
@@ -204,3 +205,16 @@ and what that found.
 - What was built
 - What it did
 - Why it did not pay
+
+## [Trunks](../../dream/docs/notes/trunks.md)
+
+`std.trunk`: one container, a sequence whose representation the VM chooses
+from what is done with it -- a buffer growing at both ends, Baker's version
+tree so linear use writes in place, and indexes that force nothing a scan
+would not.
+
+- Why one container
+- The representation
+- Indexes, and forcing nothing extra
+- What it bought
+- What is not done
