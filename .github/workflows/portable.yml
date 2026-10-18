@@ -70,7 +70,8 @@ jobs:
         with:
           name: portable-images
           path: portable-images
-      - run: sdkmanager 'ndk;29.0.14206865'
+      # sdkmanager is installed but not on the runner's PATH.
+      - run: $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager 'ndk;29.0.14206865'
       - name: Fetch pinned dependency sources
         run: |
           curl -fL https://github.com/libffi/libffi/releases/download/v3.4.6/libffi-3.4.6.tar.gz -o libffi.tar.gz
