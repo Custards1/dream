@@ -53,7 +53,10 @@ for arg in "$@"; do
 done
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# Every example still running is stopped before its directory goes: a job is
+# in the background, and an interrupted run would otherwise leave it going.
+trap 'kill $(jobs -p) 2>/dev/null; wait; rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 
 # The standard library lives in mind/, the example packages in examples/.
 LIBS=(-L "$ROOT/mind" -L "$HERE")
@@ -108,11 +111,15 @@ check() {
 # own and shown in order at the end; see the same in dream/tests/e2e.sh.
 names=()
 jobs_max="${EXAMPLES_JOBS:-$(( ($(nproc 2>/dev/null || echo 2) + 1) / 2 ))}"
+# At least one: zero would wait for ever on a job count that is never below it.
+[[ "$jobs_max" =~ ^[0-9]+$ && "$jobs_max" -ge 1 ]] || jobs_max=1
 start() {
   local name="$1"
   names+=("$name")
   ( check "$@" >"$WORK/$name.log" 2>&1; echo $? >"$WORK/$name.rc" ) &
-  while [[ "$(jobs -rp | wc -l)" -ge "$jobs_max" ]]; do wait -n; done
+  # `wait -n` is bash 4.3; where it is missing or there is nothing to wait
+  # for, wait for everything rather than spin.
+  while [[ "$(jobs -rp | wc -l)" -ge "$jobs_max" ]]; do wait -n 2>/dev/null || { wait; break; }; done
 }
 
 # Single-file examples.

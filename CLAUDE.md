@@ -277,6 +277,10 @@ dream --profile [N] IMG      # the hottest functions, by reductions
 dream --stats IMG            # reductions, collections, bytes allocated and
                              # promoted, live set at the largest major by kind,
                              # functions the JIT took
+DREAM_TIMELINE=F dream IMG   # every slice, spawn and join, for
+dream/tools/timeline.py F    # the critical path of a parallel run; with
+                             # --profile and DREAM_PROFILE_PID=1, what the root
+                             # was doing on each serial stretch of it
 benchmark/benchmark/run.sh   # seven workloads, Dream against CPython
 dreams/tests/scale.py        # generated programs of N declarations or modules
 ```
@@ -302,6 +306,9 @@ How to measure, which is where most wrong conclusions have come from:
   This repository is too small to feel an n² anywhere, and that is how four
   of them survived.
 - **Always put a timeout on a VM run.** A diverging program does not stop.
+- **A parallel build's wall clock is its critical path**, not its CPU. Ask
+  `DREAM_TIMELINE` which chain of parts and serial stretches sets it before
+  making anything cheaper ("The timeline" in dream/docs/notes/vm-performance.md).
 
 The lessons that keep coming back:
 

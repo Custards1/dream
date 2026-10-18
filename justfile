@@ -73,9 +73,10 @@ vm-pgo:
     # Compiles in the JIT's background thread are made synchronous for the
     # training runs: a run ends in `os.exit!` whether or not that thread is
     # mid-compile, and counters flushed from under it are not flow-consistent,
-    # which `-fprofile-use` rejects outright for `jit.cpp`.
-    DREAM_JIT_SYNC=1 build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/src/main.dr
-    DREAM_JIT_SYNC=1 build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/src/main.dr
+    # which `-fprofile-use` rejects outright for `jit.cpp`. And not from the
+    # test cache `DREAMS_CACHE` names: a cached image is a profile of nothing.
+    DREAMS_CACHE= DREAM_JIT_SYNC=1 build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/src/main.dr
+    DREAMS_CACHE= DREAM_JIT_SYNC=1 build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/src/main.dr
     cmp build-pgo/train/stage2.dream build-pgo/train/stage3.dream
     cmake -S . -B build-pgo -DDREAM_PGO=USE
     cmake --build build-pgo -j
@@ -89,7 +90,7 @@ vm-pgo:
 # and a non-zero exit means the gate was missed rather than that anything broke
 # -- it is missed by roughly a factor of two today. Pass a number to move it.
 bench-self-compile vm=dream target="1.25":
-    python3 dream/tests/self_compile_bench.py --vm {{vm}} --target {{target}}
+    DREAMS_CACHE= python3 dream/tests/self_compile_bench.py --vm {{vm}} --target {{target}}
 
 # The compiler, built by the compiler: the checked-in seed compiles this source
 # into `build/dreams.dream`, which is what every other recipe here runs.
