@@ -194,6 +194,12 @@ views rather than copies.
 Writing small functions out where they are called: built, measured, and not
 enabled, and why.
 
+## [Supercompilation](../../dreams/docs/notes/supercompilation.md)
+
+The plan for running programs at compile time to remove the suspensions and
+frames their intermediates cost, and the log: the round trip through its core,
+and what that found.
+
 - Inlining, measured
 - What was built
 - What it did
