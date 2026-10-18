@@ -38,7 +38,10 @@ import std.str;
 let tools : :map -> %{:string => :string};
 let tools ctx = {
     let chain = command.toolchain ctx;
-    map.merge chain (%{ "dream" => chain.["DREAM"], "dreams" => chain.["DREAMS"] })
+    // Each build a suite makes is kept and handed back when nothing it read
+    // changed (`dreams --cache`), so the suites compile what they share once.
+    map.merge chain (%{ "dream" => chain.["DREAM"], "dreams" => chain.["DREAMS"],
+                        "DREAMS_CACHE" => build.Context.root ctx + "/build/test-cache" })
 };
 
 let suite : :map -> :string -> :string -> :map;
@@ -80,8 +83,8 @@ let checks ctx =
 
 let vm_sources : [:string];
 let vm_sources = map (fn s -> "dream/src/" + s + ".cpp")
-                          ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "ffi",
-                           "io", "digest", "crypto", "regex", "bigint", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
+                          ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "trunk", "ffi",
+                           "io", "digest", "ed25519", "crypto", "regex", "bigint", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
                            "jit_rt", "tls"];
 
 /// GCC's inliner ceilings: dream/CMakeLists.txt says why at length. The
@@ -209,7 +212,8 @@ let goals ctx tc llvm libffi openssl = {
     let cli = native ctx "dream" "dream/src/cli.cpp" lib;
     let vm = steps.artifact tc cli;
     let dreams = dream.artifact (dreams_by vm (build.file "dreams/bootstrap/dreams.dream"));
-    let stage3 = dream.artifact (dreams_by vm dreams);
+    // The seed is a release build: supercompiled (`--release`).
+    let stage3 = dream.artifact (dreams_by vm dreams |> dream.flags ["--release"]);
     build.empty
     |> build.goal "vm" (build.place "build-dream" (build.artifact (steps.link_step tc cli) ""))
     |> build.note "vm" "the VM, and its library beside it, in build-dream/"
@@ -277,7 +281,7 @@ let dependencies ctx tc config libffi openssl dir = {
                     l => {
                         // LLVM reports libxml2 for WindowsManifest, outside these
                         // JIT components. Match CMake without weakening other dependencies.
-                        let selected = l.[:libraries => filter (fn lib -> lib != "-lxml2") l.[:libraries]];
+                        let selected = l.[:libraries => list.filter (fn lib -> lib != "-lxml2") l.[:libraries]];
                         build.given (probe.shared_link tc llvm_probe [(if cc.Toolchain.family tc == :msvc { "/I" } else { "-I" }) + l.[:includes]]
                                         (list.cons ((if cc.Toolchain.family tc == :msvc { "/LIBPATH:" } else { "-L" }) + l.[:libdir]) selected.[:libraries])) (fn works ->
                         if works == "yes" { goals ctx tc selected ffi_libs openssl }

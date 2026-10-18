@@ -14,7 +14,7 @@ Dont forget about strict parameters, use them when needed
 |---|---|---|
 | `dream/` | The VM: interpreter, green processes, LLVM JIT; its references and notes in `dream/docs/`. Submodule: dream-mindv2/dream. | C++ |
 | `mind/tool/` | `mind`, the build tool. Finds packages, shells out to a compiler. Submodule: dream-mindv2/mind. | Dream |
-| `mind/std/` | The standard library; its design docs and notes in `mind/std/docs/`. Submodule: dream-mindv2/std. | Dream |
+| `mind/std/` | The standard library; its design docs and notes in `mind/std/docs/`, its API published at dream-mindv2.github.io/std on every push. Submodule: dream-mindv2/std. | Dream |
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** The language spec and the compiler's notes in `dreams/docs/`. Submodule: dream-mindv2/dreams. | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. Submodule: dream-mindv2/lucid. | Dream |
 | `mind/std/src/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/src/sql/pg/README.md](mind/std/src/sql/pg/README.md). | Dream |
@@ -22,7 +22,7 @@ Dont forget about strict parameters, use them when needed
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. Submodule: dream-mindv2/vscode-dream. | JS |
 | `editors/nvim/` | The Neovim plugin: starts `lucid`, plus syntax, indent and a filetype. Submodule: dream-mindv2/dream.nvim. | Lua, Vim |
 | `examples/` | Example programs, each with its output recorded beside it. | Dream |
-| `learn/` | Learn Dream, the book: a `mind docs` site whose every example is run. Submodule: dream-mindv2/learn. | Markdown |
+| `learn/` | Learn Dream, the book: a `mind docs` site whose every example is run, published at dream-mindv2.github.io/learn on every push and daily. Submodule: dream-mindv2/learn. | Markdown |
 | `docs/` | The index of every document. Each lives with its component, in that component's `docs/`. | — |
 | `docs/notes/` | The index of the design and performance log, by section title. Each note lives in its component's `docs/notes/`. | — |
 
@@ -277,6 +277,10 @@ dream --profile [N] IMG      # the hottest functions, by reductions
 dream --stats IMG            # reductions, collections, bytes allocated and
                              # promoted, live set at the largest major by kind,
                              # functions the JIT took
+DREAM_TIMELINE=F dream IMG   # every slice, spawn and join, for
+dream/tools/timeline.py F    # the critical path of a parallel run; with
+                             # --profile and DREAM_PROFILE_PID=1, what the root
+                             # was doing on each serial stretch of it
 benchmark/benchmark/run.sh   # seven workloads, Dream against CPython
 dreams/tests/scale.py        # generated programs of N declarations or modules
 ```
@@ -302,6 +306,9 @@ How to measure, which is where most wrong conclusions have come from:
   This repository is too small to feel an n² anywhere, and that is how four
   of them survived.
 - **Always put a timeout on a VM run.** A diverging program does not stop.
+- **A parallel build's wall clock is its critical path**, not its CPU. Ask
+  `DREAM_TIMELINE` which chain of parts and serial stretches sets it before
+  making anything cheaper ("The timeline" in dream/docs/notes/vm-performance.md).
 
 The lessons that keep coming back:
 
@@ -490,10 +497,35 @@ The lessons that keep coming back:
   `DREAM_JIT_WHY=1` names what refuses a function (a `match` on anything
   but a parameter is the usual one). [mind/std/docs/notes/ml.md](mind/std/docs/notes/ml.md),
   and example 22.
+- `import std.trunk` gives **trunks**: one container, a finite
+  sequence whose representation the VM chooses from what the program does --
+  push and prepend in place, constant-time `.[i]`, `contains` and an
+  association list's `lookup`/`put` answered by indexes that evaluate nothing
+  a scan would not. Values, as everything is: linear use is written in place
+  (Baker's version tree) and an old version still reads as it was. Reach for
+  it before choosing a list, array or map by hand.
+  [dream/docs/notes/trunks.md](dream/docs/notes/trunks.md).
 - Modules are files; `mod name { .. }` writes one inside another. `import a.{x}`
   and `import a.{x as y}` bring members in.
 - Compilation is whole-program, which is why a build is just "find the packages,
   hand them to the compiler, run it".
+
+## Releasing
+
+v0.1.0 of `dreams`, `mind` and `lucid` was the first release; versions bump
+from here, and a published version is never re-tagged. A release is: bump
+`version` in the package's `mind.toml`, commit, `mind sign vX.Y.Z`, commit
+`mind.sig`, `git tag -a vX.Y.Z`, push `main` and the tag, then `mind publish`
+-- it opens an issue on [dream-mindv2/index](https://github.com/dream-mindv2/index),
+the shared index, whose Action appends the signed entry. How the index works
+and why nobody keeping it is trusted is "The index" in
+[mind/tool/README.md](mind/tool/README.md). Its workflows build `mind` at
+commits pinned in its `ci/build-mind.sh`: move them when the index code moves.
+
+GitHub shows `.dr` as Elixir (`.gitattributes` in every repository with
+Dream source) because Linguist only adds a language used across a couple of
+hundred repositories. Submitting Dream to github/linguist -- the grammar in
+`editors/vscode`, samples, an entry -- is owed once it is.
 
 ## Conventions
 

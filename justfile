@@ -17,6 +17,12 @@ image := "build/dreams.dream"
 # The compiler, as a command. `dreams` is an image rather than a native program,
 # so running it is handing it to the VM.
 dreams := dream + " " + image
+# Every build a recipe makes is kept here and handed back when nothing it read
+# has changed (`dreams --cache`, dreams/src/cache.dr), so a suite compiles a
+# program once rather than once per run, and once across every suite that
+# compiles it. The recipes that build the compiler itself clear it: what they
+# are for is the build.
+export DREAMS_CACHE := env_var_or_default("DREAMS_CACHE", justfile_directory() + "/build/test-cache")
 
 default: build
 
@@ -67,9 +73,10 @@ vm-pgo:
     # Compiles in the JIT's background thread are made synchronous for the
     # training runs: a run ends in `os.exit!` whether or not that thread is
     # mid-compile, and counters flushed from under it are not flow-consistent,
-    # which `-fprofile-use` rejects outright for `jit.cpp`.
-    DREAM_JIT_SYNC=1 build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/src/main.dr
-    DREAM_JIT_SYNC=1 build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/src/main.dr
+    # which `-fprofile-use` rejects outright for `jit.cpp`. And not from the
+    # test cache `DREAMS_CACHE` names: a cached image is a profile of nothing.
+    DREAMS_CACHE= DREAM_JIT_SYNC=1 build-pgo/bin/dream {{seed}} -L mind -L . -o build-pgo/train/stage2.dream dreams/src/main.dr
+    DREAMS_CACHE= DREAM_JIT_SYNC=1 build-pgo/bin/dream build-pgo/train/stage2.dream -L mind -L . -o build-pgo/train/stage3.dream dreams/src/main.dr
     cmp build-pgo/train/stage2.dream build-pgo/train/stage3.dream
     cmake -S . -B build-pgo -DDREAM_PGO=USE
     cmake --build build-pgo -j
@@ -83,13 +90,13 @@ vm-pgo:
 # and a non-zero exit means the gate was missed rather than that anything broke
 # -- it is missed by roughly a factor of two today. Pass a number to move it.
 bench-self-compile vm=dream target="1.25":
-    python3 dream/tests/self_compile_bench.py --vm {{vm}} --target {{target}}
+    DREAMS_CACHE= python3 dream/tests/self_compile_bench.py --vm {{vm}} --target {{target}}
 
 # The compiler, built by the compiler: the checked-in seed compiles this source
 # into `build/dreams.dream`, which is what every other recipe here runs.
 dreams: vm
     mkdir -p build
-    ./{{dream}} {{seed}} -L mind -L . -o {{image}} dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} {{seed}} -L mind -L . -o {{image}} dreams/src/main.dr
 
 # The build tool, itself a Dream program.
 mind: dreams
@@ -166,14 +173,14 @@ lucid: dreams
 # compiler, run this and keep `build/dreams.dream`.
 bootstrap: vm
     mkdir -p build
-    ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} {{seed}} --release -L mind -L . -o build/dreams.dream dreams/src/main.dr
 
 # The seed must still reproduce itself from this source: what it builds must
 # be the seed again, and build an identical third image. That equality is the whole guarantee -- it
 # says the compiler in the tree and the compiler in the image agree.
 bootstrap-check: vm
-    ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/src/main.dr
-    ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} {{seed}} --release -L mind -L . -o /tmp/dreams-stage2.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} /tmp/dreams-stage2.dream --release -L mind -L . -o /tmp/dreams-stage3.dream dreams/src/main.dr
     cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
     @cmp -s {{seed}} /tmp/dreams-stage2.dream || { echo "the seed is stale: it builds a different compiler from this source -- copy /tmp/dreams-stage2.dream over {{seed}}"; exit 1; }
     @echo "the bootstrap image reproduces itself"
@@ -184,7 +191,9 @@ bootstrap-check: vm
 # compiler's own atoms; two when something did (see "`mind/std/src/all.dr
 # --test` is not byte-stable" in dreams/docs/notes/macro-expansion.md). The stages are
 # built in a directory of their own, never over an image something may have
-# mapped, and a compiler that is still changing after five is an error.
+# mapped, and a compiler that is still changing after five is an error. The
+# seed is a release build -- supercompiled -- so every stage is built with
+# `--release`; `just dreams` is not, and costs a quarter of the time.
 reseed: vm
     #!/usr/bin/env bash
     set -euo pipefail
@@ -193,7 +202,7 @@ reseed: vm
     prev={{seed}}
     for round in 1 2 3 4 5; do
         next="$dir/stage$round.dream"
-        timeout 900 ./{{dream}} "$prev" -L mind -L . -o "$next" dreams/src/main.dr
+        DREAMS_CACHE= timeout 900 ./{{dream}} "$prev" --release -L mind -L . -o "$next" dreams/src/main.dr
         if cmp -s "$prev" "$next"; then
             if [ "$prev" = "{{seed}}" ]; then
                 echo "the seed already reproduces itself"
@@ -216,6 +225,7 @@ test-mind: build
     dream={{dream}} mind=/tmp/dream-mind-graph.dream mind/tool/tests/graph.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/options.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/scripts.sh
+    dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/reproduce.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/docs.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/learn.sh
 
@@ -404,6 +414,7 @@ test-dreams-compile: build
     dream={{dream}} image={{image}} dreams/tests/parts.sh
     dream={{dream}} image={{image}} dreams/tests/target.sh
     dream={{dream}} image={{image}} dreams/tests/units.sh
+    dream={{dream}} image={{image}} dreams/tests/sc.sh
     python3 dreams/tests/macros.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/optional_types.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/bitwise.py --dream {{dream}} --compiler {{image}}

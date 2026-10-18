@@ -38,12 +38,15 @@ end.
 - Where it stands against CPython, and what the remaining gap is made of
 - List and map code in the JIT
 - Building ahead: a producer makes a run of cells a call
+- Frames freed on return: the most it could save
+- Strict bindings are loads
 - Reusing the frame of a self tail call: measured, and not built
 - A JIT that can allocate -- the plan, and how it was done instead
 - Spilling compiled frames: measured, and not kept
 - Strict arguments are evaluated where they stand
 - A pinned heap grew past its cap
 - Strict by default: the experiment
+- The timeline, and what a parallel compile was waiting on
 
 The collector has a document of its own, [../gc.md](../../dream/docs/gc.md), and "Collecting under compiled code" there is where the JIT and the collector meet.
 
@@ -186,3 +189,32 @@ took to free device memory, and how a chain of operations runs as one pass.
 
 The payload: data past the 4 GiB line an image otherwise stops at, reached as
 views rather than copies.
+
+## [Inlining, measured](../../dreams/docs/notes/inlining.md)
+
+Writing small functions out where they are called: built, measured, and not
+enabled, and why.
+
+## [Supercompilation](../../dreams/docs/notes/supercompilation.md)
+
+The plan for running programs at compile time to remove the suspensions and
+frames their intermediates cost, and the log: the round trip through its core,
+and what that found.
+
+- Inlining, measured
+- What was built
+- What it did
+- Why it did not pay
+
+## [Trunks](../../dream/docs/notes/trunks.md)
+
+`std.trunk`: one container, a sequence whose representation the VM chooses
+from what is done with it -- a buffer growing at both ends, Baker's version
+tree so linear use writes in place, and indexes that force nothing a scan
+would not.
+
+- Why one container
+- The representation
+- Indexes, and forcing nothing extra
+- What it bought
+- What is not done
