@@ -172,14 +172,14 @@ lucid: dreams
 # compiler, run this and keep `build/dreams.dream`.
 bootstrap: vm
     mkdir -p build
-    DREAMS_CACHE= ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} {{seed}} --release -L mind -L . -o build/dreams.dream dreams/src/main.dr
 
 # The seed must still reproduce itself from this source: what it builds must
 # be the seed again, and build an identical third image. That equality is the whole guarantee -- it
 # says the compiler in the tree and the compiler in the image agree.
 bootstrap-check: vm
-    DREAMS_CACHE= ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/src/main.dr
-    DREAMS_CACHE= ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} {{seed}} --release -L mind -L . -o /tmp/dreams-stage2.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} /tmp/dreams-stage2.dream --release -L mind -L . -o /tmp/dreams-stage3.dream dreams/src/main.dr
     cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
     @cmp -s {{seed}} /tmp/dreams-stage2.dream || { echo "the seed is stale: it builds a different compiler from this source -- copy /tmp/dreams-stage2.dream over {{seed}}"; exit 1; }
     @echo "the bootstrap image reproduces itself"
@@ -190,7 +190,9 @@ bootstrap-check: vm
 # compiler's own atoms; two when something did (see "`mind/std/src/all.dr
 # --test` is not byte-stable" in dreams/docs/notes/macro-expansion.md). The stages are
 # built in a directory of their own, never over an image something may have
-# mapped, and a compiler that is still changing after five is an error.
+# mapped, and a compiler that is still changing after five is an error. The
+# seed is a release build -- supercompiled -- so every stage is built with
+# `--release`; `just dreams` is not, and costs a quarter of the time.
 reseed: vm
     #!/usr/bin/env bash
     set -euo pipefail
@@ -199,7 +201,7 @@ reseed: vm
     prev={{seed}}
     for round in 1 2 3 4 5; do
         next="$dir/stage$round.dream"
-        DREAMS_CACHE= timeout 900 ./{{dream}} "$prev" -L mind -L . -o "$next" dreams/src/main.dr
+        DREAMS_CACHE= timeout 900 ./{{dream}} "$prev" --release -L mind -L . -o "$next" dreams/src/main.dr
         if cmp -s "$prev" "$next"; then
             if [ "$prev" = "{{seed}}" ]; then
                 echo "the seed already reproduces itself"

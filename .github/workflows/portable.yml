@@ -6,6 +6,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
       - run: cmake -S . -B build -DDREAM_ENABLE_JIT=OFF
       - run: cmake --build build --parallel 2
@@ -23,6 +25,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/download-artifact@v4
         with:
           name: portable-images
@@ -59,6 +63,8 @@ jobs:
         abi: [arm64-v8a, x86_64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - run: bash -n dream/android/build.sh dream/android/termux-install.sh
       - uses: actions/download-artifact@v4
         with:

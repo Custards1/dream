@@ -212,7 +212,8 @@ let goals ctx tc llvm libffi openssl = {
     let cli = native ctx "dream" "dream/src/cli.cpp" lib;
     let vm = steps.artifact tc cli;
     let dreams = dream.artifact (dreams_by vm (build.file "dreams/bootstrap/dreams.dream"));
-    let stage3 = dream.artifact (dreams_by vm dreams);
+    // The seed is a release build: supercompiled (`--release`).
+    let stage3 = dream.artifact (dreams_by vm dreams |> dream.flags ["--release"]);
     build.empty
     |> build.goal "vm" (build.place "build-dream" (build.artifact (steps.link_step tc cli) ""))
     |> build.note "vm" "the VM, and its library beside it, in build-dream/"
