@@ -281,7 +281,7 @@ let dependencies ctx tc config libffi openssl dir = {
                     l => {
                         // LLVM reports libxml2 for WindowsManifest, outside these
                         // JIT components. Match CMake without weakening other dependencies.
-                        let selected = l.[:libraries => filter (fn lib -> lib != "-lxml2") l.[:libraries]];
+                        let selected = l.[:libraries => list.filter (fn lib -> lib != "-lxml2") l.[:libraries]];
                         build.given (probe.shared_link tc llvm_probe [(if cc.Toolchain.family tc == :msvc { "/I" } else { "-I" }) + l.[:includes]]
                                         (list.cons ((if cc.Toolchain.family tc == :msvc { "/LIBPATH:" } else { "-L" }) + l.[:libdir]) selected.[:libraries])) (fn works ->
                         if works == "yes" { goals ctx tc selected ffi_libs openssl }
