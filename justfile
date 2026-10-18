@@ -17,6 +17,12 @@ image := "build/dreams.dream"
 # The compiler, as a command. `dreams` is an image rather than a native program,
 # so running it is handing it to the VM.
 dreams := dream + " " + image
+# Every build a recipe makes is kept here and handed back when nothing it read
+# has changed (`dreams --cache`, dreams/src/cache.dr), so a suite compiles a
+# program once rather than once per run, and once across every suite that
+# compiles it. The recipes that build the compiler itself clear it: what they
+# are for is the build.
+export DREAMS_CACHE := env_var_or_default("DREAMS_CACHE", justfile_directory() + "/build/test-cache")
 
 default: build
 
@@ -89,7 +95,7 @@ bench-self-compile vm=dream target="1.25":
 # into `build/dreams.dream`, which is what every other recipe here runs.
 dreams: vm
     mkdir -p build
-    ./{{dream}} {{seed}} -L mind -L . -o {{image}} dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} {{seed}} -L mind -L . -o {{image}} dreams/src/main.dr
 
 # The build tool, itself a Dream program.
 mind: dreams
@@ -166,14 +172,14 @@ lucid: dreams
 # compiler, run this and keep `build/dreams.dream`.
 bootstrap: vm
     mkdir -p build
-    ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} {{seed}} -L mind -L . -o build/dreams.dream dreams/src/main.dr
 
 # The seed must still reproduce itself from this source: what it builds must
 # be the seed again, and build an identical third image. That equality is the whole guarantee -- it
 # says the compiler in the tree and the compiler in the image agree.
 bootstrap-check: vm
-    ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/src/main.dr
-    ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} {{seed}} -L mind -L . -o /tmp/dreams-stage2.dream dreams/src/main.dr
+    DREAMS_CACHE= ./{{dream}} /tmp/dreams-stage2.dream -L mind -L . -o /tmp/dreams-stage3.dream dreams/src/main.dr
     cmp /tmp/dreams-stage2.dream /tmp/dreams-stage3.dream
     @cmp -s {{seed}} /tmp/dreams-stage2.dream || { echo "the seed is stale: it builds a different compiler from this source -- copy /tmp/dreams-stage2.dream over {{seed}}"; exit 1; }
     @echo "the bootstrap image reproduces itself"
@@ -193,7 +199,7 @@ reseed: vm
     prev={{seed}}
     for round in 1 2 3 4 5; do
         next="$dir/stage$round.dream"
-        timeout 900 ./{{dream}} "$prev" -L mind -L . -o "$next" dreams/src/main.dr
+        DREAMS_CACHE= timeout 900 ./{{dream}} "$prev" -L mind -L . -o "$next" dreams/src/main.dr
         if cmp -s "$prev" "$next"; then
             if [ "$prev" = "{{seed}}" ]; then
                 echo "the seed already reproduces itself"

@@ -69,45 +69,50 @@ check() {
   if ! "${compile[@]}" "$src" "${LIBS[@]}" -o "$image" >"$WORK/$name.compile" 2>&1; then
     echo "FAIL $name (compile)"
     sed 's/^/    /' "$WORK/$name.compile"
-    fail=$((fail + 1))
-    return
+    return 1
   fi
   # A warning is a failure here: the examples are meant to be clean.
   if grep -qE '(^|: )warning:' "$WORK/$name.compile"; then
     echo "FAIL $name (compiled with warnings)"
     sed 's/^/    /' "$WORK/$name.compile"
-    fail=$((fail + 1))
-    return
+    return 1
   fi
 
   if ! "$dream" "$image" >"$WORK/$name.out" 2>&1; then
     echo "FAIL $name (run)"
     sed 's/^/    /' "$WORK/$name.out"
-    fail=$((fail + 1))
-    return
+    return 1
   fi
 
   if (( bless )); then
     cp "$WORK/$name.out" "$expected"
     echo "bless $name"
-    pass=$((pass + 1))
-    return
+    return 0
   fi
 
   if [[ ! -f "$expected" ]]; then
     echo "FAIL $name (no $expected; run with --bless to record it)"
-    fail=$((fail + 1))
-    return
+    return 1
   fi
   if ! diff -u "$expected" "$WORK/$name.out" >"$WORK/$name.diff"; then
     echo "FAIL $name (output changed)"
     sed 's/^/    /' "$WORK/$name.diff"
-    fail=$((fail + 1))
-    return
+    return 1
   fi
 
   echo "ok   $name"
-  pass=$((pass + 1))
+  return 0
+}
+
+# Each example is a job beside the others, its output kept in a log of its
+# own and shown in order at the end; see the same in dream/tests/e2e.sh.
+names=()
+jobs_max="${EXAMPLES_JOBS:-$(( ($(nproc 2>/dev/null || echo 2) + 1) / 2 ))}"
+start() {
+  local name="$1"
+  names+=("$name")
+  ( check "$@" >"$WORK/$name.log" 2>&1; echo $? >"$WORK/$name.rc" ) &
+  while [[ "$(jobs -rp | wc -l)" -ge "$jobs_max" ]]; do wait -n; done
 }
 
 # Single-file examples.
@@ -115,7 +120,7 @@ for src in "$HERE"/*.dr; do
   [[ -e "$src" ]] || continue
   name="$(basename "$src" .dr)"
   [[ -z "$filter" || "$name" == *"$filter"* ]] || continue
-  check "$name" "$src" "$HERE/$name.expected"
+  start "$name" "$src" "$HERE/$name.expected"
 done
 
 # Packages: any directory with a manifest, entered through src/main.dr.
@@ -128,7 +133,13 @@ for manifest in "$HERE"/*/mind.toml; do
     echo "skip $name (no src/main.dr)"
     continue
   fi
-  check "$name" "$dir/src/main.dr" "$HERE/$name.expected"
+  start "$name" "$dir/src/main.dr" "$HERE/$name.expected"
+done
+
+wait
+for name in "${names[@]}"; do
+  cat "$WORK/$name.log"
+  if [[ "$(cat "$WORK/$name.rc" 2>/dev/null)" == 0 ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); fi
 done
 
 echo

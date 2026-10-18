@@ -38,7 +38,10 @@ import std.str;
 let tools : :map -> %{:string => :string};
 let tools ctx = {
     let chain = command.toolchain ctx;
-    map.merge chain (%{ "dream" => chain.["DREAM"], "dreams" => chain.["DREAMS"] })
+    // Each build a suite makes is kept and handed back when nothing it read
+    // changed (`dreams --cache`), so the suites compile what they share once.
+    map.merge chain (%{ "dream" => chain.["DREAM"], "dreams" => chain.["DREAMS"],
+                        "DREAMS_CACHE" => build.Context.root ctx + "/build/test-cache" })
 };
 
 let suite : :map -> :string -> :string -> :map;
