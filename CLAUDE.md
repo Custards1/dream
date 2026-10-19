@@ -281,6 +281,11 @@ DREAM_TIMELINE=F dream IMG   # every slice, spawn and join, for
 dream/tools/timeline.py F    # the critical path of a parallel run; with
                              # --profile and DREAM_PROFILE_PID=1, what the root
                              # was doing on each serial stretch of it
+dream --debug 'CMDS' IMG     # the debugger, interpreted: break/trace/watch
+                             # NAME, on NAME bt, locals, continue; ..; values
+                             # shown as far as evaluated, never forced
+                             # (dream/src/debug.hpp). Reach for it before
+                             # writing a probe into the VM.
 benchmark/benchmark/run.sh   # seven workloads, Dream against CPython
 dreams/tests/scale.py        # generated programs of N declarations or modules
 ```
