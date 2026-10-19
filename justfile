@@ -225,6 +225,7 @@ test-mind: build
     dream={{dream}} mind=/tmp/dream-mind-graph.dream mind/tool/tests/graph.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/options.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/scripts.sh
+    dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} sh mind/tool/tests/install.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/reproduce.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/docs.sh
     dream={{dream}} mind=/tmp/dream-mind-graph.dream dreams={{image}} mind/tool/tests/learn.sh
@@ -454,6 +455,7 @@ test-bootstrap: bootstrap-check
 test-std: build
     ./{{dreams}} mind/std/src/all.dr --test -L mind -o /tmp/dream-std-tests.dream
     ./{{dream}} /tmp/dream-std-tests.dream
+    python3 mind/std/tests/path_dirs.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/binary.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/paths.py --dream {{dream}} --compiler {{image}}
 
