@@ -425,6 +425,7 @@ test-dreams-compile: build
     python3 dreams/tests/contracts.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/core_primitives.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/shorthand.py --dream {{dream}} --compiler {{image}}
+    python3 dreams/tests/impure_calls.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/modules.py --dream {{dream}} --compiler {{image}}
 
 # The VS Code extension's grammar, tokenized and checked against the scopes it
