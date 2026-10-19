@@ -85,6 +85,12 @@ just install         # the VM, mind, the compiler and the language server in ~/.
 `./build.sh` does the same from a clean checkout and, when something is
 missing, says what and what you lose without it.
 
+With Nix 2.27 or newer, install the full toolchain from this checkout with
+`nix profile add .`, or build it with `nix build .`. The flake includes the
+component submodules automatically. On older Nix versions, pass
+`'git+file://{absolute-checkout-path}?submodules=1'` instead of `.` (replacing
+`{absolute-checkout-path}` with the full path to this checkout).
+
 Run a single file:
 
 ```

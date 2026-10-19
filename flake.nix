@@ -2,6 +2,9 @@
   description = "Dream: a dynamically typed, lazily evaluated functional language with green processes";
 
   inputs = {
+    # The VM, compiler and libraries live in Git submodules. Include them in
+    # the source used by plain `nix build .` and `nix profile add .`.
+    self.submodules = true;
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
