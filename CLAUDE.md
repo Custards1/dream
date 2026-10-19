@@ -325,8 +325,12 @@ The lessons that keep coming back:
   inside `[:ok, strict! x]` is itself suspended; force it as a statement. A
   list built to make things happen -- processes started, messages sent -- wants
   `list.forced`, or its spawns run one at a time as a join reaches each.
-- A suspension carries its frame, so a thunk handed to `spawn!` copies
-  everything that frame reaches. Make it in a small function of its own.
+- A suspension copies the values it reads, not its frame, and an
+  interpreter frame lives on its process's stack and dies with its call
+  (`FrameStack`). Nothing on the heap may point at one: what must keep a
+  frame -- compiled code's snapshot, a parked retry -- takes a copy
+  (`heap_frame`). A thunk handed to `spawn!` still copies everything the
+  values it read reach.
 - The JIT only helps where it can take the loop. Deforestation and strict
   parameters (`!acc`) exist to hand it one.
 
