@@ -83,7 +83,7 @@ let checks ctx =
 
 let vm_sources : [:string];
 let vm_sources = map (fn s -> "dream/src/" + s + ".cpp")
-                          ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "trunk", "ffi",
+                          ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "trunk", "pack", "ffi",
                            "io", "digest", "ed25519", "crypto", "regex", "bigint", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
                            "jit_rt", "tls"];
 
