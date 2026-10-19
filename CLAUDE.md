@@ -285,7 +285,9 @@ dream --debug 'CMDS' IMG     # the debugger, interpreted: break/trace/watch
                              # NAME, on NAME bt, locals, continue; ..; values
                              # shown as far as evaluated, never forced
                              # (dream/src/debug.hpp). Reach for it before
-                             # writing a probe into the VM.
+                             # writing a probe into the VM. Locals by name
+                             # in an image built `--debug-info` (`debug =
+                             # true` in a mind.toml's [build] or profile).
 benchmark/benchmark/run.sh   # seven workloads, Dream against CPython
 dreams/tests/scale.py        # generated programs of N declarations or modules
 ```
