@@ -515,7 +515,8 @@ The lessons that keep coming back:
   -- where every socket-free example prints what the native VM does
   (`just test-browser-compat`); `dream --graphics APP` (`just graphics-vm`)
   shows it in a GTK window with a native Dream backend (`.backend`). An
-  application's own JavaScript and CSS ship beside it (`build.py --js/--css`).
+  application -- a package with a `[graphics]` section -- is built by `mind
+  build` and served by `mind run`, its own JavaScript and CSS beside it.
   [mind/std/docs/graphics.md](mind/std/docs/graphics.md) is the guide;
   "The browser VM" in dream/docs/notes/browser-vm.md is where its traps are --
   WebKitGTK refused five things without a word.

@@ -61,21 +61,19 @@ graphics-browser:
     emcmake cmake -S dream/browser -B build-browser -DCMAKE_BUILD_TYPE=Release
     cmake --build build-browser -j
 
-# A std.graphics application, built by mind/std/graphics/build.py: `just
-# graphics-app /tmp/todo mind/std/graphics/examples/todo/frontend.dr --js ..`.
-graphics-app out frontend *flags: build
-    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend "{{frontend}}" --out "{{out}}" {{flags}}
+# A std.graphics application -- a package with a `[graphics]` section -- built
+# by `mind` into OUT: `just graphics-app mind/std/graphics/examples/todo /tmp/todo`.
+graphics-app project out: build mind
+    DREAM="$PWD/{{dream}}" DREAMS="$PWD/{{image}}" MIND_STDLIB="$PWD/mind" ./{{dream}} build/mind -C "{{project}}" build --runtime "$PWD/build-browser" --output "$(realpath -m "{{out}}")"
 
 # The examples -- counter (with a backend), todo, sketch, budget -- under OUT.
-graphics-examples out: build
-    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend mind/std/graphics/examples/counter/frontend.dr --backend mind/std/graphics/examples/counter/backend.dr --out "{{out}}/counter"
-    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend mind/std/graphics/examples/todo/frontend.dr --js mind/std/graphics/examples/todo/widgets.mjs --css mind/std/graphics/examples/todo/todo.css --out "{{out}}/todo"
-    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend mind/std/graphics/examples/sketch/frontend.dr --out "{{out}}/sketch"
-    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend mind/std/graphics/examples/budget/frontend.dr --out "{{out}}/budget"
+graphics-examples out: build mind
+    for app in counter todo sketch budget; do DREAM="$PWD/{{dream}}" DREAMS="$PWD/{{image}}" MIND_STDLIB="$PWD/mind" ./{{dream}} build/mind -C mind/std/graphics/examples/$app build --runtime "$PWD/build-browser" --output "$(realpath -m "{{out}}")/$app"; done
 
-# Serve a built application to a browser at http://127.0.0.1:8000/.
-graphics-serve app port="8000":
-    python3 mind/std/graphics/serve.py "{{app}}" --port {{port}}
+# Serve a built application to a browser at http://127.0.0.1:8000/ (from a
+# project, `mind run` builds and serves it in one).
+graphics-serve app port="8000": mind
+    ./{{dream}} build/mind serve --port {{port}} --fallback index.html "{{app}}/assets"
 
 # The VM again, with GCC fitting its branch weights to a self-compile. Worth
 # about 16%, and it lands in `build-pgo` rather than in {{build_dir}} on purpose.
@@ -332,6 +330,10 @@ install-artifacts:
     # the checkout and the compiler failed to build itself.
     rm -rf {{install_dir}}/std
     cp -r mind/std {{install_dir}}/std
+    # The page's test tools (`npm ci` in mind/std/graphics) are not the library.
+    rm -rf {{install_dir}}/std/graphics/node_modules {{install_dir}}/std/graphics/examples/*/target
+    # The browser VM, when there is one, for `mind build` to ship in an application.
+    if [ -f build-browser/dream-browser.wasm ]; then mkdir -p {{install_dir}}/browser && cp build-browser/dream-browser.mjs build-browser/dream-browser.wasm {{install_dir}}/browser/; fi
 install-artifactsv2:
     mkdir -p {{install_dir}}
     cp {{dream}} {{install_dir}}/bin/dream || true
@@ -494,17 +496,17 @@ test-std: build
 # std.graphics: its Dream modules, the page's JavaScript under jsdom, the
 # examples built and run on the browser VM. Needs `just graphics-browser` and
 # `npm ci --prefix mind/std/graphics`; not in `just test`, as test-vscode is not.
-test-graphics: build
-    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --runtime build-browser
+test-graphics: build mind
+    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --mind build/mind --runtime build-browser
 
 # The same, and the examples driven in headless Chromium (Playwright's, or
 # $DREAM_CHROME). Chromium will not start under a `ulimit -v`.
-test-graphics-browser: build
-    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --runtime build-browser --browser
+test-graphics-browser: build mind
+    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --mind build/mind --runtime build-browser --browser
 
 # The same, and the desktop VM's webview under Xvfb. Run in the graphics shell.
-test-graphics-native graphics_vm="build-graphics/bin/dream": build
-    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --runtime build-browser --graphics-vm "{{graphics_vm}}"
+test-graphics-native graphics_vm="build-graphics/bin/dream": build mind
+    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --mind build/mind --runtime build-browser --graphics-vm "{{graphics_vm}}"
 
 # Whether ordinary Dream runs in a browser: every example on the browser VM,
 # its output byte for byte what the native VM prints.
