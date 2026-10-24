@@ -46,6 +46,37 @@ vm-no-jit:
     cmake -S . -B build-nojit -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build build-nojit -j
 
+# The desktop VM: `dream --graphics APP` opens an application in a GTK
+# window with WebKitGTK. Optional, and Linux only for now; the shell has GTK 3,
+# WebKitGTK 4.1 and Xvfb on top of the workspace's own.
+#     nix-shell mind/std/graphics/shell.nix --run 'just graphics-vm'
+graphics-vm:
+    cmake -S . -B build-graphics -DDREAM_ENABLE_GRAPHICS=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake --build build-graphics -j
+
+# The browser VM, build-browser/dream-browser.{mjs,wasm}: the VM compiled to
+# WebAssembly, which runs a frontend in a Web Worker. Needs Emscripten:
+#     nix-shell -p emscripten cmake --run 'just graphics-browser'
+graphics-browser:
+    emcmake cmake -S dream/browser -B build-browser -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-browser -j
+
+# A std.graphics application, built by mind/std/graphics/build.py: `just
+# graphics-app /tmp/todo mind/std/graphics/examples/todo/frontend.dr --js ..`.
+graphics-app out frontend *flags: build
+    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend "{{frontend}}" --out "{{out}}" {{flags}}
+
+# The examples -- counter (with a backend), todo, sketch, budget -- under OUT.
+graphics-examples out: build
+    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend mind/std/graphics/examples/counter/frontend.dr --backend mind/std/graphics/examples/counter/backend.dr --out "{{out}}/counter"
+    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend mind/std/graphics/examples/todo/frontend.dr --js mind/std/graphics/examples/todo/widgets.mjs --css mind/std/graphics/examples/todo/todo.css --out "{{out}}/todo"
+    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend mind/std/graphics/examples/sketch/frontend.dr --out "{{out}}/sketch"
+    python3 mind/std/graphics/build.py --vm {{dream}} --compiler {{image}} --runtime build-browser --frontend mind/std/graphics/examples/budget/frontend.dr --out "{{out}}/budget"
+
+# Serve a built application to a browser at http://127.0.0.1:8000/.
+graphics-serve app port="8000":
+    python3 mind/std/graphics/serve.py "{{app}}" --port {{port}}
+
 # The VM again, with GCC fitting its branch weights to a self-compile. Worth
 # about 16%, and it lands in `build-pgo` rather than in {{build_dir}} on purpose.
 #
@@ -459,6 +490,26 @@ test-std: build
     python3 mind/std/tests/path_dirs.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/binary.py --dream {{dream}} --compiler {{image}}
     python3 dreams/tests/paths.py --dream {{dream}} --compiler {{image}}
+
+# std.graphics: its Dream modules, the page's JavaScript under jsdom, the
+# examples built and run on the browser VM. Needs `just graphics-browser` and
+# `npm ci --prefix mind/std/graphics`; not in `just test`, as test-vscode is not.
+test-graphics: build
+    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --runtime build-browser
+
+# The same, and the examples driven in headless Chromium (Playwright's, or
+# $DREAM_CHROME). Chromium will not start under a `ulimit -v`.
+test-graphics-browser: build
+    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --runtime build-browser --browser
+
+# The same, and the desktop VM's webview under Xvfb. Run in the graphics shell.
+test-graphics-native graphics_vm="build-graphics/bin/dream": build
+    python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --runtime build-browser --graphics-vm "{{graphics_vm}}"
+
+# Whether ordinary Dream runs in a browser: every example on the browser VM,
+# its output byte for byte what the native VM prints.
+test-browser-compat: build
+    python3 dream/browser/compat.py --vm {{dream}} --compiler {{image}} --runtime build-browser --examples examples -L mind
 
 # Binary layouts against reference integers and every finite IEEE binary16 value.
 test-binary: build

@@ -498,6 +498,27 @@ The lessons that keep coming back:
   WebSockets. `std.regex` matches natively (`vm.regex_run`,
   dream/src/regex.cpp: a lazy DFA and a Pike VM).
   Examples 18-21 tour them.
+- `import std.graphics` is **user interfaces**, and `std.graphics.widgets`
+  the kit most programs want: screens, cards, buttons, labelled fields,
+  switches, tabs, tables, modal dialogs and toasts, finished as written by one
+  `Theme`, adjusted by modifiers (`|> w.primary`, `|> w.gap 4`), with no HTML
+  or CSS ([mind/std/docs/widgets.md](mind/std/docs/widgets.md)). Under it: a
+  model, typed messages (any
+  value, usually a union's) and a view of HTML (`std.graphics.html`), CSS
+  (`.css`) and canvas drawing (`.canvas`) as values; effects are calls from
+  `update!` naming the message their answer becomes (`.browser`), and the loop
+  is a process reading its mailbox, so `spawn!` and `send!` compose with it.
+  A render sends the page what changed (`ui.diff`), and `ui.lazy` is a node
+  not made again while its inputs are unchanged.
+  A frontend runs on the **browser VM** -- the VM compiled to WebAssembly
+  (`dream/browser/`, `just graphics-browser` with Emscripten), in a Web Worker
+  -- where every socket-free example prints what the native VM does
+  (`just test-browser-compat`); `dream --graphics APP` (`just graphics-vm`)
+  shows it in a GTK window with a native Dream backend (`.backend`). An
+  application's own JavaScript and CSS ship beside it (`build.py --js/--css`).
+  [mind/std/docs/graphics.md](mind/std/docs/graphics.md) is the guide;
+  "The browser VM" in dream/docs/notes/browser-vm.md is where its traps are --
+  WebKitGTK refused five things without a word.
 - `import std.ml` is **machine learning** on `std.tensor`: autodiff
   (`std.ml.ad`, graph nodes found again by identity map keys), layers
   (`std.ml.nn`: dense, conv2d, attention, transformer, LSTM, ..), losses,

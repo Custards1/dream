@@ -218,3 +218,20 @@ would not.
 - Indexes, and forcing nothing extra
 - What it bought
 - What is not done
+
+## [The browser VM](../../dream/docs/notes/browser-vm.md)
+
+The VM compiled to WebAssembly, pumped a slice at a time from a Web Worker,
+and the desktop host that shows its page in a GTK window: what ordinary Dream
+needs from a page, and what WebKitGTK refused without saying so.
+
+- The browser VM
+- One thread, pumped
+- Failures are reported at the end, as natively
+- What cannot be reached
+- Dream's library, in a page
+- The bridge is a native module
+- WebKitGTK, 2.54
+- Order
+- The window and the program
+- Renders are patches
