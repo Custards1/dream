@@ -238,3 +238,4 @@ needs from a page, and what WebKitGTK refused without saying so.
 - Order
 - The window and the program
 - Renders are patches
+- A stream of output
