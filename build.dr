@@ -84,7 +84,7 @@ let checks ctx =
 let vm_sources : [:string];
 let vm_sources = map (fn s -> "dream/src/" + s + ".cpp")
                           ["value", "image", "heap", "cores", "gc_pool", "process", "interp", "builtins", "trunk", "pack", "debug", "ffi",
-                           "io", "digest", "ed25519", "crypto", "regex", "bigint", "os", "scheduler", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
+                           "io", "digest", "ed25519", "crypto", "regex", "bigint", "os", "scheduler", "stack_thread", "runtime", "capi", "tensor", "tensor_kernels", "gpu",
                            "jit_rt", "tls"];
 
 /// GCC's inliner ceilings: dream/CMakeLists.txt says why at length. The
