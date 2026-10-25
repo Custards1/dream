@@ -562,6 +562,20 @@ and why nobody keeping it is trusted is "The index" in
 [mind/tool/README.md](mind/tool/README.md). Its workflows build `mind` at
 commits pinned in its `ci/build-mind.sh`: move them when the index code moves.
 
+**The language itself** is released as a toolchain by
+[dream-mindv2/toolchain](https://github.com/dream-mindv2/toolchain): its
+submodules pin `dream`, `dreams`, `mind/std`, `mind/tool` and `lucid` at the
+commits a release is of, and a tag `vX.Y.Z` there builds every platform (Linux
+x86_64/aarch64 in AlmaLinux 9, macOS arm64, Android aarch64 by the NDK), each
+VM self-contained (`DREAM_SELF_CONTAINED`: only the C library shared) with the
+JIT on but on Android, signs `SHA256SUMS`, and publishes the one-line
+installer (`curl -fsSL https://dream-mindv2.github.io/toolchain/install.sh |
+sh`) and `channel.json` on its Pages. `mind toolchain` installs, switches,
+updates and pins them (mind/tool/src/toolchain.dr). Everything is MIT OR
+Apache-2.0, and a `mind` release build carries every package's licence as the
+`licenses` payload and refuses a dependency whose licence does not allow the
+package's (mind/tool/src/licenses.dr).
+
 GitHub shows `.dr` as Elixir (`.gitattributes` in every repository with
 Dream source) because Linguist only adds a language used across a couple of
 hundred repositories. Submitting Dream to github/linguist -- the grammar in

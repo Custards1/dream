@@ -33,6 +33,7 @@ link_deps = { type = ["prefer_static", "static", "shared"], default = "prefer_st
 # OpenSSL, zlib and libffi -- and want checking against a build made on the
 # oldest release of each that is to be supported.
 [ship]
+license = "MIT OR Apache-2.0"
 name = "dream"
 version = "0.1.0"
 summary = "Lazily evaluated functional language: its VM, compiler and tools"
