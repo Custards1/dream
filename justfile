@@ -46,13 +46,10 @@ vm-no-jit:
     cmake -S . -B build-nojit -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build build-nojit -j
 
-# The desktop VM: `dream --graphics APP` opens an application in a GTK
-# window with WebKitGTK. Optional, and Linux only for now; the shell has GTK 3,
-# WebKitGTK 4.1 and Xvfb on top of the workspace's own.
-#     nix-shell mind/std/graphics/shell.nix --run 'just graphics-vm'
-graphics-vm:
-    cmake -S . -B build-graphics -DDREAM_ENABLE_GRAPHICS=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    cmake --build build-graphics -j
+# Every Linux VM opens an application's window: GTK and WebKitGTK are found
+# when one is first wanted, not linked (dream/src/graphics_api.hpp), so there
+# is no separate desktop build. This is `vm`, under the name it used to have.
+graphics-vm: vm
 
 # The browser VM, build-browser/dream-browser.{mjs,wasm}: the VM compiled to
 # WebAssembly, which runs a frontend in a Web Worker. Needs Emscripten:
@@ -504,8 +501,9 @@ test-graphics: build mind
 test-graphics-browser: build mind
     python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --mind build/mind --runtime build-browser --browser
 
-# The same, and the desktop VM's webview under Xvfb. Run in the graphics shell.
-test-graphics-native graphics_vm="build-graphics/bin/dream": build mind
+# The same, and the desktop window's webview under Xvfb. Run in the graphics
+# shell, whose LD_LIBRARY_PATH is where the VM finds WebKitGTK.
+test-graphics-native graphics_vm=dream: build mind
     python3 mind/std/graphics/tests/run.py --vm {{dream}} --compiler {{image}} --mind build/mind --runtime build-browser --graphics-vm "{{graphics_vm}}"
 
 # Whether ordinary Dream runs in a browser: every example on the browser VM,

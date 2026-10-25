@@ -514,8 +514,10 @@ The lessons that keep coming back:
   A frontend runs on the **browser VM** -- the VM compiled to WebAssembly
   (`dream/browser/`, `just graphics-browser` with Emscripten), in a Web Worker
   -- where every socket-free example prints what the native VM does
-  (`just test-browser-compat`); a VM built by `just graphics-vm` shows it in
-  a GTK window with a native Dream backend (`.backend`). An application -- a
+  (`just test-browser-compat`); every desktop Linux VM shows it in a GTK
+  window with a native Dream backend (`.backend`), GTK and WebKitGTK found
+  at run time rather than linked (dream/src/graphics_api.hpp), so the
+  self-contained release still needs only the C library to start. An application -- a
   package with a `[graphics]` section -- is built by `mind build` into one
   image: the backend's program with the page carried as payloads named
   `graphics/PATH`. Running that image opens the window and runs the image
