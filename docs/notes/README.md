@@ -47,6 +47,7 @@ end.
 - A pinned heap grew past its cap
 - Strict by default: the experiment
 - The timeline, and what a parallel compile was waiting on
+- Bindings in scope: a slot bound in two branches
 
 The collector has a document of its own, [../gc.md](../../dream/docs/gc.md), and "Collecting under compiled code" there is where the JIT and the collector meet.
 
