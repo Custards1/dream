@@ -514,10 +514,13 @@ The lessons that keep coming back:
   A frontend runs on the **browser VM** -- the VM compiled to WebAssembly
   (`dream/browser/`, `just graphics-browser` with Emscripten), in a Web Worker
   -- where every socket-free example prints what the native VM does
-  (`just test-browser-compat`); `dream --graphics APP` (`just graphics-vm`)
-  shows it in a GTK window with a native Dream backend (`.backend`). An
-  application -- a package with a `[graphics]` section -- is built by `mind
-  build` and served by `mind run`, its own JavaScript and CSS beside it.
+  (`just test-browser-compat`); a VM built by `just graphics-vm` shows it in
+  a GTK window with a native Dream backend (`.backend`). An application -- a
+  package with a `[graphics]` section -- is built by `mind build` into one
+  image: the backend's program with the page carried as payloads named
+  `graphics/PATH`. Running that image opens the window and runs the image
+  again `--headless` as the backend, so `mind install` and `dream -x NAME`
+  treat it as any program; `mind run` serves the same page as a site.
   [mind/std/docs/graphics.md](mind/std/docs/graphics.md) is the guide;
   "The browser VM" in dream/docs/notes/browser-vm.md is where its traps are --
   WebKitGTK refused five things without a word.
