@@ -17,6 +17,7 @@ Dont forget about strict parameters, use them when needed
 | `mind/std/` | The standard library; its design docs and notes in `mind/std/docs/`, its API published at dream-mindv2.github.io/std on every push. Submodule: dream-mindv2/std. | Dream |
 | `dreams/` | The compiler. `.dr` source to `.dream` bytecode. **The active work.** The language spec and the compiler's notes in `dreams/docs/`. Submodule: dream-mindv2/dreams. | Dream |
 | `lucid/` | The language server. Imports `dreams` as a library. Submodule: dream-mindv2/lucid. | Dream |
+| `sleep/` | sleep, a terminal emulator: terminal, HTTP request and database tabs, a command queue, colour schemes, and an assistant that learns from the shell history (`std.ml`). A `std.graphics.widgets` application; [sleep/README.md](sleep/README.md). Submodule: dream-mindv2/sleep. | Dream |
 | `mind/std/src/sql/pg/` | A PostgreSQL client: the wire protocol over `std.net`, SQL as fragments checked at compile time, a pool. [mind/std/src/sql/pg/README.md](mind/std/src/sql/pg/README.md). | Dream |
 | `mind/tool/src/pack/` | `mind pack`, the packager: .deb, .rpm, Arch packages, tarballs, Homebrew formulas, PKGBUILDs and install scripts, every byte written in Dream. [mind/tool/PACKAGING.md](mind/tool/PACKAGING.md). | Dream |
 | `editors/vscode/` | The VS Code extension: an LSP client and a grammar. Submodule: dream-mindv2/vscode-dream. | JS |
@@ -530,6 +531,12 @@ The lessons that keep coming back:
   `DREAM_JIT_WHY=1` names what refuses a function (a `match` on anything
   but a parameter is the usual one). [mind/std/docs/notes/ml.md](mind/std/docs/notes/ml.md),
   and example 22.
+- `import std.pty` runs a program on a **pseudo-terminal** of its own
+  (`pty.spawn!`, `read!`, `write!`, `resize!`, `wait!`, `signal!`): the
+  terminal is its controlling one, so it colours, buffers and redraws as for
+  a person, and `"\x03"` written is SIGINT. The handle is an ordinary io
+  stream, so a read parks the process, not a worker. `os.pty_spawn!` and
+  friends in dream/src/os.cpp; Linux and macOS. sleep is built on it.
 - `import std.trunk` gives **trunks**: one container, a finite
   sequence whose representation the VM chooses from what the program does --
   push and prepend in place, constant-time `.[i]`, `contains` and an

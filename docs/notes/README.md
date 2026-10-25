@@ -158,7 +158,9 @@ How `lucid` answers an editor, and which tree answers which question.
 - Why `fit!` trains in a process of its own
 - When the model does not fit the heap
 - Shaping the Dream code for the JIT
+- State and device-local training
 - Measured: a training run
+- Models that learn from the person
 - What is not done
 
 ## [Tensors](../../dream/docs/notes/tensors.md)
@@ -217,6 +219,7 @@ would not.
 - The representation
 - Indexes, and forcing nothing extra
 - What it bought
+- A queue kept everything it was given
 - What is not done
 
 ## [The browser VM](../../dream/docs/notes/browser-vm.md)

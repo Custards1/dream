@@ -30,3 +30,7 @@
 	path = learn
 	url = https://github.com/dream-mindv2/learn.git
 	branch = main
+[submodule "sleep"]
+	path = sleep
+	url = https://github.com/dream-mindv2/sleep.git
+	branch = main
