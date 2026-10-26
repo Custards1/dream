@@ -559,11 +559,13 @@ The lessons that keep coming back:
 ## Releasing
 
 v0.1.0 of `dreams`, `mind` and `lucid` was the first release; versions bump
-from here, and a published version is never re-tagged. A release is: bump
-`version` in the package's `mind.toml`, commit, `mind sign vX.Y.Z`, commit
-`mind.sig`, `git tag -a vX.Y.Z`, push `main` and the tag, then `mind publish`
--- it opens an issue on [dream-mindv2/index](https://github.com/dream-mindv2/index),
-the shared index, whose Action appends the signed entry. How the index works
+from here, and a published version is never re-tagged. A release is `mind
+release` in the package's directory (`patch` by default): it moves the version
+in `mind.toml` and in the source that prints it (`[release] files`), runs
+`[release] run` (dreams reseeds), commits, signs, tags, pushes `main` and the
+tag, and runs `mind publish` -- which opens an issue on
+[dream-mindv2/index](https://github.com/dream-mindv2/index), the shared index,
+whose Action appends the signed entry. `--dry-run` first. How the index works
 and why nobody keeping it is trusted is "The index" in
 [mind/tool/README.md](mind/tool/README.md). Its workflows build `mind` at
 commits pinned in its `ci/build-mind.sh`: move them when the index code moves.
