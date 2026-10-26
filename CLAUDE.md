@@ -163,7 +163,8 @@ binary under `build/`.
 
 `./build.sh` builds from a clean checkout and reports what dependencies are
 missing. libffi is required: `std.ffi` is a module every VM must provide, and a
-VM built without it is not a valid VM. LLVM is optional and gives the JIT.
+VM built without it is not a valid VM. LLVM gives the JIT, and is required unless
+the JIT is turned off on purpose (`-DDREAM_ENABLE_JIT=OFF`, `./build.sh --no-jit`).
 
 ## Testing
 

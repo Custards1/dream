@@ -63,8 +63,9 @@ the whole language.
 ## Getting started
 
 You need a C++20 compiler, CMake 3.20, [`just`](https://github.com/casey/just),
-**libffi** and **OpenSSL 3** -- `std.ffi` and `std.tls` are part of every VM.
-LLVM is optional and gives the JIT.
+**libffi** and **OpenSSL 3** -- `std.ffi` and `std.tls` are part of every VM --
+and **LLVM 15+** for the JIT, which a build leaves out only when told to
+(`-DDREAM_ENABLE_JIT=OFF`).
 
 This repository is the **workspace**: each component lives in a repository of
 its own under [dream-mindv2](https://github.com/dream-mindv2) and is checked

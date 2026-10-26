@@ -4,8 +4,9 @@
 # The aim is that this either produces a working toolchain or tells you exactly
 # what is missing and what you lose without it. libffi is required: `std.ffi`
 # is part of every VM, and a VM that cannot call C is not a valid one. LLVM is
-# optional and the build adapts to it: with it you get the JIT, without it an
-# interpreter that is still correct, just slower.
+# required too, for the JIT, unless you say `--no-jit`: without it the VM is
+# still correct, an order of magnitude slower, and that is a choice to make on
+# purpose rather than to find out about afterwards.
 #
 #   ./build.sh                 build and test
 #   ./build.sh --release       optimized
@@ -117,7 +118,8 @@ if [[ "$ENABLE_JIT" == ON ]]; then
   elif compgen -G "/nix/store/*llvm-*-dev/bin/llvm-config" >/dev/null; then
     ok "LLVM found in the Nix store -- the JIT will be built"
   else
-    warn "no LLVM: building interpreter-only (still correct, just slower)"
+    printf '    %smissing: LLVM 15 or newer  (the JIT: llvm-dev, llvm)%s\n' "$RED" "$RESET"
+    die "install LLVM and run this again, or build without the JIT: ./build.sh --no-jit"
   fi
 else
   note "JIT disabled by --no-jit"

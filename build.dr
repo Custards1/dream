@@ -257,6 +257,13 @@ let llvm_probe = "#include <llvm-c/LLJIT.h>\n#include <llvm-c/Target.h>\nextern 
     + "LLVMInitializeNativeTarget(); LLVMInitializeNativeAsmPrinter(); LLVMOrcLLJITRef jit; "
     + "LLVMOrcCreateLLJIT(&jit, nullptr); LLVMOrcDisposeLLJIT(jit); }\n";
 
+/// No LLVM, and the JIT not turned off: a refusal, as CMake's, since a VM
+/// without its JIT is slower by an order of magnitude and should be one only
+/// because someone asked.
+let no_llvm : :map;
+let no_llvm = unavailable ("LLVM was not found, and the JIT needs it: install LLVM 15 or newer (llvm-config), "
+                           + "or build without the JIT with `-D jit=off`");
+
 /// Prefer usable static dependencies, and fall back only when requested.
 let dependencies : :map -> cc.Toolchain -> :string -> [:string] -> [:string] -> :string -> :map;
 let dependencies ctx tc config libffi openssl dir = {
@@ -266,16 +273,17 @@ let dependencies ctx tc config libffi openssl dir = {
         if build.option ctx "jit" == "off" { goals ctx tc () ffi_libs openssl }
         else {
             let shared = build.given (probe.llvm_link config "--link-shared" llvm_parts)
-                (fn text -> if probe.answer text == () && config != "llvm-config" {
-                    unavailable "llvm-config cannot supply shared LLVM libraries; install shared LLVM or request static linkage"
-                } else { goals ctx tc (probe.answer text) ffi_libs openssl });
+                (fn text -> match [probe.answer text, config] {
+                    [(), "llvm-config"] => no_llvm,
+                    [(), _] => unavailable "llvm-config cannot supply shared LLVM libraries; install shared LLVM or request static linkage",
+                    [l, _] => goals ctx tc l ffi_libs openssl,
+                });
             if mode == "shared" { shared }
             else { build.given (probe.llvm_link config "--link-static" llvm_parts) (fn text ->
                 match probe.answer text {
                     () => if mode == "static" {
-                        // LLVM remains optional when it is not installed.
                         build.given (probe.llvm_link config "--link-shared" llvm_parts) (fn found ->
-                            if probe.answer found == () && config == "llvm-config" { goals ctx tc () ffi_libs openssl }
+                            if probe.answer found == () && config == "llvm-config" { no_llvm }
                             else { unavailable "LLVM static archives are unavailable" })
                     } else { shared },
                     l => {
