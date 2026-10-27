@@ -10,13 +10,6 @@ import std.num;
 
 let div a b = a / b;
 
-let parse_age! s = {
-    let n = num.parse_int s;
-    if n == () { raise! ("not a number: " + s) }
-    else if n < 0 { raise! :negative_age }
-    else { n }
-};
-
 // Pure code cannot raise -- raising is an effect -- so a step that can fail
 // answers `ok v` or `err e`. `let?` takes one step of a chain: on
 // `Result.ok(v)` it binds `v` and goes on; a failure becomes the block's
@@ -25,12 +18,22 @@ type Checked = Result :integer :any;
 
 let number : :string -> Checked;
 let number s = match num.parse_int s {
-    () => err ("not a number: " + s),
-    n => ok n,
+    Option.none => err ("not a number: " + s),
+    Option.some(n) => ok n,
 };
 
 let positive : :integer -> Checked;
 let positive n = if n > 0 { ok n } else { err :not_positive };
+
+// Bad input is an answer, not a fault: validating it answers a Result, which
+// the caller must look at, and keeps the function pure. `raise!` is for what
+// is not an answer -- a broken invariant, a division the program never meant
+// to make -- as in `main!` below.
+let age : :string -> Checked;
+let age s = {
+    let? n = number s;
+    if n < 0 { err :negative_age } else { ok n }
+};
 
 let ratio : :string -> :string -> Checked;
 let ratio a b = {
@@ -75,10 +78,10 @@ let main! = {
     // A `try!` whose body does not raise just yields the body.
     console.print! ("no raise:  " + to_string (try! { 6 * 7 } catch e { :unused }))
 
-    // Validation that reports the first bad input.
-    console.print! ("parse ok:  " + to_string (try! { parse_age! "34" } catch e { e }))
-    console.print! ("parse bad: " + to_string (try! { parse_age! "abc" } catch e { e }))
-    console.print! ("parse neg: " + to_string (try! { parse_age! "-1" } catch e { e }))
+    // Validation that reports the first bad input, as a value: no `try!`.
+    console.print! ("parse ok:  " + to_string (age "34"))
+    console.print! ("parse bad: " + to_string (age "abc"))
+    console.print! ("parse neg: " + to_string (age "-1"))
 
     // A failure inside a process arrives at `join!` as a value, so one bad
     // computation cannot take the rest down with it.

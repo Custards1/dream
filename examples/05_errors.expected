@@ -9,9 +9,9 @@ fallback:  0
 nested:    :inner
 type_of:   :error
 no raise:  42
-parse ok:  34
-parse bad: <error :error not a number: abc>
-parse neg: <error :error :negative_age>
+parse ok:  Result.ok(34)
+parse bad: Result.error("not a number: abc")
+parse neg: Result.error(:negative_age)
 in process:Result.error(<error :divide_by_zero division by zero>)
 survived:  [20, :skipped, 50]
 ratio ok:  Result.ok(42)

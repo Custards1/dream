@@ -38,7 +38,7 @@ let best! name thunk = {
 let main! = {
     let args = os.args! ();
     let n = if args == [] { 4000000 } else {
-        match num.parse_int (list.head args) { () => raise! "the size must be a whole number", k => k }
+        match num.parse_int (list.head args) { Option.none => raise! "the size must be a whole number", Option.some(k) => k }
     };
     let a = tensor.random 1 [n];
     let b = tensor.random 2 [n];
