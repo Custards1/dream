@@ -52,7 +52,7 @@ let main! = {
 
     let text = "Released 2026-03-28, patched 2026-04-02.";
     console.print! (regex.find_all_text date text)
-    console.print! (regex.find date text |> regex.named "m")
+    console.print! (regex.find date text |> Option.and_then (regex.named "m"))
     console.print! (regex.replace_all date "${d}/${m}/${y}" text)
     console.print! (regex.count words "the quick brown fox")
     console.print! (regex.split (regex.compile "\\s*[,;]\\s*") "a, b;c ,d")
