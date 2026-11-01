@@ -441,6 +441,11 @@ test-dreams-corpus: build
 # against the output recorded beside them. The other `dreams` tests ask whether
 # a stage agrees with a recorded shape; this one asks the only question that
 # finally matters, and it is the evidence that the self-hosted compiler works.
+# How far the AOT has got: every recorded program built native, run and compared.
+# Fails only on a wrong answer; what is refused is listed, as what to build next.
+test-aot-programs: build
+    DREAM={{dream}} image={{image}} dreams/tests/aot_programs.sh
+
 test-dreams-compile: build
     dream={{dream}} seed={{seed}} dreams/tests/compile.sh
     dream={{dream}} image={{image}} dreams/tests/parts.sh
