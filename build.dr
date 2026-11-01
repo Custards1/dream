@@ -123,6 +123,7 @@ let jit ctx tc llvm t = match [build.option ctx "jit", llvm] {
     [_, ()] => cc.source "dream/src/jit_stub.cpp" t,
     [_, l] =>
         t |> cc.source_with "dream/src/jit.cpp" (if l.[:rtti] { [] } else { [cc.Setting.rtti false] })
+          |> cc.source_with "dream/src/aot_object.cpp" (if l.[:rtti] { [] } else { [cc.Setting.rtti false] })
           |> cc.define "DREAM_HAVE_LLVM"
           |> cc.define "__STDC_CONSTANT_MACROS" |> cc.define "__STDC_FORMAT_MACROS" |> cc.define "__STDC_LIMIT_MACROS"
           // `-isystem`, so LLVM's headers are not held to this build's warnings.
@@ -233,7 +234,7 @@ let goals ctx tc llvm libffi openssl = {
 
 let llvm_parts : [:string];
 let llvm_parts = ["core", "orcjit", "native", "support", "target", "analysis", "passes", "ipo",
-                  "instcombine", "scalaropts", "transformutils"];
+                  "instcombine", "scalaropts", "transformutils", "irreader", "asmparser"];
 
 /// A probe asked again every build. `probe.pkg_config` keeps its answer until
 /// the question changes, and a first build on a machine without `pkg-config`

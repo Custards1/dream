@@ -445,6 +445,7 @@ test-dreams-compile: build
     dream={{dream}} seed={{seed}} dreams/tests/compile.sh
     dream={{dream}} image={{image}} dreams/tests/parts.sh
     dream={{dream}} image={{image}} dreams/tests/target.sh
+    DREAM={{dream}} image={{image}} dreams/tests/aot.sh
     dream={{dream}} image={{image}} dreams/tests/units.sh
     dream={{dream}} image={{image}} dreams/tests/sc.sh
     python3 dreams/tests/macros.py --dream {{dream}} --compiler {{image}}

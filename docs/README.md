@@ -15,6 +15,7 @@ and are the first thing to read before working on what they describe.
 | | |
 |---|---|
 | [language-spec.md](../dreams/docs/language-spec.md) | **The language**, start to finish: syntax, values, laziness, purity, patterns, errors, types, records and unions, modules, behaviours, processes, compile-time evaluation, C libraries, tests, and writing code that runs fast. Start at "A first program". |
+| [aot.md](../dreams/docs/aot.md) | **The AOT compiler**: `dreams --aot`, native executables from images. A design, and a log of how far it has got. |
 | [session-mode.md](../dreams/docs/session-mode.md), [session-work.md](../dreams/docs/session-work.md) | Retained implementation of the deprecated REPL: incremental compilation and design. |
 
 For learning it rather than looking things up, read [Learn Dream](../learn/README.md).
