@@ -1,0 +1,9 @@
+import std.console;
+import std.list;
+let gen !n !x acc = if n == 0 { acc } else { gen (n - 1) ((x * 1103515245 + 12345) % 2147483648) (x :: acc) };
+let main! = {
+    let xs = gen 1000000 42 [];
+    let ys = list.sort xs;
+    let zs = list.map (fn x -> x + 1) (list.filter (fn x -> x % 2 == 0) ys);
+    console.print! [list.length zs, list.head ys, list.sum zs];
+};

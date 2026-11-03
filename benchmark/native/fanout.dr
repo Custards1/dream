@@ -1,0 +1,12 @@
+import std.console;
+import std.list;
+
+// The same CPU-bound work, sixteen times over, each piece in a process of its own: on one
+// thread this is the sum of the pieces, and on many it is about one piece per core.
+let fib : :integer -> :integer;
+let fib n = if n < 2 { n } else { fib (n - 1) + fib (n - 2) };
+
+let main! = {
+    let ps = list.forced (list.map (fn i -> spawn! $( fib (30 + i % 2) )) (list.range 0 16));
+    console.print! (list.sum (list.map (fn p -> join! p) ps));
+};

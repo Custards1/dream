@@ -1,0 +1,10 @@
+import std.console;
+import std.list;
+import std.str;
+let main! = {
+    let words = list.map to_string (list.range 0 200000);
+    let joined = str.join_str " " words;
+    let parts = str.split " " joined;
+    let n = list.fold (fn acc w -> acc + len (str.upper w) + (if str.contains_str "99" w { 1 } else { 0 })) 0 parts;
+    console.print! [len joined, n];
+};

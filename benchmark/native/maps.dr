@@ -1,0 +1,9 @@
+import std.console;
+import std.map;
+import std.list;
+let main! = {
+    let m = list.fold (fn acc i -> acc.[i * 7 % 500009 => i]) %{} (list.range 0 500000);
+    let s = list.fold (fn acc i -> acc + m.[i else 0]) 0 (list.range 0 500000);
+    let t = list.fold (fn acc i -> acc.[to_string i => i]) %{} (list.range 0 100000);
+    console.print! [s, map.size m, map.size t];
+};

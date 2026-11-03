@@ -1,0 +1,12 @@
+import std.console;
+import std.list;
+group P { x : :float, y : :float, vx : :float, vy : :float }
+let step : :float -> P -> P;
+let step dt (p) = P.make (P.x p + dt * P.vx p) (P.y p + dt * P.vy p) (P.vx p * 0.99) (P.vy p - dt);
+let run !n ps = if n == 0 { ps } else { run (n - 1) (list.forced (list.map (step 0.01) ps)) };
+let main! = {
+    let ps = list.map (fn i -> P.make (num i) 0.0 1.0 2.0) (list.range 0 1000);
+    let out = run 1000 ps;
+    console.print! (list.fold (fn a p -> a + P.x p + P.y p) 0.0 out);
+};
+let num i = 0.0 + i;

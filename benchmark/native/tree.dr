@@ -1,0 +1,8 @@
+import std.console;
+union T { leaf, node(l : T, r : T) }
+let make : :integer -> T;
+let make d = if d == 0 { T.leaf } else { T.node (make (d - 1)) (make (d - 1)) };
+let check : T -> :integer;
+let check t = match t { T.leaf => 1, T.node(l, r) => 1 + check l + check r };
+let loop !i !acc = if i == 0 { acc } else { loop (i - 1) (acc + check (make 16)) };
+let main! = { let long = make 20; console.print! (loop 20 0); console.print! (check long); };

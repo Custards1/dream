@@ -1,0 +1,10 @@
+import std.console;
+import std.list;
+let worker! parent i = { let v = recv! (); send! parent (v + i); };
+let main! = {
+    let me = self! ();
+    let ps = list.forced (list.map (fn i -> spawn! $( worker! me i )) (list.range 0 50000));
+    list.each! (fn p -> send! p 1) ps;
+    let rec sum! !n !acc = if n == 0 { acc } else { sum! (n - 1) (acc + recv! ()) };
+    console.print! (sum! 50000 0);
+};
