@@ -1,0 +1,43 @@
+import std.console;
+import std.io;
+import std.list;
+import std.net;
+
+// A server and its clients in one program: a listener, a process for each connection that answers
+// each message with itself, and 100 clients doing 250 round trips each. What it measures is
+// parking on sockets, the poller and switching, and on many workers, all of them at once. More
+// clients than the listener's backlog of 128 would measure the kernel's retransmit of a dropped
+// connection instead, a second each.
+
+let rec serve! conn = {
+    let got = io.read! conn 4096;
+    if len got == 0 { io.close! conn } else { io.write! conn got; serve! conn }
+};
+
+let rec accept_n! listener n = if n == 0 { :done } else {
+    let conn = net.accept! listener;
+    spawn! $( serve! conn );
+    accept_n! listener (n - 1)
+};
+
+let rec rounds! conn n !acc = if n == 0 { acc } else {
+    io.write! conn "ping"
+    let back = io.read! conn 4096;
+    rounds! conn (n - 1) (acc + len back)
+};
+
+let client! port = {
+    let conn = net.connect! "127.0.0.1" port;
+    let n = rounds! conn 250 0;
+    io.close! conn
+    n
+};
+
+let main! = {
+    let listener = net.listen! 0;
+    let port = net.port! listener;
+    let acceptor = spawn! $( accept_n! listener 100 );
+    let clients = list.forced (list.map (fn i -> spawn! $( client! port )) (list.range 0 100));
+    console.print! (list.sum (list.map (fn c -> join! c) clients))
+    join! acceptor
+};

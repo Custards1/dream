@@ -16,6 +16,7 @@
 #   strs   making, joining, splitting and searching strings
 #   procs  fifty thousand processes, each sent one message and answering one: switching and copying
 #   fanout the same work split over a process per core: what more than one thread is for
+#   net    a server and 100 clients over TCP in one program, 250 round trips each: the poller under load
 
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +29,7 @@ dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
 names=("$@")
-[[ ${#names[@]} -eq 0 ]] && names=(tree maps sorts recs strs procs fanout)
+[[ ${#names[@]} -eq 0 ]] && names=(tree maps sorts recs strs procs fanout net)
 
 best() {
   local b=999999 t0 t1 ms
