@@ -74,22 +74,33 @@ running, and the program's top-level values, which live in the frame's `world`, 
 table per process, as the VM keeps a process's globals apart.
 
 For that to be possible nothing the program holds may be a suspension, so every
-closure the compiler makes is made by a builder with strict parameters, and each is a
-named `code!` rather than a lambda. The name is what tells the VM's JIT the closure may
-perform effects -- it runs the program's -- so that a call that parks under compiled
-code is not retried with the effects done twice.
+closure the compiler makes is made by a builder with strict parameters.
+
+## What may perform an effect
+
+A node's closure is `fn!` when the node may perform an effect, and a plain `fn` when it
+cannot -- what the image says of the node (its IMPURE flag), and one thing more: an
+application of a function not known until it runs may perform one whatever the image
+says (`list.fold` is pure; the function it is handed need not be), unless it is a call of
+a function of the image that cannot (worked out for every function at load, as a fixpoint
+over the calls they make by name), or of a builtin or a native without a `!`. A node
+holding such a child is one too, since its closure suspends the child's.
+
+It matters because the VM's JIT compiles pure closures, and compiled code that parks is
+run again from the top, making its suspensions again: a pure closure that suspended a
+child performing an effect performed it twice (`fold_effects`, `jit_fold_park`). An
+interpreted function's value is an `fn!` exactly when the VM would call it impure -- its
+name's `!`, or a body that performs an effect -- so `type_of` answers what the VM does.
 
 ## Where it stands
 
-On the VM, 97 of the 101 recorded programs print what the VM prints; built native, 96.
+On the VM, 98 of the 101 recorded programs print what the VM prints; built native, 97.
 What is left:
 
 - **Suspended work crossing processes** costs more than on the VM: an unevaluated
   computation carries dre's closures and frames for every level. `census` (80,000
   processes) now finishes on the VM, at 9 GB against the VM's 1.8 GB, and `caf_race`
   still outgrows a 1 GB heap.
-- **A deep chain of suspensions** is about two host frames a level, so a program near
-  the VM's frame limit (`effects_once`) is past it under a dre hosted on the VM.
 - **Native dre crashes under heavy spawn churn on several workers** (census, or a
   thousand processes a batch): a bug in the native runtime, there with or without
   sharing, and not yet found.

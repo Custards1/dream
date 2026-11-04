@@ -73,7 +73,7 @@ let main! = {
 
     // And over a socket: the listener is given a lookup rather than a pid, and
     // asks it once per request.
-    let l = remote.serve_via! 0 (registry.finder! reg "store");
+    let l = remote.serve_via! 0 (registry.finder reg "store");
     let c = remote.connect! "127.0.0.1" (remote.port_of! l);
     console.print! (to_string (remote.call! c [:get, "a"]));
 

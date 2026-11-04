@@ -37,7 +37,7 @@ let main! = {
     let listener = net.listen! 0;
     let port = net.port! listener;
     let acceptor = spawn! $( accept_n! listener 100 );
-    let clients = list.forced (list.map (fn i -> spawn! $( client! port )) (list.range 0 100));
-    console.print! (list.sum (list.map (fn c -> join! c) clients))
+    let clients = list.forced (list.map (fn! i -> spawn! $( client! port )) (list.range 0 100));
+    console.print! (list.sum (list.map (fn! c -> join! c) clients))
     join! acceptor
 };
