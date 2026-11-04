@@ -5,7 +5,9 @@
 #
 #   DRE=/tmp/dre.dream dre/tests/programs.sh [PATTERN]
 #
-# DRE is the dre to test: an image the VM runs, or dre built with `dreams --aot`.
+# DRE is the dre to test: an image the VM runs, or dre built with `dreams --aot`. Each program
+# may map DRE_MEMORY_KB (4 GB by default), and DRE_JOBS run at once: a dozen programs allowed
+# 16 GB each took the machine down once.
 
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +34,7 @@ one() {
     echo refused > "$dir/$name.verdict"
     return
   fi
-  (ulimit -v 16000000; timeout -s KILL 120 $runner "$dir/$name.dream") >"$dir/$name.out" 2>&1 </dev/null
+  (ulimit -v "${DRE_MEMORY_KB:-4000000}"; timeout -s KILL 120 $runner "$dir/$name.dream") >"$dir/$name.out" 2>&1 </dev/null
   if diff -q "$dir/$name.out" "${src%.dr}.expected" >/dev/null; then
     echo pass > "$dir/$name.verdict"
   else

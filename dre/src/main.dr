@@ -29,13 +29,19 @@ let builtins_for! img = {
     let data = array.of_list (list.map (fn [at, n, _] -> str.slice at n bytes) (image.data_table img));
     let ids = compiler_builtins.ids;
     builtins.table!
-        .[ids.["_data_count"] => fn u -> len data]
-        .[ids.["_data_at"] => fn i -> data.[i]]
+        .[ids.["_data_count"] => count_of (run.settled data)]
+        .[ids.["_data_at"] => datum_of (run.settled data)]
 };
+
+// What stands in for a builtin is shared with the rest of the program, so what it keeps is
+// forced before it is kept: a strict parameter each.
+let count_of !data = fn u -> len data;
+let datum_of !data = fn i -> data.[i];
+let answer_of !v = fn u -> v;
 
 /// The VM's natives, with the program's arguments being the ones after its image.
 let natives_for! : [:string] -> :map;
-let natives_for! args = natives.table!.["std.os.args!" => fn u -> args];
+let natives_for! args = natives.table!.["std.os.args!" => answer_of (run.settled args)];
 
 let run! : :string -> [:string] -> :any;
 let run! path args = match file.read! path {

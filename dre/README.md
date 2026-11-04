@@ -63,20 +63,36 @@ evaluator. The native runtime makes atoms at run time for it (`vm_intern_atom!`
 in mind/std/rt/main.dr) and works out a run-time record's written name and type
 from its atom's name the first time one is made, as the VM does.
 
+## What is shared
+
+The compiled program -- every function's closures, the image and the tables -- is made
+once when the image is loaded and never changes, and `spawn!` copies what a process's
+work can reach, which through any closure of it was all of it. So it is compiled whole
+at load and moved where every process reads it (`vm.share!`): a spawn copies a pointer
+to it. What changes stays each process's own: frames, function values made while
+running, and the program's top-level values, which live in the frame's `world`, one
+table per process, as the VM keeps a process's globals apart.
+
+For that to be possible nothing the program holds may be a suspension, so every
+closure the compiler makes is made by a builder with strict parameters, and each is a
+named `code!` rather than a lambda. The name is what tells the VM's JIT the closure may
+perform effects -- it runs the program's -- so that a call that parks under compiled
+code is not retried with the effects done twice.
+
 ## Where it stands
 
-On the VM, 95 of the 101 recorded programs print what the VM prints; built
-native, 97. What is left:
+On the VM, 97 of the 101 recorded programs print what the VM prints; built native, 96.
+What is left:
 
-- **A process's copy of the program.** A `spawn!` copies what its work reaches,
-  and a closure dre compiled reaches the program's tables, so every process
-  carries a copy of the compiled program and of the globals it has forced.
-  The image's bytes are shared (`vm.share!`); the closures cannot be.
-  `census` (80,000 processes) runs out of memory, and on the VM `caf_race` does
-  too, because each child's answer holds a global of its own copy and the
-  parent forces each one. The VM keeps one global per runtime.
-- **Error traces** name dre's functions, not the image's
-  (`root_failure_ends_run`).
-- `host_members` and `share_release` ask the VM about itself, and native dre's
-  runtime answers as a native program does.
-- **Speed.** Not measured yet; no JIT, by design.
+- **Suspended work crossing processes** costs more than on the VM: an unevaluated
+  computation carries dre's closures and frames for every level. `census` (80,000
+  processes) now finishes on the VM, at 9 GB against the VM's 1.8 GB, and `caf_race`
+  still outgrows a 1 GB heap.
+- **A deep chain of suspensions** is about two host frames a level, so a program near
+  the VM's frame limit (`effects_once`) is past it under a dre hosted on the VM.
+- **Native dre crashes under heavy spawn churn on several workers** (census, or a
+  thousand processes a batch): a bug in the native runtime, there with or without
+  sharing, and not yet found.
+- **Error traces** name dre's functions, not the image's (`root_failure_ends_run`).
+- `host_members` and `share_release` ask the VM about itself.
+- **Speed.** Native dre is about 9x slower than the VM on `benchmark/native/tree`.
