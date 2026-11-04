@@ -1,0 +1,58 @@
+// dre: the Dream VM, written in Dream.
+//
+//     dre IMAGE [ARGS..]
+//
+// runs a compiled image as `dream IMAGE` does. It runs on whatever runs it -- the VM, or itself
+// compiled with `dreams --aot`, which is the point: a native program that can run images is what
+// a compiler needs for `comp` and macros, and what dre is for. dre/src/run.dr is the machine.
+
+import std.array;
+import std.builtins;
+import std.console;
+import std.file;
+import std.list;
+import std.os;
+import std.str;
+
+import dreams.aot.image;
+import dreams.builtins as compiler_builtins;
+import dre.natives;
+import dre.run;
+
+let usage = "usage: dre IMAGE [ARGS..]";
+
+/// The VM's builtins with what belongs to the image put in their place: its payload, which is
+/// its own and not dre's.
+let builtins_for! : image.Image -> :array;
+let builtins_for! img = {
+    let bytes = image.payload_bytes img;
+    let data = array.of_list (list.map (fn [at, n, _] -> str.slice at n bytes) (image.data_table img));
+    let ids = compiler_builtins.ids;
+    builtins.table!
+        .[ids.["_data_count"] => fn u -> len data]
+        .[ids.["_data_at"] => fn i -> data.[i]]
+};
+
+/// The VM's natives, with the program's arguments being the ones after its image.
+let natives_for! : [:string] -> :map;
+let natives_for! args = natives.table!.["std.os.args!" => fn u -> args];
+
+let run! : :string -> [:string] -> :any;
+let run! path args = match file.read! path {
+    Option.none => { console.error! ("dre: cannot read " + path); os.exit! 2 },
+    Option.some(bytes) => match image.read bytes {
+        Result.error(why) => { console.error! ("dre: " + path + ": " + why); os.exit! 2 },
+        Result.ok(img) => if image.Image.entry img == image.no_node {
+            console.error! ("dre: " + path + " has no main!");
+            os.exit! 2
+        } else {
+            let prog = run.load! img (builtins_for! img) (natives_for! args);
+            run.main! prog
+        },
+    },
+};
+
+let main! = match os.args! () {
+    [path, ..args] => run! path args,
+    _ => { console.error! usage; os.exit! 2 },
+};

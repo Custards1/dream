@@ -1,0 +1,590 @@
+// dre's machine: an image's functions compiled, once each and when first reached, into
+// closures of the language dre itself is written in, and run.
+//
+// The program's values are this program's values. An integer, a string, a list, a map, a
+// record, an error and a process are each the thing itself, so a builtin or a native given one
+// is the builtin or native the VM running dre has, and `spawn!`, `send!`, `try!` and the
+// collector come with them. A function of the image is a function here too: an arity's worth of
+// parameters around its compiled body, so a native that takes a function -- `spawn!` above all,
+// whose argument is a thunk, which is a function of no arguments -- is given something it can
+// call. What dre adds is only what an image says and a value does not: frames, captures,
+// globals, and which statements must run, and in what order.
+//
+// A node becomes a `Code`, a function from the frame it runs in to its value. Nothing is
+// interpreted at run time but those closures: the tree is walked once, here, and each node's
+// operands are found then rather than every time it runs.
+//
+// What must happen in order is written as a statement of an impure block, here as in the
+// image: a statement is forced where it stands, and that is what the image's STRICT flag asks.
+// A value that is only computed is left to the language's own laziness, which is the image's.
+
+import std.array;
+import std.builtins;
+import std.char;
+import std.error;
+import std.lazy;
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+import std.vm;
+
+import dreams.aot.image;
+import dreams.builtins as compiler_builtins;
+
+/// What a node computes, given the frame it runs in.
+type Code = Frame -> :any;
+
+/// A constant as code.
+let constant : :any -> Code;
+let constant v = fn fr -> v;
+
+/// A running function's slots -- its parameters first, then what its blocks bind -- and the
+/// values it captured where it was made.
+group Frame { slots : :array, caps : :array }
+
+/// A node's flags (dream/docs/bytecode-format.md).
+let flag_strict = 1;
+
+/// A function's flags.
+let fn_impure = 1;
+let fn_global_value = 8;
+
+/// A global's kinds.
+let global_function = 0;
+
+/// A capture descriptor whose top bit is set names a capture of the parent, not a slot.
+let capture_of_parent = 2147483648;
+
+/// The atom index in `record_make`'s `c`, whose top bit says the record is a variant.
+let variant_bit = 2147483648;
+
+/// One function of the image, as it runs here: what it is, and its body compiled.
+group Compiled {
+    arity : :integer,
+    impure : :bool,
+    global_value : :bool,
+    slots : :integer,
+    captures : [:integer],
+    body : Code,
+}
+
+/// A loaded image and everything dre made of it. The tables are built lazily: a function is
+/// compiled the first time something reaches it, and a global's value made the first time it
+/// is read, so a large image costs what the program uses of it.
+group Program {
+    img : image.Image,
+    atoms : :array,
+    funcs : :array,
+    globals : :array,
+    builtins : :array,
+    natives : :map,
+    /// The path of each module `natives` holds, by the module: what a `field` of a module
+    /// that is a value -- `let m = math; m.abs 1` -- looks its members up under.
+    module_paths : :map,
+}
+
+/// The image's atom `i` as an atom of this program.
+let atom_of : Program -> :integer -> :atom;
+let atom_of prog i = (Program.atoms prog).[i];
+
+/// An image read to be run. `builtins` and `natives` are what its `builtin` nodes and its host
+/// modules' members are: the VM's own, with whatever the caller replaced (dre's arguments, the
+/// image's payload).
+let load! : image.Image -> :array -> :map -> Program;
+let load! img0 table natives = {
+    // The image is data that never changes and every process reads, and a process started by
+    // `spawn!` copies what its work can reach: the image once for each of them, before this.
+    let img = image.Image.make (vm.share! (image.Image.bytes img0)) (vm.share! (image.Image.table img0)) (image.Image.entry img0);
+    // Every name the image writes as an atom, made an atom here: what the VM does when it
+    // loads one, and the only thing a program cannot do for itself.
+    let atoms = array.of_list (list.map (fn i -> vm.intern_atom! (image.atom img i)) (list.range 0 (image.count img "KATM")));
+    let forced_atoms = list.forced (array.to_list atoms);
+    let rec prog = Program.make img atoms
+        (array.of_list (list.map (fn i -> compile_function! prog i) (list.range 0 (image.count img "FUNC"))))
+        (array.of_list (list.map (fn i -> global_value! prog i) (list.range 0 (image.count img "GLBL"))))
+        table natives
+        (list.fold (fn m [path, v] -> if type_of v == :module { m.[v => path] } else { m }) %{} (map.pairs natives));
+    prog
+};
+
+// --- functions ---------------------------------------------------------------------------
+
+let compile_function! : Program -> :integer -> Compiled;
+let compile_function! prog i = {
+    let img = Program.img prog;
+    let f = image.func img i;
+    let flags = image.Func.flags f;
+    Compiled.make (image.Func.arity f) (flags & fn_impure != 0) (flags & fn_global_value != 0)
+        (image.Func.slots f)
+        (image.kids img (image.func_captures_at img i) (image.Func.captures f))
+        (compile! prog (image.Func.body f))
+};
+
+/// A frame for `c` with `args` in its first slots and the rest empty.
+let frame_of : Compiled -> [:any] -> :array -> Frame;
+let frame_of c args caps = {
+    let n = Compiled.slots c;
+    let given = list.length args;
+    Frame.make (array.of_list (list.append args (list.replicate (if n > given { n - given } else { 0 }) ()))) caps
+};
+
+/// `c` run with these arguments and captures.
+let invoke : Compiled -> [:any] -> :array -> :any;
+let invoke c args caps = (Compiled.body c) (frame_of c args caps);
+
+/// Function `i` as a value: a function of this language of the same arity, which runs the
+/// compiled body. A thunk is the arity-0 case. Past eight parameters it is curried, which is
+/// the same function to anyone who applies it. An impure function is an impure one here,
+/// because `type_of` says which, and a program may ask.
+let function_value! : Compiled -> :array -> :any;
+let function_value! c caps = if Compiled.impure c { impure_value! c caps } else { match Compiled.arity c {
+    0 => $( invoke c [] caps ),
+    1 => fn a -> invoke c [a] caps,
+    2 => fn a b -> invoke c [a, b] caps,
+    3 => fn a b d -> invoke c [a, b, d] caps,
+    4 => fn a b d e -> invoke c [a, b, d, e] caps,
+    5 => fn a b d e g -> invoke c [a, b, d, e, g] caps,
+    6 => fn a b d e g h -> invoke c [a, b, d, e, g, h] caps,
+    7 => fn a b d e g h k -> invoke c [a, b, d, e, g, h, k] caps,
+    n => curried c caps n [],
+} };
+
+let impure_value! : Compiled -> :array -> :any;
+let impure_value! c caps = match Compiled.arity c {
+    // Named, because a lambda is `:pure_fn` to `type_of` whatever it calls.
+    0 => { let f! () = invoke! c [] caps; f! },
+    1 => { let f! a = invoke! c [a] caps; f! },
+    2 => { let f! a b = invoke! c [a, b] caps; f! },
+    3 => { let f! a b d = invoke! c [a, b, d] caps; f! },
+    4 => { let f! a b d e = invoke! c [a, b, d, e] caps; f! },
+    5 => { let f! a b d e g = invoke! c [a, b, d, e, g] caps; f! },
+    6 => { let f! a b d e g h = invoke! c [a, b, d, e, g, h] caps; f! },
+    7 => { let f! a b d e g h k = invoke! c [a, b, d, e, g, h, k] caps; f! },
+    n => curried c caps n [],
+};
+
+/// `invoke`, as an effect: what an impure function's value calls, so that it is one.
+let invoke! : Compiled -> [:any] -> :array -> :any;
+let invoke! c args caps = invoke c args caps;
+
+let curried : Compiled -> :array -> :integer -> [:any] -> :any;
+let curried c caps left got = if left == 0 { invoke c (list.reverse got) caps } else { fn a -> curried c caps (left - 1) (list.cons a got) };
+
+/// Global `i`'s value. A function is its function value; a pure binding of no parameters is
+/// its body's value, made once; an impure one is an action, run by naming it (`global`
+/// below), so its value here is never asked for.
+let global_value! : Program -> :integer -> :any;
+let global_value! prog i = {
+    let g = image.global (Program.img prog) i;
+    if image.Global.kind g != global_function { module_value prog (image.import_path (Program.img prog) (image.Global.target g)) }
+    else {
+        let c = (Program.funcs prog).[image.Global.target g];
+        if Compiled.arity c == 0 { invoke c [] #[] } else { function_value! c #[] }
+    }
+};
+
+/// A module as a value: one the VM provides is the VM's own, which `natives` holds by its
+/// path. Another is a module of the image, which nothing but `field` asks for, and that is
+/// resolved where it is written.
+let module_value : Program -> :string -> :any;
+let module_value prog path = (Program.natives prog).[path else [:module, path]];
+
+// --- nodes -------------------------------------------------------------------------------
+
+/// Node `i`, compiled.
+let compile! : Program -> :integer -> Code;
+let compile! prog i = {
+    let img = Program.img prog;
+    let n = image.node img i;
+    let a = image.Node.a n;
+    let b = image.Node.b n;
+    let c = image.Node.c n;
+    let sub = fn j -> compile! prog j;
+    match image.Node.op n {
+        0 => fn fr -> (),
+        1 => { let v = image.integer img a; fn fr -> v },
+        2 => { let v = float_constant img a; fn fr -> v },
+        3 => { let v = image.string img a; fn fr -> v },
+        4 => { let v = char_of a; fn fr -> v },
+        5 => { let v = a == 1; fn fr -> v },
+        6 => { let v = atom_of prog a; fn fr -> v },
+        7 => fn fr -> (),
+        8 => fn fr -> (Frame.slots fr).[a],
+        9 => fn fr -> (Frame.caps fr).[a],
+        10 => global_code prog a,
+        11 => { let v = builtin prog a; fn fr -> v },
+        12 => field_code! prog a (image.string img b),
+        13 => apply_code (sub a) (list.map (arg! prog) (image.kids img b c)),
+        14 => {
+            let cond = sub a;
+            let yes = sub b;
+            let no = if c == image.no_node { fn fr -> () } else { sub c };
+            fn fr -> if cond fr { yes fr } else { no fr }
+        },
+        15 => block_code! prog (image.kids img a b),
+        16 => {
+            // A bind outside a block's statements answers unit; the block is what threads
+            // the frame it makes, so one here binds nothing anyone reads.
+            fn fr -> ()
+        },
+        17 => closure_code! prog a,
+        18 => closure_code! prog a,
+        19 => try_code! (sub a) (sub b) c,
+        20 => { let e = sub a; fn fr -> whnf (e fr) },
+        // Each operator written into its own closure rather than passed to one: a chain of
+        // suspended sums is forced a level at a time, and a call in between was a frame more
+        // on every level of it.
+        21 => { let x = sub a; let y = sub b; fn fr -> x fr + y fr },
+        22 => { let x = sub a; let y = sub b; fn fr -> x fr - y fr },
+        23 => { let x = sub a; let y = sub b; fn fr -> x fr * y fr },
+        24 => { let x = sub a; let y = sub b; fn fr -> x fr / y fr },
+        25 => { let x = sub a; let y = sub b; fn fr -> x fr % y fr },
+        26 => { let x = sub a; let y = sub b; fn fr -> x fr == y fr },
+        27 => { let x = sub a; let y = sub b; fn fr -> x fr != y fr },
+        28 => { let x = sub a; let y = sub b; fn fr -> x fr < y fr },
+        29 => { let x = sub a; let y = sub b; fn fr -> x fr <= y fr },
+        30 => { let x = sub a; let y = sub b; fn fr -> x fr > y fr },
+        31 => { let x = sub a; let y = sub b; fn fr -> x fr >= y fr },
+        32 => { let x = sub a; let y = sub b; fn fr -> x fr && y fr },
+        33 => { let x = sub a; let y = sub b; fn fr -> x fr || y fr },
+        34 => { let x = sub a; fn fr -> 0 - x fr },
+        35 => { let x = sub a; fn fr -> not (x fr) },
+        36 => { let items = list.map sub (image.kids img a b); fn fr -> list.map (fn e -> e fr) items },
+        37 => { let items = list.map sub (image.kids img a b); fn fr -> array.of_list (list.map (fn e -> e fr) items) },
+        38 => map_code (list.map sub (image.kids img a (2 * b))),
+        39 => {
+            let container = sub a;
+            let key = sub b;
+            if c == image.no_node { fn fr -> (container fr).[key fr] }
+            else { let fallback = sub c; fn fr -> (container fr).[key fr else fallback fr] }
+        },
+        40 => { let container = sub a; let key = sub b; let v = sub c; fn fr -> (container fr).[key fr => v fr] },
+        41 => switch_code! prog (sub a) (image.kids img b c) false,
+        42 => switch_code! prog (sub a) (image.kids img b c) true,
+        43 => type_is_code (sub a) b (c == 1),
+        44 => call! prog (named prog "_list_cons") [a, b],
+        45 => call! prog (named prog "_list_tail") [a],
+        46 => call! prog (named prog "_list_is_empty") [a],
+        75 => { let x = sub a; let y = sub b; fn fr -> x fr & y fr },
+        76 => { let x = sub a; let y = sub b; fn fr -> x fr | y fr },
+        77 => { let x = sub a; let y = sub b; fn fr -> x fr ^ y fr },
+        78 => { let x = sub a; fn fr -> ~ (x fr) },
+        79 => { let x = sub a; let y = sub b; fn fr -> x fr << y fr },
+        80 => { let x = sub a; let y = sub b; fn fr -> x fr >> y fr },
+        81 => record_code prog (list.map sub (image.kids img a b)) c,
+        82 => set_many_code! prog (sub a) (image.kids img b (2 * c)),
+        83 => ensure_code! (sub a) (sub b),
+        84 => call! prog (named prog "_match_is_cons") [a],
+        85 => call! prog (named prog "_match_head") [a],
+        op if op >= 47 && op <= 74 => call! prog (builtin prog a) (image.kids img b c),
+        op => raise_code! ("dre: no meaning for node " + to_string i + "'s op " + to_string op),
+    }
+};
+
+let raise_code! : :string -> Code;
+let raise_code! why = fn fr -> error.raise_as! :dre why;
+
+/// `x`, evaluated as far as its outermost constructor. Asked in a condition, the one place the
+/// language must evaluate, as `lazy.forced` says.
+let whnf : :any -> :any;
+let whnf x = if lazy.forced x { x } else { x };
+
+let float_constant : image.Image -> :integer -> :float;
+let float_constant img i = {
+    let [low, high] = image.float_bits img i;
+    num.float_of_bytes (str.of_int_le 8 (high * 4294967296 + low))
+};
+
+let char_of : :integer -> :char;
+let char_of n = char.of_code n;
+
+let builtin : Program -> :integer -> :any;
+let builtin prog id = (Program.builtins prog).[id];
+
+/// An argument: a constant is passed as its value, as the VM passes one, and anything else
+/// as a suspension of computing it.
+union Arg {
+    value(v : :any),
+    code(c : Code),
+}
+
+/// Node `i` as an argument.
+let arg! : Program -> :integer -> Arg;
+let arg! prog i = match constant_of prog i {
+    Option.some(v) => Arg.value v,
+    Option.none => Arg.code (compile! prog i),
+};
+
+/// The value of node `i` if it is a constant: a literal, an atom, a builtin.
+let constant_of : Program -> :integer -> Option :any;
+let constant_of prog i = {
+    let img = Program.img prog;
+    let n = image.node img i;
+    let a = image.Node.a n;
+    match image.Node.op n {
+        0 => Option.some (),
+        1 => Option.some (image.integer img a),
+        2 => Option.some (float_constant img a),
+        3 => Option.some (image.string img a),
+        4 => Option.some (char_of a),
+        5 => Option.some (a == 1),
+        6 => Option.some (atom_of prog a),
+        7 => Option.some (),
+        11 => Option.some (builtin prog a),
+        _ => Option.none,
+    }
+};
+
+/// A call of a value known now -- a builtin -- on the nodes `args`.
+let call! : Program -> :any -> [:integer] -> Code;
+let call! prog f args = apply_code (constant f) (list.map (arg! prog) args);
+
+/// An application of `f` to however many arguments. One with a constant among them is
+/// applied an argument at a time, so that each constant can be handed over as the value it
+/// is; the rest are applied at once.
+let apply_code : Code -> [Arg] -> Code;
+let apply_code f args = if list.any (fn x -> match x { Arg.value(_) => true, _ => false }) args {
+    list.fold (fn g x -> match x {
+        Arg.value(v) => passing g v,
+        Arg.code(c) => fn fr -> (g fr) (c fr),
+    }) f args
+} else { apply_codes f (list.map (fn x -> match x { Arg.code(c) => c, Arg.value(v) => constant v }) args) };
+
+/// `g`'s answer applied to `v`, which a strict parameter has in hand, so that it is the value
+/// that is passed and not a suspension of reading it.
+let passing : Code -> :any -> Code;
+let passing g !v = fn fr -> (g fr) v;
+
+/// An application of `f` to however many arguments, each suspended as an argument is.
+let apply_codes : Code -> [Code] -> Code;
+let apply_codes f args = match args {
+    [] => fn fr -> (f fr) (),
+    [a] => fn fr -> (f fr) (a fr),
+    [a, b] => fn fr -> (f fr) (a fr) (b fr),
+    [a, b, c] => fn fr -> (f fr) (a fr) (b fr) (c fr),
+    [a, b, c, d] => fn fr -> (f fr) (a fr) (b fr) (c fr) (d fr),
+    [a, b, c, d, e] => fn fr -> (f fr) (a fr) (b fr) (c fr) (d fr) (e fr),
+    [a, b, c, d, e, g] => fn fr -> (f fr) (a fr) (b fr) (c fr) (d fr) (e fr) (g fr),
+    [a, b, c, d, e, g, ..rest] => apply_codes (fn fr -> (f fr) (a fr) (b fr) (c fr) (d fr) (e fr) (g fr)) rest,
+};
+
+/// A global as it is read. An impure binding of no parameters is an action, run each time it
+/// is named, as `main!` is; anything else is its value, made once.
+let global_code : Program -> :integer -> Code;
+let global_code prog i = {
+    let g = image.global (Program.img prog) i;
+    if image.Global.kind g == global_function {
+        let target = image.Global.target g;
+        let f = image.func (Program.img prog) target;
+        if image.Func.arity f == 0 && image.Func.flags f & fn_impure != 0 && image.Func.flags f & fn_global_value == 0 {
+            fn fr -> invoke (Program.funcs prog).[target] [] #[]
+        } else { fn fr -> (Program.globals prog).[i] }
+    } else { fn fr -> (Program.globals prog).[i] }
+};
+
+/// `module.member`: a member of a module the VM provides, found once where the module is named
+/// at the top level, and where it is a value, each time.
+let field_code! : Program -> :integer -> :string -> Code;
+let field_code! prog obj name = {
+    let img = Program.img prog;
+    let n = image.node img obj;
+    let named_global = image.Node.op n == 10 && image.Global.kind (image.global img (image.Node.a n)) != global_function;
+    if named_global {
+        let path = image.import_path img (image.Global.target (image.global img (image.Node.a n)));
+        match member prog path name {
+            Option.some(v) => fn fr -> v,
+            Option.none => fn fr -> no_member! path name,
+        }
+    } else {
+        let o = compile! prog obj;
+        fn fr -> {
+            let m = o fr;
+            let path = (Program.module_paths prog).[m else ""];
+            match member prog path name {
+                Option.some(v) => v,
+                Option.none => no_member! path name,
+            }
+        }
+    }
+};
+
+/// A native by its module and name. `m.f!` names `m.f` where there is no `f!`: a pure function
+/// called impurely.
+let member : Program -> :string -> :string -> Option :any;
+let member prog path name = {
+    let natives = Program.natives prog;
+    let full = path + "." + name;
+    let plain = if str.ends_with "!" name { path + "." + str.slice 0 (len name - 1) name } else { full };
+    Option.or_else (fn u -> map.lookup plain natives) (map.lookup full natives)
+};
+
+let no_member! : :string -> :string -> :any;
+let no_member! path name = error.raise_as! :no_such_member ("module `" + path + "` has no member `" + name + "`");
+
+// --- blocks ------------------------------------------------------------------------------
+
+/// A block's statements, in order. A bind makes the frame the statements after it run in; a
+/// statement the image marks strict is forced where it stands; the last is the block's value.
+union Step {
+    bind(slot : :integer, value : Code, strict : :bool, knot : :bool),
+    expr(value : Code, strict : :bool),
+}
+
+let block_code! : Program -> [:integer] -> Code;
+let block_code! prog stmts = {
+    let steps = list.map (fn s -> step! prog s) stmts;
+    fn fr -> run_steps! steps fr
+};
+
+let step! : Program -> :integer -> Step;
+let step! prog s = {
+    let img = Program.img prog;
+    let n = image.node img s;
+    let strict = image.Node.flags n & flag_strict != 0;
+    if image.Node.op n == 16 {
+        let value_op = image.Node.op (image.node img (image.Node.b n));
+        // A closure or a thunk may name itself -- `let rec go x = .. go ..` -- and is made in
+        // the frame that already holds it, as the VM suspends it to the same end.
+        Step.bind (image.Node.a n) (compile! prog (image.Node.b n)) strict (value_op == 17 || value_op == 18)
+    } else { Step.expr (compile! prog s) strict }
+};
+
+let run_steps! : [Step] -> Frame -> :any;
+let run_steps! steps fr = match steps {
+    [] => (),
+    [Step.expr(e, _)] => e fr,
+    [Step.expr(e, strict), ..rest] => {
+        if strict { whnf (e fr); };
+        run_steps! rest fr
+    },
+    [Step.bind(slot, e, strict, knot), ..rest] => {
+        let next = bound slot e knot fr;
+        if strict { whnf ((Frame.slots next).[slot]); };
+        run_steps! rest next
+    },
+};
+
+let bound : :integer -> Code -> :bool -> Frame -> Frame;
+let bound slot e knot fr = if knot {
+    let rec next = Frame.make ((Frame.slots fr).[slot => e next]) (Frame.caps fr);
+    next
+} else { Frame.make ((Frame.slots fr).[slot => e fr]) (Frame.caps fr) };
+
+// --- closures ----------------------------------------------------------------------------
+
+/// A closure or thunk of function `f`: its captures read from the frame it is made in, a
+/// parent's slot or one of the parent's own captures.
+let closure_code! : Program -> :integer -> Code;
+let closure_code! prog f = fn fr -> {
+    let c = (Program.funcs prog).[f];
+    let caps = array.of_list (list.map (fn d ->
+        if d >= capture_of_parent { (Frame.caps fr).[d - capture_of_parent] } else { (Frame.slots fr).[d] })
+        (Compiled.captures c));
+    function_value! c caps
+};
+
+// --- the rest ----------------------------------------------------------------------------
+
+let try_code! : Code -> Code -> :integer -> Code;
+let try_code! body handler slot = fn fr ->
+    try! { whnf (body fr) } catch e { handler (Frame.make ((Frame.slots fr).[slot => e]) (Frame.caps fr)) };
+
+/// The body's answer or error, then the cleanup, which `defer!` runs on every way out.
+let ensure_code! : Code -> Code -> Code;
+let ensure_code! body cleanup = fn fr -> ensured! body cleanup fr;
+
+let ensured! : Code -> Code -> Frame -> :any;
+let ensured! body cleanup fr = {
+    defer! whnf (cleanup fr);
+    whnf (body fr)
+};
+
+let map_code : [Code] -> Code;
+let map_code kvs = fn fr -> pairs_into %{} kvs fr;
+
+let pairs_into : :map -> [Code] -> Frame -> :map;
+let pairs_into m kvs fr = match kvs {
+    [k, v, ..rest] => pairs_into m.[k fr => v fr] rest fr,
+    _ => m,
+};
+
+/// `switch_atom` keys on its subject, a record by its id; `switch_head` on the head of a list
+/// cell or the first element of an array.
+let switch_code! : Program -> Code -> [:integer] -> :bool -> Code;
+let switch_code! prog subject kids on_atom = {
+    let img = Program.img prog;
+    let arms = list.map (fn [k, t] -> [atom_of prog (image.Node.a (image.node img k)), compile! prog t]) (list.chunks 2 (list.take (list.length kids - 1) kids));
+    let table = list.fold (fn m [k, t] -> if map.has k m { m } else { m.[k => t] }) %{} arms;
+    let otherwise = compile! prog (list.last kids);
+    fn fr -> {
+        let s = whnf (subject fr);
+        let key = if on_atom { record_key prog s } else { head_key s };
+        match key {
+            Option.some(k) => (table.[k else otherwise]) fr,
+            Option.none => otherwise fr,
+        }
+    }
+};
+
+/// A builtin by the name the compiler gives it.
+let named : Program -> :string -> :any;
+let named prog name = builtin prog compiler_builtins.ids.[name];
+
+let record_key : Program -> :any -> Option :atom;
+let record_key prog s = match type_of s {
+    :atom => Option.some s,
+    _ => match (named prog "_record_id") s { () => Option.none, id => Option.some id },
+};
+
+let head_key : :any -> Option :atom;
+let head_key s = match type_of s {
+    :list => if list.is_empty s { Option.none } else { atom_or_none (list.head s) },
+    :array => if len s > 0 { atom_or_none s.[0] } else { Option.none },
+    _ => Option.none,
+};
+
+let atom_or_none : :any -> Option :atom;
+let atom_or_none v = if type_of v == :atom { Option.some v } else { Option.none };
+
+/// `type_is`'s kinds, in `dream_type`'s order.
+let surface_types = #[:integer, :float, :char, :bool, :unit, :string, :atom, :list, :array, :map];
+
+let type_is_code : Code -> :integer -> :bool -> Code;
+let type_is_code subject kind invert = {
+    let want = surface_types.[kind];
+    fn fr -> (type_of (subject fr) == want) != invert
+};
+
+let record_code : Program -> [Code] -> :integer -> Code;
+let record_code prog fields c = {
+    let variant = c >= variant_bit;
+    let id = atom_of prog (if variant { c - variant_bit } else { c });
+    let make = named prog "_record_of";
+    fn fr -> make id variant (array.of_list (list.map (fn f -> f fr) fields))
+};
+
+let set_many_code! : Program -> Code -> [:integer] -> Code;
+let set_many_code! prog container kids = {
+    let pairs = list.map (fn [k, v] -> [compile! prog k, compile! prog v]) (list.chunks 2 kids);
+    fn fr -> list.fold (fn acc [k, v] -> acc.[k fr => v fr]) (container fr) pairs
+};
+
+// --- running -----------------------------------------------------------------------------
+
+/// The image's `main!`, run: what `dream IMAGE` does.
+let main! : Program -> :any;
+let main! prog = {
+    let entry = image.Image.entry (Program.img prog);
+    whnf (invoke (Program.funcs prog).[entry] [] #[])
+};
+
+when test {
+    import std.test;
+
+    let tests = [
+        test.case "the builtins are the compiler's, by position" $(
+            test.eq! (list.length compiler_builtins.names) builtins.count
+        ),
+    ];
+}

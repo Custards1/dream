@@ -1,0 +1,11 @@
+# dre: the Dream VM, written in Dream. It runs compiled images, and compiled with
+# `dreams --aot` it is a native program that can, which is what a native compiler
+# needs for `comp` and macros.
+[package]
+license = "MIT OR Apache-2.0"
+name = "dre"
+version = "0.1.0"
+description = "The Dream VM, written in Dream"
+
+[dependencies]
+dreams = "../dreams"
