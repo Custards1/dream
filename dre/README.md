@@ -50,17 +50,33 @@ compiles each program in dream/tests/programs and examples/ with the compiler
 and holds what dre prints to what is recorded. `DRE=` names a dre to test
 (an image, or a native build).
 
+## Native
+
+```
+dream build/dreams.dream -L mind -L . -L dre=dre -o dre.dream dre/src/main.dr
+dream build/dreams.dream --aot -L mind -o dre dre.dream
+DRE=$PWD/dre dre/tests/programs.sh
+```
+
+dre builds with `dreams --aot`, and a dre built so is a VM with no C++ in its
+evaluator. The native runtime makes atoms at run time for it (`vm_intern_atom!`
+in mind/std/rt/main.dr) and works out a run-time record's written name and type
+from its atom's name the first time one is made, as the VM does.
+
 ## Where it stands
 
-95 of the 101 recorded programs print what the VM prints. What is left:
+On the VM, 95 of the 101 recorded programs print what the VM prints; built
+native, 97. What is left:
 
 - **A process's copy of the program.** A `spawn!` copies what its work reaches,
   and a closure dre compiled reaches the program's tables, so every process
   carries a copy of the compiled program and of the globals it has forced.
   The image's bytes are shared (`vm.share!`); the closures cannot be.
-  `census` (80,000 processes) runs out of memory, and `caf_race` does too,
-  because each child's answer holds a global of its own copy and the parent
-  forces each one. The VM keeps one global per runtime.
+  `census` (80,000 processes) runs out of memory, and on the VM `caf_race` does
+  too, because each child's answer holds a global of its own copy and the
+  parent forces each one. The VM keeps one global per runtime.
 - **Error traces** name dre's functions, not the image's
   (`root_failure_ends_run`).
+- `host_members` and `share_release` ask the VM about itself, and native dre's
+  runtime answers as a native program does.
 - **Speed.** Not measured yet; no JIT, by design.
