@@ -97,13 +97,17 @@ name's `!`, or a body that performs an effect -- so `type_of` answers what the V
 On the VM, 98 of the 101 recorded programs print what the VM prints; built native, 97.
 What is left:
 
-- **Suspended work crossing processes** costs more than on the VM: an unevaluated
-  computation carries dre's closures and frames for every level. `census` (80,000
-  processes) now finishes on the VM, at 9 GB against the VM's 1.8 GB, and `caf_race`
-  still outgrows a 1 GB heap.
-- **Native dre crashes under heavy spawn churn on several workers** (census, or a
-  thousand processes a batch): a bug in the native runtime, there with or without
-  sharing, and not yet found.
+- **A suspension holds the frame it was made in**, and so everything the frame holds,
+  where the VM's holds only the values it reads: pure Dream cannot move a slot's value
+  into another structure without forcing it or suspending the read. A pattern's `x` in
+  `list.map`'s `[x, ..rest]` is a suspension holding `list.map`'s frame, and through it
+  the rest of the list; a process started with it carries the list too, and a fold over a
+  generated list keeps all of it. `census` (80,000 processes) takes 6.9 GB on the VM,
+  against the VM's 0.6 GB, and each `caf_race` process about 170 MB for a sum over
+  300,000 numbers, more than the VM allows a heap when sixty-four run at once. What
+  is done already: a closure's captures hold its parent's slot arrays rather than the
+  parent's frame, and a process `spawn!` starts on a thunk makes a world of its own,
+  of the program's values only, as a process the VM starts does.
 - **Error traces** name dre's functions, not the image's (`root_failure_ends_run`).
 - `host_members` and `share_release` ask the VM about itself.
 - **Speed.** Native dre is about 9x slower than the VM on `benchmark/native/tree`.
