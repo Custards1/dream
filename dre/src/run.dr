@@ -23,9 +23,13 @@
 // copies what its work can reach, which through any closure of it was all of it. So the whole
 // program is compiled when it is loaded and moved where every process reads it and none copies
 // it (`vm.share!`). What changes is each process's own: a frame, a function value made while
-// running, and the program's top-level values, which are made when first read and live in the
-// frame's `world`, a table of them per process. The VM keeps a process's globals apart in the
-// same way.
+// running, and the program's top-level values, which are made when first read and live in a
+// table of them per process, its `world`. A process finds its own with `vm.per_process`, as the
+// VM finds a process's globals, rather than by the frame it is running in: carried in frames,
+// the table went wherever a suspension did, so a process `spawn!` started was handed a copy of
+// every top-level value its parent had worked out (`census` copied the 1000-element `table`
+// into each of 80,000 processes), and a value one of them answered was worked out again by
+// whoever forced it, in the world it was made in (`caf_race`, once for each of 64 answers).
 //
 // For that to be possible nothing the compiled program holds may be a suspension: a shared
 // value is one every process reads and none may update. So every closure made here is made by a
@@ -49,9 +53,9 @@ import dreams.builtins as compiler_builtins;
 /// What a node computes, given the frame it runs in.
 type Code = Frame -> :any;
 
-/// A running function's slots -- its parameters first, then what its blocks bind -- the values
-/// it captured where it was made, and this process's top-level values.
-group Frame { slots : :array, caps : :array, world : :array }
+/// A running function's slots -- its parameters first, then what its blocks bind -- and the
+/// values it captured where it was made.
+group Frame { slots : :array, caps : :array }
 
 /// A node's flags (dream/docs/bytecode-format.md).
 let flag_strict = 1;
@@ -100,6 +104,11 @@ group Program {
     values : [:integer],
     /// Each of those globals' place in a world, by the global's index.
     places : :map,
+    /// What `vm.per_process` knows this program's worlds by: a key no other program loaded
+    /// in this VM has.
+    serial : :integer,
+    /// For each node, the function of the image it is written in (`owners_of`).
+    owners : :array,
 }
 
 /// `x` forced all the way down, and answered: what a closure keeps of a list or a table.
@@ -127,9 +136,55 @@ let load! img table natives = {
         table natives (effects_of img)
         (list.fold (fn m [path, v] -> if type_of v == :module { m.[to_string v => path] } else { m }) %{} (map.pairs natives))
         (list.map (fn i -> image.Global.target (image.global img i)) (value_globals img))
-        (world_places img);
+        (world_places img) (vm.unique! ()) (owners_of img);
     // Sharing forces it all the way down, which is every function compiled.
     vm.share! prog
+};
+
+// --- where an error was raised ---------------------------------------------------------
+//
+// The machine running dre writes on an error where it was raised, from the functions it is
+// running, and those are dre's: every error an image raised was "in `main!` (run.dr)". So
+// an image's `raise!` is written here (`raise_at_code`), with the image function it is
+// written in, and the machine, finding the place already on the error, keeps it. Only that
+// function: dre keeps no stack of the image's calls, which would be something made on every
+// call to be read on the rare one that fails. And only `raise!`: an error a builtin raises --
+// a failed `match`, a division by zero -- still says it was in dre.
+
+/// For each node of the image, the function whose body it is in, or -1. A closure's body is
+/// a function of its own, and is not walked into from the one that makes it.
+let owners_of : image.Image -> :array;
+let owners_of img = {
+    let owned = list.fold (fn m f -> owned_from img f [image.Func.body (image.func img f)] m) %{}
+        (list.range 0 (image.count img "FUNC"));
+    array.of_list (list.map (fn i -> owned.[i else -1]) (list.range 0 (image.count img "NODE")))
+};
+
+let owned_from : image.Image -> :integer -> [:integer] -> :map -> :map;
+let owned_from img f work !m = match work {
+    [] => m,
+    [i, ..rest] => if i == image.no_node || map.has i m { owned_from img f rest m }
+        else { owned_from img f (list.append (node_children img (image.node img i)) rest) m.[i => f] },
+};
+
+/// Where node `i` is, as `error.trace!` says a place: ``[:in, name, path, line, col]``.
+let place_of : Program -> :integer -> [:any];
+let place_of prog i = {
+    let img = Program.img prog;
+    let f = (Program.owners prog).[i];
+    if f < 0 { [:in, "?", "", 0, 0] }
+    else { [:in, image.string img (image.Func.name (image.func img f)), image.func_source img f, image.func_line img f, image.func_col img f] }
+};
+
+/// `raise! x`, written where it is: `x` made an error as `raise!` makes one, and placed at
+/// `place` unless it already says where it was raised, as one raised again does.
+let raise_at_code : Code -> [:any] -> Code;
+let raise_at_code !x !place = fn! fr -> raise! (placed! (x fr) place);
+
+let placed! : :any -> [:any] -> :error;
+let placed! v place = {
+    let e = if error.is_error v { v } else { error.new :error v };
+    if list.is_empty (error.trace! e) { vm.raised_at e [place] } else { e }
 };
 
 // --- functions ---------------------------------------------------------------------------
@@ -153,62 +208,61 @@ let function_of : Program -> :integer -> Compiled;
 let function_of prog f = (Program.funcs prog).[f];
 
 /// `c` run with `args`, its parameters with its other slots after them.
-let invoke : Compiled -> [:any] -> :array -> :array -> :any;
-let invoke c args caps world = (Compiled.body c) (Frame.make (array.of_list args) caps world);
+let invoke : Compiled -> [:any] -> :array -> :any;
+let invoke c args caps = (Compiled.body c) (Frame.make (array.of_list args) caps);
 
 /// Function `c` as a value: a function of this language of the same arity, which runs the
 /// compiled body. A thunk is the arity-0 case. Past seven parameters it is curried, which is
 /// the same function to anyone who applies it. An impure function is an impure one here,
 /// because `type_of` says which, and a program may ask.
-let function_value : Compiled -> :array -> :array -> :any;
-let function_value c caps w = {
+let function_value : Compiled -> :array -> :any;
+let function_value c caps = {
     let pad = Compiled.pad c;
-    if Compiled.impure c { impure_value c caps w } else { match Compiled.arity c {
-        0 => $( invoke c pad caps w ),
-        1 => fn a -> invoke c (a :: pad) caps w,
-        2 => fn a b -> invoke c (a :: b :: pad) caps w,
-        3 => fn a b d -> invoke c (a :: b :: d :: pad) caps w,
-        4 => fn a b d e -> invoke c (a :: b :: d :: e :: pad) caps w,
-        5 => fn a b d e g -> invoke c (a :: b :: d :: e :: g :: pad) caps w,
-        6 => fn a b d e g h -> invoke c (a :: b :: d :: e :: g :: h :: pad) caps w,
-        7 => fn a b d e g h k -> invoke c (a :: b :: d :: e :: g :: h :: k :: pad) caps w,
-        n => curried c caps w n [],
+    if Compiled.impure c { impure_value c caps } else { match Compiled.arity c {
+        0 => $( invoke c pad caps ),
+        1 => fn a -> invoke c (a :: pad) caps,
+        2 => fn a b -> invoke c (a :: b :: pad) caps,
+        3 => fn a b d -> invoke c (a :: b :: d :: pad) caps,
+        4 => fn a b d e -> invoke c (a :: b :: d :: e :: pad) caps,
+        5 => fn a b d e g -> invoke c (a :: b :: d :: e :: g :: pad) caps,
+        6 => fn a b d e g h -> invoke c (a :: b :: d :: e :: g :: h :: pad) caps,
+        7 => fn a b d e g h k -> invoke c (a :: b :: d :: e :: g :: h :: k :: pad) caps,
+        n => curried c caps n [],
     } }
 };
 
-let impure_value : Compiled -> :array -> :array -> :any;
-let impure_value c caps w = {
+let impure_value : Compiled -> :array -> :any;
+let impure_value c caps = {
     let pad = Compiled.pad c;
     match Compiled.arity c {
         // A thunk is a thunk, impure body or not, as the VM makes one.
-        0 => $( invoke c pad caps w ),
-        1 => fn! a -> invoke c (a :: pad) caps w,
-        2 => fn! a b -> invoke c (a :: b :: pad) caps w,
-        3 => fn! a b d -> invoke c (a :: b :: d :: pad) caps w,
-        4 => fn! a b d e -> invoke c (a :: b :: d :: e :: pad) caps w,
-        5 => fn! a b d e g -> invoke c (a :: b :: d :: e :: g :: pad) caps w,
-        6 => fn! a b d e g h -> invoke c (a :: b :: d :: e :: g :: h :: pad) caps w,
-        7 => fn! a b d e g h k -> invoke c (a :: b :: d :: e :: g :: h :: k :: pad) caps w,
-        n => curried c caps w n [],
+        0 => $( invoke c pad caps ),
+        1 => fn! a -> invoke c (a :: pad) caps,
+        2 => fn! a b -> invoke c (a :: b :: pad) caps,
+        3 => fn! a b d -> invoke c (a :: b :: d :: pad) caps,
+        4 => fn! a b d e -> invoke c (a :: b :: d :: e :: pad) caps,
+        5 => fn! a b d e g -> invoke c (a :: b :: d :: e :: g :: pad) caps,
+        6 => fn! a b d e g h -> invoke c (a :: b :: d :: e :: g :: h :: pad) caps,
+        7 => fn! a b d e g h k -> invoke c (a :: b :: d :: e :: g :: h :: k :: pad) caps,
+        n => curried c caps n [],
     }
 };
 
-let curried : Compiled -> :array -> :array -> :integer -> [:any] -> :any;
-let curried c caps w left got = if left == 0 { invoke c (list.append (list.reverse got) (Compiled.pad c)) caps w }
-    else { fn a -> curried c caps w (left - 1) (list.cons a got) };
+let curried : Compiled -> :array -> :integer -> [:any] -> :any;
+let curried c caps left got = if left == 0 { invoke c (list.append (list.reverse got) (Compiled.pad c)) caps }
+    else { fn a -> curried c caps (left - 1) (list.cons a got) };
 
 /// This process's top-level values: for each global that is a value -- a pure binding of no
 /// parameters -- its body's value, made the first time it is read. Every other global is
 /// nothing here: a function is made where it is named, and an impure binding of no parameters is
-/// an action, run each time it is named. A process started by `spawn!` makes one of its own
-/// (`spawn_code`), so it holds only the values: a slot for every global was a few hundred words
-/// for each process, in whatever it answered with too.
+/// an action, run each time it is named. Made the first time the process reads a value, so a
+/// process that reads none -- most that `spawn!` starts -- makes none.
+let world : Program -> :array;
+let world prog = vm.per_process (Program.serial prog) (world_of prog);
+
 let world_of : Program -> :array;
-let world_of prog = {
-    let rec world = array.of_list (list.map (fn f ->
-        invoke (function_of prog f) (Compiled.pad (function_of prog f)) #[] world) (Program.values prog));
-    world
-};
+let world_of prog = array.of_list (list.map (fn f ->
+    invoke (function_of prog f) (Compiled.pad (function_of prog f)) #[]) (Program.values prog));
 
 /// The globals of `img` that are values, in the order of their places in a world.
 let value_globals : image.Image -> [:integer];
@@ -247,8 +301,8 @@ let local_code !i = fn fr -> (Frame.slots fr).[i];
 let capture_code : :integer -> Code;
 let capture_code !i = fn fr -> (Frame.caps fr).[i];
 
-let world_code : :integer -> Code;
-let world_code !i = fn fr -> (Frame.world fr).[i];
+let world_code : Program -> :integer -> Code;
+let world_code !prog !i = fn fr -> (world prog).[i];
 
 let if_code : :bool -> Code -> Code -> Code -> Code;
 let if_code !eff !c !y !n = if eff { fn! fr -> if c fr { y fr } else { n fr } } else { fn fr -> if c fr { y fr } else { n fr } };
@@ -461,7 +515,7 @@ let compile_node prog i n eff = {
         9 => capture_code a,
         10 => global_code prog a,
         12 => field_code prog a (image.string img b),
-        13 => apply_code eff prog a (image.kids img b c),
+        13 => apply_code eff prog i a (image.kids img b c),
         14 => if_code eff (sub a) (sub b) (if c == image.no_node { constant () } else { sub c }),
         15 => block_code eff prog (image.kids img a b),
         // A bind outside a block's statements: the block is what threads the frame it makes,
@@ -570,8 +624,8 @@ let arg prog i = match constant_of prog i {
 
 /// An application. A function of the image named at the top level and given all its arguments
 /// is called directly, with no function value made to be applied: that is most calls.
-let apply_code : :bool -> Program -> :integer -> [:integer] -> Code;
-let apply_code eff prog callee args = {
+let apply_code : :bool -> Program -> :integer -> :integer -> [:integer] -> Code;
+let apply_code eff prog at callee args = {
     let img = Program.img prog;
     let n = image.node img callee;
     let direct = if image.Node.op n == 10 {
@@ -584,11 +638,15 @@ let apply_code eff prog callee args = {
         [11, [work]] if image.Node.a n == compiler_builtins.ids.["spawn!"] => thunk_of img work,
         _ => Option.none,
     };
-    match [direct, spawned] {
+    let raising = match [image.Node.op n, args] {
+        [11, [_]] => image.Node.a n == compiler_builtins.ids.["raise!"],
+        _ => false,
+    };
+    if raising { raise_at_code (compile prog (list.head args)) (settled (place_of prog at)) } else { match [direct, spawned] {
         [_, Option.some(f)] => spawn_code prog f,
         [Option.some(f), _] => direct_call eff prog f (list.map (arg prog) args),
         _ => apply_args eff (compile prog callee) (list.map (arg prog) args),
-    }
+    } }
 };
 
 /// The function of node `i`, if it makes a thunk.
@@ -624,17 +682,17 @@ let code_of x = match x {
     Arg.code(c) => c,
 };
 
-let direct1 !eff !prog !f !a = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: Compiled.pad c) #[] (Frame.world fr) } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: Compiled.pad c) #[] (Frame.world fr) } };
-let direct2 !eff !prog !f !a !b = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: Compiled.pad c) #[] (Frame.world fr) } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: Compiled.pad c) #[] (Frame.world fr) } };
-let direct3 !eff !prog !f !a !b !d = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: Compiled.pad c) #[] (Frame.world fr) } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: Compiled.pad c) #[] (Frame.world fr) } };
-let direct4 !eff !prog !f !a !b !d !e = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: e fr :: Compiled.pad c) #[] (Frame.world fr) } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: e fr :: Compiled.pad c) #[] (Frame.world fr) } };
+let direct1 !eff !prog !f !a = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: Compiled.pad c) #[] } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: Compiled.pad c) #[] } };
+let direct2 !eff !prog !f !a !b = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: Compiled.pad c) #[] } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: Compiled.pad c) #[] } };
+let direct3 !eff !prog !f !a !b !d = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: Compiled.pad c) #[] } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: Compiled.pad c) #[] } };
+let direct4 !eff !prog !f !a !b !d !e = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: e fr :: Compiled.pad c) #[] } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: e fr :: Compiled.pad c) #[] } };
 
 let direct_built !eff !prog !f !args = if eff { fn! fr -> {
     let c = function_of prog f;
-    invoke c (list.append (list.map (fn x -> passed x fr) args) (Compiled.pad c)) #[] (Frame.world fr)
+    invoke c (list.append (list.map (fn x -> passed x fr) args) (Compiled.pad c)) #[]
 } } else { fn fr -> {
     let c = function_of prog f;
-    invoke c (list.append (list.map (fn x -> passed x fr) args) (Compiled.pad c)) #[] (Frame.world fr)
+    invoke c (list.append (list.map (fn x -> passed x fr) args) (Compiled.pad c)) #[]
 } };
 
 /// An argument as it is passed: a constant as itself, anything else suspended.
@@ -692,16 +750,16 @@ let global_code prog i = {
     else {
         let f = image.func img (image.Global.target g);
         if is_action f { action_code prog (image.Global.target g) }
-        else if is_value f { world_code (Program.places prog).[i] }
+        else if is_value f { world_code prog (Program.places prog).[i] }
         else { function_code prog (image.Global.target g) }
     }
 };
 
 let action_code : Program -> :integer -> Code;
-let action_code !prog !f = fn fr -> { let c = function_of prog f; invoke c (Compiled.pad c) #[] (Frame.world fr) };
+let action_code !prog !f = fn fr -> { let c = function_of prog f; invoke c (Compiled.pad c) #[] };
 
 let function_code : Program -> :integer -> Code;
-let function_code !prog !f = fn! fr -> function_value (function_of prog f) #[] (Frame.world fr);
+let function_code !prog !f = fn! fr -> function_value (function_of prog f) #[];
 
 /// `module.member`: a member of a module the VM provides, found once where the module is named
 /// at the top level, and where it is a value, each time.
@@ -805,9 +863,9 @@ let run_steps steps fr = match steps {
 
 let bound : :integer -> Code -> :bool -> Frame -> Frame;
 let bound slot e knot fr = if knot {
-    let rec next = Frame.make ((Frame.slots fr).[slot => e next]) (Frame.caps fr) (Frame.world fr);
+    let rec next = Frame.make ((Frame.slots fr).[slot => e next]) (Frame.caps fr);
     next
-} else { Frame.make ((Frame.slots fr).[slot => e fr]) (Frame.caps fr) (Frame.world fr) };
+} else { Frame.make ((Frame.slots fr).[slot => e fr]) (Frame.caps fr) };
 
 // --- closures ----------------------------------------------------------------------------
 
@@ -816,36 +874,29 @@ let bound slot e knot fr = if knot {
 let closure_code : Program -> :integer -> Code;
 let closure_code !prog !f = fn! fr -> {
     let c = function_of prog f;
-    function_value c (captured c (Frame.slots fr) (Frame.caps fr)) (Frame.world fr)
+    function_value c (captured c (Frame.slots fr) (Frame.caps fr))
 };
 
 /// What `c` captures, from its parent's slots and captures. Each is a suspension of reading
 /// it, since reading a slot is forcing what is in it, and the arrays are taken first so that
-/// what each suspension holds is them: holding the parent's frame, it held the parent's world
-/// as well, and every top-level value the parent had worked out went wherever the closure
-/// did -- into each process `spawn!` started with it, a copy apiece.
+/// what each suspension holds is them and not the parent's frame.
 let captured : Compiled -> :array -> :array -> :array;
 let captured !c !slots !pcaps = array.of_list (list.map (fn d ->
     if d >= capture_of_parent { pcaps.[d - capture_of_parent] } else { slots.[d] }) (Compiled.captures c));
 
-/// `spawn! $( .. )`. The thunk is made with a world of its own, made in the new process,
-/// because that is what a process started by the VM has: top-level values of its own,
-/// worked out again where they are read (`global_value` in dream/src/interp.cpp). Made with
-/// its parent's, it was handed a copy of the parent's, values and all.
+/// `spawn! $( .. )`, the thunk made here and handed over as it is. Handed on as an argument
+/// is, it was a suspension of making it, which `spawn!` copied with the frame it held.
 let spawn_code : Program -> :integer -> Code;
 let spawn_code !prog !f = fn! fr -> {
     let c = function_of prog f;
-    spawn! (child_work prog c (captured c (Frame.slots fr) (Frame.caps fr)))
+    spawn! (function_value c (captured c (Frame.slots fr) (Frame.caps fr)))
 };
-
-let child_work : Program -> Compiled -> :array -> :any;
-let child_work !prog !c !caps = $( invoke c (Compiled.pad c) caps (world_of prog) );
 
 // --- the rest ----------------------------------------------------------------------------
 
 let try_code : :bool -> Code -> Code -> :integer -> Code;
 let try_code eff !body !handler !slot = fn! fr ->
-    try! { whnf (body fr) } catch e { handler (Frame.make ((Frame.slots fr).[slot => e]) (Frame.caps fr) (Frame.world fr)) };
+    try! { whnf (body fr) } catch e { handler (Frame.make ((Frame.slots fr).[slot => e]) (Frame.caps fr)) };
 
 /// The body's answer or error, then the cleanup, which `defer!` runs on every way out.
 let ensure_code : Code -> Code -> Code;
@@ -928,7 +979,7 @@ let pairs_onto acc kvs fr = match kvs {
 let main! : Program -> :any;
 let main! prog = {
     let c = function_of prog (image.Image.entry (Program.img prog));
-    whnf (invoke c (Compiled.pad c) #[] (world_of prog))
+    whnf (invoke c (Compiled.pad c) #[])
 };
 
 when test {

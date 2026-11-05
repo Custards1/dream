@@ -94,20 +94,28 @@ name's `!`, or a body that performs an effect -- so `type_of` answers what the V
 
 ## Where it stands
 
-On the VM, 98 of the 101 recorded programs print what the VM prints; built native, 98 of
+On the VM, all 101 recorded programs print what the VM prints; built native, all
 the 100 the native runtime can run (`share_release` asks about an area it does not have).
-What is left:
 
-- **A suspension holds the frame it was made in**, and so everything the frame holds,
-  where the VM's holds only the values it reads: pure Dream cannot move a slot's value
-  into another structure without forcing it or suspending the read. A pattern's `x` in
-  `list.map`'s `[x, ..rest]` is a suspension holding `list.map`'s frame, and through it
-  the rest of the list; a process started with it carries the list too, and a fold over a
-  generated list keeps all of it. `census` (80,000 processes) takes 6.9 GB on the VM,
-  against the VM's 0.6 GB, and each `caf_race` process about 170 MB for a sum over
-  300,000 numbers, more than the VM allows a heap when sixty-four run at once. What
-  is done already: a closure's captures hold its parent's slot arrays rather than the
-  parent's frame, and a process `spawn!` starts on a thunk makes a world of its own,
-  of the program's values only, as a process the VM starts does.
-- **Error traces** name dre's functions, not the image's (`root_failure_ends_run`).
+A process finds its table of the image's top-level values with `vm.per_process`, as the
+VM finds a process's globals, and not through the frame it is running in. In frames, the
+table went wherever a suspension did: a process `spawn!` started was handed a copy of
+every value its parent had worked out (`census` copied a 1000-element list into each of
+80,000 processes, 6.9 GB), and a value a process answered was worked out again by
+whoever forced it, in the table it was made with (`caf_race`, once for each of 64
+answers, under a native that holds the collector off). `census` now takes 0.57 GB on the
+VM, which itself takes 0.61, and 0.51 GB built native.
+
+A suspension still holds the frame it was made in, where the VM's holds only the values it
+reads. Measured, that is not what cost the memory: making each suspension on a frame of
+only the slots its code reads, copied into a new one, doubled `census` and halved the
+speed, and handing a slot's value on as it lies, in a list cell a strict parameter takes
+apart, halved the speed and saved nothing. What is left:
+
+- **Error traces** name only the image function a `raise!` is written in, which dre writes
+  on the error with `vm.raised_at` before the runtime can write dre's own functions there.
+  The VM and the native runtime name every function the error unwound through, up to
+  twelve; dre keeps no stack of the image's calls to read them from, since that would be
+  made on every call for the rare one that fails. An error a builtin raises -- a failed
+  `match`, a division by zero -- is still placed in dre.
 - **Speed.** Native dre is about 9x slower than the VM on `benchmark/native/tree`.
