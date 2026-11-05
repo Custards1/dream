@@ -95,6 +95,11 @@ group Program {
     /// up under. By the text and not the module, because a module is a key by its identity, and
     /// the shared copy of the table is not the table the program was handed its modules from.
     module_paths : :map,
+    /// The globals that are values -- a pure binding of no parameters -- as the functions that
+    /// compute them, in the order of their places in a world (`world_of`).
+    values : [:integer],
+    /// Each of those globals' place in a world, by the global's index.
+    places : :map,
 }
 
 /// `x` forced all the way down, and answered: what a closure keeps of a list or a table.
@@ -120,7 +125,9 @@ let load! img table natives = {
     let rec prog = Program.make img atoms
         (array.of_list (list.map (fn i -> compile_function prog i) (list.range 0 (image.count img "FUNC"))))
         table natives (effects_of img)
-        (list.fold (fn m [path, v] -> if type_of v == :module { m.[to_string v => path] } else { m }) %{} (map.pairs natives));
+        (list.fold (fn m [path, v] -> if type_of v == :module { m.[to_string v => path] } else { m }) %{} (map.pairs natives))
+        (list.map (fn i -> image.Global.target (image.global img i)) (value_globals img))
+        (world_places img);
     // Sharing forces it all the way down, which is every function compiled.
     vm.share! prog
 };
@@ -193,18 +200,26 @@ let curried c caps w left got = if left == 0 { invoke c (list.append (list.rever
 /// This process's top-level values: for each global that is a value -- a pure binding of no
 /// parameters -- its body's value, made the first time it is read. Every other global is
 /// nothing here: a function is made where it is named, and an impure binding of no parameters is
-/// an action, run each time it is named.
+/// an action, run each time it is named. A process started by `spawn!` makes one of its own
+/// (`spawn_code`), so it holds only the values: a slot for every global was a few hundred words
+/// for each process, in whatever it answered with too.
 let world_of : Program -> :array;
 let world_of prog = {
-    let img = Program.img prog;
-    let rec world = array.of_list (list.map (fn i -> {
-        let g = image.global img i;
-        if image.Global.kind g == global_function && is_value (image.func img (image.Global.target g)) {
-            invoke (function_of prog (image.Global.target g)) (Compiled.pad (function_of prog (image.Global.target g))) #[] world
-        } else { () }
-    }) (list.range 0 (image.count img "GLBL")));
+    let rec world = array.of_list (list.map (fn f ->
+        invoke (function_of prog f) (Compiled.pad (function_of prog f)) #[] world) (Program.values prog));
     world
 };
+
+/// The globals of `img` that are values, in the order of their places in a world.
+let value_globals : image.Image -> [:integer];
+let value_globals img = list.filter (fn i -> {
+    let g = image.global img i;
+    image.Global.kind g == global_function && is_value (image.func img (image.Global.target g))
+}) (list.range 0 (image.count img "GLBL"));
+
+/// Each value global's place in a world, by its index.
+let world_places : image.Image -> :map;
+let world_places img = list.fold (fn m [place, i] -> m.[i => place]) %{} (list.enumerate (value_globals img));
 
 let is_value : image.Func -> :bool;
 let is_value f = image.Func.arity f == 0 && (image.Func.flags f & fn_impure == 0 || image.Func.flags f & fn_global_value != 0);
@@ -565,10 +580,24 @@ let apply_code eff prog callee args = {
             Option.some (image.Global.target g)
         } else { Option.none }
     } else { Option.none };
-    match direct {
-        Option.some(f) => direct_call eff prog f (list.map (arg prog) args),
-        Option.none => apply_args eff (compile prog callee) (list.map (arg prog) args),
+    let spawned = match [image.Node.op n, args] {
+        [11, [work]] if image.Node.a n == compiler_builtins.ids.["spawn!"] => thunk_of img work,
+        _ => Option.none,
+    };
+    match [direct, spawned] {
+        [_, Option.some(f)] => spawn_code prog f,
+        [Option.some(f), _] => direct_call eff prog f (list.map (arg prog) args),
+        _ => apply_args eff (compile prog callee) (list.map (arg prog) args),
     }
+};
+
+/// The function of node `i`, if it makes a thunk.
+let thunk_of : image.Image -> :integer -> Option :integer;
+let thunk_of img i = {
+    let n = image.node img i;
+    if (image.Node.op n == 17 || image.Node.op n == 18) && image.Func.arity (image.func img (image.Node.a n)) == 0 {
+        Option.some (image.Node.a n)
+    } else { Option.none }
 };
 
 /// A call eff of a value known now -- a builtin -- on the nodes `args`.
@@ -663,7 +692,7 @@ let global_code prog i = {
     else {
         let f = image.func img (image.Global.target g);
         if is_action f { action_code prog (image.Global.target g) }
-        else if is_value f { world_code i }
+        else if is_value f { world_code (Program.places prog).[i] }
         else { function_code prog (image.Global.target g) }
     }
 };
@@ -787,11 +816,30 @@ let bound slot e knot fr = if knot {
 let closure_code : Program -> :integer -> Code;
 let closure_code !prog !f = fn! fr -> {
     let c = function_of prog f;
-    let caps = array.of_list (list.map (fn d ->
-        if d >= capture_of_parent { (Frame.caps fr).[d - capture_of_parent] } else { (Frame.slots fr).[d] })
-        (Compiled.captures c));
-    function_value c caps (Frame.world fr)
+    function_value c (captured c (Frame.slots fr) (Frame.caps fr)) (Frame.world fr)
 };
+
+/// What `c` captures, from its parent's slots and captures. Each is a suspension of reading
+/// it, since reading a slot is forcing what is in it, and the arrays are taken first so that
+/// what each suspension holds is them: holding the parent's frame, it held the parent's world
+/// as well, and every top-level value the parent had worked out went wherever the closure
+/// did -- into each process `spawn!` started with it, a copy apiece.
+let captured : Compiled -> :array -> :array -> :array;
+let captured !c !slots !pcaps = array.of_list (list.map (fn d ->
+    if d >= capture_of_parent { pcaps.[d - capture_of_parent] } else { slots.[d] }) (Compiled.captures c));
+
+/// `spawn! $( .. )`. The thunk is made with a world of its own, made in the new process,
+/// because that is what a process started by the VM has: top-level values of its own,
+/// worked out again where they are read (`global_value` in dream/src/interp.cpp). Made with
+/// its parent's, it was handed a copy of the parent's, values and all.
+let spawn_code : Program -> :integer -> Code;
+let spawn_code !prog !f = fn! fr -> {
+    let c = function_of prog f;
+    spawn! (child_work prog c (captured c (Frame.slots fr) (Frame.caps fr)))
+};
+
+let child_work : Program -> Compiled -> :array -> :any;
+let child_work !prog !c !caps = $( invoke c (Compiled.pad c) caps (world_of prog) );
 
 // --- the rest ----------------------------------------------------------------------------
 
