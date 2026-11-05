@@ -94,7 +94,8 @@ name's `!`, or a body that performs an effect -- so `type_of` answers what the V
 
 ## Where it stands
 
-On the VM, 98 of the 101 recorded programs print what the VM prints; built native, 97.
+On the VM, 98 of the 101 recorded programs print what the VM prints; built native, 98 of
+the 100 the native runtime can run (`share_release` asks about an area it does not have).
 What is left:
 
 - **A suspension holds the frame it was made in**, and so everything the frame holds,
@@ -109,5 +110,4 @@ What is left:
   parent's frame, and a process `spawn!` starts on a thunk makes a world of its own,
   of the program's values only, as a process the VM starts does.
 - **Error traces** name dre's functions, not the image's (`root_failure_ends_run`).
-- `host_members` and `share_release` ask the VM about itself.
 - **Speed.** Native dre is about 9x slower than the VM on `benchmark/native/tree`.

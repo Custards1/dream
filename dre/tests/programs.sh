@@ -48,6 +48,9 @@ for src in "$root"/dream/tests/programs/*.dr "$root"/examples/*.dr; do
   [[ -f "${src%.dr}.expected" ]] || continue
   [[ -z "$pattern" || "$name" == *$pattern* ]] || continue
   [[ -f "${src%.dr}.env" ]] && continue
+  # A dre built native runs on the native runtime, which has no area apart from its heaps for
+  # this to ask about: dreams/tests/aot_programs.sh leaves it out for the same reason.
+  [[ "$dre" != *.dream && "$name" == share_release ]] && continue
   printf '%s\0' "$src"
 done | xargs -0 -P "${DRE_JOBS:-$(( $(nproc) / 2 ))}" -I{} bash -c 'one "$@" 2>/dev/null' _ {}
 
