@@ -7,6 +7,10 @@
 #   benchmark/native/run.sh procs maps          # some
 #   image=/tmp/base/dreams.dream mind=/tmp/base/mind benchmark/native/run.sh   # A/B another compiler and runtime
 #   vm=0 benchmark/native/run.sh                # native only
+#   CXX=clang++ benchmark/native/run.sh         # the C++ column with another compiler
+#
+# A benchmark with a `.cpp` beside it is the same work in C++, built -O2, which is what native Dream
+# is measured against (dreams/docs/aot-direct.md): `!` after its time says it printed otherwise.
 #
 # What each one asks:
 #   tree   allocation and a deep recursion: a binary tree of 2^20 leaves, and many of 2^16
@@ -25,6 +29,7 @@ dream="$(realpath "${DREAM:-$root/build-dream/bin/dream}")"
 image="$(realpath "${image:-$root/build/dreams.dream}")"
 mind="$(realpath "${mind:-$root/mind}")"
 vm="${vm:-1}"
+cxx="${CXX:-g++}"
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
@@ -53,12 +58,18 @@ for w in "${names[@]}"; do
     echo "$w: does not build native"; grep error "$dir/said" | head -5; continue
   fi
   n=$(best "$dir/$w"); cp "$dir/out" "$dir/native.out"
+  # The same work in C++, where there is a translation: what "close to C++" is measured against.
+  c="-"
+  if [[ -f "$here/$w.cpp" ]] && command -v "$cxx" >/dev/null && "$cxx" -O2 -std=c++17 -o "$dir/$w.cxx" "$here/$w.cpp" 2>/dev/null; then
+    c=$(best "$dir/$w.cxx")
+    diff -q "$dir/out" "$dir/native.out" >/dev/null || c="$c!"
+  fi
   if [[ "$vm" == 1 ]]; then
     v=$(best "$dream" "$dir/$w.dream")
     if diff -q "$dir/out" "$dir/native.out" >/dev/null; then same=same; else same=DIFF; fi
-    printf '%-7s vm %6s  native %6s  %s\n' "$w" "$v" "$n" "$same"
+    printf '%-7s vm %6s  native %6s  c++ %6s  %s\n' "$w" "$v" "$n" "$c" "$same"
     if [[ "$same" == DIFF ]]; then echo "  vm:     $(head -c 200 "$dir/out")"; echo "  native: $(head -c 200 "$dir/native.out")"; fi
   else
-    printf '%-7s native %6s  %s\n' "$w" "$n" "$(head -c 60 "$dir/native.out" | tr '\n' ' ')"
+    printf '%-7s native %6s  c++ %6s  %s\n' "$w" "$n" "$c" "$(head -c 60 "$dir/native.out" | tr '\n' ' ')"
   fi
 done
