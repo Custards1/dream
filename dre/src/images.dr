@@ -1,0 +1,89 @@
+// An image run by dre, as a library: what `vm.eval_image!` and the session natives
+// (`open_image!`, `call_image!`, `close_image!`) do on the VM, for a program with no VM under
+// it. `dreams` built native runs its `comp`s, its contract batches and a package's macros
+// through these (dreams/src/images.dr); `dre` itself is `load!` and `run.main!`.
+//
+// On the VM an open image is a runtime of its own, named by an integer, and kept in a table
+// until it is closed. Here it is the loaded program, which is a value: the handle is the
+// program, closing it is letting go of it, and nothing has to be kept anywhere.
+
+import std.array;
+import std.builtins;
+import std.error;
+import std.lazy;
+import std.list;
+import std.str;
+
+import dreams.aot.image;
+import dreams.builtins as compiler_builtins;
+import dre.natives;
+import dre.run;
+
+/// The VM's builtins with what belongs to the image put in their place: its payload, which is
+/// its own and not dre's.
+let builtins_for! : image.Image -> :array;
+let builtins_for! img = {
+    let bytes = image.payload_bytes img;
+    let data = array.of_list (list.map (fn [at, n, _] -> str.slice at n bytes) (image.data_table img));
+    let ids = compiler_builtins.ids;
+    builtins.table!
+        .[ids.["_data_count"] => count_of (run.settled data)]
+        .[ids.["_data_at"] => datum_of (run.settled data)]
+};
+
+// What stands in for a builtin is shared with the rest of the program, so what it keeps is
+// forced before it is kept: a strict parameter each.
+let count_of !data = fn u -> len data;
+let datum_of !data = fn i -> data.[i];
+let answer_of !v = fn u -> v;
+
+/// The VM's natives, with the program's arguments being `args`.
+let natives_for! : [:string] -> :map;
+let natives_for! args = natives.table!.["std.os.args!" => answer_of (run.settled args)];
+
+/// `img` loaded to be run, with `args` as its arguments.
+let load! : image.Image -> [:string] -> run.Program;
+let load! img args = run.load! img (builtins_for! img) (natives_for! args);
+
+/// An image's bytes read, or raised as the VM raises an image it cannot read.
+let read! : :string -> image.Image;
+let read! bytes = match image.read bytes {
+    Result.ok(img) => img,
+    Result.error(why) => error.raise_as! :bad_image why,
+};
+
+/// `vm.eval_image! bytes`: the image's entry point run, and what it produced, forced all the
+/// way down.
+let eval! : :string -> :any;
+let eval! bytes = {
+    let img = read! bytes;
+    if image.Image.entry img == image.no_node { error.raise_as! :bad_image "the image has no entry point" };
+    deep (run.main! (load! img []))
+};
+
+/// `vm.open_image! bytes`: the image loaded and kept, as the handle the calls below take.
+let open! : :string -> run.Program;
+let open! bytes = load! (read! bytes) [];
+
+/// `vm.call_image! handle module name args`: `module.name` in an open image applied to `args`,
+/// and what it produced, forced all the way down. One of no parameters is a value, which the
+/// arguments are then applied to, as the VM does.
+let call! : run.Program -> :string -> :string -> [:any] -> :any;
+let call! prog module_name name args = match image.function_in_module (run.Program.img prog) module_name name {
+    Option.none => error.raise_as! :bad_image ("the image has no " + module_name + "." + name),
+    Option.some(f) => deep (applied! (run.function_value (run.function_of prog f) #[]) args),
+};
+
+/// `vm.close_image! handle`: nothing is kept, so there is nothing to free.
+let close! : run.Program -> :bool;
+let close! prog = true;
+
+let applied! : :any -> [:any] -> :any;
+let applied! f args = match args {
+    [] => f,
+    [a, ..rest] => applied! (f a) rest,
+};
+
+/// `x` forced all the way down, and answered.
+let deep : :any -> :any;
+let deep !x = lazy.after (lazy.settled x) x;
