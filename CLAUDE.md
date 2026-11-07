@@ -257,7 +257,11 @@ mind` runs `./mind.dream` if there is one and the installed `mind.dream`
 otherwise, and an arbitrary path still means that path. `dream -x NAME` is the
 other half — the installation and nothing else, so a file in the working
 directory cannot shadow an installed program. `just install` is what puts
-`dreams.dream` and `lucid.dream` there.
+`dreams.dream` and `lucid.dream` there. `mind install` installs a program
+native where it can (an executable named `NAME`, falling back to the image
+with a line saying why; `--image` asks for the image), and a file the VM finds
+that is not an image is `exec`ed with the program's arguments
+(`is_native_program` in dream/src/cli.cpp), so both mean the same program.
 
 The installation is `$MINDV2_PATH` when it is set; otherwise `lib/dream`
 beside the directory the VM's binary is in (`/usr/bin/dream` has
