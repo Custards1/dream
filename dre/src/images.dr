@@ -33,8 +33,11 @@ let builtins_for! img = {
 
 // What stands in for a builtin is shared with the rest of the program, so what it keeps is
 // forced before it is kept: a strict parameter each.
+let count_of : :array -> :any -> :integer;
 let count_of !data = fn u -> len data;
+let datum_of : :array -> :integer -> :any;
 let datum_of !data = fn i -> data.[i];
+let answer_of : :any -> :any -> :any;
 let answer_of !v = fn u -> v;
 
 /// The VM's natives, with the program's arguments being `args`.

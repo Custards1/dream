@@ -14,6 +14,7 @@ import dreams.aot.image;
 import dre.images;
 import dre.run;
 
+let usage : :string;
 let usage = "usage: dre IMAGE [ARGS..]";
 
 let run! : :string -> [:string] -> :any;
@@ -31,6 +32,7 @@ let run! path args = match file.read! path {
     },
 };
 
+let main! : :any;
 let main! = match os.args! () {
     [path, ..args] => run! path args,
     _ => { console.error! usage; os.exit! 2 },

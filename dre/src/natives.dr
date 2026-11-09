@@ -13,6 +13,7 @@ import std.os;
 
 /// Every native, by `module.member`, and each module by its path. An action, because naming an
 /// impure function is one.
+let table! : :map;
 let table! = %{
     "std.math" => math,
     "std.math.sqrt" => math.sqrt,

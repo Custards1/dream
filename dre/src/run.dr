@@ -58,20 +58,27 @@ type Code = Frame -> :any;
 group Frame { slots : :array, caps : :array }
 
 /// A node's flags (dream/docs/bytecode-format.md).
+let flag_strict : :integer;
 let flag_strict = 1;
+let flag_impure : :integer;
 let flag_impure = 2;
 
 /// A function's flags.
+let fn_impure : :integer;
 let fn_impure = 1;
+let fn_global_value : :integer;
 let fn_global_value = 8;
 
 /// A global's kinds.
+let global_function : :integer;
 let global_function = 0;
 
 /// A capture descriptor whose top bit is set names a capture of the parent, not a slot.
+let capture_of_parent : :integer;
 let capture_of_parent = 2147483648;
 
 /// The atom index in `record_make`'s `c`, whose top bit says the record is a variant.
+let variant_bit : :integer;
 let variant_bit = 2147483648;
 
 /// One function of the image, as it runs here: what it is, and its body compiled. `pad` is the
@@ -312,38 +319,62 @@ let force_code !eff !e = if eff { fn! fr -> whnf (e fr) } else { fn fr -> whnf (
 
 // Each operator written into its own closure rather than passed to one: a chain of suspended
 // sums is forced a level at a time, and a call eff in between was a frame more on every level.
+let add_code : :bool -> Code -> Code -> Code;
 let add_code !eff !x !y = if eff { fn! fr -> x fr + y fr } else { fn fr -> x fr + y fr };
+let sub_code : :bool -> Code -> Code -> Code;
 let sub_code !eff !x !y = if eff { fn! fr -> x fr - y fr } else { fn fr -> x fr - y fr };
+let mul_code : :bool -> Code -> Code -> Code;
 let mul_code !eff !x !y = if eff { fn! fr -> x fr * y fr } else { fn fr -> x fr * y fr };
+let div_code : :bool -> Code -> Code -> Code;
 let div_code !eff !x !y = if eff { fn! fr -> x fr / y fr } else { fn fr -> x fr / y fr };
+let mod_code : :bool -> Code -> Code -> Code;
 let mod_code !eff !x !y = if eff { fn! fr -> x fr % y fr } else { fn fr -> x fr % y fr };
+let eq_code : :bool -> Code -> Code -> Code;
 let eq_code !eff !x !y = if eff { fn! fr -> x fr == y fr } else { fn fr -> x fr == y fr };
+let ne_code : :bool -> Code -> Code -> Code;
 let ne_code !eff !x !y = if eff { fn! fr -> x fr != y fr } else { fn fr -> x fr != y fr };
+let lt_code : :bool -> Code -> Code -> Code;
 let lt_code !eff !x !y = if eff { fn! fr -> x fr < y fr } else { fn fr -> x fr < y fr };
+let le_code : :bool -> Code -> Code -> Code;
 let le_code !eff !x !y = if eff { fn! fr -> x fr <= y fr } else { fn fr -> x fr <= y fr };
+let gt_code : :bool -> Code -> Code -> Code;
 let gt_code !eff !x !y = if eff { fn! fr -> x fr > y fr } else { fn fr -> x fr > y fr };
+let ge_code : :bool -> Code -> Code -> Code;
 let ge_code !eff !x !y = if eff { fn! fr -> x fr >= y fr } else { fn fr -> x fr >= y fr };
+let and_code : :bool -> Code -> Code -> Code;
 let and_code !eff !x !y = if eff { fn! fr -> x fr && y fr } else { fn fr -> x fr && y fr };
+let or_code : :bool -> Code -> Code -> Code;
 let or_code !eff !x !y = if eff { fn! fr -> x fr || y fr } else { fn fr -> x fr || y fr };
+let band_code : :bool -> Code -> Code -> Code;
 let band_code !eff !x !y = if eff { fn! fr -> x fr & y fr } else { fn fr -> x fr & y fr };
+let bor_code : :bool -> Code -> Code -> Code;
 let bor_code !eff !x !y = if eff { fn! fr -> x fr | y fr } else { fn fr -> x fr | y fr };
+let bxor_code : :bool -> Code -> Code -> Code;
 let bxor_code !eff !x !y = if eff { fn! fr -> x fr ^ y fr } else { fn fr -> x fr ^ y fr };
+let shl_code : :bool -> Code -> Code -> Code;
 let shl_code !eff !x !y = if eff { fn! fr -> x fr << y fr } else { fn fr -> x fr << y fr };
+let shr_code : :bool -> Code -> Code -> Code;
 let shr_code !eff !x !y = if eff { fn! fr -> x fr >> y fr } else { fn fr -> x fr >> y fr };
+let neg_code : :bool -> Code -> Code;
 let neg_code !eff !x = if eff { fn! fr -> 0 - x fr } else { fn fr -> 0 - x fr };
+let not_code : :bool -> Code -> Code;
 let not_code !eff !x = if eff { fn! fr -> not (x fr) } else { fn fr -> not (x fr) };
+let bnot_code : :bool -> Code -> Code;
 let bnot_code !eff !x = if eff { fn! fr -> ~ (x fr) } else { fn fr -> ~ (x fr) };
 
 let list_code : :bool -> [Code] -> Code;
 let list_code eff !items = list_built eff (settled items);
+let list_built : :bool -> [Code] -> Code;
 let list_built !eff !items = if eff { fn! fr -> list.map (fn e -> e fr) items } else { fn fr -> list.map (fn e -> e fr) items };
 
 let array_code : :bool -> [Code] -> Code;
 let array_code eff !items = array_built eff (settled items);
+let array_built : :bool -> [Code] -> Code;
 let array_built !eff !items = if eff { fn! fr -> array.of_list (list.map (fn e -> e fr) items) } else { fn fr -> array.of_list (list.map (fn e -> e fr) items) };
 
 let map_code : :bool -> [Code] -> Code;
 let map_code eff !kvs = map_built eff (settled kvs);
+let map_built : :bool -> [Code] -> Code;
 let map_built !eff !kvs = if eff { fn! fr -> pairs_into %{} kvs fr } else { fn fr -> pairs_into %{} kvs fr };
 
 let pairs_into : :map -> [Code] -> Frame -> :map;
@@ -352,8 +383,11 @@ let pairs_into m kvs fr = match kvs {
     _ => m,
 };
 
+let get_code : :bool -> Code -> Code -> Code;
 let get_code !eff !container !key = if eff { fn! fr -> (container fr).[key fr] } else { fn fr -> (container fr).[key fr] };
+let get_else_code : :bool -> Code -> Code -> Code -> Code;
 let get_else_code !eff !container !key !fallback = if eff { fn! fr -> (container fr).[key fr else fallback fr] } else { fn fr -> (container fr).[key fr else fallback fr] };
+let set_code : :bool -> Code -> Code -> Code -> Code;
 let set_code !eff !container !key !v = if eff { fn! fr -> (container fr).[key fr => v fr] } else { fn fr -> (container fr).[key fr => v fr] };
 
 // --- nodes -------------------------------------------------------------------------------
@@ -682,11 +716,16 @@ let code_of x = match x {
     Arg.code(c) => c,
 };
 
+let direct1 : :bool -> Program -> :integer -> Code -> Code;
 let direct1 !eff !prog !f !a = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: Compiled.pad c) #[] } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: Compiled.pad c) #[] } };
+let direct2 : :bool -> Program -> :integer -> Code -> Code -> Code;
 let direct2 !eff !prog !f !a !b = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: Compiled.pad c) #[] } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: Compiled.pad c) #[] } };
+let direct3 : :bool -> Program -> :integer -> Code -> Code -> Code -> Code;
 let direct3 !eff !prog !f !a !b !d = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: Compiled.pad c) #[] } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: Compiled.pad c) #[] } };
+let direct4 : :bool -> Program -> :integer -> Code -> Code -> Code -> Code -> Code;
 let direct4 !eff !prog !f !a !b !d !e = if eff { fn! fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: e fr :: Compiled.pad c) #[] } } else { fn fr -> { let c = function_of prog f; invoke c (a fr :: b fr :: d fr :: e fr :: Compiled.pad c) #[] } };
 
+let direct_built : :bool -> Program -> :integer -> [Arg] -> Code;
 let direct_built !eff !prog !f !args = if eff { fn! fr -> {
     let c = function_of prog f;
     invoke c (list.append (list.map (fn x -> passed x fr) args) (Compiled.pad c)) #[]
@@ -721,11 +760,17 @@ let apply_args eff !f !args = {
 let passing : :bool -> Code -> :any -> Code;
 let passing !eff !g !v = if eff { fn! fr -> (g fr) v } else { fn fr -> (g fr) v };
 
+let apply0 : :bool -> Code -> Code;
 let apply0 !eff !f = if eff { fn! fr -> (f fr) () } else { fn fr -> (f fr) () };
+let apply1 : :bool -> Code -> Code -> Code;
 let apply1 !eff !f !a = if eff { fn! fr -> (f fr) (a fr) } else { fn fr -> (f fr) (a fr) };
+let apply2 : :bool -> Code -> Code -> Code -> Code;
 let apply2 !eff !f !a !b = if eff { fn! fr -> (f fr) (a fr) (b fr) } else { fn fr -> (f fr) (a fr) (b fr) };
+let apply3 : :bool -> Code -> Code -> Code -> Code -> Code;
 let apply3 !eff !f !a !b !c = if eff { fn! fr -> (f fr) (a fr) (b fr) (c fr) } else { fn fr -> (f fr) (a fr) (b fr) (c fr) };
+let apply4 : :bool -> Code -> Code -> Code -> Code -> Code -> Code;
 let apply4 !eff !f !a !b !c !d = if eff { fn! fr -> (f fr) (a fr) (b fr) (c fr) (d fr) } else { fn fr -> (f fr) (a fr) (b fr) (c fr) (d fr) };
+let apply5 : :bool -> Code -> Code -> Code -> Code -> Code -> Code -> Code;
 let apply5 !eff !f !a !b !c !d !e = if eff { fn! fr -> (f fr) (a fr) (b fr) (c fr) (d fr) (e fr) } else { fn fr -> (f fr) (a fr) (b fr) (c fr) (d fr) (e fr) };
 
 /// An application of `f` to however many arguments, each suspended as an argument is.
@@ -819,7 +864,9 @@ let block_code eff prog stmts = steps_code eff (list.map (fn s -> step prog s) s
 /// strict parameter, a `match`'s subject -- are forced in order all the same, by `lazy.after`.
 let steps_code : :bool -> [Step] -> Code;
 let steps_code !eff !steps = if eff { impure_steps (settled steps) } else { pure_steps (settled steps) };
+let impure_steps : [Step] -> Code;
 let impure_steps !steps = fn! fr -> run_steps! steps fr;
+let pure_steps : [Step] -> Code;
 let pure_steps !steps = fn fr -> run_steps steps fr;
 
 let step : Program -> :integer -> Step;
@@ -921,6 +968,7 @@ let switch_code eff prog subject kids on_atom = {
 let switch_built : :bool -> Code -> :map -> Code -> :bool -> :any -> Code;
 let switch_built eff subject table otherwise on_atom record_id = switch_kept eff subject (settled table) otherwise on_atom record_id;
 
+let switch_kept : :bool -> Code -> :map -> Code -> :bool -> :any -> Code;
 let switch_kept !eff !subject !table !otherwise !on_atom !record_id = if eff { fn! fr -> {
         let s = whnf (subject fr);
         let key = if on_atom { record_key record_id s } else { head_key s };
@@ -954,6 +1002,7 @@ let atom_or_none : :any -> Option :atom;
 let atom_or_none v = if type_of v == :atom { Option.some v } else { Option.none };
 
 /// `type_is`'s kinds, in `dream_type`'s order.
+let surface_types : #[:atom];
 let surface_types = #[:integer, :float, :char, :bool, :unit, :string, :atom, :list, :array, :map];
 
 let type_is_code : :bool -> Code -> :atom -> :bool -> Code;
@@ -961,10 +1010,12 @@ let type_is_code !eff !subject !want !invert = if eff { fn! fr -> (type_of (subj
 
 let record_code : :bool -> [Code] -> :atom -> :bool -> :any -> Code;
 let record_code eff fields id variant make = record_built eff (settled fields) id variant make;
+let record_built : :bool -> [Code] -> :any -> :any -> (:any -> :any -> :array -> :any) -> Code;
 let record_built !eff !fields !id !variant !make = if eff { fn! fr -> make id variant (array.of_list (list.map (fn f -> f fr) fields)) } else { fn fr -> make id variant (array.of_list (list.map (fn f -> f fr) fields)) };
 
 let set_many_code : :bool -> Code -> [Code] -> Code;
 let set_many_code eff container kvs = set_many_built eff container (settled kvs);
+let set_many_built : :bool -> Code -> [Code] -> Code;
 let set_many_built !eff !container !kvs = if eff { fn! fr -> pairs_onto (container fr) kvs fr } else { fn fr -> pairs_onto (container fr) kvs fr };
 
 let pairs_onto : :any -> [Code] -> Frame -> :any;
@@ -985,6 +1036,7 @@ let main! prog = {
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "the builtins are the compiler's, by position" $(
             test.eq! (list.length compiler_builtins.names) builtins.count
