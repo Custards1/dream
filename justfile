@@ -437,15 +437,22 @@ test-dreams-corpus: build
     ./{{dreams}} dreams/src/parser.dr --test -L mind -L . -o /tmp/dream-parser-tests.dream
     ./{{dream}} /tmp/dream-parser-tests.dream
 
-# The end of the pipeline: programs `dreams` compiled, run by the VM, checked
-# against the output recorded beside them. The other `dreams` tests ask whether
-# a stage agrees with a recorded shape; this one asks the only question that
-# finally matters, and it is the evidence that the self-hosted compiler works.
 # How far the AOT has got: every recorded program built native, run and compared.
 # Fails only on a wrong answer; what is refused is listed, as what to build next.
 test-aot-programs: build
     DREAM={{dream}} image={{image}} dreams/tests/aot_programs.sh
 
+# The same, its objects made through `std.llvm` -- LLVM as a library, which is
+# how a `dreams` built native makes them -- rather than by the VM: from the
+# `libdream_llvm.so` `just vm` builds beside the VM where LLVM is linked
+# statically, or whatever `$DREAM_LIB_LLVM` names.
+test-aot-llvm-library: build
+    DREAMS_AOT_FFI=1 DREAM_LIBRARY_PATH=$PWD/build-dream/lib DREAM={{dream}} image={{image}} dreams/tests/aot_programs.sh
+
+# The end of the pipeline: programs `dreams` compiled, run by the VM, checked
+# against the output recorded beside them. The other `dreams` tests ask whether
+# a stage agrees with a recorded shape; this one asks the only question that
+# finally matters, and it is the evidence that the self-hosted compiler works.
 test-dreams-compile: build
     dream={{dream}} seed={{seed}} dreams/tests/compile.sh
     dream={{dream}} image={{image}} dreams/tests/parts.sh
