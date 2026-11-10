@@ -12,9 +12,11 @@
 // a restart registers again; and both the local caller and the listener resolve
 // the name at the moment they use it rather than remembering an answer.
 import std.console;
+import std.proc;
 import std.registry;
 import std.remote;
 import std.supervisor;
+import std.time;
 
 mod store {
     derive std.server;
@@ -51,9 +53,20 @@ mod store {
 /// the registry dropping the dead server and the replacement registering, the
 /// name is free, and `()` differs from `was` too. Settling on that sent the
 /// next remote call to nobody, about one run in forty.
-let rec settle! reg name was tries = {
+///
+/// And patience is a length of time, not a number of tries. Counted, five
+/// hundred tries in a row could all be made before a loaded machine got round
+/// to the supervisor's replacement -- one run in a hundred, with forty-eight
+/// at once -- so each try past the first waits a millisecond, which also gives
+/// the other processes the turn they need, until ten seconds have gone.
+let settle! : :any -> :string -> :any -> :any;
+let settle! reg name was = settled_by! reg name was (time.monotonic! () + 10 * time.second);
+
+let settled_by! : :any -> :string -> :any -> :integer -> :any;
+let rec settled_by! reg name was deadline = {
     let p = registry.whereis! reg name;
-    if (p != was && p != ()) || tries <= 0 { p } else { settle! reg name was (tries - 1) }
+    if (p != was && p != ()) || time.monotonic! () > deadline { p }
+    else { proc.sleep! 1; settled_by! reg name was deadline }
 };
 
 let main! = {
@@ -64,7 +77,7 @@ let main! = {
     // already knows how to describe and keeps its name and restart policy.
     let sup = supervisor.start! :one_for_one
                   [registry.child! reg (store.child! "store" %{})];
-    let first = settle! reg "store" () 500;
+    let first = settle! reg "store" ();
     console.print! (to_string (registry.names! reg));
 
     // Locally, the name is the address. Nothing below ever sees a pid.
@@ -80,7 +93,7 @@ let main! = {
     // Now take the server down. The supervisor starts another, and that one
     // puts itself in the registry over the entry the dead one left.
     registry.cast! reg "store" :go_away
-    let second = settle! reg "store" first 500;
+    let second = settle! reg "store" first;
     console.print! (to_string (second != first));
 
     // The same connection, never reconnected, answered by a server that has
